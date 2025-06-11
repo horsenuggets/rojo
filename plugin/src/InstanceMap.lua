@@ -31,6 +31,9 @@ function InstanceMap.new(onInstanceChanged)
 		-- Callback that's invoked whenever an instance is changed and it was
 		-- not paused.
 		onInstanceChanged = onInstanceChanged,
+
+		-- A map from IDs to sources.
+		idsToSources = {}
 	}
 
 	return setmetatable(self, InstanceMap)
@@ -193,9 +196,30 @@ function InstanceMap:__connectSignals(instance)
 
 		self.instancesToSignal[instance] = signals
 	else
-		self.instancesToSignal[instance] = instance.Changed:Connect(function(propertyName)
-			self:__maybeFireInstanceChanged(instance, propertyName)
+		local signals = {
+			instance.Changed:Connect(function(propertyName)
+				if propertyName == "Source" then
+					return
+				end
+				self:__maybeFireInstanceChanged(instance, propertyName)
+			end)
+		}
+		
+		local hasSource = pcall(function()
+			local _ = instance.Source
 		end)
+		if hasSource then
+			table.insert(signals, instance:GetPropertyChangedSignal("Source"):Connect(function()
+				local id = self.fromInstances[instance]
+				if instance.Source == self.idsToSources[id] then
+					return
+				end
+				self.idsToSources[id] = instance.Source
+				self:__maybeFireInstanceChanged(instance, "Source")
+			end))
+		end
+
+		self.instancesToSignal[instance] = signals
 	end
 end
 

@@ -185,9 +185,12 @@ return {
 			end,
 			write = function(instance: Script, _, value: string)
 				task.spawn(function()
-					ScriptEditorService:UpdateSourceAsync(instance, function()
-						return value
-					end)
+					local currentSource = ScriptEditorService:GetEditorSource(instance)
+					if currentSource ~= value then
+						ScriptEditorService:UpdateSourceAsync(instance, function()
+							return value
+						end)
+					end
 				end)
 				return true
 			end,
@@ -200,9 +203,12 @@ return {
 			end,
 			write = function(instance: ModuleScript, _, value: string)
 				task.spawn(function()
-					ScriptEditorService:UpdateSourceAsync(instance, function()
-						return value
-					end)
+					local currentSource = ScriptEditorService:GetEditorSource(instance)
+					if currentSource ~= value then
+						ScriptEditorService:UpdateSourceAsync(instance, function()
+							return value
+						end)
+					end
 				end)
 				return true
 			end,
