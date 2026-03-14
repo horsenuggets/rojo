@@ -73,7 +73,14 @@ impl RojoTree {
         self.inner.root_ref()
     }
 
-    pub fn get_instance(&self, id: Ref) -> Option<InstanceWithMeta> {
+    /// Returns the root Instance of this tree.
+    #[inline]
+    pub fn root(&self) -> InstanceWithMeta<'_> {
+        self.get_instance(self.get_root_id())
+            .expect("RojoTrees should have a root")
+    }
+
+    pub fn get_instance(&self, id: Ref) -> Option<InstanceWithMeta<'_>> {
         if let Some(instance) = self.inner.get_by_ref(id) {
             let metadata = self.metadata_map.get(&id).unwrap();
 
@@ -83,7 +90,7 @@ impl RojoTree {
         }
     }
 
-    pub fn get_instance_mut(&mut self, id: Ref) -> Option<InstanceWithMetaMut> {
+    pub fn get_instance_mut(&mut self, id: Ref) -> Option<InstanceWithMetaMut<'_>> {
         if let Some(instance) = self.inner.get_by_ref_mut(id) {
             let metadata = self.metadata_map.get_mut(&id).unwrap();
 
@@ -322,6 +329,10 @@ impl<'a> InstanceWithMeta<'a> {
     pub fn metadata(&self) -> &'a InstanceMetadata {
         self.metadata
     }
+
+    pub fn inner(&self) -> &Instance {
+        self.instance
+    }
 }
 
 /// RojoTree's equivalent of `&'a mut Instance`.
@@ -370,6 +381,14 @@ impl InstanceWithMetaMut<'_> {
 
     pub fn metadata(&self) -> &InstanceMetadata {
         self.metadata
+    }
+
+    pub fn inner(&self) -> &Instance {
+        self.instance
+    }
+
+    pub fn inner_mut(&mut self) -> &mut Instance {
+        self.instance
     }
 }
 

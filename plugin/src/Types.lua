@@ -49,10 +49,29 @@ local ApiReadResponse = t.interface({
 	instances = t.map(RbxId, ApiInstance),
 })
 
-local ApiSubscribeResponse = t.interface({
-	sessionId = t.string,
+local SocketPacketType = t.union(t.literal("messages"))
+
+local MessagesPacket = t.interface({
 	messageCursor = t.number,
 	messages = t.array(ApiSubscribeMessage),
+})
+
+local SocketPacketBody = t.union(MessagesPacket)
+
+local ApiSocketPacket = t.interface({
+	sessionId = t.string,
+	packetType = SocketPacketType,
+	body = SocketPacketBody,
+})
+
+local ApiSerializeResponse = t.interface({
+	sessionId = t.string,
+	modelContents = t.buffer,
+})
+
+local ApiRefPatchResponse = t.interface({
+	sessionId = t.string,
+	patch = ApiSubscribeMessage,
 })
 
 local ApiError = t.interface({
@@ -75,13 +94,15 @@ return strict("Types", {
 
 	ApiInfoResponse = ApiInfoResponse,
 	ApiReadResponse = ApiReadResponse,
-	ApiSubscribeResponse = ApiSubscribeResponse,
+	ApiSocketPacket = ApiSocketPacket,
 	ApiError = ApiError,
 
 	ApiInstance = ApiInstance,
 	ApiInstanceUpdate = ApiInstanceUpdate,
 	ApiInstanceMetadata = ApiInstanceMetadata,
 	ApiSubscribeMessage = ApiSubscribeMessage,
+	ApiSerializeResponse = ApiSerializeResponse,
+	ApiRefPatchResponse = ApiRefPatchResponse,
 	ApiValue = ApiValue,
 	RbxId = RbxId,
 

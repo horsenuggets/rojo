@@ -1,9 +1,14 @@
 use std::fs;
 
-use insta::{assert_yaml_snapshot, with_settings};
+use insta::{assert_snapshot, assert_yaml_snapshot, with_settings};
 use tempfile::tempdir;
 
-use crate::rojo_test::{internable::InternAndRedact, serve_util::run_serve_test};
+use crate::rojo_test::{
+    internable::InternAndRedact,
+    serve_util::{run_serve_test, serialize_to_xml_model},
+};
+
+use librojo::web_api::SocketPacketType;
 
 #[test]
 fn empty() {
@@ -39,10 +44,12 @@ fn scripts() {
 
         fs::write(session.path().join("src/foo.lua"), "Updated foo!").unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "scripts_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -71,10 +78,12 @@ fn add_folder() {
 
         fs::create_dir(session.path().join("src/my-new-folder")).unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "add_folder_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -101,10 +110,12 @@ fn remove_file() {
 
         fs::remove_file(session.path().join("src/hello.txt")).unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "remove_file_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -131,10 +142,12 @@ fn edit_init() {
 
         fs::write(session.path().join("src/init.lua"), b"-- Edited contents").unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "edit_init_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -177,10 +190,12 @@ fn move_folder_of_stuff() {
         // will fail otherwise.
         fs::rename(stuff_path, session.path().join("src/new-stuff")).unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "move_folder_of_stuff_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -211,10 +226,12 @@ fn empty_json_model() {
         )
         .unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "empty_json_model_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -242,10 +259,12 @@ fn add_optional_folder() {
 
         fs::create_dir(session.path().join("create-later")).unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "add_optional_folder_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -434,10 +453,12 @@ fn ref_properties() {
         )
         .unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "ref_properties_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -464,10 +485,12 @@ fn ref_properties_remove() {
 
         fs::remove_file(session.path().join("src/target.model.json")).unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "ref_properties_remove_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -526,10 +549,12 @@ fn ref_properties_patch_update() {
         )
         .unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "ref_properties_patch_update_subscribe",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -578,10 +603,12 @@ fn model_pivot_migration() {
         )
         .unwrap();
 
-        let subscribe_response = session.get_api_subscribe(0).unwrap();
+        let socket_packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
         assert_yaml_snapshot!(
             "model_pivot_migration_all",
-            subscribe_response.intern_and_redact(&mut redactions, ())
+            socket_packet.intern_and_redact(&mut redactions, ())
         );
 
         let read_response = session.get_api_read(root_id).unwrap();
@@ -589,5 +616,70 @@ fn model_pivot_migration() {
             "model_pivot_migration_all-2",
             read_response.intern_and_redact(&mut redactions, root_id)
         );
+    });
+}
+
+#[test]
+fn meshpart_with_id() {
+    run_serve_test("meshpart_with_id", |session, mut redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+
+        assert_yaml_snapshot!("meshpart_with_id_info", redactions.redacted_yaml(&info));
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        assert_yaml_snapshot!(
+            "meshpart_with_id_all",
+            read_response.intern_and_redact(&mut redactions, root_id)
+        );
+
+        // This is a bit awkward, but it's fine.
+        let (meshpart, _) = read_response
+            .instances
+            .iter()
+            .find(|(_, inst)| inst.class_name == "MeshPart")
+            .unwrap();
+        let (objectvalue, _) = read_response
+            .instances
+            .iter()
+            .find(|(_, inst)| inst.class_name == "ObjectValue")
+            .unwrap();
+
+        let serialize_response = session
+            .get_api_serialize(&[*meshpart, *objectvalue], info.session_id)
+            .unwrap();
+
+        // We don't assert a snapshot on the SerializeResponse because the model includes the
+        // Refs from the DOM as names, which means it will obviously be different every time
+        // this code runs. Still, we ensure that the SessionId is right at least.
+        assert_eq!(serialize_response.session_id, info.session_id);
+
+        let model = serialize_to_xml_model(&serialize_response, &redactions);
+        assert_snapshot!("meshpart_with_id_serialize_model", model);
+    });
+}
+
+#[test]
+fn forced_parent() {
+    run_serve_test("forced_parent", |session, mut redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+
+        assert_yaml_snapshot!("forced_parent_info", redactions.redacted_yaml(&info));
+
+        let read_response = session.get_api_read(root_id).unwrap();
+        assert_yaml_snapshot!(
+            "forced_parent_all",
+            read_response.intern_and_redact(&mut redactions, root_id)
+        );
+
+        let serialize_response = session
+            .get_api_serialize(&[root_id], info.session_id)
+            .unwrap();
+
+        assert_eq!(serialize_response.session_id, info.session_id);
+
+        let model = serialize_to_xml_model(&serialize_response, &redactions);
+        assert_snapshot!("forced_parent_serialize_model", model);
     });
 }

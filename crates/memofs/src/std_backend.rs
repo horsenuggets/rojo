@@ -63,6 +63,10 @@ impl VfsBackend for StdBackend {
         fs_err::write(path, data)
     }
 
+    fn exists(&mut self, path: &Path) -> io::Result<bool> {
+        std::fs::exists(path)
+    }
+
     fn read_dir(&mut self, path: &Path) -> io::Result<ReadDir> {
         let entries: Result<Vec<_>, _> = fs_err::read_dir(path)?.collect();
         let mut entries = entries?;
@@ -76,6 +80,14 @@ impl VfsBackend for StdBackend {
         Ok(ReadDir {
             inner: Box::new(inner),
         })
+    }
+
+    fn create_dir(&mut self, path: &Path) -> io::Result<()> {
+        fs_err::create_dir(path)
+    }
+
+    fn create_dir_all(&mut self, path: &Path) -> io::Result<()> {
+        fs_err::create_dir_all(path)
     }
 
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
@@ -94,6 +106,10 @@ impl VfsBackend for StdBackend {
         })
     }
 
+    fn canonicalize(&mut self, path: &Path) -> io::Result<PathBuf> {
+        fs_err::canonicalize(path)
+    }
+
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent> {
         self.watcher_receiver.clone()
     }
@@ -109,15 +125,13 @@ impl VfsBackend for StdBackend {
             self.watches.insert(path.to_path_buf());
             self.watcher
                 .watch(path, RecursiveMode::Recursive)
-                .map_err(|inner| io::Error::new(io::ErrorKind::Other, inner))
+                .map_err(io::Error::other)
         }
     }
 
     fn unwatch(&mut self, path: &Path) -> io::Result<()> {
         self.watches.remove(path);
-        self.watcher
-            .unwatch(path)
-            .map_err(|inner| io::Error::new(io::ErrorKind::Other, inner))
+        self.watcher.unwatch(path).map_err(io::Error::other)
     }
 }
 

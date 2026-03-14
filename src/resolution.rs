@@ -2,8 +2,8 @@ use std::borrow::Borrow;
 
 use anyhow::{bail, format_err};
 use rbx_dom_weak::types::{
-    Attributes, CFrame, Color3, Content, ContentId, Enum, Font, MaterialColors, Matrix3, Tags,
-    Variant, VariantType, Vector2, Vector3,
+    Attributes, CFrame, Color3, Content, ContentId, ContentType, Enum, Font, MaterialColors,
+    Matrix3, Tags, Variant, VariantType, Vector2, Vector3,
 };
 use rbx_reflection::{DataType, PropertyDescriptor};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,98 @@ impl UnresolvedValue {
             UnresolvedValue::Ambiguous(partial) => partial.resolve_unambiguous(),
         }
     }
+
+    /// Creates an `UnresolvedValue` from a variant, using a class and property
+    /// name to potentially allow for ambiguous Enum variants.
+    pub fn from_variant(variant: Variant, class_name: &str, prop_name: &str) -> Self {
+        let descriptor = find_descriptor(class_name, prop_name);
+        if descriptor.is_some() {
+            // We can only use an ambiguous syntax if the property is known
+            // to the reflection database.
+            Self::Ambiguous(match variant {
+                Variant::Enum(rbx_enum) => {
+                    if let Some(property) = descriptor {
+                        if let DataType::Enum(enum_name) = &property.data_type {
+                            let database = rbx_reflection_database::get().unwrap();
+                            if let Some(enum_descriptor) = database.enums.get(enum_name) {
+                                for (variant_name, id) in &enum_descriptor.items {
+                                    if *id == rbx_enum.to_u32() {
+                                        return Self::Ambiguous(AmbiguousValue::String(
+                                            variant_name.to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Self::FullyQualified(variant);
+                }
+                Variant::Bool(bool) => AmbiguousValue::Bool(bool),
+                Variant::Float32(n) => AmbiguousValue::Number(n as f64),
+                Variant::Float64(n) => AmbiguousValue::Number(n),
+                Variant::Int32(n) => AmbiguousValue::Number(n as f64),
+                Variant::Int64(n) => AmbiguousValue::Number(n as f64),
+                Variant::String(str) => AmbiguousValue::String(str),
+                Variant::Tags(tags) => {
+                    AmbiguousValue::StringArray(tags.iter().map(|s| s.to_string()).collect())
+                }
+                Variant::Content(ref content) => match content.value() {
+                    ContentType::None => AmbiguousValue::String(String::new()),
+                    ContentType::Uri(uri) => AmbiguousValue::String(uri.clone()),
+                    _ => return Self::FullyQualified(variant),
+                },
+                Variant::ContentId(content) => AmbiguousValue::String(content.into_string()),
+                Variant::Vector2(vector) => {
+                    AmbiguousValue::Array2([vector.x as f64, vector.y as f64])
+                }
+                Variant::Vector3(vector) => {
+                    AmbiguousValue::Array3([vector.x as f64, vector.y as f64, vector.z as f64])
+                }
+                Variant::Color3(color) => {
+                    AmbiguousValue::Array3([color.r as f64, color.g as f64, color.b as f64])
+                }
+                Variant::CFrame(cf) => AmbiguousValue::Array12([
+                    cf.position.x as f64,
+                    cf.position.y as f64,
+                    cf.position.z as f64,
+                    cf.orientation.x.x as f64,
+                    cf.orientation.x.y as f64,
+                    cf.orientation.x.z as f64,
+                    cf.orientation.y.x as f64,
+                    cf.orientation.y.y as f64,
+                    cf.orientation.y.z as f64,
+                    cf.orientation.z.x as f64,
+                    cf.orientation.z.y as f64,
+                    cf.orientation.z.z as f64,
+                ]),
+                Variant::Attributes(attr) => AmbiguousValue::Attributes(attr),
+                Variant::Font(font) => AmbiguousValue::Font(font),
+                Variant::MaterialColors(colors) => AmbiguousValue::MaterialColors(colors),
+                _ => {
+                    return Self::FullyQualified(variant);
+                }
+            })
+        } else {
+            Self::FullyQualified(variant)
+        }
+    }
+
+    /// Creates an `UnresolvedValue` from a variant, only returning ambiguous
+    /// values if they're able to be resolved in a context-free environment.
+    pub fn from_variant_unambiguous(variant: Variant) -> Self {
+        match variant {
+            Variant::String(str) => Self::Ambiguous(AmbiguousValue::String(str)),
+            Variant::Float64(number) => Self::Ambiguous(AmbiguousValue::Number(number)),
+            Variant::Bool(bool) => Self::Ambiguous(AmbiguousValue::Bool(bool)),
+            Variant::BinaryString(bstr) => match std::str::from_utf8(bstr.as_ref()) {
+                Ok(_) => Self::Ambiguous(AmbiguousValue::String(
+                    String::from_utf8(bstr.into_vec()).unwrap(),
+                )),
+                Err(_) => Self::FullyQualified(Variant::BinaryString(bstr)),
+            },
+            _ => Self::FullyQualified(variant),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,7 +154,7 @@ impl AmbiguousValue {
 
         match &property.data_type {
             DataType::Enum(enum_name) => {
-                let database = rbx_reflection_database::get();
+                let database = rbx_reflection_database::get().unwrap();
 
                 let enum_descriptor = database.enums.get(enum_name).ok_or_else(|| {
                     format_err!("Unknown enum {}. This is a Rojo bug!", enum_name)
@@ -203,7 +295,7 @@ fn find_descriptor(
     class_name: &str,
     prop_name: &str,
 ) -> Option<&'static PropertyDescriptor<'static>> {
-    let database = rbx_reflection_database::get();
+    let database = rbx_reflection_database::get().unwrap();
     let mut current_class_name = class_name;
 
     loop {
@@ -248,14 +340,15 @@ fn nonexhaustive_list(values: &[&str]) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::json;
 
     fn resolve(class: &str, prop: &str, json_value: &str) -> Variant {
-        let unresolved: UnresolvedValue = serde_json::from_str(json_value).unwrap();
+        let unresolved: UnresolvedValue = json::from_str(json_value).unwrap();
         unresolved.resolve(class, prop).unwrap()
     }
 
     fn resolve_unambiguous(json_value: &str) -> Variant {
-        let unresolved: UnresolvedValue = serde_json::from_str(json_value).unwrap();
+        let unresolved: UnresolvedValue = json::from_str(json_value).unwrap();
         unresolved.resolve_unambiguous().unwrap()
     }
 

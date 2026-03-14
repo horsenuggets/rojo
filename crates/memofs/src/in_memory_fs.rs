@@ -157,6 +157,11 @@ impl VfsBackend for InMemoryFs {
         )
     }
 
+    fn exists(&mut self, path: &Path) -> io::Result<bool> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.entries.contains_key(path))
+    }
+
     fn read_dir(&mut self, path: &Path) -> io::Result<ReadDir> {
         let inner = self.inner.lock().unwrap();
 
@@ -174,6 +179,21 @@ impl VfsBackend for InMemoryFs {
             Some(Entry::File { .. }) => must_be_dir(path),
             None => not_found(path),
         }
+    }
+
+    fn create_dir(&mut self, path: &Path) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.load_snapshot(path.to_path_buf(), VfsSnapshot::empty_dir())
+    }
+
+    fn create_dir_all(&mut self, path: &Path) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut path_buf = path.to_path_buf();
+        while let Some(parent) = path_buf.parent() {
+            inner.load_snapshot(parent.to_path_buf(), VfsSnapshot::empty_dir())?;
+            path_buf.pop();
+        }
+        inner.load_snapshot(path.to_path_buf(), VfsSnapshot::empty_dir())
     }
 
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
@@ -212,6 +232,33 @@ impl VfsBackend for InMemoryFs {
         }
     }
 
+    // TODO: We rely on Rojo to prepend cwd to any relative path before storing paths
+    // in MemoFS. The current implementation will error if no prepended absolute path
+    // is found. It really only normalizes paths within the provided path's context.
+    // Example: "/Users/username/project/../other/file.txt" ->
+    // "/Users/username/other/file.txt"
+    // Erroneous example: "/Users/../../other/file.txt" -> "/other/file.txt"
+    // This is not very robust. We should implement proper path normalization here or otherwise
+    // warn if we are missing context and can not fully canonicalize the path correctly.
+    fn canonicalize(&mut self, path: &Path) -> io::Result<PathBuf> {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::CurDir => {}
+                _ => normalized.push(component),
+            }
+        }
+
+        let inner = self.inner.lock().unwrap();
+        match inner.entries.get(&normalized) {
+            Some(_) => Ok(normalized),
+            None => not_found(&normalized),
+        }
+    }
+
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent> {
         let inner = self.inner.lock().unwrap();
 
@@ -228,23 +275,17 @@ impl VfsBackend for InMemoryFs {
 }
 
 fn must_be_file<T>(path: &Path) -> io::Result<T> {
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "path {} was a directory, but must be a file",
-            path.display()
-        ),
-    ))
+    Err(io::Error::other(format!(
+        "path {} was a directory, but must be a file",
+        path.display()
+    )))
 }
 
 fn must_be_dir<T>(path: &Path) -> io::Result<T> {
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "path {} was a file, but must be a directory",
-            path.display()
-        ),
-    ))
+    Err(io::Error::other(format!(
+        "path {} was a file, but must be a directory",
+        path.display()
+    )))
 }
 
 fn not_found<T>(path: &Path) -> io::Result<T> {
