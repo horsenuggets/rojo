@@ -138,6 +138,18 @@ impl Default for InstanceMetadata {
     }
 }
 
+/// Marker type indicating that `.luaurc` alias resolution is enabled.
+/// When present on an `InstanceContext`, alias-based requires will be
+/// transformed into relative require-by-string paths during
+/// snapshotting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequireContext {
+    /// The absolute path of the project root directory (where the
+    /// .project.json file lives).
+    #[serde(serialize_with = "path_serializer::serialize_absolute")]
+    pub project_root: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceContext {
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -145,6 +157,11 @@ pub struct InstanceContext {
     pub emit_legacy_scripts: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sync_rules: Vec<SyncRule>,
+
+    /// When set, `.luaurc` alias requires will be resolved during
+    /// snapshotting. Only enabled during `rojo build`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_context: Option<Arc<RequireContext>>,
 }
 
 impl InstanceContext {
@@ -153,6 +170,7 @@ impl InstanceContext {
             path_ignore_rules: Arc::new(Vec::new()),
             emit_legacy_scripts: emit_legacy_scripts_default().unwrap(),
             sync_rules: Vec::new(),
+            require_context: None,
         }
     }
 

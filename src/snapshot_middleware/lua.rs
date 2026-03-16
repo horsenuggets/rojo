@@ -14,6 +14,7 @@ use crate::{
 
 use super::{
     dir::{snapshot_dir_no_meta, syncback_dir_no_meta},
+    luaurc::{self, ResolveInfo},
     meta_file::{AdjacentMetadata, DirectoryMetadata},
     PathExt as _,
 };
@@ -69,10 +70,32 @@ pub fn snapshot_lua(
     };
 
     let contents = vfs.read_to_string_lf_normalized(path)?;
-    let contents_str = contents.as_str();
+
+    // If alias resolution is enabled, resolve .luaurc alias requires
+    // into relative require-by-string paths.
+    let source = if context.require_context.is_some() {
+        let info = ResolveInfo {
+            file_path: path,
+            vfs,
+        };
+
+        match luaurc::resolve_requires(&contents, &info) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                log::warn!(
+                    "Failed to resolve requires in {}: {}",
+                    path.display(),
+                    err
+                );
+                contents.as_str().to_string()
+            }
+        }
+    } else {
+        contents.as_str().to_string()
+    };
 
     let mut properties = UstrMap::with_capacity(2);
-    properties.insert(ustr("Source"), contents_str.into());
+    properties.insert(ustr("Source"), source.as_str().into());
 
     if let Some(run_context) = run_context {
         properties.insert(

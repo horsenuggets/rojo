@@ -10,6 +10,7 @@ mod dir;
 mod json;
 mod json_model;
 mod lua;
+mod luaurc;
 mod meta_file;
 mod project;
 mod rbxm;

@@ -18,7 +18,7 @@ use crate::{
     session_id::SessionId,
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstanceContext, InstanceSnapshot,
-        PatchSet, RojoTree,
+        PatchSet, RequireContext, RojoTree,
     },
     snapshot_middleware::snapshot_from_vfs,
 };
@@ -94,6 +94,12 @@ impl ServeSession {
     /// The project file is expected to be loaded out-of-band since it's
     /// currently loaded from the filesystem directly instead of through the
     /// in-memory filesystem layer.
+    /// Start a new serve session from the given in-memory filesystem and
+    /// start path.
+    ///
+    /// The project file is expected to be loaded out-of-band since it's
+    /// currently loaded from the filesystem directly instead of through
+    /// the in-memory filesystem layer.
     pub fn new<P: AsRef<Path>>(vfs: Vfs, start_path: P) -> Result<Self, ServeSessionError> {
         let start_path = start_path.as_ref();
         let start_time = Instant::now();
@@ -106,8 +112,15 @@ impl ServeSession {
 
         let root_id = tree.get_root_id();
 
-        let instance_context =
+        let mut instance_context =
             InstanceContext::with_emit_legacy_scripts(root_project.emit_legacy_scripts);
+
+        // Enable .luaurc alias resolution. Alias requires are
+        // transformed into relative require-by-string paths during
+        // snapshotting. This applies to both build and serve modes.
+        instance_context.require_context = Some(Arc::new(RequireContext {
+            project_root: root_project.folder_location().to_path_buf(),
+        }));
 
         log::trace!("Generating snapshot of instances from VFS");
         let snapshot = snapshot_from_vfs(&instance_context, &vfs, start_path)?;
