@@ -82,11 +82,7 @@ pub fn snapshot_lua(
         match luaurc::resolve_requires(&contents, &info) {
             Ok(resolved) => resolved,
             Err(err) => {
-                log::warn!(
-                    "Failed to resolve requires in {}: {}",
-                    path.display(),
-                    err
-                );
+                log::warn!("Failed to resolve requires in {}: {}", path.display(), err);
                 contents.as_str().to_string()
             }
         }

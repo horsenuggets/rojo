@@ -11,7 +11,6 @@ use full_moon::{
 use memofs::Vfs;
 use serde::Deserialize;
 
-
 /// Parsed `.luaurc` file content.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,23 +34,13 @@ fn find_luaurc(
         match vfs.read_to_string(&luaurc_path) {
             Ok(contents) => {
                 let rc: LuauRc = serde_json::from_str(&contents)
-                    .with_context(|| {
-                        format!(
-                            "failed to parse {}",
-                            luaurc_path.display()
-                        )
-                    })?;
+                    .with_context(|| format!("failed to parse {}", luaurc_path.display()))?;
                 return Ok(Some((rc.aliases, current)));
             }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to read {}",
-                        luaurc_path.display()
-                    )
-                });
+                return Err(err)
+                    .with_context(|| format!("failed to read {}", luaurc_path.display()));
             }
         }
 
@@ -77,10 +66,7 @@ pub struct ResolveInfo<'a> {
 ///
 /// Returns the transformed source, or the original if no changes were
 /// needed.
-pub fn resolve_requires(
-    source: &str,
-    info: &ResolveInfo,
-) -> anyhow::Result<String> {
+pub fn resolve_requires(source: &str, info: &ResolveInfo) -> anyhow::Result<String> {
     let file_dir = info
         .file_path
         .parent()
@@ -100,19 +86,11 @@ pub fn resolve_requires(
     let luaurc_dir = luaurc.as_ref().unwrap().1.as_path();
 
     // Quick check: skip parsing if no custom alias strings present
-    if !aliases
-        .keys()
-        .any(|k| source.contains(&format!("@{k}")))
-    {
+    if !aliases.keys().any(|k| source.contains(&format!("@{k}"))) {
         return Ok(source.to_string());
     }
 
-    let replacements = find_require_replacements(
-        source,
-        file_dir,
-        aliases,
-        luaurc_dir,
-    )?;
+    let replacements = find_require_replacements(source, file_dir, aliases, luaurc_dir)?;
 
     if replacements.is_empty() {
         return Ok(source.to_string());
@@ -124,10 +102,7 @@ pub fn resolve_requires(
     sorted.sort_by(|a, b| b.start.cmp(&a.start));
 
     for replacement in sorted {
-        result.replace_range(
-            replacement.start..replacement.end,
-            &replacement.new_text,
-        );
+        result.replace_range(replacement.start..replacement.end, &replacement.new_text);
     }
 
     Ok(result)
@@ -188,8 +163,7 @@ fn compute_relative_require(
 /// logical paths (no filesystem access needed), handling the
 /// InMemoryFs paths used in tests.
 fn diff_paths(target: &Path, base: &Path) -> Option<PathBuf> {
-    let target_components: Vec<_> =
-        target.components().collect();
+    let target_components: Vec<_> = target.components().collect();
     let base_components: Vec<_> = base.components().collect();
 
     // Find common prefix length
@@ -223,9 +197,8 @@ fn find_require_replacements(
     aliases: &HashMap<String, String>,
     luaurc_dir: &Path,
 ) -> anyhow::Result<Vec<Replacement>> {
-    let ast = full_moon::parse(source).map_err(|e| {
-        anyhow::anyhow!("failed to parse Luau source: {e:?}")
-    })?;
+    let ast = full_moon::parse(source)
+        .map_err(|e| anyhow::anyhow!("failed to parse Luau source: {e:?}"))?;
 
     let mut replacements = Vec::new();
 
@@ -238,12 +211,7 @@ fn find_require_replacements(
         let call_end = call_byte_end(call);
 
         if let Some(replacement) = resolve_alias_require(
-            &content,
-            script_dir,
-            aliases,
-            luaurc_dir,
-            call_start,
-            call_end,
+            &content, script_dir, aliases, luaurc_dir, call_start, call_end,
         ) {
             replacements.push(replacement);
         }
@@ -253,10 +221,7 @@ fn find_require_replacements(
 }
 
 /// Visit a block, looking for require() calls with string arguments.
-fn visit_block(
-    block: &ast::Block,
-    callback: &mut dyn FnMut(&ast::FunctionCall, String),
-) {
+fn visit_block(block: &ast::Block, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
     for stmt in block.stmts() {
         visit_stmt(stmt, callback);
     }
@@ -269,10 +234,7 @@ fn visit_block(
     }
 }
 
-fn visit_stmt(
-    stmt: &ast::Stmt,
-    callback: &mut dyn FnMut(&ast::FunctionCall, String),
-) {
+fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
     match stmt {
         ast::Stmt::FunctionCall(call) => {
             check_function_call(call, callback);
@@ -317,10 +279,7 @@ fn visit_stmt(
     }
 }
 
-fn visit_expr(
-    expr: &Expression,
-    callback: &mut dyn FnMut(&ast::FunctionCall, String),
-) {
+fn visit_expr(expr: &Expression, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
     match expr {
         Expression::FunctionCall(call) => {
             check_function_call(call, callback);
@@ -339,9 +298,7 @@ fn check_function_call(
     callback: &mut dyn FnMut(&ast::FunctionCall, String),
 ) {
     let is_require = match call.prefix() {
-        Prefix::Name(token) => {
-            token.token().to_string() == "require"
-        }
+        Prefix::Name(token) => token.token().to_string() == "require",
         _ => false,
     };
 
@@ -355,21 +312,19 @@ fn check_function_call(
     }
 
     let content = match &suffixes[0] {
-        Suffix::Call(ast::Call::AnonymousCall(
-            ast::FunctionArgs::Parentheses {
-                arguments,
-                parentheses: _,
-            },
-        )) => {
+        Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses {
+            arguments,
+            parentheses: _,
+        })) => {
             let args: Vec<_> = arguments.iter().collect();
             if args.len() != 1 {
                 return;
             }
             extract_string_from_expr(&args[0])
         }
-        Suffix::Call(ast::Call::AnonymousCall(
-            ast::FunctionArgs::String(string_token),
-        )) => extract_string_from_token(string_token),
+        Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::String(string_token))) => {
+            extract_string_from_token(string_token)
+        }
         _ => return,
     };
 
@@ -382,25 +337,17 @@ fn check_function_call(
 
 /// Extract string content from an Expression that is a string
 /// literal.
-fn extract_string_from_expr(
-    expr: &Expression,
-) -> Option<String> {
+fn extract_string_from_expr(expr: &Expression) -> Option<String> {
     match expr {
-        Expression::String(token_ref) => {
-            extract_string_from_token(token_ref)
-        }
+        Expression::String(token_ref) => extract_string_from_token(token_ref),
         _ => None,
     }
 }
 
 /// Extract the content of a string literal from a TokenReference.
-fn extract_string_from_token(
-    token_ref: &TokenReference,
-) -> Option<String> {
+fn extract_string_from_token(token_ref: &TokenReference) -> Option<String> {
     match token_ref.token().token_type() {
-        TokenType::StringLiteral { literal, .. } => {
-            Some(literal.to_string())
-        }
+        TokenType::StringLiteral { literal, .. } => Some(literal.to_string()),
         _ => None,
     }
 }
@@ -408,9 +355,7 @@ fn extract_string_from_token(
 /// Get the byte offset of the start of a function call.
 fn call_byte_start(call: &ast::FunctionCall) -> usize {
     match call.prefix() {
-        Prefix::Name(token) => {
-            token.token().start_position().bytes()
-        }
+        Prefix::Name(token) => token.token().start_position().bytes(),
         _ => 0,
     }
 }
@@ -427,18 +372,10 @@ fn call_byte_end(call: &ast::FunctionCall) -> usize {
 /// Get the byte end of a suffix.
 fn suffix_byte_end(suffix: &Suffix) -> usize {
     match suffix {
-        Suffix::Call(ast::Call::AnonymousCall(func_args)) => {
-            func_args_byte_end(func_args)
-        }
-        Suffix::Call(ast::Call::MethodCall(method)) => {
-            func_args_byte_end(method.args())
-        }
-        Suffix::Index(ast::Index::Brackets {
-            brackets, ..
-        }) => token_end(brackets.tokens().1),
-        Suffix::Index(ast::Index::Dot { name, .. }) => {
-            token_end(name.token())
-        }
+        Suffix::Call(ast::Call::AnonymousCall(func_args)) => func_args_byte_end(func_args),
+        Suffix::Call(ast::Call::MethodCall(method)) => func_args_byte_end(method.args()),
+        Suffix::Index(ast::Index::Brackets { brackets, .. }) => token_end(brackets.tokens().1),
+        Suffix::Index(ast::Index::Dot { name, .. }) => token_end(name.token()),
         _ => 0,
     }
 }
@@ -446,15 +383,9 @@ fn suffix_byte_end(suffix: &Suffix) -> usize {
 /// Get the byte end of function arguments.
 fn func_args_byte_end(args: &ast::FunctionArgs) -> usize {
     match args {
-        ast::FunctionArgs::Parentheses {
-            parentheses, ..
-        } => token_end(parentheses.tokens().1),
-        ast::FunctionArgs::String(token) => {
-            token_end(token.token())
-        }
-        ast::FunctionArgs::TableConstructor(table) => {
-            token_end(table.braces().tokens().1)
-        }
+        ast::FunctionArgs::Parentheses { parentheses, .. } => token_end(parentheses.tokens().1),
+        ast::FunctionArgs::String(token) => token_end(token.token()),
+        ast::FunctionArgs::TableConstructor(table) => token_end(table.braces().tokens().1),
         _ => 0,
     }
 }
@@ -476,9 +407,7 @@ fn resolve_alias_require(
     let without_at = &alias_path[1..];
 
     let (alias_name, sub_path) = match without_at.find('/') {
-        Some(idx) => {
-            (&without_at[..idx], Some(&without_at[idx + 1..]))
-        }
+        Some(idx) => (&without_at[..idx], Some(&without_at[idx + 1..])),
         None => (without_at, None),
     };
 
@@ -490,11 +419,7 @@ fn resolve_alias_require(
     if let Some(alias_target) = aliases.get(alias_name) {
         let alias_fs_path = luaurc_dir.join(alias_target);
 
-        let require_path = compute_relative_require(
-            script_dir,
-            &alias_fs_path,
-            sub_path,
-        );
+        let require_path = compute_relative_require(script_dir, &alias_fs_path, sub_path);
 
         Some(Replacement {
             start: call_start,
@@ -502,11 +427,7 @@ fn resolve_alias_require(
             new_text: format!(r#"require("{require_path}")"#),
         })
     } else {
-        log::warn!(
-            "Unknown alias @{} in {}",
-            alias_name,
-            script_dir.display()
-        );
+        log::warn!("Unknown alias @{} in {}", alias_name, script_dir.display());
         None
     }
 }
@@ -557,12 +478,9 @@ mod test {
 
     #[test]
     fn self_alias_left_untouched() {
-        let source =
-            r#"local Assets = require("@self/Assets")"#;
+        let source = r#"local Assets = require("@self/Assets")"#;
         let info = ResolveInfo {
-            file_path: Path::new(
-                "/project/Source/Plugin/init.plugin.luau",
-            ),
+            file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
             vfs: &make_test_vfs(&[]),
         };
 
@@ -572,12 +490,9 @@ mod test {
 
     #[test]
     fn resolve_custom_alias() {
-        let source =
-            r#"local Fusion = require("@packages/Fusion")"#;
+        let source = r#"local Fusion = require("@packages/Fusion")"#;
         let info = ResolveInfo {
-            file_path: Path::new(
-                "/project/Source/Plugin/init.plugin.luau",
-            ),
+            file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
             vfs: &make_test_vfs(&[(
                 "/project/.luaurc",
                 r#"{"aliases": {"packages": "Packages"}}"#,
@@ -585,20 +500,14 @@ mod test {
         };
 
         let result = resolve_requires(source, &info).unwrap();
-        assert_eq!(
-            result,
-            r#"local Fusion = require("../../Packages/Fusion")"#
-        );
+        assert_eq!(result, r#"local Fusion = require("../../Packages/Fusion")"#);
     }
 
     #[test]
     fn resolve_bare_alias() {
-        let source =
-            r#"local Loader = require("@rbxpackageloader")"#;
+        let source = r#"local Loader = require("@rbxpackageloader")"#;
         let info = ResolveInfo {
-            file_path: Path::new(
-                "/project/Source/Plugin/init.plugin.luau",
-            ),
+            file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
             vfs: &make_test_vfs(&[(
                 "/project/.luaurc",
                 r#"{"aliases": {"rbxpackageloader": "Source/RbxPackageLoader"}}"#,
@@ -606,10 +515,7 @@ mod test {
         };
 
         let result = resolve_requires(source, &info).unwrap();
-        assert_eq!(
-            result,
-            r#"local Loader = require("../RbxPackageLoader")"#
-        );
+        assert_eq!(result, r#"local Loader = require("../RbxPackageLoader")"#);
     }
 
     #[test]
@@ -656,10 +562,7 @@ mod test {
 
     /// Helper to get the Source property of an instance by name,
     /// searching all descendants of the root.
-    fn find_source_by_name(
-        session: &ServeSession,
-        name: &str,
-    ) -> Option<String> {
+    fn find_source_by_name(session: &ServeSession, name: &str) -> Option<String> {
         let tree = session.tree();
         let root_id = tree.get_root_id();
         find_source_recursive(&tree, root_id, name)
@@ -673,17 +576,13 @@ mod test {
         let inst = tree.get_instance(id)?;
 
         if inst.name() == name {
-            if let Some(Variant::String(source)) =
-                inst.properties().get(&ustr("Source"))
-            {
+            if let Some(Variant::String(source)) = inst.properties().get(&ustr("Source")) {
                 return Some(source.clone());
             }
         }
 
         for &child_id in inst.children() {
-            if let Some(result) =
-                find_source_recursive(tree, child_id, name)
-            {
+            if let Some(result) = find_source_recursive(tree, child_id, name) {
                 return Some(result);
             }
         }
@@ -693,9 +592,7 @@ mod test {
 
     /// Build a VFS with a complete project structure and create a
     /// ServeSession from it.
-    fn create_test_session(
-        files: Vec<(&str, VfsSnapshot)>,
-    ) -> ServeSession {
+    fn create_test_session(files: Vec<(&str, VfsSnapshot)>) -> ServeSession {
         let mut imfs = InMemoryFs::new();
         for (path, snapshot) in files {
             imfs.load_snapshot(path, snapshot).unwrap();
@@ -723,10 +620,7 @@ mod test {
                         }"#,
                     ),
                 ),
-                (
-                    ".luaurc",
-                    VfsSnapshot::file(r#"{"aliases": {}}"#),
-                ),
+                (".luaurc", VfsSnapshot::file(r#"{"aliases": {}}"#)),
                 (
                     "src",
                     VfsSnapshot::dir([
@@ -737,17 +631,13 @@ mod test {
 return {}"#,
                             ),
                         ),
-                        (
-                            "Child.luau",
-                            VfsSnapshot::file("return {}"),
-                        ),
+                        ("Child.luau", VfsSnapshot::file("return {}")),
                     ]),
                 ),
             ]),
         )]);
 
-        let source = find_source_by_name(&session, "Source")
-            .expect("should find Source script");
+        let source = find_source_by_name(&session, "Source").expect("should find Source script");
         assert!(
             source.contains(r#"require("@self/Child")"#),
             "@self should be left untouched, got: {source}"
@@ -778,16 +668,11 @@ return {}"#,
                 ),
                 (
                     ".luaurc",
-                    VfsSnapshot::file(
-                        r#"{"aliases": {"packages": "Packages"}}"#,
-                    ),
+                    VfsSnapshot::file(r#"{"aliases": {"packages": "Packages"}}"#),
                 ),
                 (
                     "Packages",
-                    VfsSnapshot::dir([(
-                        "Fusion.luau",
-                        VfsSnapshot::file("return {}"),
-                    )]),
+                    VfsSnapshot::dir([("Fusion.luau", VfsSnapshot::file("return {}"))]),
                 ),
                 (
                     "Source",
@@ -805,14 +690,11 @@ return {}"#,
             ]),
         )]);
 
-        let source = find_source_by_name(&session, "Plugin")
-            .expect("should find Plugin script");
+        let source = find_source_by_name(&session, "Plugin").expect("should find Plugin script");
         // Plugin is at Source/Plugin/, Packages is at Packages/
         // Relative: ../../Packages/Fusion
         assert!(
-            source.contains(
-                r#"require("../../Packages/Fusion")"#
-            ),
+            source.contains(r#"require("../../Packages/Fusion")"#),
             "alias should resolve to relative path, got: {source}"
         );
     }
@@ -862,25 +744,19 @@ return {}"#,
                         ),
                         (
                             "RbxPackageLoader",
-                            VfsSnapshot::dir([(
-                                "init.luau",
-                                VfsSnapshot::file("return {}"),
-                            )]),
+                            VfsSnapshot::dir([("init.luau", VfsSnapshot::file("return {}"))]),
                         ),
                     ]),
                 ),
             ]),
         )]);
 
-        let source = find_source_by_name(&session, "Plugin")
-            .expect("should find Plugin script");
+        let source = find_source_by_name(&session, "Plugin").expect("should find Plugin script");
         // Plugin at Source/Plugin/, target at
         // Source/RbxPackageLoader/
         // Relative: ../RbxPackageLoader
         assert!(
-            source.contains(
-                r#"require("../RbxPackageLoader")"#
-            ),
+            source.contains(r#"require("../RbxPackageLoader")"#),
             "remapped alias should resolve to relative path, got: {source}"
         );
     }
@@ -918,16 +794,13 @@ return {}"#,
             ]),
         )]);
 
-        let source = find_source_by_name(&session, "Script")
-            .expect("should find Script");
+        let source = find_source_by_name(&session, "Script").expect("should find Script");
         assert!(
             source.contains(r#"require("./Sibling")"#),
             "relative require should be untouched, got: {source}"
         );
         assert!(
-            source.contains(
-                r#"require(script.Parent._Index["promise"])"#
-            ),
+            source.contains(r#"require(script.Parent._Index["promise"])"#),
             "Wally require should be untouched, got: {source}"
         );
     }
@@ -962,16 +835,11 @@ return {}"#,
                 ),
                 (
                     ".luaurc",
-                    VfsSnapshot::file(
-                        r#"{"aliases": {"packages": "Packages"}}"#,
-                    ),
+                    VfsSnapshot::file(r#"{"aliases": {"packages": "Packages"}}"#),
                 ),
                 (
                     "Packages",
-                    VfsSnapshot::dir([(
-                        "SharedLib.luau",
-                        VfsSnapshot::file("return {}"),
-                    )]),
+                    VfsSnapshot::dir([("SharedLib.luau", VfsSnapshot::file("return {}"))]),
                 ),
                 (
                     "src",
@@ -979,23 +847,18 @@ return {}"#,
                         "server",
                         VfsSnapshot::dir([(
                             "Main.server.luau",
-                            VfsSnapshot::file(
-                                r#"local Lib = require("@packages/SharedLib")"#,
-                            ),
+                            VfsSnapshot::file(r#"local Lib = require("@packages/SharedLib")"#),
                         )]),
                     )]),
                 ),
             ]),
         )]);
 
-        let source = find_source_by_name(&session, "Main")
-            .expect("should find Main script");
+        let source = find_source_by_name(&session, "Main").expect("should find Main script");
         // Main at src/server/, Packages at Packages/
         // Relative: ../../Packages/SharedLib
         assert!(
-            source.contains(
-                r#"require("../../Packages/SharedLib")"#
-            ),
+            source.contains(r#"require("../../Packages/SharedLib")"#),
             "cross-service alias should resolve to relative path, got: {source}"
         );
     }
@@ -1024,21 +887,13 @@ return {}"#,
                 ),
                 (
                     ".luaurc",
-                    VfsSnapshot::file(
-                        r#"{"aliases": {"packages": "Packages"}}"#,
-                    ),
+                    VfsSnapshot::file(r#"{"aliases": {"packages": "Packages"}}"#),
                 ),
                 (
                     "Packages",
                     VfsSnapshot::dir([
-                        (
-                            "Fusion.luau",
-                            VfsSnapshot::file("return {}"),
-                        ),
-                        (
-                            "Roact.luau",
-                            VfsSnapshot::file("return {}"),
-                        ),
+                        ("Fusion.luau", VfsSnapshot::file("return {}")),
+                        ("Roact.luau", VfsSnapshot::file("return {}")),
                     ]),
                 ),
                 (
@@ -1056,19 +911,14 @@ return {}"#,
             ]),
         )]);
 
-        let source = find_source_by_name(&session, "Source")
-            .expect("should find Source script");
+        let source = find_source_by_name(&session, "Source").expect("should find Source script");
 
         assert!(
-            source.contains(
-                r#"require("../Packages/Fusion")"#
-            ),
+            source.contains(r#"require("../Packages/Fusion")"#),
             "first alias should resolve, got: {source}"
         );
         assert!(
-            source.contains(
-                r#"require("../Packages/Roact")"#
-            ),
+            source.contains(r#"require("../Packages/Roact")"#),
             "second alias should resolve, got: {source}"
         );
         assert!(
@@ -1101,16 +951,11 @@ return {}"#,
                 ),
                 (
                     ".luaurc",
-                    VfsSnapshot::file(
-                        r#"{"aliases": {"lib": "lib"}}"#,
-                    ),
+                    VfsSnapshot::file(r#"{"aliases": {"lib": "lib"}}"#),
                 ),
                 (
                     "lib",
-                    VfsSnapshot::dir([(
-                        "init.luau",
-                        VfsSnapshot::file("return {}"),
-                    )]),
+                    VfsSnapshot::dir([("init.luau", VfsSnapshot::file("return {}"))]),
                 ),
                 (
                     "src",
@@ -1125,8 +970,7 @@ return {}"#,
             ]),
         )]);
 
-        let source = find_source_by_name(&session, "Main")
-            .expect("should find Main script");
+        let source = find_source_by_name(&session, "Main").expect("should find Main script");
         // Main at src/, lib at lib/
         // Relative: ../lib
         assert!(
