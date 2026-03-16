@@ -3,6 +3,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v7.7.0)"
+        required: true
+
+env:
+  TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   create-release:
@@ -14,7 +22,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create ${{ github.ref_name }} --draft --verify-tag --title ${{ github.ref_name }}
+          gh release create $TAG_NAME --draft --verify-tag --title $TAG_NAME
 
   build-plugin:
     needs: ["create-release"]
@@ -37,7 +45,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ github.ref_name }} Rojo.rbxm
+          gh release upload $TAG_NAME Rojo.rbxm
 
       - name: Upload Plugin to Artifacts
         uses: actions/upload-artifact@v4
@@ -46,7 +54,7 @@ jobs:
           path: Rojo.rbxm
       
       - name: Upload Plugin to Roblox
-        if: ${{ secrets.PLUGIN_UPLOAD_TOKEN != '' }}
+        if: ${{ vars.PLUGIN_CI_UNIVERSE_ID != '' }}
         env:
           RBX_API_KEY: ${{ secrets.PLUGIN_UPLOAD_TOKEN }}
           RBX_UNIVERSE_ID: ${{ vars.PLUGIN_CI_PLACE_ID }}
@@ -127,8 +135,6 @@ jobs:
 
       - name: Generate Artifact Name
         shell: bash
-        env:
-          TAG_NAME: ${{ github.ref_name }}
         run: |
           echo "ARTIFACT_NAME=$BIN-${TAG_NAME#v}-${{ matrix.label }}.zip" >> "$GITHUB_ENV"
 
@@ -149,7 +155,7 @@ jobs:
             zip ../$ARTIFACT_NAME *
           fi
 
-          gh release upload ${{ github.ref_name }} ../$ARTIFACT_NAME
+          gh release upload $TAG_NAME ../$ARTIFACT_NAME
 
       - name: Upload Archive to Artifacts
         uses: actions/upload-artifact@v4
