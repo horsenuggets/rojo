@@ -31,6 +31,14 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [7.7.0-rc.1-horse.0.3] (March 18th, 2026)
+
+* Compute alias require paths relative to the DataModel tree instead of the filesystem. Project tree `$path` mappings are now used to determine the correct relative path, fixing cases where the filesystem has directories (e.g. `Source/`) that don't exist in the DataModel.
+* Fix init scripts producing `../` instead of `./` for sibling requires. Init scripts usurp their parent folder, so their "current directory" is the folder's parent.
+* Filter out duplicate `init` child from `snapshot_lua_init` output. The init script that usurps a folder no longer appears as both the container and a child.
+
+[7.7.0-rc.1-horse.0.3]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.3
+
 ## [7.7.0-rc.1-horse.0.2] (March 18th, 2026)
 
 * Added `init.plugin.luau` and `init.plugin.lua` support as init scripts. Plugin scripts in `init.plugin.luau` files now usurp their parent directory, matching the behavior of `init.luau`, `init.server.luau`, and `init.client.luau`. This fixes alias resolution for plugin scripts that use folder-based module organization.

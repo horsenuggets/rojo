@@ -53,25 +53,3 @@ children:
       Source:
         String: "return {}"
     children: []
-  - snapshot_id: "00000000000000000000000000000000"
-    metadata:
-      ignore_unknown_instances: false
-      instigating_source:
-        Path: /root/init.plugin.luau
-      relevant_paths:
-        - /root/init.plugin.luau
-        - /root/init.meta.json
-        - /root/init.meta.jsonc
-      context:
-        emit_legacy_scripts: false
-      specified_id: ~
-      middleware: pluginScript
-      schema: ~
-    name: init
-    class_name: Script
-    properties:
-      RunContext:
-        Enum: 3
-      Source:
-        String: "print('hello')"
-    children: []

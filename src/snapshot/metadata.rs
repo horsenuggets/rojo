@@ -138,16 +138,27 @@ impl Default for InstanceMetadata {
     }
 }
 
-/// Marker type indicating that `.luaurc` alias resolution is enabled.
-/// When present on an `InstanceContext`, alias-based requires will be
-/// transformed into relative require-by-string paths during
-/// snapshotting.
+/// Holds context for `.luaurc` alias resolution. When present on an
+/// `InstanceContext`, alias-based requires will be transformed into
+/// relative require-by-string paths during snapshotting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequireContext {
     /// The absolute path of the project root directory (where the
     /// .project.json file lives).
     #[serde(serialize_with = "path_serializer::serialize_absolute")]
     pub project_root: PathBuf,
+
+    /// Maps filesystem paths (relative to project root) to their
+    /// DataModel path segments. Used to compute relative require
+    /// paths that match the DataModel tree structure rather than
+    /// the filesystem layout.
+    ///
+    /// For example, a project tree like:
+    /// ```json
+    /// { "Plugin": { "$path": "Source/Plugin" } }
+    /// ```
+    /// produces: `("Source/Plugin", ["Plugin"])`
+    pub path_mappings: Vec<(PathBuf, Vec<String>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

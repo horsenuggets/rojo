@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     io,
     net::IpAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::{
     change_processor::ChangeProcessor,
     message_queue::MessageQueue,
-    project::{Project, ProjectError},
+    project::{Project, ProjectError, ProjectNode},
     session_id::SessionId,
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstanceContext, InstanceSnapshot,
@@ -118,8 +118,10 @@ impl ServeSession {
         // Enable .luaurc alias resolution. Alias requires are
         // transformed into relative require-by-string paths during
         // snapshotting. This applies to both build and serve modes.
+        let path_mappings = extract_path_mappings(&root_project);
         instance_context.require_context = Some(Arc::new(RequireContext {
             project_root: root_project.folder_location().to_path_buf(),
+            path_mappings,
         }));
 
         log::trace!("Generating snapshot of instances from VFS");
@@ -248,4 +250,40 @@ pub enum ServeSessionError {
         #[from]
         source: anyhow::Error,
     },
+}
+
+/// Recursively extracts `$path` mappings from the project tree.
+/// Each entry maps a filesystem path (relative to the project root)
+/// to the DataModel path segments leading to that node.
+///
+/// For example, given:
+/// ```json
+/// { "Packages": { "$path": "Packages" },
+///   "Plugin": { "$path": "Source/Plugin" } }
+/// ```
+/// This produces:
+/// - `("Packages", ["Packages"])`
+/// - `("Source/Plugin", ["Plugin"])`
+fn extract_path_mappings(project: &Project) -> Vec<(PathBuf, Vec<String>)> {
+    let mut mappings = Vec::new();
+
+    fn walk(node: &ProjectNode, dm_path: &[String], mappings: &mut Vec<(PathBuf, Vec<String>)>) {
+        if let Some(ref path_node) = node.path {
+            mappings.push((path_node.path().to_path_buf(), dm_path.to_vec()));
+        }
+
+        for (name, child) in &node.children {
+            let mut child_path = dm_path.to_vec();
+            child_path.push(name.clone());
+            walk(child, &child_path, mappings);
+        }
+    }
+
+    walk(&project.tree, &[], &mut mappings);
+
+    // Sort by filesystem path length (longest first) so that
+    // more specific mappings match before broader ones.
+    mappings.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
+
+    mappings
 }

@@ -73,10 +73,12 @@ pub fn snapshot_lua(
 
     // If alias resolution is enabled, resolve .luaurc alias requires
     // into relative require-by-string paths.
-    let source = if context.require_context.is_some() {
+    let source = if let Some(ref req_ctx) = context.require_context {
         let info = ResolveInfo {
             file_path: path,
             vfs,
+            path_mappings: &req_ctx.path_mappings,
+            project_root: &req_ctx.project_root,
         };
 
         match luaurc::resolve_requires(&contents, &info) {
@@ -146,7 +148,16 @@ pub fn snapshot_lua_init(
     let mut init_snapshot =
         snapshot_lua(context, vfs, init_path, &dir_snapshot.name, script_type)?.unwrap();
 
-    init_snapshot.children = dir_snapshot.children;
+    // Filter out the init file itself from the directory's children
+    // to avoid creating a duplicate instance. The init script becomes
+    // the container, so it should not also appear as a child. The
+    // child is always named "init" since the sync rule strips the
+    // script type suffix (e.g. init.plugin.luau -> "init").
+    init_snapshot.children = dir_snapshot
+        .children
+        .into_iter()
+        .filter(|child| child.name != "init")
+        .collect();
     init_snapshot.metadata = dir_snapshot.metadata;
     // The directory snapshot middleware includes all possible init paths
     // so we don't need to add it here.

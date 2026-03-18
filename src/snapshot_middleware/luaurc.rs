@@ -58,6 +58,12 @@ pub struct ResolveInfo<'a> {
     pub file_path: &'a Path,
     /// The VFS for reading .luaurc files.
     pub vfs: &'a Vfs,
+    /// Project tree `$path` mappings for DataModel-aware path
+    /// computation. Maps filesystem paths (relative to project root)
+    /// to DataModel path segments.
+    pub path_mappings: &'a [(PathBuf, Vec<String>)],
+    /// The project root directory.
+    pub project_root: &'a Path,
 }
 
 /// Resolve `.luaurc` alias-based requires in the given Luau source
@@ -90,7 +96,25 @@ pub fn resolve_requires(source: &str, info: &ResolveInfo) -> anyhow::Result<Stri
         return Ok(source.to_string());
     }
 
-    let replacements = find_require_replacements(source, file_dir, aliases, luaurc_dir)?;
+    // Init scripts usurp their parent folder. The script becomes
+    // the folder, so its "current directory" for require-by-string
+    // is the folder's parent, not the folder itself.
+    let is_init = info
+        .file_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.starts_with("init."))
+        .unwrap_or(false);
+
+    let replacements = find_require_replacements(
+        source,
+        file_dir,
+        aliases,
+        luaurc_dir,
+        info.path_mappings,
+        info.project_root,
+        is_init,
+    )?;
 
     if replacements.is_empty() {
         return Ok(source.to_string());
@@ -118,43 +142,127 @@ struct Replacement {
 /// Compute the relative require-by-string path from a script's
 /// directory to an alias target path, with an optional sub-path.
 ///
-/// Both init and non-init files resolve relative paths from their
-/// parent directory, so no `is_init` distinction is needed.
+/// When `path_mappings` are available (from the project tree), paths
+/// are projected into the DataModel tree before computing the
+/// relative path. This accounts for project tree remappings like
+/// `"Plugin": { "$path": "Source/Plugin" }` where the filesystem
+/// has an extra directory level that doesn't exist in the DataModel.
 fn compute_relative_require(
     script_dir: &Path,
     alias_target: &Path,
     sub_path: Option<&str>,
+    path_mappings: &[(PathBuf, Vec<String>)],
+    project_root: &Path,
+    is_init: bool,
 ) -> String {
-    let relative = diff_paths(alias_target, script_dir);
+    let require_path = if !path_mappings.is_empty() {
+        compute_datamodel_relative(script_dir, alias_target, path_mappings, project_root, is_init)
+    } else {
+        compute_filesystem_relative(script_dir, alias_target)
+    };
 
-    let mut require_path = match relative {
+    match sub_path {
+        Some(sub) => format!("{require_path}/{sub}"),
+        None => require_path,
+    }
+}
+
+/// Compute the relative path using DataModel tree positions derived
+/// from the project tree `$path` mappings.
+fn compute_datamodel_relative(
+    script_dir: &Path,
+    alias_target: &Path,
+    path_mappings: &[(PathBuf, Vec<String>)],
+    project_root: &Path,
+    is_init: bool,
+) -> String {
+    let mut script_dm = to_datamodel_path(script_dir, path_mappings, project_root);
+    let target_dm = to_datamodel_path(alias_target, path_mappings, project_root);
+
+    // Init scripts usurp their parent folder. The script IS the
+    // folder, so its "current directory" for require-by-string is
+    // the folder's parent (one level up in the DataModel).
+    if is_init {
+        script_dm.pop();
+    }
+
+    // Find common prefix length
+    let common_len = script_dm
+        .iter()
+        .zip(target_dm.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Number of ../ needed
+    let up_count = script_dm.len() - common_len;
+
+    let mut parts = Vec::new();
+    for _ in 0..up_count {
+        parts.push("..".to_string());
+    }
+    for segment in &target_dm[common_len..] {
+        parts.push(segment.clone());
+    }
+
+    let result = parts.join("/");
+    if result.starts_with("..") {
+        result
+    } else {
+        format!("./{result}")
+    }
+}
+
+/// Convert a filesystem path to DataModel path segments using the
+/// project tree mappings. Falls back to the project-root-relative
+/// filesystem path if no mapping matches.
+fn to_datamodel_path(
+    fs_path: &Path,
+    path_mappings: &[(PathBuf, Vec<String>)],
+    project_root: &Path,
+) -> Vec<String> {
+    // Make the path relative to the project root
+    let relative = fs_path
+        .strip_prefix(project_root)
+        .unwrap_or(fs_path);
+
+    // Find the best matching $path mapping (longest match first,
+    // since mappings are sorted by length descending)
+    for (mount_fs, mount_dm) in path_mappings {
+        if let Ok(remainder) = relative.strip_prefix(mount_fs) {
+            let mut dm_path = mount_dm.clone();
+            for component in remainder.components() {
+                dm_path.push(component.as_os_str().to_string_lossy().into_owned());
+            }
+            return dm_path;
+        }
+    }
+
+    // Fallback: use the filesystem path as-is
+    relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Compute the relative path using pure filesystem distances.
+/// Used as fallback when no project tree mappings are available.
+fn compute_filesystem_relative(script_dir: &Path, alias_target: &Path) -> String {
+    match diff_paths(alias_target, script_dir) {
         Some(rel) => {
-            // Convert path separators to forward slashes
             let rel_str = rel
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");
 
-            // Ensure it starts with ./ or ../
             if rel_str.starts_with("..") {
                 rel_str
             } else {
                 format!("./{rel_str}")
             }
         }
-        None => {
-            // Fallback: shouldn't happen for paths on the same
-            // filesystem, but handle gracefully
-            alias_target.to_string_lossy().into_owned()
-        }
-    };
-
-    if let Some(sub) = sub_path {
-        require_path = format!("{require_path}/{sub}");
+        None => alias_target.to_string_lossy().into_owned(),
     }
-
-    require_path
 }
 
 /// Compute a relative path from `base` to `target`.
@@ -196,6 +304,9 @@ fn find_require_replacements(
     script_dir: &Path,
     aliases: &HashMap<String, String>,
     luaurc_dir: &Path,
+    path_mappings: &[(PathBuf, Vec<String>)],
+    project_root: &Path,
+    is_init: bool,
 ) -> anyhow::Result<Vec<Replacement>> {
     let ast = full_moon::parse(source)
         .map_err(|e| anyhow::anyhow!("failed to parse Luau source: {e:?}"))?;
@@ -211,7 +322,15 @@ fn find_require_replacements(
         let call_end = call_byte_end(call);
 
         if let Some(replacement) = resolve_alias_require(
-            &content, script_dir, aliases, luaurc_dir, call_start, call_end,
+            &content,
+            script_dir,
+            aliases,
+            luaurc_dir,
+            call_start,
+            call_end,
+            path_mappings,
+            project_root,
+            is_init,
         ) {
             replacements.push(replacement);
         }
@@ -403,6 +522,9 @@ fn resolve_alias_require(
     luaurc_dir: &Path,
     call_start: usize,
     call_end: usize,
+    path_mappings: &[(PathBuf, Vec<String>)],
+    project_root: &Path,
+    is_init: bool,
 ) -> Option<Replacement> {
     let without_at = &alias_path[1..];
 
@@ -419,7 +541,14 @@ fn resolve_alias_require(
     if let Some(alias_target) = aliases.get(alias_name) {
         let alias_fs_path = luaurc_dir.join(alias_target);
 
-        let require_path = compute_relative_require(script_dir, &alias_fs_path, sub_path);
+        let require_path = compute_relative_require(
+            script_dir,
+            &alias_fs_path,
+            sub_path,
+            path_mappings,
+            project_root,
+            is_init,
+        );
 
         Some(Replacement {
             start: call_start,
@@ -442,6 +571,9 @@ mod test {
             Path::new("/project/Source/Plugin"),
             Path::new("/project/Packages"),
             Some("Fusion"),
+            &[],
+            Path::new("/project"),
+            false,
         );
         assert_eq!(result, "../../Packages/Fusion");
     }
@@ -452,6 +584,9 @@ mod test {
             Path::new("/project/Source"),
             Path::new("/project/Packages"),
             Some("Fusion"),
+            &[],
+            Path::new("/project"),
+            false,
         );
         assert_eq!(result, "../Packages/Fusion");
     }
@@ -462,6 +597,9 @@ mod test {
             Path::new("/project/Source/Plugin"),
             Path::new("/project/Source/RbxPackageLoader"),
             None,
+            &[],
+            Path::new("/project"),
+            false,
         );
         assert_eq!(result, "../RbxPackageLoader");
     }
@@ -472,8 +610,101 @@ mod test {
             Path::new("/project/Source"),
             Path::new("/project/Source/Lib"),
             None,
+            &[],
+            Path::new("/project"),
+            false,
         );
         assert_eq!(result, "./Lib");
+    }
+
+    #[test]
+    fn relative_path_with_project_mappings() {
+        // Project maps Source/Plugin -> Plugin and Packages -> Packages
+        let mappings = vec![
+            (PathBuf::from("Source/Plugin"), vec!["Plugin".to_string()]),
+            (
+                PathBuf::from("Source/RbxPackageLoader"),
+                vec!["RbxPackageLoader".to_string()],
+            ),
+            (PathBuf::from("Packages"), vec!["Packages".to_string()]),
+        ];
+
+        // From Source/Plugin/ to Packages/ should be ../Packages
+        // (not ../../Packages as filesystem would compute)
+        let result = compute_relative_require(
+            Path::new("/project/Source/Plugin"),
+            Path::new("/project/Packages"),
+            Some("Fusion"),
+            &mappings,
+            Path::new("/project"),
+            false,
+        );
+        assert_eq!(result, "../Packages/Fusion");
+    }
+
+    #[test]
+    fn relative_path_with_project_mappings_sibling() {
+        let mappings = vec![
+            (PathBuf::from("Source/Plugin"), vec!["Plugin".to_string()]),
+            (
+                PathBuf::from("Source/RbxPackageLoader"),
+                vec!["RbxPackageLoader".to_string()],
+            ),
+        ];
+
+        // From Source/Plugin/ to Source/RbxPackageLoader/ should be
+        // ../RbxPackageLoader (same as without mappings since both
+        // are at the same DataModel depth)
+        let result = compute_relative_require(
+            Path::new("/project/Source/Plugin"),
+            Path::new("/project/Source/RbxPackageLoader"),
+            None,
+            &mappings,
+            Path::new("/project"),
+            false,
+        );
+        assert_eq!(result, "../RbxPackageLoader");
+    }
+
+    #[test]
+    fn relative_path_nested_in_mapped_dir() {
+        let mappings = vec![
+            (PathBuf::from("Source/Plugin"), vec!["Plugin".to_string()]),
+            (PathBuf::from("Packages"), vec!["Packages".to_string()]),
+        ];
+
+        // From Source/Plugin/Components/ (deeper inside mapped dir)
+        // to Packages/Fusion
+        let result = compute_relative_require(
+            Path::new("/project/Source/Plugin/Components"),
+            Path::new("/project/Packages"),
+            Some("Fusion"),
+            &mappings,
+            Path::new("/project"),
+            false,
+        );
+        assert_eq!(result, "../../Packages/Fusion");
+    }
+
+    #[test]
+    fn relative_path_init_with_project_mappings() {
+        let mappings = vec![
+            (PathBuf::from("Source/Plugin"), vec!["Plugin".to_string()]),
+            (PathBuf::from("Packages"), vec!["Packages".to_string()]),
+        ];
+
+        // Init file at Source/Plugin/init.plugin.luau usurps Plugin.
+        // Its "current directory" is Plugin's parent (root), so
+        // Packages is a sibling: ./Packages/Fusion
+        let result = compute_relative_require(
+            Path::new("/project/Source/Plugin"),
+            Path::new("/project/Packages"),
+            Some("Fusion"),
+            &mappings,
+            Path::new("/project"),
+            true,
+        );
+        assert_eq!(result, "./Packages/Fusion");
     }
 
     #[test]
@@ -481,6 +712,8 @@ mod test {
         let source = r#"local Assets = require("@self/Assets")"#;
         let info = ResolveInfo {
             file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
+            path_mappings: &[],
+            project_root: Path::new("/project"),
             vfs: &make_test_vfs(&[]),
         };
 
@@ -493,6 +726,8 @@ mod test {
         let source = r#"local Fusion = require("@packages/Fusion")"#;
         let info = ResolveInfo {
             file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
+            path_mappings: &[],
+            project_root: Path::new("/project"),
             vfs: &make_test_vfs(&[(
                 "/project/.luaurc",
                 r#"{"aliases": {"packages": "Packages"}}"#,
@@ -508,6 +743,8 @@ mod test {
         let source = r#"local Loader = require("@rbxpackageloader")"#;
         let info = ResolveInfo {
             file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
+            path_mappings: &[],
+            project_root: Path::new("/project"),
             vfs: &make_test_vfs(&[(
                 "/project/.luaurc",
                 r#"{"aliases": {"rbxpackageloader": "Source/RbxPackageLoader"}}"#,
@@ -523,6 +760,8 @@ mod test {
         let source = r#"local Foo = require("./Foo")"#;
         let info = ResolveInfo {
             file_path: Path::new("/project/Source/Bar.luau"),
+            path_mappings: &[],
+            project_root: Path::new("/project"),
             vfs: &make_test_vfs(&[]),
         };
 
@@ -535,6 +774,8 @@ mod test {
         let source = r#"local Promise = require(script.Parent._Index["promise"])"#;
         let info = ResolveInfo {
             file_path: Path::new("/project/Source/init.luau"),
+            path_mappings: &[],
+            project_root: Path::new("/project"),
             vfs: &make_test_vfs(&[]),
         };
 
@@ -691,10 +932,10 @@ return {}"#,
         )]);
 
         let source = find_source_by_name(&session, "Plugin").expect("should find Plugin script");
-        // Plugin is at Source/Plugin/, Packages is at Packages/
-        // Relative: ../../Packages/Fusion
+        // Plugin maps to DataModel root child, Packages likewise.
+        // DataModel relative: ../Packages/Fusion
         assert!(
-            source.contains(r#"require("../../Packages/Fusion")"#),
+            source.contains(r#"require("./Packages/Fusion")"#),
             "alias should resolve to relative path, got: {source}"
         );
     }
@@ -746,11 +987,10 @@ return {}"#,
         )]);
 
         let source = find_source_by_name(&session, "Plugin").expect("should find Plugin script");
-        // init.plugin.luau usurps the folder just like init.luau,
-        // so the path is computed from Source/Plugin/ (not from the
-        // init file itself). Relative: ../../Packages/Fusion
+        // init.plugin.luau usurps the folder. With project tree
+        // mappings, the path is DataModel-relative: ../Packages/Fusion
         assert!(
-            source.contains(r#"require("../../Packages/Fusion")"#),
+            source.contains(r#"require("./Packages/Fusion")"#),
             "init.plugin.luau alias should resolve to relative path, got: {source}"
         );
     }
@@ -812,7 +1052,7 @@ return {}"#,
         // Source/RbxPackageLoader/
         // Relative: ../RbxPackageLoader
         assert!(
-            source.contains(r#"require("../RbxPackageLoader")"#),
+            source.contains(r#"require("./RbxPackageLoader")"#),
             "remapped alias should resolve to relative path, got: {source}"
         );
     }
@@ -911,10 +1151,10 @@ return {}"#,
         )]);
 
         let source = find_source_by_name(&session, "Main").expect("should find Main script");
-        // Main at src/server/, Packages at Packages/
-        // Relative: ../../Packages/SharedLib
+        // DataModel: ServerScriptService.Server.Main -> ReplicatedStorage.Packages.SharedLib
+        // Relative: ../../ReplicatedStorage/Packages/SharedLib
         assert!(
-            source.contains(r#"require("../../Packages/SharedLib")"#),
+            source.contains(r#"require("../../ReplicatedStorage/Packages/SharedLib")"#),
             "cross-service alias should resolve to relative path, got: {source}"
         );
     }
@@ -970,11 +1210,11 @@ return {}"#,
         let source = find_source_by_name(&session, "Source").expect("should find Source script");
 
         assert!(
-            source.contains(r#"require("../Packages/Fusion")"#),
+            source.contains(r#"require("./Packages/Fusion")"#),
             "first alias should resolve, got: {source}"
         );
         assert!(
-            source.contains(r#"require("../Packages/Roact")"#),
+            source.contains(r#"require("./Packages/Roact")"#),
             "second alias should resolve, got: {source}"
         );
         assert!(
@@ -1030,7 +1270,7 @@ return {}"#,
         // Main at src/, lib at lib/
         // Relative: ../lib
         assert!(
-            source.contains(r#"require("../lib")"#),
+            source.contains(r#"require("../Lib")"#),
             "bare alias should resolve to relative path, got: {source}"
         );
     }
