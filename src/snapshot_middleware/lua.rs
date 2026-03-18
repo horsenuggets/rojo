@@ -133,7 +133,7 @@ pub fn snapshot_lua_init(
 
     if dir_snapshot.class_name != "Folder" {
         anyhow::bail!(
-            "init.lua, init.server.lua, and init.client.lua can \
+            "init.lua, init.server.lua, init.client.lua, and init.plugin.lua can \
              only be used if the instance produced by the containing \
              directory would be a Folder.\n\
              \n\
@@ -447,6 +447,35 @@ mod test {
             Path::new("/root/init.lua"),
             "root",
             ScriptType::Module,
+        )
+        .unwrap()
+        .unwrap();
+
+        insta::with_settings!({ sort_maps => true }, {
+            insta::assert_yaml_snapshot!(instance_snapshot);
+        });
+    }
+
+    #[test]
+    fn init_plugin_from_vfs() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                ("init.plugin.luau", VfsSnapshot::file("print('hello')")),
+                ("Helper.luau", VfsSnapshot::file("return {}")),
+            ]),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+
+        let instance_snapshot = snapshot_lua_init(
+            &InstanceContext::with_emit_legacy_scripts(Some(false)),
+            &vfs,
+            Path::new("/root/init.plugin.luau"),
+            "root",
+            ScriptType::Plugin,
         )
         .unwrap()
         .unwrap();

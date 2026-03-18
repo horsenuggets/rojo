@@ -700,6 +700,62 @@ return {}"#,
     }
 
     #[test]
+    fn integration_init_plugin_alias() {
+        let session = create_test_session(vec![(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "test",
+                            "tree": {
+                                "$className": "Folder",
+                                "Packages": {
+                                    "$path": "Packages"
+                                },
+                                "Plugin": {
+                                    "$path": "Source/Plugin"
+                                }
+                            }
+                        }"#,
+                    ),
+                ),
+                (
+                    ".luaurc",
+                    VfsSnapshot::file(r#"{"aliases": {"packages": "Packages"}}"#),
+                ),
+                (
+                    "Packages",
+                    VfsSnapshot::dir([("Fusion.luau", VfsSnapshot::file("return {}"))]),
+                ),
+                (
+                    "Source",
+                    VfsSnapshot::dir([(
+                        "Plugin",
+                        VfsSnapshot::dir([(
+                            "init.plugin.luau",
+                            VfsSnapshot::file(
+                                r#"local Fusion = require("@packages/Fusion")
+return {}"#,
+                            ),
+                        )]),
+                    )]),
+                ),
+            ]),
+        )]);
+
+        let source = find_source_by_name(&session, "Plugin").expect("should find Plugin script");
+        // init.plugin.luau usurps the folder just like init.luau,
+        // so the path is computed from Source/Plugin/ (not from the
+        // init file itself). Relative: ../../Packages/Fusion
+        assert!(
+            source.contains(r#"require("../../Packages/Fusion")"#),
+            "init.plugin.luau alias should resolve to relative path, got: {source}"
+        );
+    }
+
+    #[test]
     fn integration_remapped_alias() {
         let session = create_test_session(vec![(
             "/project",

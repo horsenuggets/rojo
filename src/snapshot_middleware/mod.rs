@@ -125,6 +125,8 @@ fn get_dir_middleware<'path>(
             (Middleware::ServerScriptDir, "init.server.lua"),
             (Middleware::ClientScriptDir, "init.client.luau"),
             (Middleware::ClientScriptDir, "init.client.lua"),
+            (Middleware::PluginScriptDir, "init.plugin.luau"),
+            (Middleware::PluginScriptDir, "init.plugin.lua"),
             (Middleware::CsvDir, "init.csv"),
         ]
     });
@@ -208,6 +210,8 @@ pub enum Middleware {
     #[serde(skip_deserializing)]
     ModuleScriptDir,
     #[serde(skip_deserializing)]
+    PluginScriptDir,
+    #[serde(skip_deserializing)]
     CsvDir,
 }
 
@@ -259,6 +263,9 @@ impl Middleware {
             Self::ModuleScriptDir => {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::Module)
             }
+            Self::PluginScriptDir => {
+                snapshot_lua_init(context, vfs, path, name, ScriptType::Plugin)
+            }
             Self::CsvDir => snapshot_csv_init(context, vfs, path, name),
         };
         if let Ok(Some(ref mut snapshot)) = output {
@@ -301,6 +308,10 @@ impl Middleware {
             Middleware::ModuleScriptDir => syncback_lua_init(ScriptType::Module, snapshot),
             Middleware::CsvDir => syncback_csv_init(snapshot),
 
+            Middleware::PluginScriptDir => {
+                syncback_lua_init(ScriptType::Plugin, snapshot)
+            }
+
             Middleware::PluginScript
             | Middleware::LegacyServerScript
             | Middleware::LegacyClientScript
@@ -320,6 +331,7 @@ impl Middleware {
                 | Middleware::ServerScriptDir
                 | Middleware::ClientScriptDir
                 | Middleware::ModuleScriptDir
+                | Middleware::PluginScriptDir
                 | Middleware::CsvDir
         )
     }

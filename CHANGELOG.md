@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [7.7.0-rc.1-horse.0.2] (March 18th, 2026)
+
+* Added `init.plugin.luau` and `init.plugin.lua` support as init scripts. Plugin scripts in `init.plugin.luau` files now usurp their parent directory, matching the behavior of `init.luau`, `init.server.luau`, and `init.client.luau`. This fixes alias resolution for plugin scripts that use folder-based module organization.
+
+[7.7.0-rc.1-horse.0.2]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.2
+
 ## [7.7.0-rc.1-horse.0.1] (March 16th, 2026)
 
 * Added .luaurc alias resolution during build and serve. Custom alias requires like `require("@packages/Fusion")` are transformed into relative require-by-string paths like `require("../../Packages/Fusion")`. Uses full_moon AST parsing to find require() calls. Leaves `@self` and non-alias requires untouched.
