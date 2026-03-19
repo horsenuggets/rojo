@@ -18,6 +18,7 @@ local Settings = require(Plugin.Settings)
 local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
 local ServeSession = require(Plugin.ServeSession)
+local SharedAPI = require(Plugin.SharedAPI)
 local ApiContext = require(Plugin.ApiContext)
 local PatchSet = require(Plugin.PatchSet)
 local PatchTree = require(Plugin.PatchTree)
@@ -156,6 +157,8 @@ function App:init()
 		end)
 	end
 
+	SharedAPI.register(self)
+
 	if self:isAutoConnectPlaytestServerAvailable() then
 		self:useRunningConnectionInfo()
 		self:startSession()
@@ -174,6 +177,8 @@ function App:init()
 end
 
 function App:willUnmount()
+	SharedAPI.unregister()
+
 	self:endSession()
 
 	self.waypointConnection:Disconnect()
