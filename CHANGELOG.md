@@ -31,6 +31,25 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [7.7.0-rc.1-horse.0.6] (March 19th, 2026)
+
+* Auto-increment port when default port is already in use. When `rojo serve` starts without an explicit `--port` flag and the default port (34872) is taken, it now automatically tries the next available port instead of crashing. The chosen port is displayed in the startup message.
+* Improved error handling in `LiveServer::start()` by replacing panicking `.unwrap()` calls with proper error propagation.
+
+[7.7.0-rc.1-horse.0.6]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.6
+
+## [7.7.0-rc.1-horse.0.5] (March 19th, 2026)
+
+* Fix double slash in require paths for same-directory aliases
+
+[7.7.0-rc.1-horse.0.5]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.5
+
+## [7.7.0-rc.1-horse.0.4] (March 18th, 2026)
+
+* Added shared.Rojo API for programmatic plugin control
+
+[7.7.0-rc.1-horse.0.4]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.4
+
 ## [7.7.0-rc.1-horse.0.3] (March 18th, 2026)
 
 * Compute alias require paths relative to the DataModel tree instead of the filesystem. Project tree `$path` mappings are now used to determine the correct relative path, fixing cases where the filesystem has directories (e.g. `Source/`) that don't exist in the DataModel.
