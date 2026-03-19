@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use hyper::{
     server::Server,
     service::{make_service_fn, service_fn},
@@ -30,7 +31,7 @@ impl LiveServer {
         LiveServer { serve_session }
     }
 
-    pub fn start(self, address: SocketAddr) {
+    pub fn start(self, address: SocketAddr) -> anyhow::Result<()> {
         let serve_session = Arc::clone(&self.serve_session);
 
         let make_service = make_service_fn(move |_conn| {
@@ -53,9 +54,13 @@ impl LiveServer {
             }
         });
 
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new().context("Failed to create tokio runtime")?;
         let _guard = rt.enter();
-        let server = Server::bind(&address).serve(make_service);
-        rt.block_on(server).unwrap();
+        let server = Server::try_bind(&address)
+            .context(format!("Failed to bind to {}", address))?
+            .serve(make_service);
+        rt.block_on(server).context("Server error")?;
+
+        Ok(())
     }
 }

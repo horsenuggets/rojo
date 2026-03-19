@@ -1,6 +1,6 @@
 use std::{
     io::{self, Write},
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, TcpListener},
     path::PathBuf,
     sync::Arc,
 };
@@ -15,6 +15,7 @@ use super::{resolve_path, GlobalOptions};
 
 const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const DEFAULT_PORT: u16 = 34872;
+const MAX_PORT_ATTEMPTS: u16 = 100;
 
 /// Expose a Rojo project to the Rojo Studio plugin.
 #[derive(Debug, Parser)]
@@ -46,18 +47,44 @@ impl ServeCommand {
             .or_else(|| session.serve_address())
             .unwrap_or(DEFAULT_BIND_ADDRESS.into());
 
+        let explicit_port = self.port.is_some();
+
         let port = self
             .port
             .or_else(|| session.project_port())
             .unwrap_or(DEFAULT_PORT);
 
+        let port = if explicit_port {
+            port
+        } else {
+            find_available_port(ip, port)?
+        };
+
         let server = LiveServer::new(session);
 
         let _ = show_start_message(ip, port, global.color.into());
-        server.start((ip, port).into());
+        server.start((ip, port).into())?;
 
         Ok(())
     }
+}
+
+fn find_available_port(ip: IpAddr, starting_port: u16) -> anyhow::Result<u16> {
+    for offset in 0..MAX_PORT_ATTEMPTS {
+        let port = starting_port
+            .checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("Port number overflow"))?;
+
+        if TcpListener::bind((ip, port)).is_ok() {
+            return Ok(port);
+        }
+    }
+
+    anyhow::bail!(
+        "Could not find an available port in range {}-{}",
+        starting_port,
+        starting_port.saturating_add(MAX_PORT_ATTEMPTS - 1)
+    )
 }
 
 fn show_start_message(bind_address: IpAddr, port: u16, color: ColorChoice) -> io::Result<()> {
