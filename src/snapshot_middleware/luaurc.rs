@@ -162,6 +162,7 @@ fn compute_relative_require(
     };
 
     match sub_path {
+        Some(sub) if require_path.ends_with('/') => format!("{require_path}{sub}"),
         Some(sub) => format!("{require_path}/{sub}"),
         None => require_path,
     }
@@ -257,6 +258,8 @@ fn compute_filesystem_relative(script_dir: &Path, alias_target: &Path) -> String
 
             if rel_str.starts_with("..") {
                 rel_str
+            } else if rel_str.is_empty() {
+                ".".to_string()
             } else {
                 format!("./{rel_str}")
             }
@@ -1273,5 +1276,64 @@ return {}"#,
             source.contains(r#"require("../Lib")"#),
             "bare alias should resolve to relative path, got: {source}"
         );
+    }
+
+    #[test]
+    fn no_double_slash_for_sibling_in_alias_directory() {
+        // When a script is inside the alias target directory and
+        // requires a sibling via the alias, the path should not
+        // contain double slashes.
+        let result = compute_relative_require(
+            Path::new("/project/Stories"),
+            Path::new("/project/Stories"),
+            Some("makeStory"),
+            &[],
+            Path::new("/project"),
+            false,
+        );
+        assert_eq!(result, "./makeStory");
+        assert!(
+            !result.contains("//"),
+            "should not have double slashes, got: {result}"
+        );
+    }
+
+    #[test]
+    fn same_directory_no_sub_path() {
+        let result = compute_relative_require(
+            Path::new("/project/Stories"),
+            Path::new("/project/Stories"),
+            None,
+            &[],
+            Path::new("/project"),
+            false,
+        );
+        assert_eq!(result, ".");
+    }
+
+    #[test]
+    fn child_directory_with_sub_path() {
+        let result = compute_relative_require(
+            Path::new("/project/Source"),
+            Path::new("/project/Source/Lib"),
+            Some("Util"),
+            &[],
+            Path::new("/project"),
+            false,
+        );
+        assert_eq!(result, "./Lib/Util");
+    }
+
+    #[test]
+    fn parent_directory_with_sub_path() {
+        let result = compute_relative_require(
+            Path::new("/project/Source/Lib"),
+            Path::new("/project/Source"),
+            Some("Main"),
+            &[],
+            Path::new("/project"),
+            false,
+        );
+        assert_eq!(result, "../Main");
     }
 }
