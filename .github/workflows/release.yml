@@ -124,6 +124,10 @@ jobs:
       - name: Build Release
         run: cargo build --release --locked --verbose --target ${{ matrix.target }}
 
+      - name: Sign macOS Binary
+        if: matrix.host == 'macos'
+        run: codesign -s - --force "target/${{ matrix.target }}/release/$BIN"
+
       - name: Save Rust Cache
         uses: actions/cache/save@v4
         with:
