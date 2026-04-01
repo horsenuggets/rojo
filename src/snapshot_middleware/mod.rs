@@ -308,9 +308,7 @@ impl Middleware {
             Middleware::ModuleScriptDir => syncback_lua_init(ScriptType::Module, snapshot),
             Middleware::CsvDir => syncback_csv_init(snapshot),
 
-            Middleware::PluginScriptDir => {
-                syncback_lua_init(ScriptType::Plugin, snapshot)
-            }
+            Middleware::PluginScriptDir => syncback_lua_init(ScriptType::Plugin, snapshot),
 
             Middleware::PluginScript
             | Middleware::LegacyServerScript

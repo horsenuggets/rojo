@@ -92,8 +92,7 @@ function SharedAPI.register(app)
 		if registeredApp.state.appStatus ~= "Confirming" then
 			return {
 				success = false,
-				error = "Not in confirming state, current status is "
-					.. tostring(registeredApp.state.appStatus),
+				error = "Not in confirming state, current status is " .. tostring(registeredApp.state.appStatus),
 			}
 		end
 
@@ -115,8 +114,7 @@ function SharedAPI.register(app)
 		if registeredApp.state.appStatus ~= "Confirming" then
 			return {
 				success = false,
-				error = "Not in confirming state, current status is "
-					.. tostring(registeredApp.state.appStatus),
+				error = "Not in confirming state, current status is " .. tostring(registeredApp.state.appStatus),
 			}
 		end
 
@@ -208,8 +206,7 @@ function SharedAPI.register(app)
 
 		return {
 			success = false,
-			error = `Timed out after {timeout} seconds, current `
-				.. `status is {registeredApp.state.appStatus}`,
+			error = `Timed out after {timeout} seconds, current ` .. `status is {registeredApp.state.appStatus}`,
 		}
 	end
 

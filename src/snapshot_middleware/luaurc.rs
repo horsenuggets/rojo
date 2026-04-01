@@ -156,7 +156,13 @@ fn compute_relative_require(
     is_init: bool,
 ) -> String {
     let require_path = if !path_mappings.is_empty() {
-        compute_datamodel_relative(script_dir, alias_target, path_mappings, project_root, is_init)
+        compute_datamodel_relative(
+            script_dir,
+            alias_target,
+            path_mappings,
+            project_root,
+            is_init,
+        )
     } else {
         compute_filesystem_relative(script_dir, alias_target)
     };
@@ -222,9 +228,7 @@ fn to_datamodel_path(
     project_root: &Path,
 ) -> Vec<String> {
     // Make the path relative to the project root
-    let relative = fs_path
-        .strip_prefix(project_root)
-        .unwrap_or(fs_path);
+    let relative = fs_path.strip_prefix(project_root).unwrap_or(fs_path);
 
     // Find the best matching $path mapping (longest match first,
     // since mappings are sorted by length descending)
