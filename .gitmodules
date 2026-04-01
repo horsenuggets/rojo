@@ -22,3 +22,6 @@
 [submodule ".lune/opencloud-execute"]
 	path = .lune/opencloud-execute
 	url = https://github.com/Dekkonot/opencloud-luau-execute-lune.git
+[submodule "Submodules/luau-cicd"]
+	path = submodules/luau-cicd
+	url = git@github.com:horsenuggets/luau-cicd.git

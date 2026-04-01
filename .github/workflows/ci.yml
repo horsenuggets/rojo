@@ -3,22 +3,36 @@ name: CI
 on:
   push:
     branches:
-    - master
     - main
 
   pull_request:
     branches:
-    - master
     - main
+    - release
 
 jobs:
   build:
-    name: Build and Test
-    runs-on: ${{ matrix.os }}
+    name: CI - ${{ matrix.name }}
+    runs-on: ${{ matrix.runner-os }}
 
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest, windows-11-arm, ubuntu-22.04-arm]
+        include:
+          - name: Windows x86_64
+            runner-os: windows-latest
+
+          - name: Windows aarch64
+            runner-os: windows-11-arm
+
+          - name: Linux x86_64
+            runner-os: ubuntu-22.04
+
+          - name: Linux aarch64
+            runner-os: ubuntu-22.04-arm
+
+          - name: macOS aarch64
+            runner-os: macos-15
 
     steps:
     - uses: actions/checkout@v4
@@ -35,7 +49,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ matrix.runner-os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build
       run: cargo build --locked --verbose
@@ -50,7 +64,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ matrix.runner-os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
   msrv:
     name: Check MSRV
@@ -86,7 +100,7 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
   lint:
-    name: Rustfmt, Clippy, Stylua, & Selene
+    name: Lint
     runs-on: ubuntu-latest
 
     steps:

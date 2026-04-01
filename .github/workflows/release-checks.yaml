@@ -1,0 +1,178 @@
+name: Release checks
+
+on:
+  pull_request:
+    branches:
+      - release
+
+jobs:
+  pr-title:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title format
+        run: |
+          TITLE="${{ github.event.pull_request.title }}"
+          echo "Checking PR title: $TITLE"
+
+          if [[ ! "$TITLE" =~ ^Release\ [0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "::error::PR title must be 'Release X.Y.Z' or 'Release X.Y.Z-suffix'"
+            exit 1
+          fi
+
+          echo "PR title is valid."
+
+  diff-check:
+    name: Verify diff matches main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check diff with main
+        run: |
+          git fetch origin main
+
+          DIFF=$(git diff origin/main..HEAD)
+
+          if [ -n "$DIFF" ]; then
+            echo "::error::PR branch has changes that differ from main. The release branch must contain exactly what is in main."
+            echo "Diff:"
+            echo "$DIFF"
+            exit 1
+          fi
+
+          echo "PR branch matches main exactly."
+
+  version:
+    name: Validate version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version file exists
+        run: |
+          if [ ! -f "VERSION" ]; then
+            echo "::error::VERSION file not found"
+            exit 1
+          fi
+          echo "VERSION file exists."
+
+      - name: Check version bump
+        run: |
+          git fetch origin release || true
+
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "Current version: $VERSION"
+
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists. Please bump the version."
+            exit 1
+          fi
+
+          echo "Version $VERSION is new."
+
+      - name: Check changelog entry
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+
+          if ! grep -q "## \`$VERSION\`" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md does not have an entry for version $VERSION"
+            echo "Expected to find: ## \`$VERSION\`"
+            exit 1
+          fi
+
+          echo "Changelog entry found for version $VERSION."
+
+      - name: Verify PR title matches VERSION
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          EXPECTED_TITLE="Release $VERSION"
+          ACTUAL_TITLE="${{ github.event.pull_request.title }}"
+
+          if [ "$EXPECTED_TITLE" != "$ACTUAL_TITLE" ]; then
+            echo "::error::PR title '$ACTUAL_TITLE' does not match VERSION file. Expected '$EXPECTED_TITLE'"
+            exit 1
+          fi
+
+          echo "PR title matches VERSION file."
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check Cargo.toml version matches
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          CARGO_VERSION=$(./scripts/get-version.sh)
+
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::VERSION file ($VERSION) does not match Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+
+          echo "VERSION file matches Cargo.toml."
+
+  build-test:
+    name: Build test - ${{ matrix.name }}
+    runs-on: ${{ matrix.runner-os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86_64
+            runner-os: windows-latest
+            cargo-target: x86_64-pc-windows-msvc
+
+          - name: Windows aarch64
+            runner-os: windows-11-arm
+            cargo-target: aarch64-pc-windows-msvc
+
+          - name: Linux x86_64
+            runner-os: ubuntu-22.04
+            cargo-target: x86_64-unknown-linux-gnu
+
+          - name: Linux aarch64
+            runner-os: ubuntu-22.04-arm
+            cargo-target: aarch64-unknown-linux-gnu
+
+          - name: macOS x86_64
+            runner-os: macos-15
+            cargo-target: x86_64-apple-darwin
+
+          - name: macOS aarch64
+            runner-os: macos-15
+            cargo-target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cargo-target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.cargo-target }}
+
+  build-test-plugin:
+    name: Build test - Plugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rokit
+        uses: CompeyDev/setup-rokit@v0.1.2
+
+      - name: Build plugin
+        run: rojo build plugin --output Rojo.rbxm

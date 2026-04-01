@@ -31,26 +31,26 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
-## [7.7.0-rc.1-horse.0.6] (March 19th, 2026)
+## `7.7.0-rc.1-horse.0.6`
 
 * Auto-increment port when default port is already in use. When `rojo serve` starts without an explicit `--port` flag and the default port (34872) is taken, it now automatically tries the next available port instead of crashing. The chosen port is displayed in the startup message.
 * Improved error handling in `LiveServer::start()` by replacing panicking `.unwrap()` calls with proper error propagation.
 
 [7.7.0-rc.1-horse.0.6]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.6
 
-## [7.7.0-rc.1-horse.0.5] (March 19th, 2026)
+## `7.7.0-rc.1-horse.0.5`
 
 * Fix double slash in require paths for same-directory aliases
 
 [7.7.0-rc.1-horse.0.5]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.5
 
-## [7.7.0-rc.1-horse.0.4] (March 18th, 2026)
+## `7.7.0-rc.1-horse.0.4`
 
 * Added shared.Rojo API for programmatic plugin control
 
 [7.7.0-rc.1-horse.0.4]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.4
 
-## [7.7.0-rc.1-horse.0.3] (March 18th, 2026)
+## `7.7.0-rc.1-horse.0.3`
 
 * Compute alias require paths relative to the DataModel tree instead of the filesystem. Project tree `$path` mappings are now used to determine the correct relative path, fixing cases where the filesystem has directories (e.g. `Source/`) that don't exist in the DataModel.
 * Fix init scripts producing `../` instead of `./` for sibling requires. Init scripts usurp their parent folder, so their "current directory" is the folder's parent.
@@ -58,20 +58,19 @@ Making a new release? Simply add the new header with the version and date undern
 
 [7.7.0-rc.1-horse.0.3]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.3
 
-## [7.7.0-rc.1-horse.0.2] (March 18th, 2026)
+## `7.7.0-rc.1-horse.0.2`
 
 * Added `init.plugin.luau` and `init.plugin.lua` support as init scripts. Plugin scripts in `init.plugin.luau` files now usurp their parent directory, matching the behavior of `init.luau`, `init.server.luau`, and `init.client.luau`. This fixes alias resolution for plugin scripts that use folder-based module organization.
 
 [7.7.0-rc.1-horse.0.2]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.2
 
-## [7.7.0-rc.1-horse.0.1] (March 16th, 2026)
+## `7.7.0-rc.1-horse.0.1`
 
 * Added .luaurc alias resolution during build and serve. Custom alias requires like `require("@packages/Fusion")` are transformed into relative require-by-string paths like `require("../../Packages/Fusion")`. Uses full_moon AST parsing to find require() calls. Leaves `@self` and non-alias requires untouched.
 
 [7.7.0-rc.1-horse.0.1]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.1
 
-## [7.7.0-rc.1]
-
+## `7.7.0-rc.1`
 * `inf` and `nan` values in properties are now synced ([#1176])
 * Fixed a bug caused by having reference properties (such as `ObjectValue.Value`) that point to an Instance not included in syncback. ([#1179])
 * Fixed instance replacement fallback failing when too many instances needed to be replaced. ([#1192])
@@ -90,7 +89,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#1215]: https://github.com/rojo-rbx/rojo/pull/1215
 [#1217]: https://github.com/rojo-rbx/rojo/pull/1217
 
-## [7.7.0-rc.1] (November 27th, 2025)
+## `7.7.0-rc.1`
 
 * Fixed a bug where passing `--skip-git` to `rojo init` would still create a file named `gitignore.txt` ([#1172])
 * A new command `rojo syncback` has been added. It can be used as `rojo syncback [path to project] --input [path to file]`. ([#937])
@@ -137,7 +136,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#1159]: https://github.com/rojo-rbx/rojo/pull/1159
 [#1172]: https://github.com/rojo-rbx/rojo/pull/1172
 
-## [7.6.1] (November 6th, 2025)
+## `7.6.1`
 
 * Fixed a bug where the last sync timestamp was not updating correctly in the plugin ([#1132])
 * Improved the reliability of sync replacements by adding better error handling and recovery ([#1135])
@@ -152,7 +151,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#1144]: https://github.com/rojo-rbx/rojo/pull/1144
 [#1145]: https://github.com/rojo-rbx/rojo/pull/1145
 
-## [7.6.0] (October 10th, 2025)
+## `7.6.0`
 
 * Added flag to `rojo init` to skip initializing a git repository ([#1122])
 * Added fallback method for when an Instance can't be synced through normal means ([#1030])
@@ -186,13 +185,13 @@ Making a new release? Simply add the new header with the version and date undern
 [#1104]: https://github.com/rojo-rbx/rojo/pull/1104
 [#1122]: https://github.com/rojo-rbx/rojo/pull/1122
 
-## [7.5.1] (April 25th, 2025)
+## `7.5.1`
 
 * Fixed output spam related to `Instance.Capabilities` in the plugin
 
 [7.5.1]: https://github.com/rojo-rbx/rojo/releases/tag/v7.5.1
 
-## [7.5.0] (April 25th, 2025)
+## `7.5.0`
 
 * Fixed an edge case that caused model pivots to not be built correctly in some cases ([#1027])
 * Add `blockedPlaceIds` project config field to allow blocking place ids from being live synced ([#1021])
@@ -310,14 +309,14 @@ Making a new release? Simply add the new header with the version and date undern
 [#1021]: https://github.com/rojo-rbx/rojo/pull/1021
 [#1027]: https://github.com/rojo-rbx/rojo/pull/1027
 
-## [7.4.4] (August 22nd, 2024)
+## `7.4.4`
 
 * Fixed issue with reading attributes from `Lighting` in new place files
 * `Instance.Archivable` will now default to `true` when building a project into a binary (`rbxm`/`rbxl`) file rather than `false`.
 
 [7.4.4]: https://github.com/rojo-rbx/rojo/releases/tag/v7.4.4
 
-## [7.4.3] (August 6th, 2024)
+## `7.4.3`
 
 * Fixed issue with building binary files introduced in 7.4.2
 * Fixed `value of type nil cannot be converted to number` warning spam in output. [#955]
@@ -325,7 +324,7 @@ Making a new release? Simply add the new header with the version and date undern
 [7.4.3]: https://github.com/rojo-rbx/rojo/releases/tag/v7.4.3
 [#955]: https://github.com/rojo-rbx/rojo/pull/955
 
-## [7.4.2] (July 23, 2024)
+## `7.4.2`
 
 * Added Never option to Confirmation ([#893])
 * Fixed removing trailing newlines ([#903])
@@ -338,7 +337,7 @@ Making a new release? Simply add the new header with the version and date undern
 [Surface_Appearance_Color_1]: https://devforum.roblox.com/t/jailbreak-custom-character-turned-shiny-black-no-texture/3075563
 [Surface_Appearance_Color_2]: https://devforum.roblox.com/t/surfaceappearance-not-displaying-correctly/3075588
 
-## [7.4.1] (February 20, 2024)
+## `7.4.1`
 
 * Made the `name` field optional on project files ([#870])
 
@@ -363,7 +362,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#868]: https://github.com/rojo-rbx/rojo/pull/868
 [#870]: https://github.com/rojo-rbx/rojo/pull/870
 
-## [7.4.0] (January 16, 2024)
+## `7.4.0`
 
 * Improved the visualization for array properties like Tags ([#829])
 * Significantly improved performance of `rojo serve`, `rojo build --watch`, and `rojo sourcemap --watch` on macOS. ([#830])
@@ -376,7 +375,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#831]: https://github.com/rojo-rbx/rojo/pull/831
 [#833]: https://github.com/rojo-rbx/rojo/pull/833
 
-## [7.4.0-rc3] (October 25, 2023)
+## `7.4.0-rc3`
 
 * Changed `sourcemap --watch` to only generate the sourcemap when it's necessary ([#800])
 * Switched script source property getter and setter to `ScriptEditorService` methods ([#801])
@@ -393,14 +392,14 @@ Making a new release? Simply add the new header with the version and date undern
 [#807]: https://github.com/rojo-rbx/rojo/pull/807
 [#809]: https://github.com/rojo-rbx/rojo/pull/809
 
-## [7.4.0-rc2] (October 3, 2023)
+## `7.4.0-rc2`
 
 * Fixed bug with parsing version for plugin validation ([#797])
 
 [7.4.0-rc2]: https://github.com/rojo-rbx/rojo/releases/tag/v7.4.0-rc2
 [#797]: https://github.com/rojo-rbx/rojo/pull/797
 
-## [7.4.0-rc1] (October 3, 2023)
+## `7.4.0-rc1`
 
 ### Additions
 
@@ -561,7 +560,7 @@ Making a new release? Simply add the new header with the version and date undern
 [rbx-dom#296]: https://github.com/rojo-rbx/rbx-dom/pull/296
 [rbx-dom#299]: https://github.com/rojo-rbx/rbx-dom/pull/299
 
-## [7.3.0] (April 22, 2023)
+## `7.3.0`
 
 * Added `$attributes` to project format. ([#574])
 * Added `--watch` flag to `rojo sourcemap`. ([#602])
@@ -598,7 +597,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#637]: https://github.com/rojo-rbx/rojo/pull/637
 [#642]: https://github.com/rojo-rbx/rojo/pull/642
 
-## [7.2.1] (July 8, 2022)
+## `7.2.1`
 
 * Fixed notification sound by changing it to a generic sound. ([#566])
 * Added setting to turn off sound effects. ([#568])
@@ -607,7 +606,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#566]: https://github.com/rojo-rbx/rojo/pull/566
 [#568]: https://github.com/rojo-rbx/rojo/pull/568
 
-## [7.2.0] (June 29, 2022)
+## `7.2.0`
 
 * Added support for `.luau` files. ([#552])
 * Added support for live syncing Attributes and Tags. ([#553])
@@ -631,7 +630,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#563]: https://github.com/rojo-rbx/rojo/pull/563
 [#564]: https://github.com/rojo-rbx/rojo/pull/564
 
-## [7.1.1] (May 26, 2022)
+## `7.1.1`
 
 * Fixed sourcemap command not stripping paths correctly ([#544])
 * Fixed Studio plugin settings not saving correctly.
@@ -639,7 +638,7 @@ Making a new release? Simply add the new header with the version and date undern
 [7.1.1]: https://github.com/rojo-rbx/rojo/releases/tag/v7.1.1
 [#544]: https://github.com/rojo-rbx/rojo/pull/544
 
-## [7.1.0] (May 22, 2022)
+## `7.1.0`
 
 * Added support for specifying an address to be used by default in project files. ([#507])
 * Added support for optional paths in project files. ([#472])
@@ -656,7 +655,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#537]: https://github.com/rojo-rbx/rojo/pull/537
 [#538]: https://github.com/rojo-rbx/rojo/pull/538
 
-## [7.0.0] (December 10, 2021)
+## `7.0.0`
 
 * Fixed Rojo's interactions with properties enabled by FFlags that are not yet enabled. ([#493])
 * Improved output in Roblox Studio plugin when bad property data is encountered.
@@ -669,7 +668,7 @@ Making a new release? Simply add the new header with the version and date undern
 [#493]: https://github.com/rojo-rbx/rojo/pull/493
 [#500]: https://github.com/rojo-rbx/rojo/pull/500
 
-## [7.0.0-rc.3] (October 19, 2021)
+## `7.0.0-rc.3`
 
 This is the last release candidate for Rojo 7. In an effort to get Rojo 7 out the door, we'll be freezing features from here on out, something we should've done a couple months ago.
 
@@ -684,11 +683,11 @@ Expect to see Rojo 7 stable soon!
 [#482]: https://github.com/rojo-rbx/rojo/pull/482
 [#484]: https://github.com/rojo-rbx/rojo/pull/484
 
-## 7.0.0-rc.2 (October 19, 2021)
+## `7.0.0-rc.2`
 
 (Botched release due to Git mishap, oops!)
 
-## [7.0.0-rc.1] (August 23, 2021)
+## `7.0.0-rc.1`
 
 In Rojo 6 and previous Rojo 7 alphas, an explicit Vector3 property would be written like this:
 
@@ -742,7 +741,7 @@ The shorthand property format that most users use is not impacted. For reference
 [#464]: https://github.com/rojo-rbx/rojo/pull/464
 [#466]: https://github.com/rojo-rbx/rojo/pull/466
 
-## [7.0.0-alpha.4] (May 5, 2021)
+## `7.0.0-alpha.4`
 
 * Added the `gameId` and `placeId` optional properties to project files.
 
@@ -761,7 +760,7 @@ The shorthand property format that most users use is not impacted. For reference
 [#413]: https://github.com/rojo-rbx/rojo/pull/413
 [#420]: https://github.com/rojo-rbx/rojo/pull/420
 
-## [7.0.0-alpha.3] (February 19, 2021)
+## `7.0.0-alpha.3`
 
 * Updated dependencies, fixing `OptionalCoordinateFrame`-related issues.
 * Added `--address` flag to `rojo serve` to allow for external connections. ([#403])
@@ -769,13 +768,13 @@ The shorthand property format that most users use is not impacted. For reference
 [7.0.0-alpha.3]: https://github.com/rojo-rbx/rojo/releases/tag/v7.0.0-alpha.3
 [#403]: https://github.com/rojo-rbx/rojo/pull/403
 
-## [7.0.0-alpha.2] (February 19, 2021)
+## `7.0.0-alpha.2`
 
 * Fixed incorrect protocol version between the client and server.
 
 [7.0.0-alpha.2]: https://github.com/rojo-rbx/rojo/releases/tag/v7.0.0-alpha.2
 
-## [7.0.0-alpha.1] (February 18, 2021)
+## `7.0.0-alpha.1`
 
 This release includes a brand new implementation of the Roblox DOM. It brings performance improvements, much better support for `rbxl` and `rbxm` files, and a better internal API.
 
@@ -791,19 +790,19 @@ Formatting of types will change more before the stable release of Rojo 7. We're 
 [7.0.0-alpha.1]: https://github.com/rojo-rbx/rojo/releases/tag/v7.0.0-alpha.1
 [allValues.json]: https://github.com/rojo-rbx/rojo/blob/f4a790eb50b74e482000bad1dcfe22533992fb20/plugin/rbx_dom_lua/src/allValues.json
 
-## [6.0.2] (February 9, 2021)
+## `6.0.2`
 
 * Fixed `rojo upload` to handle CSRF challenges.
 
 [6.0.2]: https://github.com/rojo-rbx/rojo/releases/tag/v6.0.2
 
-## [6.0.1] (January 22, 2021)
+## `6.0.1`
 
 * Fixed `rojo upload` requests being rejected by Roblox
 
 [6.0.1]: https://github.com/rojo-rbx/rojo/releases/tag/v6.0.1
 
-## [6.0.0] (January 16, 2021)
+## `6.0.0`
 
 * Improved server error messages
   * The server will now keep running in more error cases
@@ -811,7 +810,7 @@ Formatting of types will change more before the stable release of Rojo 7. We're 
 
 [6.0.0]: https://github.com/rojo-rbx/rojo/releases/tag/v6.0.0
 
-## [6.0.0-rc.4] (December 14, 2020)
+## `6.0.0-rc.4`
 
 * Added brand new Rojo UI ([#367])
 * Added `projectName` to `/api/rojo` output.
@@ -819,14 +818,14 @@ Formatting of types will change more before the stable release of Rojo 7. We're 
 [6.0.0-rc.4]: https://github.com/rojo-rbx/rojo/releases/tag/v6.0.0-rc.4
 [#367]: https://github.com/rojo-rbx/rojo/pull/367
 
-## [6.0.0-rc.3] (November 19, 2020)
+## `6.0.0-rc.3`
 
 * Fixed the Rojo plugin attempting to write the non-scriptable properties `Instance.SourceAssetId` and `HttpServer.HttpEnabled`.
 * Fixed the Rojo plugin's handling of null referents.
 
 [6.0.0-rc.3]: https://github.com/rojo-rbx/rojo/releases/tag/v6.0.0-rc.3
 
-## [6.0.0-rc.2] (November 19, 2020)
+## `6.0.0-rc.2`
 
 * Fixed crash when malformed CSV files are put into a project. ([#310])
 * Fixed incorrect string escaping when producing Lua code from JSON files. ([#314])
@@ -845,7 +844,7 @@ Formatting of types will change more before the stable release of Rojo 7. We're 
 [#317]: https://github.com/rojo-rbx/rojo/issues/317
 [#320]: https://github.com/rojo-rbx/rojo/issues/320
 
-## [6.0.0-rc.1] (March 29, 2020)
+## `6.0.0-rc.1`
 
 This release jumped from 0.6.0 to 6.0.0. Rojo has been in use in production for many users for quite a long times, and so 6.0 is a more accurate reflection of Rojo's version than a pre-1.0 version.
 
@@ -864,7 +863,7 @@ This release jumped from 0.6.0 to 6.0.0. Rojo has been in use in production for 
 [#304]: https://github.com/rojo-rbx/rojo/pull/304
 [#308]: https://github.com/rojo-rbx/rojo/pull/308
 
-## [0.6.0-alpha.3] (March 13, 2020)
+## `0.6.0-alpha.3`
 
 * Added `--watch` argument to `rojo build`. ([#284])
 * Added dark theme support to plugin. ([#241])
@@ -881,14 +880,14 @@ This release jumped from 0.6.0 to 6.0.0. Rojo has been in use in production for 
 [#241]: https://github.com/rojo-rbx/rojo/issues/241
 [#284]: https://github.com/rojo-rbx/rojo/pull/284
 
-## [0.6.0-alpha.2] (March 6, 2020)
+## `0.6.0-alpha.2`
 
 * Fixed `rojo upload` command always uploading models.
 * Removed `--kind` parameter to `rojo upload`; Rojo now automatically uploads the correct kind of asset based on your project file.
 
 [0.6.0-alpha.2]: https://github.com/rojo-rbx/rojo/releases/tag/v0.6.0-alpha.2
 
-## [0.5.4] (February 26, 2020)
+## `0.5.4`
 
 This is a general maintenance release for the Rojo 0.5.x release series.
 
@@ -897,7 +896,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 
 [0.5.4]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.4
 
-## [0.6.0-alpha.1] (January 22, 2020)
+## `0.6.0-alpha.1`
 
 ### General
 
@@ -929,20 +928,20 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#95]: https://github.com/rojo-rbx/rojo/issues/95
 [#142]: https://github.com/rojo-rbx/rojo/issues/142
 
-## [0.5.3] (October 15, 2019)
+## `0.5.3`
 
 * Fixed an issue where Rojo would throw an error when encountering recently-added instance classes.
 
 [0.5.3]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.3
 
-## [0.5.2] (October 14, 2019)
+## `0.5.2`
 
 * Fixed an issue where `LocalizationTable` instances would have their column order randomized. ([#173])
 
 [0.5.2]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.2
 [#173]: https://github.com/rojo-rbx/rojo/issues/173
 
-## [0.5.1] (October 4, 2019)
+## `0.5.1`
 
 * Fixed an issue where Rojo would drop changes if they happened too quickly ([#252])
 * Improved diagnostics for when the Rojo plugin cannot create an instance.
@@ -952,7 +951,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.5.1]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.1
 [#252]: https://github.com/rojo-rbx/rojo/issues/252
 
-## [0.5.0] (August 27, 2019)
+## `0.5.0`
 
 * Changed `.model.json` naming, which may require projects to migrate ambiguous cases:
   * The file name now takes precedence over the `Name` field in the model, like Rojo 0.4.x.
@@ -964,7 +963,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.5.0]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.0
 [#201]: https://github.com/rojo-rbx/rojo/issues/201
 
-## [0.5.0-alpha.13] (August 2, 2019)
+## `0.5.0-alpha.13`
 
 * Bumped minimum Rust version to 1.34.0.
 * Fixed default port documentation in `rojo serve --help` ([#219])
@@ -973,7 +972,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.5.0-alpha.13]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.0-alpha.13
 [#219]: https://github.com/rojo-rbx/rojo/issues/219
 
-## [0.5.0-alpha.12] (July 2, 2019)
+## `0.5.0-alpha.12`
 
 * Added `.meta.json` files
   * `init.meta.json` files replace `init.model.json` files from Rojo 0.4.x ([#183])
@@ -999,7 +998,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#190]: https://github.com/rojo-rbx/rojo/issues/190
 [#191]: https://github.com/rojo-rbx/rojo/issues/191
 
-## [0.5.0-alpha.11] (May 29, 2019)
+## `0.5.0-alpha.11`
 
 * Added support for implicit property values in JSON model files ([#154])
 * `Content` properties can now be specified in projects and model files as regular string literals.
@@ -1014,13 +1013,12 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.5.0-alpha.11]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.0-alpha.11
 [#154]: https://github.com/rojo-rbx/rojo/pull/154
 
-## 0.5.0-alpha.10
-
+## `0.5.0-alpha.10`
 * This release was a dud due to [#176] and was rolled back.
 
 [#176]: https://github.com/rojo-rbx/rojo/issues/176
 
-## [0.5.0-alpha.9] (April 4, 2019)
+## `0.5.0-alpha.9`
 
 * Changed `rojo build` to use buffered I/O, which can make it up to 2x faster in some cases.
   * Building [*Road Not Taken*](https://github.com/LPGhatguy/roads) to an `rbxlx` file dropped from 150ms to 70ms on my machine
@@ -1032,7 +1030,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#149]: https://github.com/rojo-rbx/rojo/pull/149
 [#152]: https://github.com/rojo-rbx/rojo/pull/152
 
-## [0.5.0-alpha.8] (March 29, 2019)
+## `0.5.0-alpha.8`
 
 * Added support for a bunch of new types when dealing with XML model/place files:
   * `ColorSequence`
@@ -1052,7 +1050,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#135]: https://github.com/rojo-rbx/rojo/pull/135
 [#141]: https://github.com/rojo-rbx/rojo/issues/141
 
-## [0.5.0-alpha.6] (March 19, 2019)
+## `0.5.0-alpha.6`
 
 * Fixed `rojo init` giving unexpected results by upgrading to `rbx_dom_weak` 1.1.0
 * Fixed live server not responding when the Rojo plugin is connected ([#133])
@@ -1066,7 +1064,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.5.0-alpha.6]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.0-alpha.6
 [#133]: https://github.com/rojo-rbx/rojo/issues/133
 
-## [0.5.0-alpha.5] (March 1, 2019)
+## `0.5.0-alpha.5`
 
 * Upgraded core dependencies, which improves compatibility for lots of instance types
   * Upgraded from `rbx_tree` 0.2.0 to `rbx_dom_weak` 1.0.0
@@ -1083,7 +1081,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#121]: https://github.com/rojo-rbx/rojo/issues/121
 [#130]: https://github.com/rojo-rbx/rojo/pull/130
 
-## [0.5.0-alpha.4] (February 8, 2019)
+## `0.5.0-alpha.4`
 
 * Added support for nested partitions ([#102])
 * Added support for 'transmuting' partitions ([#112])
@@ -1096,7 +1094,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#105]: https://github.com/rojo-rbx/rojo/issues/105
 [#112]: https://github.com/rojo-rbx/rojo/issues/112
 
-## [0.5.0-alpha.3] (February 1, 2019)
+## `0.5.0-alpha.3`
 
 * Changed default project file name from `roblox-project.json` to `default.project.json` ([#120])
   * The old file name will still be supported until 0.5.0 is fully released.
@@ -1111,7 +1109,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#119]: https://github.com/rojo-rbx/rojo/pull/119
 [#120]: https://github.com/rojo-rbx/rojo/pull/120
 
-## [0.5.0-alpha.2] (January 28, 2019)
+## `0.5.0-alpha.2`
 
 * Added support for `.model.json` files, compatible with 0.4.x
 * Fixed in-memory filesystem not handling out-of-order filesystem change events
@@ -1120,7 +1118,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.5.0-alpha.2]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.0-alpha.2
 [#110]: https://github.com/rojo-rbx/rojo/issues/110
 
-## [0.5.0-alpha.1] (January 25, 2019)
+## `0.5.0-alpha.1`
 
 * Changed plugin UI to be way prettier
   * Thanks to [Reselim](https://github.com/Reselim) for the design!
@@ -1131,7 +1129,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 
 [0.5.0-alpha.1]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.0-alpha.1
 
-## [0.5.0-alpha.0] (January 14, 2019)
+## `0.5.0-alpha.0`
 
 * "Epiphany" rewrite, in progress since the beginning of time
 * New live sync protocol
@@ -1159,13 +1157,13 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 
 [0.5.0-alpha.0]: https://github.com/rojo-rbx/rojo/releases/tag/v0.5.0-alpha.0
 
-## [0.4.13] (November 12, 2018)
+## `0.4.13`
 
 * When `rojo.json` points to a file or directory that does not exist, Rojo now issues a warning instead of throwing an error and exiting
 
 [0.4.13]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.13
 
-## [0.4.12] (June 21, 2018)
+## `0.4.12`
 
 * Fixed obscure assertion failure when renaming or deleting files ([#78])
 * Added a `PluginAction` for the sync in command, which should help with some automation scripts ([#80])
@@ -1174,7 +1172,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#78]: https://github.com/rojo-rbx/rojo/issues/78
 [#80]: https://github.com/rojo-rbx/rojo/pull/80
 
-## [0.4.11] (June 10, 2018)
+## `0.4.11`
 
 * Defensively insert existing instances into RouteMap; should fix most duplication cases when syncing into existing trees.
 * Fixed incorrect synchronization from `Plugin:_pull` that would cause polling to create issues
@@ -1183,7 +1181,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 
 [0.4.11]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.11
 
-## [0.4.10] (June 2, 2018)
+## `0.4.10`
 
 * Added support for `init.model.json` files, which enable versioning `Tool` instances (among other things) with Rojo. ([#66])
 * Fixed obscure error when syncing into an invalid service.
@@ -1192,7 +1190,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.4.10]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.10
 [#66]: https://github.com/rojo-rbx/rojo/issues/66
 
-## [0.4.9] (May 26, 2018)
+## `0.4.9`
 
 * Fixed warning when renaming or removing files that would sometimes corrupt the instance cache ([#72])
 * JSON models are no longer as strict -- `Children` and `Properties` are now optional.
@@ -1200,13 +1198,13 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.4.9]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.9
 [#72]: https://github.com/rojo-rbx/rojo/pull/72
 
-## [0.4.8] (May 26, 2018)
+## `0.4.8`
 
 * Hotfix to prevent errors from being thrown when objects managed by Rojo are deleted
 
 [0.4.8]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.8
 
-## [0.4.7] (May 25, 2018)
+## `0.4.7`
 
 * Added icons to the Rojo plugin, made by [@Vorlias](https://github.com/Vorlias)! ([#70])
 * Server will now issue a warning if no partitions are specified in `rojo serve` ([#40])
@@ -1215,7 +1213,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#40]: https://github.com/rojo-rbx/rojo/issues/40
 [#70]: https://github.com/rojo-rbx/rojo/pull/70
 
-## [0.4.6] (May 21, 2018)
+## `0.4.6`
 
 * Rojo handles being restarted by Roblox Studio more gracefully ([#67])
 * Folders should no longer get collapsed when syncing occurs.
@@ -1227,7 +1225,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.4.6]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.6
 [#67]: https://github.com/rojo-rbx/rojo/issues/67
 
-## [0.4.5] (May 1, 2018)
+## `0.4.5`
 
 * Rojo messages are now prefixed with `Rojo:` to make them stand out in the output more.
 * Fixed server to notice file changes *much* more quickly. (200ms vs 1000ms)
@@ -1241,13 +1239,13 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [#61]: https://github.com/rojo-rbx/rojo/issues/61
 [#63]: https://github.com/rojo-rbx/rojo/issues/63
 
-## [0.4.4] (April 7, 2018)
+## `0.4.4`
 
 * Fix small regression introduced in 0.4.3
 
 [0.4.4]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.4
 
-## [0.4.3] (April 7, 2018)
+## `0.4.3`
 
 * Plugin now automatically selects `HttpService` if it determines that HTTP isn't enabled ([#58])
 * Plugin now has much more robust handling and will wipe all state when the server changes.
@@ -1256,21 +1254,21 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.4.3]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.3
 [#58]: https://github.com/rojo-rbx/rojo/pull/58
 
-## [0.4.2] (April 4, 2018)
+## `0.4.2`
 
 * Fixed final case of duplicated instance insertion, caused by reconciled instances not being inserted into `RouteMap`.
   * The reconciler is still not a perfect solution, especially if script instances get moved around without being destroyed. I don't think this can be fixed before a big refactor.
 
 [0.4.2]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.2
 
-## [0.4.1] (April 1, 2018)
+## `0.4.1`
 
 * Merged plugin repository into main Rojo repository for easier tracking.
 * Improved `RouteMap` object tracking; this should fix some cases of duplicated instances being synced into the tree.
 
 [0.4.1]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.1
 
-## [0.4.0] (March 27, 2018)
+## `0.4.0`
 
 * Protocol version 1, which shifts more responsibility onto the server
   * This is a **major breaking** change!
@@ -1282,21 +1280,21 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.4.0]: https://github.com/rojo-rbx/rojo/releases/tag/v0.4.0
 [#46]: https://github.com/rojo-rbx/rojo/issues/46
 
-## [0.3.2] (December 20, 2017)
+## `0.3.2`
 
 * Fixed `rojo serve` failing to correctly construct an absolute root path when passed as an argument
 * Fixed intense CPU usage when running `rojo serve`
 
 [0.3.2]: https://github.com/rojo-rbx/rojo/releases/tag/v0.3.2
 
-## [0.3.1] (December 14, 2017)
+## `0.3.1`
 
 * Improved error reporting when invalid JSON is found in a `rojo.json` project
   * These messages are passed on from Serde
 
 [0.3.1]: https://github.com/rojo-rbx/rojo/releases/tag/v0.3.1
 
-## [0.3.0] (December 12, 2017)
+## `0.3.0`
 
 * Factored out the plugin into a separate repository
 * Fixed server when using a file as a partition
@@ -1306,7 +1304,7 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 [0.3.0]: https://github.com/rojo-rbx/rojo/releases/tag/v0.3.0
 [#9]: https://github.com/rojo-rbx/rojo/pull/9
 
-## [0.2.3] (December 4, 2017)
+## `0.2.3`
 
 * Plugin only release
 * Tightened `init` file rules to only match script files
@@ -1314,28 +1312,28 @@ This is a general maintenance release for the Rojo 0.5.x release series.
 
 [0.2.3]: https://github.com/rojo-rbx/rojo/releases/tag/v0.2.3
 
-## [0.2.2] (December 1, 2017)
+## `0.2.2`
 
 * Plugin only release
 * Fixed broken reconciliation behavior with `init` files
 
 [0.2.2]: https://github.com/rojo-rbx/rojo/releases/tag/v0.2.2
 
-## [0.2.1] (December 1, 2017)
+## `0.2.1`
 
 * Plugin only release
 * Changes default port to 8000
 
 [0.2.1]: https://github.com/rojo-rbx/rojo/releases/tag/v0.2.1
 
-## [0.2.0] (December 1, 2017)
+## `0.2.0`
 
 * Support for `init.lua` like rbxfs and rbxpacker
 * More robust syncing with a new reconciler
 
 [0.2.0]: https://github.com/rojo-rbx/rojo/releases/tag/v0.2.0
 
-## [0.1.0] (November 29, 2017)
+## `0.1.0`
 
 * Initial release, functionally very similar to [rbxfs](https://github.com/LPGhatguy/rbxfs)
 

@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - release
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  init:
+    name: Init
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.value }}
+      changelog: ${{ steps.get_changelog.outputs.value }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version from VERSION file
+        id: get_version
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "value=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Extract changelog for this version
+        id: get_changelog
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          CHANGELOG=$(awk -v ver="\`$VERSION\`" '
+            /^## / {
+              if (found) exit
+              if (index($0, ver) > 0) found=1
+              next
+            }
+            found { print }
+          ' CHANGELOG.md | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sed '/^$/N;/^\n$/d')
+
+          echo "$CHANGELOG" > /tmp/changelog.txt
+          echo "value<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  build:
+    needs: ["init"]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86_64
+            runner-os: windows-latest
+            artifact-name: rojo-${{ needs.init.outputs.version }}-windows-x86_64
+            cargo-target: x86_64-pc-windows-msvc
+
+          - name: Windows aarch64
+            runner-os: windows-11-arm
+            artifact-name: rojo-${{ needs.init.outputs.version }}-windows-aarch64
+            cargo-target: aarch64-pc-windows-msvc
+
+          - name: Linux x86_64
+            runner-os: ubuntu-22.04
+            artifact-name: rojo-${{ needs.init.outputs.version }}-linux-x86_64
+            cargo-target: x86_64-unknown-linux-gnu
+
+          - name: Linux aarch64
+            runner-os: ubuntu-22.04-arm
+            artifact-name: rojo-${{ needs.init.outputs.version }}-linux-aarch64
+            cargo-target: aarch64-unknown-linux-gnu
+
+          - name: macOS x86_64
+            runner-os: macos-15
+            artifact-name: rojo-${{ needs.init.outputs.version }}-macos-x86_64
+            cargo-target: x86_64-apple-darwin
+
+          - name: macOS aarch64
+            runner-os: macos-15
+            artifact-name: rojo-${{ needs.init.outputs.version }}-macos-aarch64
+            cargo-target: aarch64-apple-darwin
+
+    name: Build - ${{ matrix.name }}
+    runs-on: ${{ matrix.runner-os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cargo-target }}
+
+      - name: Build binary
+        run: cargo build --release --locked --target ${{ matrix.cargo-target }}
+
+      - name: Create release archive
+        run: ./scripts/zip-release.sh ${{ matrix.cargo-target }}
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: release.zip
+
+  build-plugin:
+    name: Build plugin
+    needs: ["init"]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rokit
+        uses: CompeyDev/setup-rokit@v0.1.2
+
+      - name: Build plugin
+        run: rojo build plugin --output Rojo.rbxm
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rojo-${{ needs.init.outputs.version }}-plugin
+          path: Rojo.rbxm
+
+  release-github:
+    name: Release (GitHub)
+    runs-on: ubuntu-latest
+    needs: ["init", "build", "build-plugin"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download releases
+        uses: actions/download-artifact@v4
+        with:
+          path: ./releases
+
+      - name: Unpack releases
+        run: ./scripts/unpack-releases.sh "./releases"
+
+      - name: Move plugin to releases
+        run: |
+          PLUGIN_DIR="releases/rojo-${{ needs.init.outputs.version }}-plugin"
+          if [ -d "$PLUGIN_DIR" ]; then
+            mv "$PLUGIN_DIR/Rojo.rbxm" "releases/Rojo.rbxm"
+            rm -rf "$PLUGIN_DIR"
+          fi
+
+      - name: Write changelog to file
+        run: |
+          cat << 'EOF' > /tmp/changelog.txt
+          ${{ needs.init.outputs.changelog }}
+          EOF
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ needs.init.outputs.version }}" \
+            --title "${{ needs.init.outputs.version }}" \
+            --notes-file /tmp/changelog.txt \
+            ./releases/*.zip \
+            ./releases/Rojo.rbxm
