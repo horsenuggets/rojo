@@ -34,7 +34,7 @@ Making a new release? Simply add the new header with the version and date undern
 ## `7.7.0-rc.1-horse.0.8`
 
 * Resolve alias requires in Luau `const` declarations (e.g. `const t = require("@packages/t")`). The require parser moves to full_moon 3, which understands `const`, so these requires no longer ship unresolved.
-* Resolve alias requires inside function bodies, including local, global, and `const` functions and anonymous functions, which were previously skipped.
+* Resolve alias requires inside function bodies, callback arguments, table fields, and operator expressions, which were previously skipped. Functions with a parameter named `require` are left alone.
 
 [7.7.0-rc.1-horse.0.8]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.8
 
