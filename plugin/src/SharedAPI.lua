@@ -22,16 +22,16 @@ API:
 
 --]]
 
-local RunService = game:GetService("RunService")
+const RunService = game:GetService("RunService")
 
-local Rojo = script:FindFirstAncestor("Rojo")
-local Packages = Rojo.Packages
+const Rojo = script:FindFirstAncestor("Rojo")
+const Packages = Rojo.Packages
 
-local Log = require(Packages.Log)
+const Log = require(Packages.Log)
 
-local Config = require(script.Parent.Config)
+const Config = require(script.Parent.Config)
 
-local SharedAPI = {}
+const SharedAPI = {}
 
 local registeredApp = nil
 
@@ -42,7 +42,7 @@ function SharedAPI.register(app)
 
 	registeredApp = app
 
-	local api = {}
+	const api = {}
 
 	function api.connect(host, port)
 		if registeredApp == nil then
@@ -132,7 +132,7 @@ function SharedAPI.register(app)
 			}
 		end
 
-		local result = {
+		const result = {
 			status = registeredApp.state.appStatus,
 		}
 
@@ -154,8 +154,8 @@ function SharedAPI.register(app)
 			}
 		end
 
-		local host = registeredApp.host:getValue()
-		local port = registeredApp.port:getValue()
+		const host = registeredApp.host:getValue()
+		const port = registeredApp.port:getValue()
 
 		return {
 			host = if #host > 0 then host else Config.defaultHost,
@@ -182,9 +182,9 @@ function SharedAPI.register(app)
 
 		registeredApp:startSession()
 
-		local startTime = os.clock()
+		const startTime = os.clock()
 		while os.clock() - startTime < timeout do
-			local status = registeredApp.state.appStatus
+			const status = registeredApp.state.appStatus
 
 			if status == "Confirming" then
 				registeredApp.confirmationBindable:Fire("Accept")
