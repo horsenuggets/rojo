@@ -630,11 +630,23 @@ fn resolve_alias_require(
     };
 
     // @self is natively supported by Roblox's require-by-string
-    if alias_name == "self" {
+    if alias_name.eq_ignore_ascii_case("self") {
         return None;
     }
 
-    if let Some(alias_target) = aliases.get(alias_name) {
+    // Luau matches alias names without regard to case
+    let alias_target = aliases
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(alias_name))
+        .map(|(_, target)| target);
+
+    if let Some(alias_target) = alias_target {
+        // Aliases into the home folder (like Lune's `~/.lune/.typedefs/`) point outside
+        // the project, so they can't become part of the place and are left as they are
+        if alias_target.starts_with('~') {
+            return None;
+        }
+
         let alias_fs_path = luaurc_dir.join(alias_target);
 
         let require_path = compute_relative_require(
@@ -1511,6 +1523,35 @@ return {}"#,
                 .map(|name| format!(r#"require("../Packages/{name}")"#))
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn matches_alias_names_without_regard_to_case() {
+        assert_eq!(
+            replaced_requires("local a = require(\"@Packages/a\")\nlocal b = require(\"@PACKAGES/b\")\nreturn a\n"),
+            vec![
+                r#"require("../Packages/a")"#.to_string(),
+                r#"require("../Packages/b")"#.to_string(),
+            ]
+        );
+        assert!(replaced_requires("local m = require(\"@Self/Module\")\nreturn m\n").is_empty());
+    }
+
+    #[test]
+    fn leaves_home_folder_aliases_alone() {
+        let aliases =
+            HashMap::from([("lune".to_string(), "~/.lune/.typedefs/0.11.1/".to_string())]);
+        let replacements = find_require_replacements(
+            "local fs = require(\"@lune/fs\")\nreturn fs\n",
+            Path::new("/project/Source"),
+            &aliases,
+            Path::new("/project"),
+            &[],
+            Path::new("/project"),
+            false,
+        )
+        .unwrap();
+        assert!(replacements.is_empty());
     }
 
     #[test]
