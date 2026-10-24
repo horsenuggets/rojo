@@ -31,6 +31,13 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.0-rc.1-horse.0.10`
+
+* Rewrite alias requires at the head of a call or index chain, such as `require("@packages/Commandline").Command`, `require("@x"):Method()`, and `require("@x")["Key"]`, replacing only the `require(...)` call and leaving the rest of the chain alone.
+* Bump StyLua to 2.6.0 and selene to 0.32.0 so plugin code can use Luau `const`, and use `const` in the fork's `SharedAPI` plugin module.
+
+[7.7.0-rc.1-horse.0.10]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.10
+
 ## `7.7.0-rc.1-horse.0.9`
 
 * Match alias names without regard to case, as Luau does, so `require("@DevPackages/x")` resolves through a `devpackages` alias.
