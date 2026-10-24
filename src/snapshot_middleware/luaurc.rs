@@ -351,11 +351,9 @@ fn visit_block(block: &ast::Block, callback: &mut dyn FnMut(&ast::FunctionCall, 
     for stmt in block.stmts() {
         visit_stmt(stmt, callback);
     }
-    if let Some(last) = block.last_stmt() {
-        if let ast::LastStmt::Return(ret) = last {
-            for expr in ret.returns() {
-                visit_expr(expr, callback);
-            }
+    if let Some(ast::LastStmt::Return(ret)) = block.last_stmt() {
+        for expr in ret.returns() {
+            visit_expr(expr, callback);
         }
     }
 }
