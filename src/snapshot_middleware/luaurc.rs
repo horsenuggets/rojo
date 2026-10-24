@@ -406,6 +406,16 @@ fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(&ast::FunctionCall, Str
         ast::Stmt::GenericFor(for_stmt) => {
             visit_block(for_stmt.block(), callback);
         }
+        // Requires inside function bodies, such as lazy requires, need rewriting too
+        ast::Stmt::LocalFunction(function) => {
+            visit_block(function.body().block(), callback);
+        }
+        ast::Stmt::FunctionDeclaration(function) => {
+            visit_block(function.body().block(), callback);
+        }
+        ast::Stmt::ConstFunction(function) => {
+            visit_block(function.body().block(), callback);
+        }
         _ => {}
     }
 }
@@ -417,6 +427,9 @@ fn visit_expr(expr: &Expression, callback: &mut dyn FnMut(&ast::FunctionCall, St
         }
         Expression::Parentheses { expression, .. } => {
             visit_expr(expression, callback);
+        }
+        Expression::Function(function) => {
+            visit_block(function.body().block(), callback);
         }
         _ => {}
     }
@@ -1375,6 +1388,24 @@ return {}"#,
                 r#"require("../Packages/t")"#.to_string(),
                 r#"require("../Packages/b")"#.to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn rewrites_requires_inside_function_bodies() {
+        let source = [
+            "local function a() return require(\"@packages/a\") end",
+            "function M.b() return require(\"@packages/b\") end",
+            "const function c() return require(\"@packages/c\") end",
+            "local d = function() return require(\"@packages/d\") end",
+            "return M",
+        ]
+        .join("\n");
+        assert_eq!(
+            replaced_requires(&source),
+            ["a", "b", "c", "d"]
+                .map(|name| format!(r#"require("../Packages/{name}")"#))
+                .to_vec()
         );
     }
 
