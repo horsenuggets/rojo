@@ -361,7 +361,7 @@ fn visit_block(block: &ast::Block, callback: &mut dyn FnMut(&ast::FunctionCall, 
 fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
     match stmt {
         ast::Stmt::FunctionCall(call) => {
-            check_function_call(call, callback);
+            visit_call(call, callback);
         }
         ast::Stmt::LocalAssignment(local) => {
             for expr in local.expressions() {
@@ -406,28 +406,100 @@ fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(&ast::FunctionCall, Str
         }
         // Requires inside function bodies, such as lazy requires, need rewriting too
         ast::Stmt::LocalFunction(function) => {
-            visit_block(function.body().block(), callback);
+            visit_function_body(function.body(), callback);
         }
         ast::Stmt::FunctionDeclaration(function) => {
-            visit_block(function.body().block(), callback);
+            visit_function_body(function.body(), callback);
         }
         ast::Stmt::ConstFunction(function) => {
-            visit_block(function.body().block(), callback);
+            visit_function_body(function.body(), callback);
         }
         _ => {}
+    }
+}
+
+/// Visit a function body, unless one of its parameters is named `require`. Inside such a
+/// function, `require` is the caller's value rather than Roblox's module loader, so its
+/// calls must keep their original arguments.
+fn visit_function_body(
+    body: &ast::FunctionBody,
+    callback: &mut dyn FnMut(&ast::FunctionCall, String),
+) {
+    let shadows_require = body.parameters().iter().any(|parameter| {
+        matches!(parameter, ast::Parameter::Name(name) if name.token().to_string() == "require")
+    });
+    if !shadows_require {
+        visit_block(body.block(), callback);
+    }
+}
+
+/// Check a call itself, then everything passed to it, so requires inside callbacks and
+/// argument tables are found too.
+fn visit_call(call: &ast::FunctionCall, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
+    check_function_call(call, callback);
+    for suffix in call.suffixes() {
+        match suffix {
+            Suffix::Call(ast::Call::AnonymousCall(args)) => visit_function_args(args, callback),
+            Suffix::Call(ast::Call::MethodCall(method)) => {
+                visit_function_args(method.args(), callback)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn visit_function_args(
+    args: &ast::FunctionArgs,
+    callback: &mut dyn FnMut(&ast::FunctionCall, String),
+) {
+    match args {
+        ast::FunctionArgs::Parentheses { arguments, .. } => {
+            for expr in arguments {
+                visit_expr(expr, callback);
+            }
+        }
+        ast::FunctionArgs::TableConstructor(table) => visit_table(table, callback),
+        _ => {}
+    }
+}
+
+fn visit_table(
+    table: &ast::TableConstructor,
+    callback: &mut dyn FnMut(&ast::FunctionCall, String),
+) {
+    for field in table.fields() {
+        match field {
+            ast::Field::ExpressionKey { key, value, .. } => {
+                visit_expr(key, callback);
+                visit_expr(value, callback);
+            }
+            ast::Field::NameKey { value, .. } => visit_expr(value, callback),
+            ast::Field::NoKey(value) => visit_expr(value, callback),
+            _ => {}
+        }
     }
 }
 
 fn visit_expr(expr: &Expression, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
     match expr {
         Expression::FunctionCall(call) => {
-            check_function_call(call, callback);
+            visit_call(call, callback);
         }
         Expression::Parentheses { expression, .. } => {
             visit_expr(expression, callback);
         }
         Expression::Function(function) => {
-            visit_block(function.body().block(), callback);
+            visit_function_body(function.body(), callback);
+        }
+        Expression::TableConstructor(table) => {
+            visit_table(table, callback);
+        }
+        Expression::BinaryOperator { lhs, rhs, .. } => {
+            visit_expr(lhs, callback);
+            visit_expr(rhs, callback);
+        }
+        Expression::UnaryOperator { expression, .. } => {
+            visit_expr(expression, callback);
         }
         _ => {}
     }
@@ -1402,6 +1474,40 @@ return {}"#,
         assert_eq!(
             replaced_requires(&source),
             ["a", "b", "c", "d"]
+                .map(|name| format!(r#"require("../Packages/{name}")"#))
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn leaves_calls_to_a_require_parameter_alone() {
+        let source = [
+            "local function a(require) return require(\"@packages/a\") end",
+            "const f = function(x, require) return require(\"@packages/b\") end",
+            "local function c() return require(\"@packages/c\") end",
+            "return a",
+        ]
+        .join("\n");
+        assert_eq!(
+            replaced_requires(&source),
+            vec![r#"require("../Packages/c")"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn rewrites_requires_inside_callbacks_and_tables() {
+        let source = [
+            "task.defer(function() return require(\"@packages/a\") end)",
+            "signal:Connect(function() return require(\"@packages/b\") end)",
+            "local deps = { c = require(\"@packages/c\"), require(\"@packages/d\") }",
+            "local e = setmetatable({}, { __index = function() return require(\"@packages/e\") end })",
+            "local f = fallback or require(\"@packages/f\")",
+            "return deps",
+        ]
+        .join("\n");
+        assert_eq!(
+            replaced_requires(&source),
+            ["a", "b", "c", "d", "e", "f"]
                 .map(|name| format!(r#"require("../Packages/{name}")"#))
                 .to_vec()
         );
