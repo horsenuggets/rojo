@@ -370,6 +370,11 @@ fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(&ast::FunctionCall, Str
                 visit_expr(expr, callback);
             }
         }
+        ast::Stmt::ConstAssignment(constant) => {
+            for expr in constant.expressions() {
+                visit_expr(expr, callback);
+            }
+        }
         ast::Stmt::Assignment(assign) => {
             for expr in assign.expressions() {
                 visit_expr(expr, callback);
@@ -437,20 +442,21 @@ fn check_function_call(
         return;
     }
 
-    let content = match &suffixes[0] {
-        Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses {
+    let Suffix::Call(ast::Call::AnonymousCall(args)) = suffixes[0] else {
+        return;
+    };
+    let content = match args.as_ref() {
+        ast::FunctionArgs::Parentheses {
             arguments,
             parentheses: _,
-        })) => {
+        } => {
             let args: Vec<_> = arguments.iter().collect();
             if args.len() != 1 {
                 return;
             }
-            extract_string_from_expr(&args[0])
+            extract_string_from_expr(args[0])
         }
-        Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::String(string_token))) => {
-            extract_string_from_token(string_token)
-        }
+        ast::FunctionArgs::String(string_token) => extract_string_from_token(string_token),
         _ => return,
     };
 
@@ -1339,5 +1345,44 @@ return {}"#,
             false,
         );
         assert_eq!(result, "../Main");
+    }
+
+    /// Returns the replacement text for every alias require found in `source`, for a
+    /// script in /project/Source with `@packages` pointing at /project/Packages.
+    fn replaced_requires(source: &str) -> Vec<String> {
+        let aliases = HashMap::from([("packages".to_string(), "Packages".to_string())]);
+        find_require_replacements(
+            source,
+            Path::new("/project/Source"),
+            &aliases,
+            Path::new("/project"),
+            &[],
+            Path::new("/project"),
+            false,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|replacement| replacement.new_text)
+        .collect()
+    }
+
+    #[test]
+    fn rewrites_requires_in_const_declarations() {
+        let source = "const t = require(\"@packages/t\")\nconst a, b = 1, require(\"@packages/b\")\nreturn t\n";
+        assert_eq!(
+            replaced_requires(source),
+            vec![
+                r#"require("../Packages/t")"#.to_string(),
+                r#"require("../Packages/b")"#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrites_local_and_const_requires_alike() {
+        assert_eq!(
+            replaced_requires("local t = require(\"@packages/t\")\nreturn t\n"),
+            replaced_requires("const t = require(\"@packages/t\")\nreturn t\n"),
+        );
     }
 }
