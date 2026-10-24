@@ -92,7 +92,12 @@ pub fn resolve_requires(source: &str, info: &ResolveInfo) -> anyhow::Result<Stri
     let luaurc_dir = luaurc.as_ref().unwrap().1.as_path();
 
     // Quick check: skip parsing if no custom alias strings present
-    if !aliases.keys().any(|k| source.contains(&format!("@{k}"))) {
+    // (alias names match without regard to case, so the check does too)
+    let lowercase_source = source.to_ascii_lowercase();
+    if !aliases
+        .keys()
+        .any(|k| lowercase_source.contains(&format!("@{}", k.to_ascii_lowercase())))
+    {
         return Ok(source.to_string());
     }
 
@@ -630,11 +635,25 @@ fn resolve_alias_require(
     };
 
     // @self is natively supported by Roblox's require-by-string
-    if alias_name == "self" {
+    if alias_name.eq_ignore_ascii_case("self") {
         return None;
     }
 
-    if let Some(alias_target) = aliases.get(alias_name) {
+    // Luau matches alias names without regard to case
+    let alias_target = aliases
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(alias_name))
+        .map(|(_, target)| target);
+
+    if let Some(alias_target) = alias_target {
+        // Aliases into the home folder (like Lune's `~/.lune/.typedefs/`) point outside
+        // the project, so they can't become part of the place and are left as they are.
+        // A folder that merely starts with `~` (like `~packages`) is still project-relative.
+        if alias_target == "~" || alias_target.starts_with("~/") || alias_target.starts_with("~\\")
+        {
+            return None;
+        }
+
         let alias_fs_path = luaurc_dir.join(alias_target);
 
         let require_path = compute_relative_require(
@@ -832,6 +851,26 @@ mod test {
 
         let result = resolve_requires(source, &info).unwrap();
         assert_eq!(result, r#"local Fusion = require("../../Packages/Fusion")"#);
+    }
+
+    #[test]
+    fn resolve_alias_written_in_a_different_case() {
+        let source = r#"local Fusion = require("@DevPackages/Fusion")"#;
+        let info = ResolveInfo {
+            file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
+            path_mappings: &[],
+            project_root: Path::new("/project"),
+            vfs: &make_test_vfs(&[(
+                "/project/.luaurc",
+                r#"{"aliases": {"devpackages": "DevPackages"}}"#,
+            )]),
+        };
+
+        let result = resolve_requires(source, &info).unwrap();
+        assert_eq!(
+            result,
+            r#"local Fusion = require("../../DevPackages/Fusion")"#
+        );
     }
 
     #[test]
@@ -1511,6 +1550,52 @@ return {}"#,
                 .map(|name| format!(r#"require("../Packages/{name}")"#))
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn matches_alias_names_without_regard_to_case() {
+        assert_eq!(
+            replaced_requires("local a = require(\"@Packages/a\")\nlocal b = require(\"@PACKAGES/b\")\nreturn a\n"),
+            vec![
+                r#"require("../Packages/a")"#.to_string(),
+                r#"require("../Packages/b")"#.to_string(),
+            ]
+        );
+        assert!(replaced_requires("local m = require(\"@Self/Module\")\nreturn m\n").is_empty());
+    }
+
+    #[test]
+    fn rewrites_project_folders_that_start_with_a_tilde() {
+        let aliases = HashMap::from([("pkgs".to_string(), "~packages".to_string())]);
+        let replacements = find_require_replacements(
+            "local t = require(\"@pkgs/t\")\nreturn t\n",
+            Path::new("/project/Source"),
+            &aliases,
+            Path::new("/project"),
+            &[],
+            Path::new("/project"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].new_text, r#"require("../~packages/t")"#);
+    }
+
+    #[test]
+    fn leaves_home_folder_aliases_alone() {
+        let aliases =
+            HashMap::from([("lune".to_string(), "~/.lune/.typedefs/0.11.1/".to_string())]);
+        let replacements = find_require_replacements(
+            "local fs = require(\"@lune/fs\")\nreturn fs\n",
+            Path::new("/project/Source"),
+            &aliases,
+            Path::new("/project"),
+            &[],
+            Path::new("/project"),
+            false,
+        )
+        .unwrap();
+        assert!(replacements.is_empty());
     }
 
     #[test]
