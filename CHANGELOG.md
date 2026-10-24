@@ -31,6 +31,13 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.0-rc.1-horse.0.9`
+
+* Match alias names without regard to case, as Luau does, so `require("@DevPackages/x")` resolves through a `devpackages` alias.
+* Leave aliases that point into the home folder (such as Lune's `~/.lune/.typedefs/`) unchanged instead of rewriting them into broken `./~/...` paths.
+
+[7.7.0-rc.1-horse.0.9]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.9
+
 ## `7.7.0-rc.1-horse.0.8`
 
 * Resolve alias requires in Luau `const` declarations (e.g. `const t = require("@packages/t")`). The require parser moves to full_moon 3, which understands `const`, so these requires no longer ship unresolved.
