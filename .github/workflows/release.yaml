@@ -123,7 +123,7 @@ jobs:
         uses: CompeyDev/setup-rokit@v0.1.2
 
       - name: Build plugin
-        run: rojo build plugin --output Rojo.rbxm
+        run: rojo build plugin.project.json --output Rojo.rbxm
 
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v4
