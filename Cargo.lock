@@ -683,9 +683,9 @@ checksum = "3dcaa9ae7725d12cdb85b3ad99a434db70b468c09ded17e012d86b5c1010f7a7"
 
 [[package]]
 name = "full_moon"
-version = "2.1.1"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40373a6bf84c41c6124c01cbedf5ab53d0d468adf1c0d7efd4c3273531fbb609"
+checksum = "5bc70b300f9b09c409fa0a68a9f0c3e6b43573e47680d16932a0f8dade11a193"
 dependencies = [
  "bytecount",
  "cfg-if 1.0.4",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "rojo"
-version = "7.7.0-rc.1-horse.0.7"
+version = "7.7.0-rc.1-horse.0.8"
 dependencies = [
  "anyhow",
  "backtrace",

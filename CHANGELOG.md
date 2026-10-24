@@ -31,6 +31,13 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.0-rc.1-horse.0.8`
+
+* Resolve alias requires in Luau `const` declarations (e.g. `const t = require("@packages/t")`). The require parser moves to full_moon 3, which understands `const`, so these requires no longer ship unresolved.
+* Resolve alias requires inside function bodies, callback arguments, table fields, and operator expressions, which were previously skipped. Functions with a parameter named `require` are left alone.
+
+[7.7.0-rc.1-horse.0.8]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.0-rc.1-horse.0.8
+
 ## `7.7.0-rc.1-horse.0.6`
 
 * Auto-increment port when default port is already in use. When `rojo serve` starts without an explicit `--port` flag and the default port (34872) is taken, it now automatically tries the next available port instead of crashing. The chosen port is displayed in the startup message.
