@@ -92,7 +92,12 @@ pub fn resolve_requires(source: &str, info: &ResolveInfo) -> anyhow::Result<Stri
     let luaurc_dir = luaurc.as_ref().unwrap().1.as_path();
 
     // Quick check: skip parsing if no custom alias strings present
-    if !aliases.keys().any(|k| source.contains(&format!("@{k}"))) {
+    // (alias names match without regard to case, so the check does too)
+    let lowercase_source = source.to_ascii_lowercase();
+    if !aliases
+        .keys()
+        .any(|k| lowercase_source.contains(&format!("@{}", k.to_ascii_lowercase())))
+    {
         return Ok(source.to_string());
     }
 
@@ -642,8 +647,10 @@ fn resolve_alias_require(
 
     if let Some(alias_target) = alias_target {
         // Aliases into the home folder (like Lune's `~/.lune/.typedefs/`) point outside
-        // the project, so they can't become part of the place and are left as they are
-        if alias_target.starts_with('~') {
+        // the project, so they can't become part of the place and are left as they are.
+        // A folder that merely starts with `~` (like `~packages`) is still project-relative.
+        if alias_target == "~" || alias_target.starts_with("~/") || alias_target.starts_with("~\\")
+        {
             return None;
         }
 
@@ -844,6 +851,26 @@ mod test {
 
         let result = resolve_requires(source, &info).unwrap();
         assert_eq!(result, r#"local Fusion = require("../../Packages/Fusion")"#);
+    }
+
+    #[test]
+    fn resolve_alias_written_in_a_different_case() {
+        let source = r#"local Fusion = require("@DevPackages/Fusion")"#;
+        let info = ResolveInfo {
+            file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
+            path_mappings: &[],
+            project_root: Path::new("/project"),
+            vfs: &make_test_vfs(&[(
+                "/project/.luaurc",
+                r#"{"aliases": {"devpackages": "DevPackages"}}"#,
+            )]),
+        };
+
+        let result = resolve_requires(source, &info).unwrap();
+        assert_eq!(
+            result,
+            r#"local Fusion = require("../../DevPackages/Fusion")"#
+        );
     }
 
     #[test]
@@ -1535,6 +1562,23 @@ return {}"#,
             ]
         );
         assert!(replaced_requires("local m = require(\"@Self/Module\")\nreturn m\n").is_empty());
+    }
+
+    #[test]
+    fn rewrites_project_folders_that_start_with_a_tilde() {
+        let aliases = HashMap::from([("pkgs".to_string(), "~packages".to_string())]);
+        let replacements = find_require_replacements(
+            "local t = require(\"@pkgs/t\")\nreturn t\n",
+            Path::new("/project/Source"),
+            &aliases,
+            Path::new("/project"),
+            &[],
+            Path::new("/project"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].new_text, r#"require("../~packages/t")"#);
     }
 
     #[test]
