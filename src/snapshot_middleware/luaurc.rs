@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -325,21 +326,18 @@ fn find_require_replacements(
 
     let mut replacements = Vec::new();
 
-    visit_block(ast.nodes(), &mut |call, content| {
+    visit_block(ast.nodes(), &mut |range, content| {
         if !content.starts_with('@') {
             return;
         }
-
-        let call_start = call_byte_start(call);
-        let call_end = call_byte_end(call);
 
         if let Some(replacement) = resolve_alias_require(
             &content,
             script_dir,
             aliases,
             luaurc_dir,
-            call_start,
-            call_end,
+            range.start,
+            range.end,
             path_mappings,
             project_root,
             is_init,
@@ -352,7 +350,7 @@ fn find_require_replacements(
 }
 
 /// Visit a block, looking for require() calls with string arguments.
-fn visit_block(block: &ast::Block, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
+fn visit_block(block: &ast::Block, callback: &mut dyn FnMut(Range<usize>, String)) {
     for stmt in block.stmts() {
         visit_stmt(stmt, callback);
     }
@@ -363,7 +361,7 @@ fn visit_block(block: &ast::Block, callback: &mut dyn FnMut(&ast::FunctionCall, 
     }
 }
 
-fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
+fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(Range<usize>, String)) {
     match stmt {
         ast::Stmt::FunctionCall(call) => {
             visit_call(call, callback);
@@ -379,6 +377,9 @@ fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(&ast::FunctionCall, Str
             }
         }
         ast::Stmt::Assignment(assign) => {
+            for var in assign.variables() {
+                visit_var(var, callback);
+            }
             for expr in assign.expressions() {
                 visit_expr(expr, callback);
             }
@@ -426,10 +427,7 @@ fn visit_stmt(stmt: &ast::Stmt, callback: &mut dyn FnMut(&ast::FunctionCall, Str
 /// Visit a function body, unless one of its parameters is named `require`. Inside such a
 /// function, `require` is the caller's value rather than Roblox's module loader, so its
 /// calls must keep their original arguments.
-fn visit_function_body(
-    body: &ast::FunctionBody,
-    callback: &mut dyn FnMut(&ast::FunctionCall, String),
-) {
+fn visit_function_body(body: &ast::FunctionBody, callback: &mut dyn FnMut(Range<usize>, String)) {
     let shadows_require = body.parameters().iter().any(|parameter| {
         matches!(parameter, ast::Parameter::Name(name) if name.token().to_string() == "require")
     });
@@ -438,25 +436,46 @@ fn visit_function_body(
     }
 }
 
-/// Check a call itself, then everything passed to it, so requires inside callbacks and
-/// argument tables are found too.
-fn visit_call(call: &ast::FunctionCall, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
-    check_function_call(call, callback);
-    for suffix in call.suffixes() {
+/// Check a call or index chain such as `require("@x").Field:Method()` for a require at its
+/// head, then everything passed or indexed along it, so requires inside callbacks,
+/// argument tables, and bracket keys are found too.
+fn visit_chain<'a>(
+    prefix: &Prefix,
+    suffixes: impl Iterator<Item = &'a Suffix>,
+    callback: &mut dyn FnMut(Range<usize>, String),
+) {
+    if let Prefix::Expression(expression) = prefix {
+        visit_expr(expression, callback);
+    }
+    let mut suffixes = suffixes.peekable();
+    if let Some(first) = suffixes.peek() {
+        check_require_call(prefix, first, callback);
+    }
+    for suffix in suffixes {
         match suffix {
             Suffix::Call(ast::Call::AnonymousCall(args)) => visit_function_args(args, callback),
             Suffix::Call(ast::Call::MethodCall(method)) => {
                 visit_function_args(method.args(), callback)
+            }
+            Suffix::Index(ast::Index::Brackets { expression, .. }) => {
+                visit_expr(expression, callback)
             }
             _ => {}
         }
     }
 }
 
-fn visit_function_args(
-    args: &ast::FunctionArgs,
-    callback: &mut dyn FnMut(&ast::FunctionCall, String),
-) {
+fn visit_call(call: &ast::FunctionCall, callback: &mut dyn FnMut(Range<usize>, String)) {
+    visit_chain(call.prefix(), call.suffixes(), callback);
+}
+
+fn visit_var(var: &ast::Var, callback: &mut dyn FnMut(Range<usize>, String)) {
+    if let ast::Var::Expression(var_expression) = var {
+        visit_chain(var_expression.prefix(), var_expression.suffixes(), callback);
+    }
+}
+
+fn visit_function_args(args: &ast::FunctionArgs, callback: &mut dyn FnMut(Range<usize>, String)) {
     match args {
         ast::FunctionArgs::Parentheses { arguments, .. } => {
             for expr in arguments {
@@ -468,10 +487,7 @@ fn visit_function_args(
     }
 }
 
-fn visit_table(
-    table: &ast::TableConstructor,
-    callback: &mut dyn FnMut(&ast::FunctionCall, String),
-) {
+fn visit_table(table: &ast::TableConstructor, callback: &mut dyn FnMut(Range<usize>, String)) {
     for field in table.fields() {
         match field {
             ast::Field::ExpressionKey { key, value, .. } => {
@@ -485,7 +501,7 @@ fn visit_table(
     }
 }
 
-fn visit_expr(expr: &Expression, callback: &mut dyn FnMut(&ast::FunctionCall, String)) {
+fn visit_expr(expr: &Expression, callback: &mut dyn FnMut(Range<usize>, String)) {
     match expr {
         Expression::FunctionCall(call) => {
             visit_call(call, callback);
@@ -506,31 +522,29 @@ fn visit_expr(expr: &Expression, callback: &mut dyn FnMut(&ast::FunctionCall, St
         Expression::UnaryOperator { expression, .. } => {
             visit_expr(expression, callback);
         }
+        Expression::Var(var) => {
+            visit_var(var, callback);
+        }
         _ => {}
     }
 }
 
-/// Check if a function call is `require("@...")` and if so, invoke
-/// the callback with the call and the string content.
-fn check_function_call(
-    call: &ast::FunctionCall,
-    callback: &mut dyn FnMut(&ast::FunctionCall, String),
+/// Check if a chain starts with `require("@...")` and if so, invoke the callback with the
+/// byte range of just that call (not anything chained after it, like `.Field`) and the
+/// string content.
+fn check_require_call(
+    prefix: &Prefix,
+    first_suffix: &Suffix,
+    callback: &mut dyn FnMut(Range<usize>, String),
 ) {
-    let is_require = match call.prefix() {
-        Prefix::Name(token) => token.token().to_string() == "require",
-        _ => false,
+    let Prefix::Name(name) = prefix else {
+        return;
     };
-
-    if !is_require {
+    if name.token().to_string() != "require" {
         return;
     }
 
-    let suffixes: Vec<_> = call.suffixes().collect();
-    if suffixes.len() != 1 {
-        return;
-    }
-
-    let Suffix::Call(ast::Call::AnonymousCall(args)) = suffixes[0] else {
+    let Suffix::Call(ast::Call::AnonymousCall(args)) = first_suffix else {
         return;
     };
     let content = match args.as_ref() {
@@ -550,7 +564,8 @@ fn check_function_call(
 
     if let Some(content) = content {
         if content.starts_with('@') {
-            callback(call, content);
+            let start = name.token().start_position().bytes();
+            callback(start..func_args_byte_end(args), content);
         }
     }
 }
@@ -569,34 +584,6 @@ fn extract_string_from_token(token_ref: &TokenReference) -> Option<String> {
     match token_ref.token().token_type() {
         TokenType::StringLiteral { literal, .. } => Some(literal.to_string()),
         _ => None,
-    }
-}
-
-/// Get the byte offset of the start of a function call.
-fn call_byte_start(call: &ast::FunctionCall) -> usize {
-    match call.prefix() {
-        Prefix::Name(token) => token.token().start_position().bytes(),
-        _ => 0,
-    }
-}
-
-/// Get the byte offset of the end of a function call.
-fn call_byte_end(call: &ast::FunctionCall) -> usize {
-    if let Some(last_suffix) = call.suffixes().last() {
-        suffix_byte_end(last_suffix)
-    } else {
-        0
-    }
-}
-
-/// Get the byte end of a suffix.
-fn suffix_byte_end(suffix: &Suffix) -> usize {
-    match suffix {
-        Suffix::Call(ast::Call::AnonymousCall(func_args)) => func_args_byte_end(func_args),
-        Suffix::Call(ast::Call::MethodCall(method)) => func_args_byte_end(method.args()),
-        Suffix::Index(ast::Index::Brackets { brackets, .. }) => token_end(brackets.tokens().1),
-        Suffix::Index(ast::Index::Dot { name, .. }) => token_end(name.token()),
-        _ => 0,
     }
 }
 
@@ -1596,6 +1583,84 @@ return {}"#,
         )
         .unwrap();
         assert!(replacements.is_empty());
+    }
+
+    /// Returns the source with every alias require rewritten, for the same setup as
+    /// `replaced_requires`.
+    fn rewritten_source(source: &str) -> String {
+        let aliases = HashMap::from([("packages".to_string(), "Packages".to_string())]);
+        let mut replacements = find_require_replacements(
+            source,
+            Path::new("/project/Source"),
+            &aliases,
+            Path::new("/project"),
+            &[],
+            Path::new("/project"),
+            false,
+        )
+        .unwrap();
+        replacements.sort_by(|a, b| b.start.cmp(&a.start));
+        let mut result = source.to_string();
+        for replacement in replacements {
+            result.replace_range(replacement.start..replacement.end, &replacement.new_text);
+        }
+        result
+    }
+
+    #[test]
+    fn rewrites_requires_followed_by_a_dot_index() {
+        assert_eq!(
+            rewritten_source("const Command = require(\"@packages/Commandline\").Command\n"),
+            "const Command = require(\"../Packages/Commandline\").Command\n"
+        );
+        assert_eq!(
+            rewritten_source("local A = require(\"@packages/a\").B.C\n"),
+            "local A = require(\"../Packages/a\").B.C\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_requires_followed_by_a_method_call() {
+        assert_eq!(
+            rewritten_source("local x = require(\"@packages/a\"):Get(require(\"@packages/b\"))\nrequire(\"@packages/c\"):Start()\n"),
+            "local x = require(\"../Packages/a\"):Get(require(\"../Packages/b\"))\nrequire(\"../Packages/c\"):Start()\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_requires_followed_by_a_bracket_index() {
+        assert_eq!(
+            rewritten_source("local x = require(\"@packages/a\")[\"Key\"]\nlocal y = require(\"@packages/b\")[require(\"@packages/c\")]\n"),
+            "local x = require(\"../Packages/a\")[\"Key\"]\nlocal y = require(\"../Packages/b\")[require(\"../Packages/c\")]\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_chained_requires_inside_function_bodies() {
+        assert_eq!(
+            rewritten_source("local function f()\n\treturn require(\"@packages/a\").Field, require \"@packages/b\".Other\nend\n"),
+            "local function f()\n\treturn require(\"../Packages/a\").Field, require(\"../Packages/b\").Other\nend\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_chained_requires_in_assignments_and_calls() {
+        assert_eq!(
+            rewritten_source("require(\"@packages/a\").Value = require(\"@packages/b\").Default\nrequire(\"@packages/c\").init()\n"),
+            "require(\"../Packages/a\").Value = require(\"../Packages/b\").Default\nrequire(\"../Packages/c\").init()\n"
+        );
+    }
+
+    #[test]
+    fn leaves_chained_calls_to_a_require_parameter_alone() {
+        let source = "local function f(require)\n\treturn require(\"@packages/a\").Field\nend\n";
+        assert_eq!(rewritten_source(source), source);
+    }
+
+    #[test]
+    fn leaves_requires_that_are_not_at_the_head_of_a_chain_alone() {
+        let source = "local x = loader.require(\"@packages/a\").Field\n";
+        assert_eq!(rewritten_source(source), source);
     }
 
     #[test]
