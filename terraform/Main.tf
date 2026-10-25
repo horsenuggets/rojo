@@ -17,6 +17,9 @@ module "repo" {
   source     = "../submodules/luau-cicd/Terraform/Modules/LuauRepo"
   repository = "rojo"
 
+  # Upstream sync PRs land with a merge commit to keep upstream history on main.
+  allow_merge_commit = true
+
   main_checks = [
     "Check MSRV",
     "CI - Linux aarch64",
