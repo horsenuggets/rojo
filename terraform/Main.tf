@@ -1,5 +1,6 @@
 terraform {
-  required_version = ">= 1.0"
+  # The CopilotReview module in luau-cicd uses terraform_data and check blocks.
+  required_version = ">= 1.5"
 
   required_providers {
     github = {
