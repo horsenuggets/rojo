@@ -26,3 +26,8 @@
 
 # JetBrains IDEs
 /.idea/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*

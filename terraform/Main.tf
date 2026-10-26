@@ -1,5 +1,6 @@
 terraform {
-  required_version = ">= 1.0"
+  # The CopilotReview module in luau-cicd uses terraform_data and check blocks.
+  required_version = ">= 1.5"
 
   required_providers {
     github = {
@@ -16,6 +17,9 @@ provider "github" {
 module "repo" {
   source     = "../submodules/luau-cicd/Terraform/Modules/LuauRepo"
   repository = "rojo"
+
+  # Upstream sync PRs land with a merge commit to keep upstream history on main.
+  allow_merge_commit = true
 
   main_checks = [
     "Check MSRV",
