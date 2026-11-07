@@ -135,7 +135,8 @@ pub fn snapshot_lua_init(
 
     if dir_snapshot.class_name != "Folder" {
         anyhow::bail!(
-            "init.lua, init.server.lua, init.client.lua, and init.plugin.lua can \
+            "init.lua, init.server.lua, init.client.lua, init.legacy.lua, \
+             init.local.lua, and init.plugin.lua can \
              only be used if the instance produced by the containing \
              directory would be a Folder.\n\
              \n\
@@ -151,12 +152,21 @@ pub fn snapshot_lua_init(
     // Filter out the init file itself from the directory's children
     // to avoid creating a duplicate instance. The init script becomes
     // the container, so it should not also appear as a child. The
-    // child is always named "init" since the sync rule strips the
-    // script type suffix (e.g. init.plugin.luau -> "init").
+    // child is named "init" when a sync rule strips the script type
+    // suffix (e.g. init.plugin.luau -> "init"), so also match on the
+    // source path in case the project has no rule for the suffix.
     init_snapshot.children = dir_snapshot
         .children
         .into_iter()
-        .filter(|child| child.name != "init")
+        .filter(|child| {
+            child.name != "init"
+                && child
+                    .metadata
+                    .instigating_source
+                    .as_ref()
+                    .map(|source| source.path())
+                    != Some(init_path)
+        })
         .collect();
     init_snapshot.metadata = dir_snapshot.metadata;
     // The directory snapshot middleware includes all possible init paths
@@ -212,6 +222,8 @@ pub fn syncback_lua_init<'sync>(
         ScriptType::Server => "init.server.luau",
         ScriptType::Client => "init.client.luau",
         ScriptType::Module => "init.luau",
+        ScriptType::LegacyServer => "init.legacy.luau",
+        ScriptType::LegacyClient => "init.local.luau",
         _ => anyhow::bail!("syncback is not yet implemented for {script_type:?}"),
     });
 
@@ -224,7 +236,7 @@ pub fn syncback_lua_init<'sync>(
     let mut dir_syncback = syncback_dir_no_meta(snapshot)?;
     dir_syncback.fs_snapshot.add_file(&path, contents);
 
-    let meta = DirectoryMetadata::from_syncback_snapshot(snapshot, path.clone())?;
+    let meta = DirectoryMetadata::from_syncback_snapshot(snapshot, snapshot.path.clone())?;
     if let Some(mut meta) = meta {
         // Scripts have relatively few properties that we care about, so shifting
         // is fine.
@@ -494,6 +506,78 @@ mod test {
         insta::with_settings!({ sort_maps => true }, {
             insta::assert_yaml_snapshot!(instance_snapshot);
         });
+    }
+
+    #[test]
+    fn init_legacy_from_vfs() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                ("init.legacy.luau", VfsSnapshot::file("print('hello')")),
+                ("Helper.luau", VfsSnapshot::file("return {}")),
+            ]),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+
+        let instance_snapshot = snapshot_lua_init(
+            &InstanceContext::with_emit_legacy_scripts(Some(true)),
+            &vfs,
+            Path::new("/root/init.legacy.luau"),
+            "root",
+            ScriptType::LegacyServer,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(instance_snapshot.name, "root");
+        assert_eq!(instance_snapshot.class_name, "Script");
+
+        let child_names = instance_snapshot
+            .children
+            .iter()
+            .map(|child| child.name.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(child_names, vec!["Helper"]);
+    }
+
+    #[test]
+    fn init_local_from_vfs() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                ("init.local.luau", VfsSnapshot::file("print('hello')")),
+                ("Helper.luau", VfsSnapshot::file("return {}")),
+            ]),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+
+        let instance_snapshot = snapshot_lua_init(
+            &InstanceContext::with_emit_legacy_scripts(Some(true)),
+            &vfs,
+            Path::new("/root/init.local.luau"),
+            "root",
+            ScriptType::LegacyClient,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(instance_snapshot.name, "root");
+        assert_eq!(instance_snapshot.class_name, "LocalScript");
+
+        let child_names = instance_snapshot
+            .children
+            .iter()
+            .map(|child| child.name.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(child_names, vec!["Helper"]);
     }
 
     #[test]
