@@ -236,7 +236,7 @@ pub fn syncback_lua_init<'sync>(
     let mut dir_syncback = syncback_dir_no_meta(snapshot)?;
     dir_syncback.fs_snapshot.add_file(&path, contents);
 
-    let meta = DirectoryMetadata::from_syncback_snapshot(snapshot, path.clone())?;
+    let meta = DirectoryMetadata::from_syncback_snapshot(snapshot, snapshot.path.clone())?;
     if let Some(mut meta) = meta {
         // Scripts have relatively few properties that we care about, so shifting
         // is fine.

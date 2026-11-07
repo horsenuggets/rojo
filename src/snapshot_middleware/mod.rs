@@ -92,7 +92,10 @@ pub fn snapshot_from_vfs(
         // TODO: Is this even necessary anymore?
         match file_name {
             "init.server.luau" | "init.server.lua" | "init.client.luau" | "init.client.lua"
-            | "init.luau" | "init.lua" | "init.csv" => return Ok(None),
+            | "init.legacy.luau" | "init.legacy.lua" | "init.local.luau" | "init.local.lua"
+            | "init.plugin.luau" | "init.plugin.lua" | "init.luau" | "init.lua" | "init.csv" => {
+                return Ok(None)
+            }
             _ => {}
         }
 
@@ -491,6 +494,28 @@ mod test {
         )]);
 
         assert_eq!(middleware, Middleware::LegacyServerScriptDir);
+    }
+
+    #[test]
+    fn alternate_init_files_do_not_become_children() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                ("init.legacy.luau", VfsSnapshot::file("print('luau')")),
+                ("init.legacy.lua", VfsSnapshot::file("print('lua')")),
+            ]),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+        let instance_snapshot =
+            snapshot_from_vfs(&InstanceContext::new(), &vfs, Path::new("/root"))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(instance_snapshot.class_name, "Script");
+        assert!(instance_snapshot.children.is_empty());
     }
 
     #[test]
