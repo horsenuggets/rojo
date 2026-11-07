@@ -15,6 +15,10 @@ metadata:
     - /root/init.server.luau
     - /root/init.client.lua
     - /root/init.client.luau
+    - /root/init.legacy.lua
+    - /root/init.legacy.luau
+    - /root/init.local.lua
+    - /root/init.local.luau
     - /root/init.plugin.lua
     - /root/init.plugin.luau
     - /root/init.csv

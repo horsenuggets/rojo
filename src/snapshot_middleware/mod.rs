@@ -125,6 +125,10 @@ fn get_dir_middleware<'path>(
             (Middleware::ServerScriptDir, "init.server.lua"),
             (Middleware::ClientScriptDir, "init.client.luau"),
             (Middleware::ClientScriptDir, "init.client.lua"),
+            (Middleware::LegacyServerScriptDir, "init.legacy.luau"),
+            (Middleware::LegacyServerScriptDir, "init.legacy.lua"),
+            (Middleware::LegacyClientScriptDir, "init.local.luau"),
+            (Middleware::LegacyClientScriptDir, "init.local.lua"),
             (Middleware::PluginScriptDir, "init.plugin.luau"),
             (Middleware::PluginScriptDir, "init.plugin.lua"),
             (Middleware::CsvDir, "init.csv"),
@@ -208,6 +212,10 @@ pub enum Middleware {
     #[serde(skip_deserializing)]
     ClientScriptDir,
     #[serde(skip_deserializing)]
+    LegacyServerScriptDir,
+    #[serde(skip_deserializing)]
+    LegacyClientScriptDir,
+    #[serde(skip_deserializing)]
     ModuleScriptDir,
     #[serde(skip_deserializing)]
     PluginScriptDir,
@@ -263,6 +271,12 @@ impl Middleware {
             Self::ModuleScriptDir => {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::Module)
             }
+            Self::LegacyServerScriptDir => {
+                snapshot_lua_init(context, vfs, path, name, ScriptType::LegacyServer)
+            }
+            Self::LegacyClientScriptDir => {
+                snapshot_lua_init(context, vfs, path, name, ScriptType::LegacyClient)
+            }
             Self::PluginScriptDir => {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::Plugin)
             }
@@ -306,6 +320,12 @@ impl Middleware {
             Middleware::ServerScriptDir => syncback_lua_init(ScriptType::Server, snapshot),
             Middleware::ClientScriptDir => syncback_lua_init(ScriptType::Client, snapshot),
             Middleware::ModuleScriptDir => syncback_lua_init(ScriptType::Module, snapshot),
+            Middleware::LegacyServerScriptDir => {
+                syncback_lua_init(ScriptType::LegacyServer, snapshot)
+            }
+            Middleware::LegacyClientScriptDir => {
+                syncback_lua_init(ScriptType::LegacyClient, snapshot)
+            }
             Middleware::CsvDir => syncback_csv_init(snapshot),
 
             Middleware::PluginScriptDir => syncback_lua_init(ScriptType::Plugin, snapshot),
@@ -329,6 +349,8 @@ impl Middleware {
                 | Middleware::ServerScriptDir
                 | Middleware::ClientScriptDir
                 | Middleware::ModuleScriptDir
+                | Middleware::LegacyServerScriptDir
+                | Middleware::LegacyClientScriptDir
                 | Middleware::PluginScriptDir
                 | Middleware::CsvDir
         )
@@ -442,4 +464,42 @@ pub fn default_sync_rules() -> &'static [SyncRule] {
             sync_rule!("*.{yml,yaml}", Yaml),
         ]
     })
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use memofs::{InMemoryFs, VfsSnapshot};
+    use std::path::Path;
+
+    fn middleware_for_dir(entries: Vec<(&str, VfsSnapshot)>) -> Middleware {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot("/root", VfsSnapshot::dir(entries))
+            .unwrap();
+
+        let vfs = Vfs::new(imfs);
+        let (middleware, _, _) = get_dir_middleware(&vfs, Path::new("/root")).unwrap();
+        middleware
+    }
+
+    #[test]
+    fn legacy_server_init_selects_legacy_server_dir() {
+        let middleware = middleware_for_dir(vec![(
+            "init.legacy.luau",
+            VfsSnapshot::file("print('server')"),
+        )]);
+
+        assert_eq!(middleware, Middleware::LegacyServerScriptDir);
+    }
+
+    #[test]
+    fn legacy_client_init_selects_legacy_client_dir() {
+        let middleware = middleware_for_dir(vec![(
+            "init.local.luau",
+            VfsSnapshot::file("print('client')"),
+        )]);
+
+        assert_eq!(middleware, Middleware::LegacyClientScriptDir);
+    }
 }
