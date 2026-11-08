@@ -468,7 +468,7 @@ fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Pa
 /// It **does not** handle properties that should not serialize for other
 /// reasons, such as being defaults or being marked as not serializing in the
 /// ReflectionDatabase.
-fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet> {
+pub(crate) fn get_property_filter(project: &Project, new_inst: &Instance) -> Option<UstrSet> {
     let filter = &project.syncback_rules.as_ref()?.ignore_properties;
     let mut set = UstrSet::default();
 

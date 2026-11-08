@@ -15,6 +15,23 @@
 	returns it.
 ]]
 local function orderSwaps(swaps)
+	-- Cache each parent's child-to-index map so finding every sibling's
+	-- position stays linear in the parent's child count instead of scanning
+	-- the full child array once per swap.
+	local indexByParent = {}
+
+	local function findSiblingIndex(parent, child)
+		local indices = indexByParent[parent]
+		if indices == nil then
+			indices = {}
+			for index, sibling in parent:GetChildren() do
+				indices[sibling] = index
+			end
+			indexByParent[parent] = indices
+		end
+		return indices[child] or 0
+	end
+
 	for _, swap in swaps do
 		local depth = 0
 		local ancestor = swap.oldInstance.Parent
@@ -25,8 +42,9 @@ local function orderSwaps(swaps)
 		swap.depth = depth
 
 		local siblingIndex = 0
-		if swap.oldInstance.Parent ~= nil then
-			siblingIndex = table.find(swap.oldInstance.Parent:GetChildren(), swap.oldInstance) or 0
+		local parent = swap.oldInstance.Parent
+		if parent ~= nil then
+			siblingIndex = findSiblingIndex(parent, swap.oldInstance)
 		end
 		swap.siblingIndex = siblingIndex
 	end

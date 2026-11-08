@@ -103,6 +103,11 @@ impl AllowedHosts {
 /// arbitrary hostnames may legitimately resolve to the server. Listing extra
 /// hosts keeps validation on even for those binds.
 pub fn allowed_hosts(bind: IpAddr, port: u16, extra: &[String]) -> Option<AllowedHosts> {
+    // Collapse IPv4-mapped IPv6 addresses so that a bind like
+    // `::ffff:127.0.0.1` is still recognized as loopback, which keeps
+    // Host/Origin validation on for a loopback-only server.
+    let bind = canonical(bind);
+
     let extra_hosts: Vec<String> = extra
         .iter()
         .map(|host| normalize_host(host.trim()).to_owned())
@@ -483,6 +488,12 @@ mod test {
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
         assert!(!mapped.is_loopback());
         assert!(canonical(mapped).is_loopback());
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_bind_keeps_validation_on() {
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(allowed_hosts(mapped, 34872, &[]).is_some());
     }
 
     #[test]

@@ -344,6 +344,21 @@ function ServeSession:__replaceInstances(idList)
 		})
 	end
 
+	-- Only the instances being swapped get re-appended, so untouched siblings
+	-- stay put and replaced siblings land at the end. Record each affected
+	-- parent's original order so we can restore it after the swaps, including
+	-- when only some of a parent's children are replaced.
+	local originalOrders = {}
+	local replacementByOld = {}
+	for _, swap in swaps do
+		replacementByOld[swap.oldInstance] = swap.replacement
+
+		local parent = swap.oldInstance.Parent
+		if parent ~= nil and originalOrders[parent] == nil then
+			originalOrders[parent] = parent:GetChildren()
+		end
+	end
+
 	for _, swap in orderSwaps(swaps) do
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
@@ -392,6 +407,23 @@ function ServeSession:__replaceInstances(idList)
 			-- This is a bit funky, but it saves the order of Selection
 			-- which might matter for some use cases.
 			selection[selectionMap[oldInstance]] = replacement
+		end
+	end
+
+	-- Re-append the affected parents' children in their original order. This
+	-- includes untouched siblings, which the swap loop never moved but that the
+	-- replacements now sit after.
+	for parent, originalChildren in originalOrders do
+		-- If the parent itself was replaced, its children now live under the
+		-- replacement, so restore order there instead.
+		local targetParent = replacementByOld[parent] or parent
+		for _, oldChild in originalChildren do
+			local child = replacementByOld[oldChild] or oldChild
+			if child.Parent == targetParent then
+				-- Reassigning Parent appends the child, so walking the original
+				-- order rebuilds GetChildren().
+				attemptReparent(child, targetParent)
+			end
 		end
 	end
 
