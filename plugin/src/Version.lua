@@ -111,6 +111,44 @@ Version._cachedLatestCompatible = nil :: {
 	timestamp: number,
 }?
 
+--[[
+	A user may choose to reject requests to api.github.com. If they do, we want
+	to disable the setting for checking for updates to indicate that it does
+	nothing.
+]]
+Version._apiBlocked = nil :: boolean?
+
+--[[
+	Whether we have already probed the GitHub API this session. Without this, a
+	request that failed for a reason other than a blocked API leaves
+	`_apiBlocked` nil and every render retries the network request.
+]]
+Version._apiProbed = false
+
+function Version.isApiBlocked(): boolean
+	if Version._apiBlocked ~= nil then
+		return Version._apiBlocked
+	end
+
+	-- Don't probe while update checks are off; the setting does nothing then,
+	-- so blocking a render on the network for it is wasted work.
+	if not Settings:get("checkForUpdates") then
+		return false
+	end
+
+	if not Version._apiProbed then
+		Version._apiProbed = true
+
+		local isLocalInstall = string.find(debug.traceback(), "\n[^\n]-user_.-$") ~= nil
+		Version.retrieveLatestCompatible({
+			version = Config.version,
+			includePrereleases = isLocalInstall and Settings:get("checkForPrereleases"),
+		})
+	end
+
+	return Version._apiBlocked
+end
+
 function Version.retrieveLatestCompatible(options: {
 	version: { number },
 	includePrereleases: boolean?,
@@ -136,8 +174,13 @@ function Version.retrieveLatestCompatible(options: {
 		:await()
 
 	if success == false or type(releases) ~= "table" or next(releases) ~= 1 then
+		-- Roblox's HTTP errors are weird!
+		if string.find(tostring(releases), "^Unknown HTTP error: HttpService permission denied") then
+			Version._apiBlocked = true
+		end
 		return nil
 	end
+	Version._apiBlocked = false
 
 	-- Iterate through releases, looking for the latest compatible version
 	local latestCompatible: LatestReleaseInfo? = nil

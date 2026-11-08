@@ -224,6 +224,7 @@ pub fn syncback_lua_init<'sync>(
         ScriptType::Module => "init.luau",
         ScriptType::LegacyServer => "init.legacy.luau",
         ScriptType::LegacyClient => "init.local.luau",
+        ScriptType::Plugin => "init.plugin.luau",
         _ => anyhow::bail!("syncback is not yet implemented for {script_type:?}"),
     });
 

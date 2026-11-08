@@ -18,6 +18,7 @@ local PatchSet = require(script.Parent.PatchSet)
 local Reconciler = require(script.Parent.Reconciler)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
+local orderSwaps = require(script.Parent.orderSwaps)
 
 local Status = strict("Session.Status", {
 	NotStarted = "NotStarted",
@@ -320,6 +321,14 @@ function ServeSession:__replaceInstances(idList)
 		return false
 	end
 
+	-- Roblox appends to GetChildren() on every reparent, so the order in which
+	-- we re-parent replacements determines their final sibling order.
+	-- We process ancestors before descendants (so each replacement's
+	-- parent already exists when we re-parent it) and siblings in their original
+	-- GetChildren() order. Because the loop below moves the old instance's
+	-- children into the replacement *before* re-parenting the replacement, this
+	-- rebuilds GetChildren() exactly as it was before the swap.
+	local swaps = {}
 	for id, replacement in replacements do
 		local oldInstance = self.__instanceMap.fromIds[id]
 		if not oldInstance then
@@ -327,6 +336,31 @@ function ServeSession:__replaceInstances(idList)
 			Log.warn("Instance {} not found in InstanceMap during sync replacement", id)
 			continue
 		end
+
+		table.insert(swaps, {
+			id = id,
+			replacement = replacement,
+			oldInstance = oldInstance,
+		})
+	end
+
+	-- Only the instances being swapped get re-appended, so untouched siblings
+	-- stay put and replaced siblings land at the end. Record each affected
+	-- parent's original order so we can restore it after the swaps, including
+	-- when only some of a parent's children are replaced.
+	local originalOrders = {}
+	local replacementByOld = {}
+	for _, swap in swaps do
+		replacementByOld[swap.oldInstance] = swap.replacement
+
+		local parent = swap.oldInstance.Parent
+		if parent ~= nil and originalOrders[parent] == nil then
+			originalOrders[parent] = parent:GetChildren()
+		end
+	end
+
+	for _, swap in orderSwaps(swaps) do
+		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
 		self.__instanceMap:insert(id, replacement)
 		Log.trace("Swapping Instance {} out via api/models/ endpoint", id)
@@ -373,6 +407,23 @@ function ServeSession:__replaceInstances(idList)
 			-- This is a bit funky, but it saves the order of Selection
 			-- which might matter for some use cases.
 			selection[selectionMap[oldInstance]] = replacement
+		end
+	end
+
+	-- Re-append the affected parents' children in their original order. This
+	-- includes untouched siblings, which the swap loop never moved but that the
+	-- replacements now sit after.
+	for parent, originalChildren in originalOrders do
+		-- If the parent itself was replaced, its children now live under the
+		-- replacement, so restore order there instead.
+		local targetParent = replacementByOld[parent] or parent
+		for _, oldChild in originalChildren do
+			local child = replacementByOld[oldChild] or oldChild
+			if child.Parent == targetParent then
+				-- Reassigning Parent appends the child, so walking the original
+				-- order rebuilds GetChildren().
+				attemptReparent(child, targetParent)
+			end
 		end
 	end
 

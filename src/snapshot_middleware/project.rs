@@ -8,7 +8,7 @@ use anyhow::{bail, Context};
 use memofs::Vfs;
 use rbx_dom_weak::{
     types::{Attributes, Ref, Variant},
-    ustr, HashMapExt as _, Instance, Ustr, UstrMap,
+    ustr, HashMapExt as _, Instance, Ustr, UstrMap, UstrSet,
 };
 use rbx_reflection::ClassTag;
 
@@ -20,7 +20,9 @@ use crate::{
         PathIgnoreRule, SyncRule,
     },
     snapshot_middleware::Middleware,
-    syncback::{filter_properties, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
+    syncback::{
+        filter_properties, get_property_filter, FsSnapshot, SyncbackReturn, SyncbackSnapshot,
+    },
     variant_eq::variant_eq,
     RojoRef,
 };
@@ -344,6 +346,11 @@ pub fn syncback_project<'sync>(
     let mut new_child_map = HashMap::new();
 
     let mut node_changed_map = Vec::new();
+    // Tracks whether any stale default-valued properties were removed from
+    // project nodes. If so, we must reserialize even if
+    // project_node_should_reserialize wouldn't otherwise detect a change
+    // (it only compares node properties forward, not in reverse).
+    let mut removed_stale_properties = false;
     let mut node_queue = VecDeque::with_capacity(1);
     node_queue.push_back((&mut project.tree, old_inst, snapshot.new_inst()));
 
@@ -402,10 +409,12 @@ pub fn syncback_project<'sync>(
 
             // We only want to set properties if it needs it.
             if !middleware.handles_own_properties() {
-                project_node_property_syncback_path(snapshot, new_inst, node);
+                removed_stale_properties |=
+                    project_node_property_syncback_path(snapshot, new_inst, node);
             }
         } else {
-            project_node_property_syncback_no_path(snapshot, new_inst, node);
+            removed_stale_properties |=
+                project_node_property_syncback_no_path(snapshot, new_inst, node);
         }
 
         for child_ref in new_inst.children() {
@@ -507,11 +516,17 @@ pub fn syncback_project<'sync>(
     }
     let mut fs_snapshot = FsSnapshot::new();
 
-    for (node_properties, node_attributes, old_inst) in node_changed_map {
-        if project_node_should_reserialize(node_properties, node_attributes, old_inst)? {
-            fs_snapshot.add_file(project_path, serde_json::to_vec_pretty(&project)?);
-            break;
+    let mut needs_reserialize = removed_stale_properties;
+    if !needs_reserialize {
+        for (node_properties, node_attributes, old_inst) in node_changed_map {
+            if project_node_should_reserialize(node_properties, node_attributes, old_inst)? {
+                needs_reserialize = true;
+                break;
+            }
         }
+    }
+    if needs_reserialize {
+        fs_snapshot.add_file(project_path, serde_json::to_vec_pretty(&project)?);
     }
 
     Ok(SyncbackReturn {
@@ -521,15 +536,18 @@ pub fn syncback_project<'sync>(
     })
 }
 
+/// Syncs properties from the new instance into the project node.
+/// Returns `true` if any stale properties were removed (i.e. properties
+/// that existed in the project node but are now at their engine default).
 fn project_node_property_syncback(
-    _snapshot: &SyncbackSnapshot,
+    snapshot: &SyncbackSnapshot,
     filtered_properties: UstrMap<&Variant>,
     new_inst: &Instance,
     node: &mut ProjectNode,
-) {
+) -> bool {
     let properties = &mut node.properties;
     let mut attributes = BTreeMap::new();
-    for (name, value) in filtered_properties {
+    for (&name, &value) in &filtered_properties {
         match value {
             Variant::Attributes(attrs) => {
                 for (attr_name, attr_value) in attrs.iter() {
@@ -552,14 +570,79 @@ fn project_node_property_syncback(
             }
         }
     }
+
+    // Remove stale properties: entries that exist in the project node's
+    // $properties but are no longer in the filtered (non-default) properties
+    // from the instance. This handles the case where Studio resets a property
+    // to its engine default — filter_properties won't include it, so we need
+    // to clean up the now-stale project entry.
+    let class_data = rbx_reflection_database::get()
+        .ok()
+        .and_then(|db| db.classes.get(new_inst.class.as_str()));
+    let ignored_properties = get_property_filter(snapshot.project(), new_inst);
+    let len_before = properties.len();
+    properties.retain(|prop_name, _| {
+        // Only remove if the property has a known default value in the
+        // reflection database. If there's no default, the property might be
+        // absent from the instance for other reasons (e.g. unknown property),
+        // so we conservatively keep it.
+        let has_default = class_data
+            .as_ref()
+            .is_some_and(|data| data.default_properties.contains_key(prop_name.as_str()));
+
+        if !should_remove_stale_property(
+            prop_name,
+            &filtered_properties,
+            ignored_properties.as_ref(),
+            has_default,
+        ) {
+            return true;
+        }
+
+        log::debug!(
+            "Removing stale property '{}' from project node for class '{}': \
+             value has been reset to engine default",
+            prop_name,
+            new_inst.class
+        );
+        false
+    });
+    let removed_stale = properties.len() < len_before;
+
     node.attributes = attributes;
+    removed_stale
+}
+
+/// Returns whether a project `$properties` entry is stale and should be
+/// removed from the project node.
+///
+/// An entry is stale when it is absent from the instance's filtered properties
+/// and the reflection database knows a default for it, which means the value
+/// was reset to that default in Studio. Properties excluded by
+/// `syncbackRules.ignoreProperties` are kept, since their absence from the
+/// filtered set only reflects the ignore rule.
+fn should_remove_stale_property(
+    prop_name: &Ustr,
+    filtered_properties: &UstrMap<&Variant>,
+    ignored_properties: Option<&UstrSet>,
+    has_default: bool,
+) -> bool {
+    if filtered_properties.contains_key(prop_name) {
+        return false;
+    }
+
+    if ignored_properties.is_some_and(|ignored| ignored.contains(prop_name)) {
+        return false;
+    }
+
+    has_default
 }
 
 fn project_node_property_syncback_path(
     snapshot: &SyncbackSnapshot,
     new_inst: &Instance,
     node: &mut ProjectNode,
-) {
+) -> bool {
     let filtered_properties = snapshot
         .get_path_filtered_properties(new_inst.referent())
         .unwrap();
@@ -570,7 +653,7 @@ fn project_node_property_syncback_no_path(
     snapshot: &SyncbackSnapshot,
     new_inst: &Instance,
     node: &mut ProjectNode,
-) {
+) -> bool {
     let filtered_properties = filter_properties(snapshot.project(), new_inst);
     project_node_property_syncback(snapshot, filtered_properties, new_inst, node)
 }
@@ -1093,5 +1176,58 @@ mod test {
         .expect("snapshot returned no instances");
 
         insta::assert_yaml_snapshot!(instance_snapshot);
+    }
+
+    #[test]
+    fn stale_property_removal_truth_table() {
+        let name = ustr("Property");
+        let value = Variant::Int32(1);
+
+        for &is_filtered in &[false, true] {
+            for &is_ignored in &[false, true] {
+                for &has_default in &[false, true] {
+                    let mut filtered_properties = UstrMap::default();
+                    if is_filtered {
+                        filtered_properties.insert(name, &value);
+                    }
+
+                    let mut ignored_properties = UstrSet::default();
+                    if is_ignored {
+                        ignored_properties.insert(name);
+                    }
+
+                    let expected = !is_filtered && !is_ignored && has_default;
+                    assert_eq!(
+                        should_remove_stale_property(
+                            &name,
+                            &filtered_properties,
+                            Some(&ignored_properties),
+                            has_default,
+                        ),
+                        expected,
+                        "filtered={is_filtered} ignored={is_ignored} has_default={has_default}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_property_removal_without_ignore_rules() {
+        let name = ustr("Property");
+        let filtered_properties = UstrMap::default();
+
+        assert!(should_remove_stale_property(
+            &name,
+            &filtered_properties,
+            None,
+            true
+        ));
+        assert!(!should_remove_stale_property(
+            &name,
+            &filtered_properties,
+            None,
+            false
+        ));
     }
 }

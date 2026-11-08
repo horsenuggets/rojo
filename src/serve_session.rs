@@ -101,8 +101,9 @@ impl ServeSession {
     /// currently loaded from the filesystem directly instead of through
     /// the in-memory filesystem layer.
     pub fn new<P: AsRef<Path>>(vfs: Vfs, start_path: P) -> Result<Self, ServeSessionError> {
-        let start_path = start_path.as_ref();
         let start_time = Instant::now();
+        let start_path = vfs.canonicalize(start_path.as_ref())?;
+        let start_path = start_path.as_path();
 
         log::trace!("Starting new ServeSession at path {}", start_path.display());
 
@@ -222,6 +223,10 @@ impl ServeSession {
         self.root_project.serve_address
     }
 
+    pub fn serve_allowed_hosts(&self) -> &[String] {
+        &self.root_project.serve_allowed_hosts
+    }
+
     pub fn root_dir(&self) -> &Path {
         self.root_project.folder_location()
     }
@@ -286,4 +291,40 @@ fn extract_path_mappings(project: &Project) -> Vec<(PathBuf, Vec<String>)> {
     mappings.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
 
     mappings
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use memofs::StdBackend;
+
+    #[test]
+    fn tree_is_keyed_by_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{ "name": "test", "tree": { "$className": "Folder" } }"#,
+        )
+        .unwrap();
+
+        // `std::fs::canonicalize` yields a verbatim path on Windows.
+        // On other platforms it simply resolves the path (e.g. symlinks),
+        // which the session must also handle.
+        let start_path = std::fs::canonicalize(dir.path()).unwrap();
+
+        let vfs = Vfs::new(StdBackend::new().unwrap());
+        let session = ServeSession::new(vfs, &start_path).unwrap();
+
+        let project_file = start_path.join("default.project.json");
+        let canonical = session.vfs().canonicalize(&project_file).unwrap();
+
+        assert!(
+            !session.tree().get_ids_at_path(&canonical).is_empty(),
+            "project file {} should be tracked in the tree under its canonical \
+             path {}, matching what the watcher reports",
+            project_file.display(),
+            canonical.display(),
+        );
+    }
 }

@@ -219,9 +219,9 @@ pub enum Middleware {
     #[serde(skip_deserializing)]
     LegacyClientScriptDir,
     #[serde(skip_deserializing)]
-    ModuleScriptDir,
-    #[serde(skip_deserializing)]
     PluginScriptDir,
+    #[serde(skip_deserializing)]
+    ModuleScriptDir,
     #[serde(skip_deserializing)]
     CsvDir,
 }
@@ -271,6 +271,9 @@ impl Middleware {
             Self::ClientScriptDir => {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::Client)
             }
+            Self::PluginScriptDir => {
+                snapshot_lua_init(context, vfs, path, name, ScriptType::Plugin)
+            }
             Self::ModuleScriptDir => {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::Module)
             }
@@ -279,9 +282,6 @@ impl Middleware {
             }
             Self::LegacyClientScriptDir => {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::LegacyClient)
-            }
-            Self::PluginScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::Plugin)
             }
             Self::CsvDir => snapshot_csv_init(context, vfs, path, name),
         };
@@ -322,6 +322,7 @@ impl Middleware {
             Middleware::Dir => syncback_dir(snapshot),
             Middleware::ServerScriptDir => syncback_lua_init(ScriptType::Server, snapshot),
             Middleware::ClientScriptDir => syncback_lua_init(ScriptType::Client, snapshot),
+            Middleware::PluginScriptDir => syncback_lua_init(ScriptType::Plugin, snapshot),
             Middleware::ModuleScriptDir => syncback_lua_init(ScriptType::Module, snapshot),
             Middleware::LegacyServerScriptDir => {
                 syncback_lua_init(ScriptType::LegacyServer, snapshot)
@@ -330,8 +331,6 @@ impl Middleware {
                 syncback_lua_init(ScriptType::LegacyClient, snapshot)
             }
             Middleware::CsvDir => syncback_csv_init(snapshot),
-
-            Middleware::PluginScriptDir => syncback_lua_init(ScriptType::Plugin, snapshot),
 
             Middleware::PluginScript
             | Middleware::LegacyServerScript
@@ -351,10 +350,10 @@ impl Middleware {
             Middleware::Dir
                 | Middleware::ServerScriptDir
                 | Middleware::ClientScriptDir
+                | Middleware::PluginScriptDir
                 | Middleware::ModuleScriptDir
                 | Middleware::LegacyServerScriptDir
                 | Middleware::LegacyClientScriptDir
-                | Middleware::PluginScriptDir
                 | Middleware::CsvDir
         )
     }
