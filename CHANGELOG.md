@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.0.11`
+
+* Merged upstream rojo through 7.7.1, bringing the websocket serve protocol, syncback, `init.plugin` support, Windows verbatim path fixes, `rojo serve` origin validation, and clearer startup errors into the fork.
+
+[7.7.1-horse.0.11]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.1-horse.0.11
+
 ## `7.7.0-rc.1-horse.0.11`
 
 * Folders containing `init.legacy.luau` now become a `Script` with the Legacy run context, and folders containing `init.local.luau` become a `LocalScript`. Syncback writes the same file names, and `init` scripts now sync their metadata back to `init.meta.json`.
