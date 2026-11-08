@@ -283,9 +283,6 @@ impl Middleware {
             Self::LegacyClientScriptDir => {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::LegacyClient)
             }
-            Self::PluginScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::Plugin)
-            }
             Self::CsvDir => snapshot_csv_init(context, vfs, path, name),
         };
         if let Ok(Some(ref mut snapshot)) = output {
@@ -335,8 +332,6 @@ impl Middleware {
             }
             Middleware::CsvDir => syncback_csv_init(snapshot),
 
-            Middleware::PluginScriptDir => syncback_lua_init(ScriptType::Plugin, snapshot),
-
             Middleware::PluginScript
             | Middleware::LegacyServerScript
             | Middleware::LegacyClientScript
@@ -359,7 +354,6 @@ impl Middleware {
                 | Middleware::ModuleScriptDir
                 | Middleware::LegacyServerScriptDir
                 | Middleware::LegacyClientScriptDir
-                | Middleware::PluginScriptDir
                 | Middleware::CsvDir
         )
     }
