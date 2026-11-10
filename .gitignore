@@ -27,6 +27,10 @@
 # JetBrains IDEs
 /.idea/
 
+# Parallel worktrees at the repository root
+/.worktrees/
+/.wt/
+
 # Terraform
 .terraform/
 *.tfstate

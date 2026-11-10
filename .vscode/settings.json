@@ -1,4 +1,56 @@
 {
+  "[terraform]": {
+    "editor.defaultFormatter": "jkillian.custom-local-formatters",
+    "editor.detectIndentation": false,
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "file",
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  },
+  "[terraform-mock]": {
+    "editor.defaultFormatter": "jkillian.custom-local-formatters",
+    "editor.detectIndentation": false,
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "file",
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  },
+  "[terraform-search]": {
+    "editor.defaultFormatter": "jkillian.custom-local-formatters",
+    "editor.detectIndentation": false,
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "file",
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  },
+  "[terraform-test]": {
+    "editor.defaultFormatter": "jkillian.custom-local-formatters",
+    "editor.detectIndentation": false,
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "file",
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  },
+  "[terraform-vars]": {
+    "editor.defaultFormatter": "jkillian.custom-local-formatters",
+    "editor.detectIndentation": false,
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "file",
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  },
+  "customLocalFormatters.formatters": [
+    {
+      "command": "go -C submodules/tf4fmt run ./src/cmd/tf4fmt -",
+      "languages": [
+        "terraform",
+        "terraform-mock",
+        "terraform-search",
+        "terraform-test",
+        "terraform-vars"
+      ]
+    }
+  ],
   "luau-lsp.sourcemap.rojoProjectFile": "plugin.project.json",
   "luau-lsp.sourcemap.autogenerate": true
 }
