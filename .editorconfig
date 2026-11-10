@@ -27,6 +27,12 @@ indent_style = tab
 
 [*.luau]
 indent_style = tab
+
+[*.{tf,tfvars,tftest.hcl,tfmock.hcl,tfquery.hcl}]
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+
 [*.{yml,yaml}]
 indent_style = space
 indent_size = 2

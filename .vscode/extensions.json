@@ -1,5 +1,7 @@
 {
   "recommendations": [
+    "hashicorp.terraform",
+    "jkillian.custom-local-formatters",
     "JohnnyMorganz.luau-lsp",
     "JohnnyMorganz.stylua",
     "Kampfkarren.selene-vscode",
