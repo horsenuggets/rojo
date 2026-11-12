@@ -31,6 +31,13 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.0.12`
+
+* Added `syncbackRules.instancesAsDirectories` to capture complete instance hierarchies as four-space, newline-terminated JSON metadata, including duplicate and file-system-safe names.
+* Preserved StringValue and LocalizationTable contents, and filtered non-finite values that cannot be represented in JSON.
+
+[7.7.1-horse.0.12]: https://github.com/horsenuggets/rojo/releases/tag/7.7.1-horse.0.12
+
 ## `7.7.1-horse.0.11`
 
 * Merged upstream rojo through 7.7.1, bringing the websocket serve protocol, syncback, `init.plugin` support, Windows verbatim path fixes, `rojo serve` origin validation, and clearer startup errors into the fork.
