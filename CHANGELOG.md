@@ -31,12 +31,18 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.0.13`
+
+* Fixed the package version reported by release binaries with `rojo --version`.
+
+[7.7.1-horse.0.13]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.1-horse.0.13
+
 ## `7.7.1-horse.0.12`
 
 * Added `syncbackRules.instancesAsDirectories` to capture complete instance hierarchies as four-space, newline-terminated JSON metadata, including duplicate and file-system-safe names.
 * Preserved StringValue and LocalizationTable contents, and filtered non-finite values that cannot be represented in JSON.
 
-[7.7.1-horse.0.12]: https://github.com/horsenuggets/rojo/releases/tag/7.7.1-horse.0.12
+[7.7.1-horse.0.12]: https://github.com/horsenuggets/rojo/releases/tag/v7.7.1-horse.0.12
 
 ## `7.7.1-horse.0.11`
 
