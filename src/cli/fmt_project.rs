@@ -25,7 +25,7 @@ impl FmtProjectCommand {
         let project = Project::load_fuzzy(&vfs, &base_path)?
             .context("A project file is required to run 'rojo fmt-project'")?;
 
-        let serialized = serde_json::to_string_pretty(&project)
+        let serialized = crate::json::to_string_pretty(&project)
             .context("could not re-encode project file as JSON")?;
 
         fs_err::write(&project.file_location, serialized)

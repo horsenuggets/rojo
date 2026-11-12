@@ -28,10 +28,12 @@ use crate::{
     Project,
 };
 
-pub use file_names::{extension_for_middleware, name_for_inst, validate_file_name};
+pub use file_names::{
+    extension_for_middleware, name_for_inst, unique_child_stems, validate_file_name,
+};
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
-pub use property_filter::{filter_properties, filter_properties_preallocated};
+pub use property_filter::{filter_properties, filter_properties_preallocated, is_json_compatible};
 pub use snapshot::{SyncbackData, SyncbackSnapshot};
 
 /// The name of an enviroment variable to use to override the behavior of
@@ -337,6 +339,15 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
 
     if let Some(override_middleware) = snapshot.middleware {
         return override_middleware;
+    } else if instances_as_directories(snapshot.project()) {
+        middleware = match inst.class.as_str() {
+            "Script" => Middleware::ServerScript,
+            "LocalScript" => Middleware::ClientScript,
+            "ModuleScript" => Middleware::ModuleScript,
+            "StringValue" => Middleware::Text,
+            "LocalizationTable" => Middleware::Csv,
+            _ => Middleware::Dir,
+        };
     } else if let Some(old_middleware) = old_middleware {
         return old_middleware;
     } else if json_model_classes.contains(inst.class.as_str()) {
@@ -412,9 +423,19 @@ pub struct SyncbackRules {
     /// generally a better UX.
     #[serde(skip_serializing_if = "Option::is_none")]
     create_ignore_dir_paths: Option<bool>,
+    /// Whether every non-script Instance should be written as a directory with
+    /// an `init.meta.json` file instead of a model file. Siblings with
+    /// duplicate or file system unsafe names get unique directory names, and
+    /// their real names are stored in their metadata. Defaults to `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instances_as_directories: Option<bool>,
 }
 
 impl SyncbackRules {
+    pub fn instances_as_directories(&self) -> bool {
+        self.instances_as_directories.unwrap_or_default()
+    }
+
     pub fn compile_globs(&self) -> anyhow::Result<Vec<IgnorableGlob>> {
         let mut globs = Vec::with_capacity(self.ignore_paths.len());
         let dir_ignore_paths = self.create_ignore_dir_paths.unwrap_or(true);
@@ -459,6 +480,15 @@ fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Pa
         }
     }
     true
+}
+
+/// Returns whether the project asks for every non-script Instance to be written
+/// as a directory.
+pub(crate) fn instances_as_directories(project: &Project) -> bool {
+    project
+        .syncback_rules
+        .as_ref()
+        .is_some_and(SyncbackRules::instances_as_directories)
 }
 
 /// Returns a set of properties that should not be written with syncback if
@@ -558,6 +588,7 @@ mod test {
             sync_unscriptable: None,
             ignore_referents: None,
             create_ignore_dir_paths,
+            instances_as_directories: None,
         }
     }
 

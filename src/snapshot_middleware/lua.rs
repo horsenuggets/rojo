@@ -199,8 +199,8 @@ pub fn syncback_lua<'sync>(
         if !meta.is_empty() {
             let parent_location = snapshot.path.parent_err()?;
             fs_snapshot.add_file(
-                parent_location.join(format!("{}.meta.json", new_inst.name)),
-                serde_json::to_vec_pretty(&meta).context("cannot serialize metadata")?,
+                parent_location.join(format!("{}.meta.json", snapshot.file_stem())),
+                crate::json::to_vec_pretty(&meta).context("cannot serialize metadata")?,
             );
         }
     }
@@ -246,7 +246,7 @@ pub fn syncback_lua_init<'sync>(
         if !meta.is_empty() {
             dir_syncback.fs_snapshot.add_file(
                 snapshot.path.join("init.meta.json"),
-                serde_json::to_vec_pretty(&meta)
+                crate::json::to_vec_pretty(&meta)
                     .context("could not serialize new init.meta.json")?,
             );
         }

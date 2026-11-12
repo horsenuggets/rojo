@@ -4,7 +4,23 @@
 //! to reduce boilerplate and improve ergonomics when working with JSONC files.
 
 use anyhow::Context as _;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
+
+/// Serializes a value as pretty JSON using four-space indentation and a
+/// trailing newline, which is the default format for files written by Rojo.
+pub fn to_vec_pretty<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
+    value.serialize(&mut serializer)?;
+    output.push(b'\n');
+    Ok(output)
+}
+
+/// Serializes a value as pretty JSON using Rojo's default file format.
+pub fn to_string_pretty<T: Serialize>(value: &T) -> serde_json::Result<String> {
+    Ok(String::from_utf8(to_vec_pretty(value)?).expect("JSON should always be valid UTF-8"))
+}
 
 /// Parse JSONC text into a `serde_json::Value`.
 ///
@@ -135,6 +151,17 @@ pub fn from_slice_with_context<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    #[test]
+    fn pretty_json_uses_four_spaces_and_a_trailing_newline() {
+        let value = serde_json::json!({"outer": {"inner": true}});
+        let text = to_string_pretty(&value).unwrap();
+        assert_eq!(
+            text,
+            "{\n    \"outer\": {\n        \"inner\": true\n    }\n}\n"
+        );
+        assert_eq!(to_vec_pretty(&value).unwrap(), text.as_bytes());
+    }
 
     #[test]
     fn test_parse_value() {

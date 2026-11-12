@@ -59,8 +59,8 @@ pub fn syncback_txt<'sync>(
         if !meta.is_empty() {
             let parent = snapshot.path.parent_err()?;
             fs_snapshot.add_file(
-                parent.join(format!("{}.meta.json", new_inst.name)),
-                serde_json::to_vec_pretty(&meta).context("could not serialize metadata")?,
+                parent.join(format!("{}.meta.json", snapshot.file_stem())),
+                crate::json::to_vec_pretty(&meta).context("could not serialize metadata")?,
             );
         }
     }

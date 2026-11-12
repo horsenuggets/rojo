@@ -250,7 +250,7 @@ fn write_sourcemap(
 
     if let Some(output_path) = output {
         let mut file = BufWriter::new(File::create(output_path)?);
-        serde_json::to_writer(&mut file, &root_node)?;
+        file.write_all(&crate::json::to_vec_pretty(&root_node)?)?;
         file.flush()?;
 
         println!("Created sourcemap at {}", output_path.display());
