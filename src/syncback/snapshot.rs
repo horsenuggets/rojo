@@ -268,8 +268,11 @@ pub fn filter_out_property(inst: &Instance, prop_name: &str, middleware: Middlew
             // `$path` or via being on the file system.
             prop_name == "Source" || prop_name == "ScriptGuid"
         }
-        "LocalizationTable" => middleware == Middleware::Csv && prop_name == "Contents",
-        "StringValue" => middleware == Middleware::Text && prop_name == "Value",
+        "LocalizationTable" => prop_name == "Contents",
+        // A StringValue with children has no text file to hold its value, so
+        // keep it in the directory metadata. Text files and project nodes own
+        // their values instead.
+        "StringValue" => middleware != Middleware::Dir && prop_name == "Value",
         _ => false,
     }
 }
