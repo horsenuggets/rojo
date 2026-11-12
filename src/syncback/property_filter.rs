@@ -116,9 +116,9 @@ pub fn is_json_compatible(value: &Variant) -> bool {
         Variant::Region3(value) => vector3_is_finite(&value.min) && vector3_is_finite(&value.max),
         Variant::UDim(value) => value.scale.is_finite(),
         Variant::UDim2(value) => value.x.scale.is_finite() && value.y.scale.is_finite(),
-        Variant::Attributes(attributes) => attributes
-            .iter()
-            .all(|(_, value)| is_json_compatible(value)),
+        // Attribute bags are filtered per entry when serialized and hashed so
+        // one non-finite attribute does not discard all the valid ones.
+        Variant::Attributes(_) => true,
         _ => true,
     }
 }
