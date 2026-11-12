@@ -8,9 +8,13 @@ use memofs::{DirEntry, Vfs};
 
 use crate::{
     snapshot::{
-        is_path_ignored, InstanceContext, InstanceMetadata, InstanceSnapshot, InstigatingSource,
+        is_path_ignored, InstanceContext, InstanceMetadata, InstanceSnapshot, InstanceWithMeta,
+        InstigatingSource,
     },
-    syncback::{hash_instance, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
+    syncback::{
+        hash_instance, instances_as_directories, unique_child_stems, FsSnapshot, SyncbackReturn,
+        SyncbackSnapshot,
+    },
 };
 
 use super::{meta_file::DirectoryMetadata, snapshot_from_vfs};
@@ -111,7 +115,7 @@ pub fn syncback_dir<'sync>(
         if !meta.is_empty() {
             dir_syncback.fs_snapshot.add_file(
                 snapshot.path.join("init.meta.json"),
-                serde_json::to_vec_pretty(&meta)
+                crate::json::to_vec_pretty(&meta)
                     .context("could not serialize new init.meta.json")?,
             );
         }
@@ -137,6 +141,103 @@ pub fn syncback_dir_no_meta<'sync>(
 
     let mut children = Vec::new();
     let mut removed_children = Vec::new();
+
+    if instances_as_directories(snapshot.project()) {
+        // Duplicate and unsafe names are given unique file names instead of
+        // being rejected, so children are matched to the old tree by the file
+        // name they would be written to rather than by their Instance name.
+        let stems = unique_child_stems(snapshot.new_tree(), new_inst);
+        let mut old_child_map = HashMap::new();
+        let mut project_children = HashMap::new();
+        if let Some(old_inst) = snapshot.old_inst() {
+            for child in old_inst.children() {
+                let inst = snapshot.get_old_instance(*child).unwrap();
+                if matches!(
+                    inst.metadata().instigating_source,
+                    Some(InstigatingSource::ProjectNode { .. })
+                ) {
+                    // The project syncback handles one child per matching
+                    // project node, so only skip that many new children.
+                    *project_children.entry(inst.name()).or_insert(0) += 1;
+                    continue;
+                }
+                let file_name = inst
+                    .metadata()
+                    .relevant_paths
+                    .first()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str());
+                if let Some(file_name) = file_name {
+                    old_child_map.insert(file_name.to_lowercase(), inst);
+                }
+            }
+        }
+
+        for new_child_ref in new_inst.children() {
+            let new_child = snapshot.get_new_instance(*new_child_ref).unwrap();
+            if let Some(remaining) = project_children.get_mut(new_child.name.as_str()) {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    project_children.remove(new_child.name.as_str());
+                }
+                continue;
+            }
+            let stem = &stems[new_child_ref];
+            let fresh = snapshot.with_stem(&snapshot.path, *new_child_ref, None, stem);
+            let file_name = fresh
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_lowercase);
+            let old_child: Option<InstanceWithMeta> =
+                file_name.and_then(|name| old_child_map.remove(&name));
+            children.push(match old_child {
+                Some(old_child) => {
+                    snapshot.with_stem(&snapshot.path, *new_child_ref, Some(old_child.id()), stem)
+                }
+                None => fresh,
+            });
+        }
+        removed_children.extend(old_child_map.into_values());
+    } else {
+        children_by_name(snapshot, &mut children, &mut removed_children)?;
+    }
+
+    let mut fs_snapshot = FsSnapshot::new();
+
+    if let Some(old_ref) = snapshot.old {
+        let new_hash = hash_instance(snapshot.project(), snapshot.new_tree(), snapshot.new)
+            .expect("new Instance should be hashable");
+        let old_hash = hash_instance(snapshot.project(), snapshot.old_tree(), old_ref)
+            .expect("old Instance should be hashable");
+
+        if old_hash != new_hash {
+            fs_snapshot.add_dir(&snapshot.path);
+        } else {
+            log::debug!(
+                "Skipping reserializing directory {} because old and new tree hash the same",
+                new_inst.name
+            );
+        }
+    } else {
+        fs_snapshot.add_dir(&snapshot.path);
+    }
+
+    Ok(SyncbackReturn {
+        fs_snapshot,
+        children,
+        removed_children,
+    })
+}
+
+/// Pairs the children of a directory with the old tree by Instance name, which
+/// requires every child to have a unique name.
+fn children_by_name<'sync>(
+    snapshot: &SyncbackSnapshot<'sync>,
+    children: &mut Vec<SyncbackSnapshot<'sync>>,
+    removed_children: &mut Vec<InstanceWithMeta<'sync>>,
+) -> anyhow::Result<()> {
+    let new_inst = snapshot.new_inst();
 
     // We have to enforce unique child names for the file system.
     let mut child_names = HashSet::with_capacity(new_inst.children().len());
@@ -198,31 +299,8 @@ pub fn syncback_dir_no_meta<'sync>(
             children.push(snapshot.with_joined_path(*new_child_ref, None)?);
         }
     }
-    let mut fs_snapshot = FsSnapshot::new();
 
-    if let Some(old_ref) = snapshot.old {
-        let new_hash = hash_instance(snapshot.project(), snapshot.new_tree(), snapshot.new)
-            .expect("new Instance should be hashable");
-        let old_hash = hash_instance(snapshot.project(), snapshot.old_tree(), old_ref)
-            .expect("old Instance should be hashable");
-
-        if old_hash != new_hash {
-            fs_snapshot.add_dir(&snapshot.path);
-        } else {
-            log::debug!(
-                "Skipping reserializing directory {} because old and new tree hash the same",
-                new_inst.name
-            );
-        }
-    } else {
-        fs_snapshot.add_dir(&snapshot.path);
-    }
-
-    Ok(SyncbackReturn {
-        fs_snapshot,
-        children,
-        removed_children,
-    })
+    Ok(())
 }
 
 #[cfg(test)]

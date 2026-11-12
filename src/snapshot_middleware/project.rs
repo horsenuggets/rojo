@@ -21,7 +21,8 @@ use crate::{
     },
     snapshot_middleware::Middleware,
     syncback::{
-        filter_properties, get_property_filter, FsSnapshot, SyncbackReturn, SyncbackSnapshot,
+        filter_properties, get_property_filter, instances_as_directories, FsSnapshot,
+        SyncbackReturn, SyncbackSnapshot,
     },
     variant_eq::variant_eq,
     RojoRef,
@@ -338,6 +339,7 @@ pub fn syncback_project<'sync>(
         rule.base_path.clone_from(&base_path)
     }
 
+    let as_directories = instances_as_directories(snapshot.project());
     let mut descendant_snapshots = Vec::new();
     let mut removed_descendants = Vec::new();
 
@@ -421,7 +423,11 @@ pub fn syncback_project<'sync>(
             let child = snapshot
                 .get_new_instance(*child_ref)
                 .expect("all children of Instances should be in new DOM");
-            if new_child_map.insert(&child.name, child).is_some() {
+            if as_directories {
+                // Only children named in the project file are matched here,
+                // and the directory syncback gives duplicates unique names.
+                new_child_map.entry(&child.name).or_insert(child);
+            } else if new_child_map.insert(&child.name, child).is_some() {
                 anyhow::bail!(
                     "Instances that are direct children of an Instance that is made by a project file \
                     must have a unique name.\nThe child '{}' of '{}' is duplicated in the place file.", child.name, old_inst.name()
@@ -432,7 +438,9 @@ pub fn syncback_project<'sync>(
             let child = snapshot
                 .get_old_instance(*child_ref)
                 .expect("all children of Instances should be in old DOM");
-            if old_child_map.insert(child.name(), child).is_some() {
+            if as_directories {
+                old_child_map.entry(child.name()).or_insert(child);
+            } else if old_child_map.insert(child.name(), child).is_some() {
                 anyhow::bail!(
                     "Instances that are direct children of an Instance that is made by a project file \
                     must have a unique name.\nThe child '{}' of '{}' is duplicated on the file system.", child.name(), old_inst.name()
@@ -478,6 +486,13 @@ pub fn syncback_project<'sync>(
                     old_inst.name(), project_path.display(),
                 )
             }
+        }
+
+        if as_directories {
+            // Children that aren't in the project are written, renamed, and
+            // removed by the syncback of the directory this node points at.
+            new_child_map.clear();
+            old_child_map.clear();
         }
 
         // All of the children in this loop are by their nature not in the
@@ -526,7 +541,7 @@ pub fn syncback_project<'sync>(
         }
     }
     if needs_reserialize {
-        fs_snapshot.add_file(project_path, serde_json::to_vec_pretty(&project)?);
+        fs_snapshot.add_file(project_path, crate::json::to_vec_pretty(&project)?);
     }
 
     Ok(SyncbackReturn {

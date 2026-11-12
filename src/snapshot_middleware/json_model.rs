@@ -86,7 +86,7 @@ pub fn syncback_json_model<'sync>(
     Ok(SyncbackReturn {
         fs_snapshot: FsSnapshot::new().with_added_file(
             &snapshot.path,
-            serde_json::to_vec_pretty(&model).context("failed to serialize new JSON Model")?,
+            crate::json::to_vec_pretty(&model).context("failed to serialize new JSON Model")?,
         ),
         children: Vec::new(),
         removed_children: Vec::new(),

@@ -1,6 +1,8 @@
 use blake3::Hasher;
 use rbx_dom_weak::types::{ContentType, PhysicalProperties, Variant, Vector3};
 
+use crate::syncback::property_filter::is_json_compatible;
+
 macro_rules! round {
     ($value:expr) => {
         (($value * 10.0).round() / 10.0)
@@ -30,8 +32,10 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             let mut sorted: Vec<(&String, &Variant)> = attrs.iter().collect();
             sorted.sort_unstable_by_key(|(name, _)| *name);
             for (name, attribute) in sorted {
-                hasher.update(name.as_bytes());
-                hash_variant(hasher, attribute);
+                if is_json_compatible(attribute) {
+                    hasher.update(name.as_bytes());
+                    hash_variant(hasher, attribute);
+                }
             }
         }
         Variant::Axes(a) => hash!(hasher, &[a.bits()]),
@@ -213,4 +217,26 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
 
 fn vector_hash(hasher: &mut Hasher, vector: Vector3) {
     n_hash!(hasher, round!(vector.x), round!(vector.y), round!(vector.z))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbx_dom_weak::types::Attributes;
+
+    #[test]
+    fn invalid_attributes_do_not_hide_valid_attributes() {
+        let mut valid = Attributes::new();
+        valid.insert("Good".to_owned(), "kept".into());
+
+        let mut mixed = valid.clone();
+        mixed.insert("Bad".to_owned(), f64::INFINITY.into());
+
+        let mut valid_hasher = Hasher::new();
+        hash_variant(&mut valid_hasher, &Variant::Attributes(valid));
+        let mut mixed_hasher = Hasher::new();
+        hash_variant(&mut mixed_hasher, &Variant::Attributes(mixed));
+
+        assert_eq!(valid_hasher.finalize(), mixed_hasher.finalize());
+    }
 }

@@ -140,14 +140,22 @@ fn get_dir_middleware<'path>(
 
     for default_project_name in DEFAULT_PROJECT_NAMES {
         let project_path = dir_path.join(default_project_name);
-        if vfs.metadata(&project_path).with_not_found()?.is_some() {
+        if vfs
+            .metadata(&project_path)
+            .with_not_found()?
+            .is_some_and(|metadata| metadata.is_file())
+        {
             return Ok((Middleware::Project, dir_name, project_path));
         }
     }
 
     for (middleware, name) in order {
         let test_path = dir_path.join(name);
-        if vfs.metadata(&test_path).with_not_found()?.is_some() {
+        if vfs
+            .metadata(&test_path)
+            .with_not_found()?
+            .is_some_and(|metadata| metadata.is_file())
+        {
             return Ok((*middleware, dir_name, test_path));
         }
     }
@@ -515,6 +523,16 @@ mod test {
 
         assert_eq!(instance_snapshot.class_name, "Script");
         assert!(instance_snapshot.children.is_empty());
+    }
+
+    #[test]
+    fn directories_named_like_initializers_are_not_initializers() {
+        let middleware = middleware_for_dir(vec![
+            ("init.luau", VfsSnapshot::empty_dir()),
+            ("default.project.json", VfsSnapshot::empty_dir()),
+        ]);
+
+        assert_eq!(middleware, Middleware::Dir);
     }
 
     #[test]

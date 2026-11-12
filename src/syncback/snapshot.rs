@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     snapshot::{InstanceWithMeta, RojoTree},
-    snapshot_middleware::Middleware,
+    snapshot_middleware::{default_sync_rules, Middleware},
     Project,
 };
 use rbx_dom_weak::{
@@ -12,7 +12,11 @@ use rbx_dom_weak::{
     Instance, Ustr, UstrMap, WeakDom,
 };
 
-use super::{get_best_middleware, name_for_inst, property_filter::filter_properties};
+use super::{
+    file_names::{file_name_for_stem, stem_for_path},
+    get_best_middleware, name_for_inst,
+    property_filter::filter_properties,
+};
 
 #[derive(Clone, Copy)]
 pub struct SyncbackData<'sync> {
@@ -48,6 +52,68 @@ impl<'sync> SyncbackSnapshot<'sync> {
         snapshot.path = self.path.join(name.as_ref());
 
         Ok(snapshot)
+    }
+
+    /// Constructs a SyncbackSnapshot inside `base_path` like
+    /// [`Self::with_base_path`], but a new Instance is written using `stem`
+    /// from [`unique_child_stems`] instead of its own name. Instances that
+    /// already exist on the file system keep their current file name.
+    ///
+    /// [`unique_child_stems`]: super::file_names::unique_child_stems
+    pub fn with_stem(
+        &self,
+        base_path: &Path,
+        new_ref: Ref,
+        old_ref: Option<Ref>,
+        stem: &str,
+    ) -> Self {
+        let mut snapshot = Self {
+            data: self.data,
+            old: old_ref,
+            new: new_ref,
+            path: PathBuf::new(),
+            middleware: None,
+        };
+        let old_name = snapshot
+            .old_inst()
+            .and_then(|old| old.metadata().relevant_paths.first())
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str());
+        let name = match old_name {
+            Some(name) => name.to_owned(),
+            None => file_name_for_stem(get_best_middleware(&snapshot), stem),
+        };
+        snapshot.path = base_path.join(name);
+
+        snapshot
+    }
+
+    /// Returns the name this Instance should store in its metadata. This is
+    /// only needed when its file name doesn't already give Rojo its real name.
+    pub fn name_override(&self) -> Option<String> {
+        let name = &self.new_inst().name;
+        (self.file_stem() != name.as_str()).then(|| name.clone())
+    }
+
+    /// Returns the name Rojo will read this Instance's file back as, which is
+    /// also the stem of its adjacent `.meta.json` file.
+    pub fn file_stem(&self) -> &str {
+        let middleware = get_best_middleware(self);
+        for rule in self
+            .data
+            .project
+            .sync_rules
+            .iter()
+            .chain(default_sync_rules())
+        {
+            if rule.middleware == middleware && rule.matches(&self.path) {
+                if let Ok(stem) = rule.file_name_for_path(&self.path) {
+                    return stem;
+                }
+            }
+        }
+
+        stem_for_path(middleware, &self.path).unwrap_or(self.new_inst().name.as_str())
     }
 
     /// Constructs a SyncbackSnapshot from the provided refs and a base path,
@@ -111,9 +177,10 @@ impl<'sync> SyncbackSnapshot<'sync> {
 
         // The only filtering we have to do is filter out properties that are
         // special-cased in some capacity.
+        let middleware = get_best_middleware(self);
         let properties = filter_properties(self.data.project, inst)
             .into_iter()
-            .filter(|(name, _)| !filter_out_property(inst, name))
+            .filter(|(name, _)| !filter_out_property(inst, name, middleware))
             .collect();
 
         Some(properties)
@@ -208,7 +275,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
     }
 }
 
-pub fn filter_out_property(inst: &Instance, prop_name: &str) -> bool {
+pub fn filter_out_property(inst: &Instance, prop_name: &str, middleware: Middleware) -> bool {
     match inst.class.as_str() {
         "Script" | "LocalScript" | "ModuleScript" => {
             // These properties shouldn't be set by scripts that are created via
@@ -216,7 +283,10 @@ pub fn filter_out_property(inst: &Instance, prop_name: &str) -> bool {
             prop_name == "Source" || prop_name == "ScriptGuid"
         }
         "LocalizationTable" => prop_name == "Contents",
-        "StringValue" => prop_name == "Value",
+        // A StringValue with children has no text file to hold its value, so
+        // keep it in the directory metadata. Text files and project nodes own
+        // their values instead.
+        "StringValue" => middleware != Middleware::Dir && prop_name == "Value",
         _ => false,
     }
 }

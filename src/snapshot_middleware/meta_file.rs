@@ -10,7 +10,10 @@ use rbx_dom_weak::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    json, resolution::UnresolvedValue, snapshot::InstanceSnapshot, syncback::SyncbackSnapshot,
+    json,
+    resolution::UnresolvedValue,
+    snapshot::InstanceSnapshot,
+    syncback::{is_json_compatible, SyncbackSnapshot},
     RojoRef,
 };
 
@@ -30,6 +33,10 @@ pub struct AdjacentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignore_unknown_instances: Option<bool>,
 
+    /// The Instance's real name, for when its file name can't hold it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub properties: IndexMap<Ustr, UnresolvedValue>,
 
@@ -38,6 +45,13 @@ pub struct AdjacentMetadata {
 
     #[serde(skip)]
     pub path: PathBuf,
+}
+
+/// Renames the snapshot to the name stored in metadata, if there is one.
+fn apply_name(name: &mut Option<String>, snapshot: &mut InstanceSnapshot) {
+    if let Some(name) = name.take() {
+        snapshot.name = name.into();
+    }
 }
 
 impl AdjacentMetadata {
@@ -126,7 +140,7 @@ impl AdjacentMetadata {
                     for (attr_name, attr_value) in attrs.iter() {
                         // We (probably) don't want to preserve internal
                         // attributes, only user defined ones.
-                        if attr_name.starts_with("RBX") {
+                        if attr_name.starts_with("RBX") || !is_json_compatible(attr_value) {
                             continue;
                         }
                         attributes.insert(
@@ -150,6 +164,7 @@ impl AdjacentMetadata {
             } else {
                 None
             },
+            name: snapshot.name_override(),
             properties,
             attributes,
             path,
@@ -215,6 +230,7 @@ impl AdjacentMetadata {
 
     pub fn apply_all(&mut self, snapshot: &mut InstanceSnapshot) -> anyhow::Result<()> {
         self.apply_ignore_unknown_instances(snapshot);
+        apply_name(&mut self.name, snapshot);
         self.apply_properties(snapshot)?;
         self.apply_id(snapshot)?;
         self.apply_schema(snapshot)?;
@@ -226,11 +242,13 @@ impl AdjacentMetadata {
     ///
     /// - The number of properties and attributes is 0
     /// - `ignore_unknown_instances` is None
+    /// - `name` is None
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
             && self.properties.is_empty()
             && self.ignore_unknown_instances.is_none()
+            && self.name.is_none()
     }
 
     // TODO: Add method to allow selectively applying parts of metadata and
@@ -252,6 +270,10 @@ pub struct DirectoryMetadata {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignore_unknown_instances: Option<bool>,
+
+    /// The Instance's real name, for when its directory name can't hold it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub properties: IndexMap<Ustr, UnresolvedValue>,
@@ -378,6 +400,7 @@ impl DirectoryMetadata {
             } else {
                 None
             },
+            name: snapshot.name_override(),
             properties,
             attributes,
             class_name: None,
@@ -389,6 +412,7 @@ impl DirectoryMetadata {
 
     pub fn apply_all(&mut self, snapshot: &mut InstanceSnapshot) -> anyhow::Result<()> {
         self.apply_ignore_unknown_instances(snapshot);
+        apply_name(&mut self.name, snapshot);
         self.apply_class_name(snapshot)?;
         self.apply_properties(snapshot)?;
         self.apply_id(snapshot)?;
@@ -469,12 +493,14 @@ impl DirectoryMetadata {
     ///
     /// - The number of properties and attributes is 0
     /// - `ignore_unknown_instances` is None
+    /// - `name` is None
     /// - `class_name` is either None or not Some("Folder")
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
             && self.properties.is_empty()
             && self.ignore_unknown_instances.is_none()
+            && self.name.is_none()
             && if let Some(class) = &self.class_name {
                 class == "Folder"
             } else {
