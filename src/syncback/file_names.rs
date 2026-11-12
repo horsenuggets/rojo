@@ -158,6 +158,32 @@ pub fn validate_file_name<S: AsRef<str>>(name: S) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Returns the middleware used for an Instance in `instancesAsDirectories`
+/// mode, including the directory variant when it has children.
+pub fn directory_middleware_for_instance(inst: &Instance) -> Middleware {
+    let middleware = match inst.class.as_str() {
+        "Script" => Middleware::ServerScript,
+        "LocalScript" => Middleware::ClientScript,
+        "ModuleScript" => Middleware::ModuleScript,
+        "StringValue" => Middleware::Text,
+        "LocalizationTable" => Middleware::Csv,
+        _ => Middleware::Dir,
+    };
+
+    if inst.children().is_empty() {
+        middleware
+    } else {
+        match middleware {
+            Middleware::ServerScript => Middleware::ServerScriptDir,
+            Middleware::ClientScript => Middleware::ClientScriptDir,
+            Middleware::ModuleScript => Middleware::ModuleScriptDir,
+            Middleware::Csv => Middleware::CsvDir,
+            Middleware::Text => Middleware::Dir,
+            other => other,
+        }
+    }
+}
+
 /// Returns whether instances of this class are written as files rather than
 /// directories when `instancesAsDirectories` is enabled.
 fn is_file_class(class: &str) -> bool {
@@ -170,7 +196,7 @@ fn is_file_class(class: &str) -> bool {
 /// Forbidden and control characters become `_`, as do dots in the names of
 /// script files (so `Foo.server` cannot turn into a server script). Names that
 /// end in a space or dot, are empty, are reserved on Windows, or would collide
-/// with a directory's `init` file get a `_` added.
+/// with an initializer path get adjusted.
 fn sanitize_stem(name: &str, class: &str) -> String {
     let is_file = is_file_class(class);
     let mut stem: String = name
@@ -188,23 +214,63 @@ fn sanitize_stem(name: &str, class: &str) -> String {
     let reserved = INVALID_WINDOWS_NAMES
         .iter()
         .any(|reserved| upper == *reserved || upper.starts_with(&format!("{reserved}.")));
-    let is_init = is_file && stem.eq_ignore_ascii_case("init");
+    if reserved {
+        // Windows reserves the component before the first dot, so appending
+        // after an extension would not make names like `aux.txt` safe.
+        stem.insert(0, '_');
+    }
 
-    if stem.is_empty() || stem.ends_with([' ', '.']) || reserved || is_init {
+    let lower = stem.to_ascii_lowercase();
+    let file_backed = matches!(
+        class,
+        "Script" | "LocalScript" | "ModuleScript" | "StringValue" | "LocalizationTable"
+    );
+    let initializer = (file_backed && lower == "init")
+        || [
+            "init.lua",
+            "init.luau",
+            "init.server.lua",
+            "init.server.luau",
+            "init.client.lua",
+            "init.client.luau",
+            "init.legacy.lua",
+            "init.legacy.luau",
+            "init.local.lua",
+            "init.local.luau",
+            "init.plugin.lua",
+            "init.plugin.luau",
+            "init.csv",
+            "init.meta.json",
+            "init.meta.jsonc",
+            "default.project.json",
+            "default.project.jsonc",
+        ]
+        .contains(&lower.as_str());
+
+    if stem.is_empty() || stem.ends_with([' ', '.']) || initializer {
         stem.push('_');
     }
 
     stem
 }
 
-/// Assigns each child of `parent` a file stem that is safe for the file system
-/// and unique among its siblings, ignoring case. The first sibling to use a
-/// stem keeps it, and later ones get `~2`, `~3`, and so on.
-///
-/// The result only depends on the children's names, classes, and order, so the
-/// same tree always produces the same stems.
+/// Returns every path a child can occupy, including its adjacent metadata.
+fn output_paths(middleware: Middleware, stem: &str) -> Vec<String> {
+    let mut paths = vec![file_name_for_stem(middleware, stem)];
+    if middleware.is_dir() {
+        paths.push(format!("{stem}/init.meta.json"));
+    } else {
+        paths.push(format!("{stem}.meta.json"));
+    }
+    paths
+}
+
+/// Assigns each child of `parent` a file stem whose generated output paths are
+/// safe and unique among its siblings, ignoring case. The first available stem
+/// is kept, and later collisions get `~2`, `~3`, and so on.
 pub fn unique_child_stems(dom: &WeakDom, parent: &Instance) -> HashMap<Ref, String> {
-    let mut taken = HashSet::with_capacity(parent.children().len());
+    let mut taken = HashSet::with_capacity(parent.children().len() * 2);
+    let mut next_suffix = HashMap::new();
     let mut stems = HashMap::with_capacity(parent.children().len());
 
     for child_ref in parent.children() {
@@ -212,13 +278,30 @@ pub fn unique_child_stems(dom: &WeakDom, parent: &Instance) -> HashMap<Ref, Stri
             .get_by_ref(*child_ref)
             .expect("children should be in the DOM");
         let base = sanitize_stem(&child.name, &child.class);
-        let mut stem = base.clone();
-        let mut counter = 1;
-        while !taken.insert(stem.to_lowercase()) {
+        let base_key = base.to_lowercase();
+        let middleware = directory_middleware_for_instance(child);
+        let mut counter = next_suffix.get(&base_key).copied().unwrap_or(1);
+
+        loop {
+            let stem = if counter == 1 {
+                base.clone()
+            } else {
+                format!("{base}~{counter}")
+            };
+            let paths = output_paths(middleware, &stem);
+            if paths
+                .iter()
+                .all(|path| !taken.contains(&path.to_lowercase()))
+            {
+                for path in paths {
+                    taken.insert(path.to_lowercase());
+                }
+                next_suffix.insert(base_key, counter + 1);
+                stems.insert(*child_ref, stem);
+                break;
+            }
             counter += 1;
-            stem = format!("{base}~{counter}");
         }
-        stems.insert(*child_ref, stem);
     }
 
     stems
@@ -291,8 +374,8 @@ mod test {
                 "_",
                 "trailing _",
                 "dots..._",
-                "CON_",
-                "aux.txt_",
+                "_CON",
+                "_aux.txt",
                 "tab_here"
             ]
         );
@@ -318,6 +401,37 @@ mod test {
             stems_for(&[("a?", "Part"), ("a_", "Part"), ("a*", "Part")]),
             ["a_", "a_~2", "a_~3"]
         );
+    }
+
+    #[test]
+    fn output_paths_are_deduped_not_only_stems() {
+        assert_eq!(
+            stems_for(&[("Foo.luau", "Folder"), ("Foo", "ModuleScript")]),
+            ["Foo.luau", "Foo~2"]
+        );
+        assert_eq!(
+            stems_for(&[("Foo.meta.json", "Folder"), ("Foo", "ModuleScript")]),
+            ["Foo.meta.json", "Foo~2"]
+        );
+    }
+
+    #[test]
+    fn initializer_names_are_reserved() {
+        assert_eq!(
+            stems_for(&[
+                ("init", "LocalizationTable"),
+                ("init.luau", "Folder"),
+                ("default.project.json", "Folder"),
+            ]),
+            ["init_", "init.luau_", "default.project.json_"]
+        );
+    }
+
+    #[test]
+    fn many_duplicates_use_incrementing_suffixes() {
+        let stems = stems_for(&vec![("Part", "Part"); 1000]);
+        assert_eq!(stems[0], "Part");
+        assert_eq!(stems[999], "Part~1000");
     }
 
     #[test]

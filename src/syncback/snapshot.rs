@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     snapshot::{InstanceWithMeta, RojoTree},
-    snapshot_middleware::Middleware,
+    snapshot_middleware::{default_sync_rules, Middleware},
     Project,
 };
 use rbx_dom_weak::{
@@ -98,8 +98,22 @@ impl<'sync> SyncbackSnapshot<'sync> {
     /// Returns the name Rojo will read this Instance's file back as, which is
     /// also the stem of its adjacent `.meta.json` file.
     pub fn file_stem(&self) -> &str {
-        stem_for_path(get_best_middleware(self), &self.path)
-            .unwrap_or(self.new_inst().name.as_str())
+        let middleware = get_best_middleware(self);
+        for rule in self
+            .data
+            .project
+            .sync_rules
+            .iter()
+            .chain(default_sync_rules())
+        {
+            if rule.middleware == middleware && rule.matches(&self.path) {
+                if let Ok(stem) = rule.file_name_for_path(&self.path) {
+                    return stem;
+                }
+            }
+        }
+
+        stem_for_path(middleware, &self.path).unwrap_or(self.new_inst().name.as_str())
     }
 
     /// Constructs a SyncbackSnapshot from the provided refs and a base path,

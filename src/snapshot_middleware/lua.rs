@@ -149,23 +149,18 @@ pub fn snapshot_lua_init(
     let mut init_snapshot =
         snapshot_lua(context, vfs, init_path, &dir_snapshot.name, script_type)?.unwrap();
 
-    // Filter out the init file itself from the directory's children
-    // to avoid creating a duplicate instance. The init script becomes
-    // the container, so it should not also appear as a child. The
-    // child is named "init" when a sync rule strips the script type
-    // suffix (e.g. init.plugin.luau -> "init"), so also match on the
-    // source path in case the project has no rule for the suffix.
+    // Filter out the init file itself from the directory's children by its
+    // source path. A different child may legitimately be named `init`.
     init_snapshot.children = dir_snapshot
         .children
         .into_iter()
         .filter(|child| {
-            child.name != "init"
-                && child
-                    .metadata
-                    .instigating_source
-                    .as_ref()
-                    .map(|source| source.path())
-                    != Some(init_path)
+            child
+                .metadata
+                .instigating_source
+                .as_ref()
+                .map(|source| source.path())
+                != Some(init_path)
         })
         .collect();
     init_snapshot.metadata = dir_snapshot.metadata;
@@ -478,6 +473,38 @@ mod test {
         insta::with_settings!({ sort_maps => true }, {
             insta::assert_yaml_snapshot!(instance_snapshot);
         });
+    }
+
+    #[test]
+    fn init_keeps_a_distinct_child_named_init() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                ("init.luau", VfsSnapshot::file("return {}")),
+                ("init_.luau", VfsSnapshot::file("return {}")),
+                ("init_.meta.json", VfsSnapshot::file(r#"{"name":"init"}"#)),
+            ]),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new(imfs);
+        let instance_snapshot = snapshot_lua_init(
+            &InstanceContext::with_emit_legacy_scripts(Some(false)),
+            &vfs,
+            Path::new("/root/init.luau"),
+            "root",
+            ScriptType::Module,
+        )
+        .unwrap()
+        .unwrap();
+
+        let child_names = instance_snapshot
+            .children
+            .iter()
+            .map(|child| child.name.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(child_names, vec!["init"]);
     }
 
     #[test]

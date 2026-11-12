@@ -148,7 +148,7 @@ pub fn syncback_dir_no_meta<'sync>(
         // name they would be written to rather than by their Instance name.
         let stems = unique_child_stems(snapshot.new_tree(), new_inst);
         let mut old_child_map = HashMap::new();
-        let mut project_children = HashSet::new();
+        let mut project_children = HashMap::new();
         if let Some(old_inst) = snapshot.old_inst() {
             for child in old_inst.children() {
                 let inst = snapshot.get_old_instance(*child).unwrap();
@@ -156,8 +156,9 @@ pub fn syncback_dir_no_meta<'sync>(
                     inst.metadata().instigating_source,
                     Some(InstigatingSource::ProjectNode { .. })
                 ) {
-                    // The project syncback handles children it defines.
-                    project_children.insert(inst.name());
+                    // The project syncback handles one child per matching
+                    // project node, so only skip that many new children.
+                    *project_children.entry(inst.name()).or_insert(0) += 1;
                     continue;
                 }
                 let file_name = inst
@@ -174,7 +175,11 @@ pub fn syncback_dir_no_meta<'sync>(
 
         for new_child_ref in new_inst.children() {
             let new_child = snapshot.get_new_instance(*new_child_ref).unwrap();
-            if project_children.contains(new_child.name.as_str()) {
+            if let Some(remaining) = project_children.get_mut(new_child.name.as_str()) {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    project_children.remove(new_child.name.as_str());
+                }
                 continue;
             }
             let stem = &stems[new_child_ref];

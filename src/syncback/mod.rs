@@ -29,7 +29,8 @@ use crate::{
 };
 
 pub use file_names::{
-    extension_for_middleware, name_for_inst, unique_child_stems, validate_file_name,
+    directory_middleware_for_instance, extension_for_middleware, name_for_inst, unique_child_stems,
+    validate_file_name,
 };
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
@@ -340,14 +341,7 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
     if let Some(override_middleware) = snapshot.middleware {
         return override_middleware;
     } else if instances_as_directories(snapshot.project()) {
-        middleware = match inst.class.as_str() {
-            "Script" => Middleware::ServerScript,
-            "LocalScript" => Middleware::ClientScript,
-            "ModuleScript" => Middleware::ModuleScript,
-            "StringValue" => Middleware::Text,
-            "LocalizationTable" => Middleware::Csv,
-            _ => Middleware::Dir,
-        };
+        return directory_middleware_for_instance(inst);
     } else if let Some(old_middleware) = old_middleware {
         return old_middleware;
     } else if json_model_classes.contains(inst.class.as_str()) {
