@@ -70,6 +70,20 @@ impl<T> IoResultExt<T> for io::Result<T> {
 pub trait VfsBackend: sealed::Sealed + Send + Sync + 'static {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn write(&mut self, path: &Path, data: &[u8]) -> io::Result<()>;
+    fn write_atomic(
+        &mut self,
+        path: &Path,
+        data: &[u8],
+        expected: Option<&[u8]>,
+    ) -> io::Result<()> {
+        if self.read(path).with_not_found()?.as_deref() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Filesystem changed before persistence",
+            ));
+        }
+        self.write(path, data)
+    }
     fn exists(&self, path: &Path) -> io::Result<bool>;
     fn read_dir(&self, path: &Path) -> io::Result<ReadDir>;
     fn create_dir(&mut self, path: &Path) -> io::Result<()>;
@@ -513,6 +527,17 @@ impl VfsLock<'_> {
         let path = path.as_ref();
         let contents = contents.as_ref();
         self.inner.write(path, contents)
+    }
+
+    /// Replaces one file atomically after checking its expected contents.
+    /// External writers must still coordinate to exclude a check/replace race.
+    pub fn write_atomic(
+        &mut self,
+        path: &Path,
+        contents: &[u8],
+        expected: Option<&[u8]>,
+    ) -> io::Result<()> {
+        self.inner.backend.write_atomic(path, contents, expected)
     }
 
     /// Read all of the children of a directory.

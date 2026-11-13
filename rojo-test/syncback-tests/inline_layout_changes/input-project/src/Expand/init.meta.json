@@ -1,0 +1,14 @@
+{
+  "children": [
+    {
+      "className": "Folder",
+      "name": "Holder",
+      "children": [
+        {
+          "className": "Part",
+          "name": "Brick"
+        }
+      ]
+    }
+  ]
+}

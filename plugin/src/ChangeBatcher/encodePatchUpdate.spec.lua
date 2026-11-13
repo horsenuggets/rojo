@@ -1,6 +1,21 @@
 return function()
 	local encodePatchUpdate = require(script.Parent.encodePatchUpdate)
 
+	it("should never encode attributes the filesystem can't hold", function()
+		local part = Instance.new("Part")
+		part:SetAttribute("Health", 5)
+		part:SetAttribute("Far", math.huge)
+		part:SetAttribute("Broken", 0 / 0)
+		part:SetAttribute("Rojo_Id", "linked")
+		local update = encodePatchUpdate(part, "PART", { Attributes = true })
+		local attributes = update.changedProperties.Attributes.Attributes
+		expect(attributes.Health ~= nil).to.equal(true)
+		expect(attributes.Far).to.equal(nil)
+		expect(attributes.Broken).to.equal(nil)
+		expect(attributes.Rojo_Id).to.equal(nil)
+		part:Destroy()
+	end)
+
 	it("should return an update when there are property changes", function()
 		local part = Instance.new("Part")
 		local properties = {
@@ -41,19 +56,24 @@ return function()
 		local part = Instance.new("Part")
 		local properties = {
 			Position = true,
+			Size = true,
 			Color = true,
 		}
 
 		part.Position = Vector3.new(0, 100, 0)
+		part.Size = Vector3.new(2, 100, 4)
 		part.Color = Color3.new(0.8, 0.2, 0.9)
 
 		local update = encodePatchUpdate(part, "PART", properties)
-		local position = update.changedProperties.Position
+		local size = update.changedProperties.Size
 		local color = update.changedProperties.Color
 
-		expect(position.Vector3[1]).to.equal(0)
-		expect(position.Vector3[2]).to.equal(100)
-		expect(position.Vector3[3]).to.equal(0)
+		-- Position doesn't serialize; it's carried by CFrame.
+		expect(update.changedProperties.Position).to.equal(nil)
+
+		expect(size.Vector3[1]).to.equal(2)
+		expect(size.Vector3[2]).to.equal(100)
+		expect(size.Vector3[3]).to.equal(4)
 
 		expect(color.Color3[1]).to.be.near(0.8, 0.01)
 		expect(color.Color3[2]).to.be.near(0.2, 0.01)

@@ -48,6 +48,27 @@ return function()
 	end)
 
 	describe("__cycle", function()
+		it("should dispatch once and unpause instances when a callback returns a patch", function()
+			local instanceMap = InstanceMap.new()
+			local dispatched = {}
+			local changeBatcher = ChangeBatcher.new(instanceMap, function(patch)
+				table.insert(dispatched, patch)
+				return patch
+			end)
+			local part = Instance.new("Part")
+			instanceMap:insert("PART", part)
+			instanceMap.pausedUpdateInstances[part] = true
+			changeBatcher:add(part, "Name")
+
+			changeBatcher:__cycle(0.2)
+
+			expect(#dispatched).to.equal(1)
+			expect(instanceMap.pausedUpdateInstances[part]).to.equal(nil)
+			changeBatcher:stop()
+			instanceMap:stop()
+			part:Destroy()
+		end)
+
 		it("should immediately unpause any paused instances after each cycle", function()
 			local instanceMap = InstanceMap.new()
 			local changeBatcher = ChangeBatcher.new(instanceMap, noop)
@@ -69,7 +90,9 @@ return function()
 
 		it("should return a patch when there are changes to process and the resulting patch is non-empty", function()
 			local instanceMap = InstanceMap.new()
-			local changeBatcher = ChangeBatcher.new(instanceMap, noop)
+			local changeBatcher = ChangeBatcher.new(instanceMap, function(patch)
+				return patch
+			end)
 			local part = Instance.new("Part")
 
 			instanceMap:insert("PART", part)
@@ -82,6 +105,21 @@ return function()
 			local patch = changeBatcher:__flush()
 
 			assert(PatchSet.validate(patch))
+		end)
+
+		it("should dispatch flushed patches to the write callback", function()
+			local instanceMap = InstanceMap.new()
+			local flushedPatch = nil
+			local changeBatcher = ChangeBatcher.new(instanceMap, function(patch)
+				flushedPatch = patch
+				return patch
+			end)
+			local part = Instance.new("Part")
+			instanceMap:insert("PART", part)
+			changeBatcher.__pendingPropertyChanges[part] = { Transparency = true }
+			local result = changeBatcher:__flush()
+			expect(result).to.equal(flushedPatch)
+			assert(PatchSet.validate(result))
 		end)
 
 		it("should return nil when there are changes to process and the resulting patch is empty", function()

@@ -7,7 +7,7 @@ use std::{collections::HashSet, io};
 use crossbeam_channel::Receiver;
 use notify::{watcher, DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::{DirEntry, Metadata, ReadDir, VfsBackend, VfsEvent};
+use crate::{DirEntry, IoResultExt, Metadata, ReadDir, VfsBackend, VfsEvent};
 
 /// `VfsBackend` that uses `std::fs` and the `notify` crate.
 pub struct StdBackend {
@@ -61,6 +61,46 @@ impl VfsBackend for StdBackend {
 
     fn write(&mut self, path: &Path, data: &[u8]) -> io::Result<()> {
         fs_err::write(path, data)
+    }
+
+    fn write_atomic(
+        &mut self,
+        path: &Path,
+        data: &[u8],
+        expected: Option<&[u8]>,
+    ) -> io::Result<()> {
+        use std::io::Write;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("A file must have a parent directory"))?;
+        let metadata = fs_err::symlink_metadata(path).with_not_found()?;
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.is_file())
+        {
+            return Err(io::Error::other("Atomic updates require a regular file"));
+        }
+        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+        staged.write_all(data)?;
+        if let Some(metadata) = metadata {
+            staged.as_file().set_permissions(metadata.permissions())?;
+        }
+        staged.as_file().sync_all()?;
+        if self.read(path).with_not_found()?.as_deref() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Filesystem changed before persistence",
+            ));
+        }
+        if expected.is_some() {
+            staged.persist(path).map_err(|error| error.error)?;
+        } else {
+            staged
+                .persist_noclobber(path)
+                .map_err(|error| error.error)?;
+        }
+        Ok(())
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
@@ -145,6 +185,37 @@ impl VfsBackend for StdBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_rejects_changed_or_unexpected_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let mut backend = StdBackend::new().unwrap();
+        fs_err::write(&path, b"disk").unwrap();
+        for expected in [None, Some(b"stale".as_slice())] {
+            let error = backend
+                .write_atomic(&path, b"studio", expected)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(fs_err::read(&path).unwrap(), b"disk");
+        }
+        backend
+            .write_atomic(&path, b"studio", Some(b"disk"))
+            .unwrap();
+        assert_eq!(fs_err::read(&path).unwrap(), b"studio");
+        assert_eq!(fs_err::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_write_creates_a_missing_file_without_clobbering() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("metadata");
+        let mut backend = StdBackend::new().unwrap();
+        backend.write_atomic(&path, b"new", None).unwrap();
+        assert_eq!(fs_err::read(&path).unwrap(), b"new");
+        assert!(backend.write_atomic(&path, b"other", None).is_err());
+        assert_eq!(fs_err::read(&path).unwrap(), b"new");
+    }
 
     #[test]
     fn failed_watch_registration_can_be_retried() {

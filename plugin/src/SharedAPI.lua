@@ -19,6 +19,12 @@ API:
 > shared.Rojo.getAddress() - Get the current host and port
 > shared.Rojo.connectAndAccept(host?, port?, timeout?) -
   Connect and auto-accept confirmation
+> shared.Rojo.setTwoWaySync(enabled) - Configure two-way sync before connecting
+> shared.Rojo.getTwoWaySync() - Get whether two-way sync is enabled
+> shared.Rojo.getSyncResults() - Get pending, saved, conflicted, and failed writes
+> shared.Rojo.getConfirmationSummary(limit?) - Describe the pending sync confirmation
+> shared.Rojo.getNotifications() - Get current write and connection notifications
+> shared.Rojo.clearSyncResults() - Clear recorded write outcomes
 
 --]]
 
@@ -30,6 +36,8 @@ const Packages = Rojo.Packages
 const Log = require(Packages.Log)
 
 const Config = require(script.Parent.Config)
+const Settings = require(script.Parent.Settings)
+const summarizePatch = require(script.Parent.summarizePatch)
 
 const SharedAPI = {}
 
@@ -161,6 +169,83 @@ function SharedAPI.register(app)
 			host = if #host > 0 then host else Config.defaultHost,
 			port = if #port > 0 then port else Config.defaultPort,
 		}
+	end
+
+	function api.setTwoWaySync(enabled)
+		if registeredApp.state.appStatus == "Connected" or registeredApp.state.appStatus == "Connecting" then
+			return {
+				success = false,
+				error = "Two-way sync must be configured before connecting",
+			}
+		end
+
+		Settings:set("twoWaySync", enabled == true)
+
+		return {
+			success = true,
+			enabled = enabled == true,
+		}
+	end
+
+	function api.getTwoWaySync()
+		return {
+			enabled = Settings:get("twoWaySync"),
+		}
+	end
+
+	function api.getConfirmationSummary(limit)
+		if registeredApp.state.appStatus ~= "Confirming" then
+			return {
+				success = false,
+				error = "Not in confirming state, current status is " .. tostring(registeredApp.state.appStatus),
+			}
+		end
+
+		local confirmData = registeredApp.state.confirmData
+		local summary = summarizePatch(confirmData.patch, confirmData.instanceMap, limit or 100)
+		summary.success = true
+		return summary
+	end
+
+	function api.getNotifications()
+		local notifications = {}
+		for id, notification in pairs(registeredApp.state.notifications) do
+			notifications[id] = {
+				text = notification.text,
+				isFullscreen = notification.isFullscreen == true,
+			}
+		end
+
+		return notifications
+	end
+
+	function api.getSyncResults()
+		if registeredApp.serveSession == nil then
+			return {}
+		end
+
+		return registeredApp.serveSession:getSyncResults()
+	end
+
+	function api.clearSyncResults()
+		if registeredApp.serveSession ~= nil then
+			registeredApp.serveSession:clearSyncResults()
+		end
+
+		return {
+			success = true,
+		}
+	end
+
+	function api.flush()
+		if registeredApp.serveSession == nil then
+			return {
+				success = false,
+				error = "Rojo is not connected",
+			}
+		end
+
+		return registeredApp.serveSession:flushChanges()
 	end
 
 	function api.connectAndAccept(host, port, timeout)

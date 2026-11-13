@@ -167,8 +167,10 @@ pub struct InstanceContext {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub path_ignore_rules: Arc<Vec<PathIgnoreRule>>,
     pub emit_legacy_scripts: bool,
+    // Every instance's metadata keeps a context, and cloning a rule's compiled
+    // glob regex allocates a fresh match cache pool, so the list is shared.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sync_rules: Vec<SyncRule>,
+    pub sync_rules: Arc<Vec<SyncRule>>,
 
     /// When set, `.luaurc` alias requires will be resolved during
     /// snapshotting. Only enabled during `rojo build`.
@@ -181,6 +183,13 @@ pub struct InstanceContext {
     pub(crate) active_projects: Option<Arc<Vec<PathBuf>>>,
     #[serde(skip)]
     pub(crate) active_directories: Option<Arc<Vec<PathBuf>>>,
+
+    /// Set only while reading one instance's own file for a two-way sync write.
+    /// Directories then skip children stored in their own files, so checking an
+    /// edit doesn't re-read a folder's entire subtree. Always cleared before the
+    /// snapshot is compared or applied.
+    #[serde(skip)]
+    pub(crate) shallow: bool,
 }
 
 impl InstanceContext {
@@ -188,10 +197,11 @@ impl InstanceContext {
         Self {
             path_ignore_rules: Arc::new(Vec::new()),
             emit_legacy_scripts: emit_legacy_scripts_default().unwrap(),
-            sync_rules: Vec::new(),
+            sync_rules: Arc::new(Vec::new()),
             require_context: None,
             active_projects: None,
             active_directories: None,
+            shallow: false,
         }
     }
 
@@ -227,12 +237,17 @@ impl InstanceContext {
     where
         I: IntoIterator<Item = SyncRule>,
     {
-        self.sync_rules.extend(new_rules);
+        let mut new_rules = new_rules.into_iter().peekable();
+        if new_rules.peek().is_none() {
+            return;
+        }
+
+        Arc::make_mut(&mut self.sync_rules).extend(new_rules);
     }
 
     /// Clears all sync rules for this InstanceContext
     pub fn clear_sync_rules(&mut self) {
-        self.sync_rules.clear();
+        self.sync_rules = Arc::new(Vec::new());
     }
 
     pub fn set_emit_legacy_scripts(&mut self, emit_legacy_scripts: bool) {
@@ -409,5 +424,42 @@ impl SyncRule {
                 .and_then(|s| s.to_str())
                 .with_context(|| format!("file name of {} is invalid", path.display()))
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn rule(pattern: &str) -> SyncRule {
+        SyncRule {
+            include: Glob::new(pattern).unwrap(),
+            exclude: None,
+            middleware: Middleware::Text,
+            suffix: None,
+            base_path: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn cloned_contexts_share_sync_rules_until_changed() {
+        let mut parent = InstanceContext::new();
+        parent.add_sync_rules([rule("*.text")]);
+
+        let mut child = parent.clone();
+        assert!(Arc::ptr_eq(&parent.sync_rules, &child.sync_rules));
+
+        child.add_sync_rules(std::iter::empty());
+        assert!(Arc::ptr_eq(&parent.sync_rules, &child.sync_rules));
+
+        child.add_sync_rules([rule("*.data")]);
+        assert!(!Arc::ptr_eq(&parent.sync_rules, &child.sync_rules));
+        assert_eq!(parent.sync_rules.len(), 1);
+        assert_eq!(child.sync_rules.len(), 2);
+
+        child.clear_sync_rules();
+        assert!(child.sync_rules.is_empty());
+        assert_eq!(parent.sync_rules.len(), 1);
+        assert!(parent.get_user_sync_rule(Path::new("a.text")).is_some());
     }
 }

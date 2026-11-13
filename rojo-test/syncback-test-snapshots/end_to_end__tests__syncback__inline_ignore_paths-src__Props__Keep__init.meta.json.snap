@@ -1,0 +1,8 @@
+---
+source: tests/tests/syncback.rs
+assertion_line: 35
+expression: src/Props/Keep/init.meta.json
+---
+{
+    "className": "Configuration"
+}

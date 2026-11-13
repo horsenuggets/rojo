@@ -1,0 +1,12 @@
+{
+  "name": "inline_relayout_unchanged",
+  "tree": {
+    "$className": "Folder",
+    "src": {
+      "$path": "src"
+    }
+  },
+  "syncbackRules": {
+    "instancesAsDirectories": true
+  }
+}

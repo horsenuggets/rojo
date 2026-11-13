@@ -1,0 +1,21 @@
+---
+source: tests/tests/syncback.rs
+expression: default.project.json
+---
+{
+    "name": "non_finite_attributes",
+    "tree": {
+        "$className": "Folder",
+        "ProjectNode": {
+            "$className": "Folder",
+            "$attributes": {
+                "Finite": {
+                    "Float32": 1.0
+                }
+            }
+        },
+        "src": {
+            "$path": "src"
+        }
+    }
+}

@@ -23,8 +23,8 @@ use crate::{
     },
     snapshot_middleware::Middleware,
     syncback::{
-        filter_properties, get_property_filter, instances_as_directories, FsSnapshot,
-        SyncbackReturn, SyncbackSnapshot,
+        filter_properties, get_property_filter, instances_as_directories, is_json_compatible,
+        FsSnapshot, SyncbackReturn, SyncbackSnapshot,
     },
     variant_eq::variant_eq,
     RojoRef,
@@ -598,7 +598,7 @@ fn project_node_property_syncback(
                 for (attr_name, attr_value) in attrs.iter() {
                     // We (probably) don't want to preserve internal attributes,
                     // only user defined ones.
-                    if attr_name.starts_with("RBX") {
+                    if attr_name.starts_with("RBX") || !is_json_compatible(attr_value) {
                         continue;
                     }
                     attributes.insert(

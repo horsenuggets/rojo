@@ -117,7 +117,7 @@ function SettingsPage:render()
 				description = "What type of reminders you receive for syncing your project",
 				transparency = self.props.transparency,
 				layoutOrder = layoutIncrement(),
-				visible = Settings:getBinding("showNotifications"),
+				visible = false,
 
 				options = syncReminderModes,
 			}),
@@ -128,9 +128,7 @@ function SettingsPage:render()
 				description = "Look for available sync servers periodically",
 				transparency = self.props.transparency,
 				layoutOrder = layoutIncrement(),
-				visible = Settings:getBindings("syncReminderMode", "showNotifications"):map(function(values)
-					return values.syncReminderMode ~= "None" and values.showNotifications
-				end),
+				visible = false,
 			}),
 
 			ConfirmationBehavior = e(Setting, {
@@ -198,6 +196,7 @@ function SettingsPage:render()
 				lockedTooltip = "(HTTP requests to api.github.com are blocked, Rojo cannot fetch what the latest version is.)",
 				transparency = self.props.transparency,
 				layoutOrder = layoutIncrement(),
+				visible = false,
 			}),
 
 			CheckForPreleases = e(Setting, {
@@ -206,9 +205,7 @@ function SettingsPage:render()
 				description = "Include prereleases when checking for updates",
 				transparency = self.props.transparency,
 				layoutOrder = layoutIncrement(),
-				visible = if string.find(debug.traceback(), "\n[^\n]-user_.-$") == nil
-					then false -- Must be a local install to allow prerelease checks
-					else Settings:getBinding("checkForUpdates"),
+				visible = false,
 			}),
 
 			AutoConnectPlaytestServer = e(Setting, {

@@ -1,0 +1,12 @@
+{
+  "name": "inline_layout_changes",
+  "tree": {
+    "$className": "Folder",
+    "src": {
+      "$path": "src"
+    }
+  },
+  "syncbackRules": {
+    "instancesAsDirectories": true
+  }
+}

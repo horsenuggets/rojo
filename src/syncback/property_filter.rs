@@ -152,6 +152,32 @@ fn cframe_is_finite(cframe: &CFrame) -> bool {
     .all(f32::is_finite)
 }
 
+pub(crate) fn can_write_property(project: &Project, class_name: &str, prop_name: &str) -> bool {
+    if !should_property_serialize(class_name, prop_name) {
+        return false;
+    }
+    if project
+        .syncback_rules
+        .as_ref()
+        .and_then(|rules| rules.sync_unscriptable)
+        != Some(false)
+    {
+        return true;
+    }
+    let database = rbx_reflection_database::get().unwrap();
+    let mut current_class = class_name;
+    while let Some(class) = database.classes.get(current_class) {
+        if let Some(property) = class.properties.get(prop_name) {
+            return !matches!(property.scriptability, Scriptability::None);
+        }
+        match class.superclass {
+            Some(parent) => current_class = parent,
+            None => break,
+        }
+    }
+    true
+}
+
 fn should_property_serialize(class_name: &str, prop_name: &str) -> bool {
     let database = rbx_reflection_database::get().unwrap();
     let mut current_class_name = class_name;

@@ -1,0 +1,7 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Mixed/Scripts/Marker/init.meta.json
+---
+{
+    "className": "Part"
+}

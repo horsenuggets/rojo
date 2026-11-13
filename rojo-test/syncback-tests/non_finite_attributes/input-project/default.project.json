@@ -1,0 +1,12 @@
+{
+  "name": "non_finite_attributes",
+  "tree": {
+    "$className": "Folder",
+    "ProjectNode": {
+      "$className": "Folder"
+    },
+    "src": {
+      "$path": "src"
+    }
+  }
+}

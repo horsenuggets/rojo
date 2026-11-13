@@ -1,0 +1,12 @@
+{
+  "name": "inline_jsonc_rewrite",
+  "tree": {
+    "$className": "Folder",
+    "src": {
+      "$path": "src"
+    }
+  },
+  "syncbackRules": {
+    "instancesAsDirectories": true
+  }
+}

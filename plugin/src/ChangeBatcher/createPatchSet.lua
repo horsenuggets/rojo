@@ -18,8 +18,10 @@ return function(instanceMap, propertyChanges)
 	for instance, properties in propertyChanges do
 		local instanceId = instanceMap.fromInstances[instance]
 
-		if instanceId == nil then
-			Log.warn("Ignoring change for instance {:?} as it is unknown to Rojo", instance)
+		-- The DataModel comes from the project file rather than anything Studio can
+		-- write back, and connecting renames it to the project's name.
+		if instanceId == nil or instance:IsA("DataModel") then
+			propertyChanges[instance] = nil
 			continue
 		end
 
@@ -30,8 +32,10 @@ return function(instanceMap, propertyChanges)
 				Log.warn("Cannot sync non-nil Parent property changes yet")
 			end
 		else
-			local update = encodePatchUpdate(instance, instanceId, properties)
-			table.insert(patch.updated, update)
+			local update = encodePatchUpdate(instance, instanceId, properties, instanceMap)
+			if update ~= nil then
+				table.insert(patch.updated, update)
+			end
 		end
 
 		propertyChanges[instance] = nil

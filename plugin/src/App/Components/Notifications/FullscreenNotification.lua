@@ -114,9 +114,9 @@ function FullscreenNotification:render()
 			Logo = e("ImageLabel", {
 				ImageTransparency = self.transparency,
 				Image = Assets.Images.Logo,
-				ImageColor3 = theme.Header.LogoColor,
+				ScaleType = Enum.ScaleType.Fit,
 				BackgroundTransparency = 1,
-				Size = UDim2.fromOffset(60, 27),
+				Size = UDim2.fromOffset(48, 48),
 				LayoutOrder = 1,
 			}),
 			Info = e("TextLabel", {

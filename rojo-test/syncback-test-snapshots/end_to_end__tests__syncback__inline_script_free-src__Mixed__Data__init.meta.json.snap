@@ -1,0 +1,28 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Mixed/Data/init.meta.json
+---
+{
+    "children": [
+        {
+            "className": "Part",
+            "name": "Target",
+            "attributes": {
+                "Rojo_Id": "target-id"
+            }
+        },
+        {
+            "className": "Configuration",
+            "name": "Settings",
+            "children": [
+                {
+                    "className": "BoolValue",
+                    "name": "Flag",
+                    "properties": {
+                        "Value": true
+                    }
+                }
+            ]
+        }
+    ]
+}

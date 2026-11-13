@@ -4,7 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use memofs::Vfs;
+use memofs::{IoResultExt, Vfs};
+
+use crate::snapshot_middleware::dir_init_files;
 
 /// A simple representation of a subsection of a file system.
 #[derive(Default)]
@@ -128,6 +130,107 @@ impl FsSnapshot {
         Ok(())
     }
 
+    /// Captures raw source bytes before snapshotting or serialization can race an editor.
+    pub fn capture_file_contents(
+        paths: &[PathBuf],
+        vfs: &Vfs,
+    ) -> io::Result<HashMap<PathBuf, Option<Vec<u8>>>> {
+        let mut lock = vfs.lock();
+        let mut expected = HashMap::new();
+        let mut pending: Vec<PathBuf> = paths.to_vec();
+        while let Some(path) = pending.pop() {
+            if lock
+                .metadata(&path)
+                .with_not_found()?
+                .is_some_and(|metadata| metadata.is_dir())
+            {
+                // Directories don't record their absent init files, since that
+                // costs memory for every directory. Capture them here so a write
+                // still fails if one appears and changes what the directory is.
+                for (_, name) in dir_init_files() {
+                    let init_path = path.join(name);
+                    if !expected.contains_key(&init_path) {
+                        pending.push(init_path);
+                    }
+                }
+                continue;
+            }
+            let contents = lock
+                .read(&path)
+                .with_not_found()?
+                .map(|bytes| (*bytes).clone());
+            expected.insert(path, contents);
+        }
+        Ok(expected)
+    }
+
+    /// Persists a scoped update without allowing partial multi-file writes.
+    /// Directory creation and removals require a transaction and are rejected here.
+    pub fn write_single_file_to_vfs<P: AsRef<Path>>(
+        &self,
+        base: P,
+        vfs: &Vfs,
+        expected: &HashMap<PathBuf, Option<Vec<u8>>>,
+    ) -> io::Result<()> {
+        let mut lock = vfs.lock();
+        let base = base.as_ref();
+        if !self.removed_files.is_empty() || !self.removed_dirs.is_empty() {
+            return Err(io::Error::other(
+                "Scoped updates cannot remove filesystem paths",
+            ));
+        }
+        for path in &self.added_dirs {
+            if !lock.metadata(base.join(path))?.is_dir() {
+                return Err(io::Error::other(
+                    "Scoped updates require existing directories",
+                ));
+            }
+        }
+        for (path, previous) in expected {
+            let current = lock.read(path).with_not_found()?;
+            if current.as_ref().map(|bytes| bytes.as_slice()) != previous.as_deref() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Filesystem changed before persistence",
+                ));
+            }
+        }
+        let mut changed = Vec::new();
+        for (path, contents) in &self.added_files {
+            let path = base.join(path);
+            let previous = expected.get(&path).ok_or_else(|| {
+                io::Error::other("The write target was not included in filesystem validation")
+            })?;
+            if previous.as_deref() != Some(contents.as_slice()) {
+                changed.push((path, contents, previous));
+            }
+        }
+        if changed.len() > 1 {
+            return Err(io::Error::other(
+                "Multi-file updates require transactional persistence and are not supported yet",
+            ));
+        }
+        if let Some((path, contents, previous)) = changed.pop() {
+            lock.write_atomic(&path, contents, previous.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether writing this snapshot would change any file's contents,
+    /// compared with the contents captured in `expected`.
+    pub fn changes_files<P: AsRef<Path>>(
+        &self,
+        base: P,
+        expected: &HashMap<PathBuf, Option<Vec<u8>>>,
+    ) -> bool {
+        let base = base.as_ref();
+        self.added_files.iter().any(|(path, contents)| {
+            expected
+                .get(&base.join(path))
+                .is_none_or(|previous| previous.as_deref() != Some(contents.as_slice()))
+        })
+    }
+
     /// Returns whether this `FsSnapshot` is empty or not.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -135,6 +238,21 @@ impl FsSnapshot {
             && self.added_dirs.is_empty()
             && self.removed_files.is_empty()
             && self.removed_dirs.is_empty()
+    }
+
+    /// Changes an added file's destination without changing its contents.
+    pub fn retarget_added_file(&mut self, from: &Path, to: &Path) {
+        if let Some(contents) = self.added_files.remove(from) {
+            self.added_files.insert(to.to_path_buf(), contents);
+        }
+    }
+
+    /// Retains only added files needed by the scoped update.
+    pub fn retain_added_files<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        self.added_files.retain(|path, _| predicate(path));
     }
 
     /// Returns a list of paths that would be added by this `FsSnapshot`.
@@ -187,5 +305,163 @@ impl FsSnapshot {
         let mut removed_dirs: Vec<_> = self.removed_dirs.iter().map(PathBuf::as_path).collect();
         removed_dirs.sort_unstable();
         removed_dirs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn multi_file_scoped_updates_fail_before_changing_any_file() {
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot("/project", VfsSnapshot::empty_dir())
+            .unwrap();
+        backend
+            .load_snapshot("/project/a", VfsSnapshot::file("old a"))
+            .unwrap();
+        backend
+            .load_snapshot("/project/b", VfsSnapshot::file("old b"))
+            .unwrap();
+        let vfs = Vfs::new(backend);
+        let expected = FsSnapshot::capture_file_contents(
+            &[PathBuf::from("/project/a"), PathBuf::from("/project/b")],
+            &vfs,
+        )
+        .unwrap();
+        let staged = FsSnapshot::new()
+            .with_added_file("a", b"new a".to_vec())
+            .with_added_file("b", b"new b".to_vec());
+        assert!(staged
+            .write_single_file_to_vfs("/project", &vfs, &expected)
+            .is_err());
+        assert_eq!(&**vfs.read("/project/a").unwrap(), b"old a");
+        assert_eq!(&**vfs.read("/project/b").unwrap(), b"old b");
+    }
+
+    #[test]
+    fn raw_disk_edits_after_capture_are_never_overwritten() {
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot("/project", VfsSnapshot::empty_dir())
+            .unwrap();
+        backend
+            .load_snapshot("/project/a", VfsSnapshot::file("old"))
+            .unwrap();
+        let vfs = Vfs::new(backend);
+        let expected =
+            FsSnapshot::capture_file_contents(&[PathBuf::from("/project/a")], &vfs).unwrap();
+        let staged = FsSnapshot::new().with_added_file("a", b"studio".to_vec());
+        vfs.write("/project/a", b"disk edit").unwrap();
+        let error = staged
+            .write_single_file_to_vfs("/project", &vfs, &expected)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(&**vfs.read("/project/a").unwrap(), b"disk edit");
+    }
+
+    #[test]
+    fn new_init_files_in_a_captured_directory_block_writes() {
+        for (_, init_name) in dir_init_files() {
+            let mut backend = InMemoryFs::new();
+            backend
+                .load_snapshot("/project", VfsSnapshot::empty_dir())
+                .unwrap();
+            backend
+                .load_snapshot("/project/Folder", VfsSnapshot::empty_dir())
+                .unwrap();
+            backend
+                .load_snapshot("/project/Folder/init.meta.json", VfsSnapshot::file("{}"))
+                .unwrap();
+            let vfs = Vfs::new(backend);
+            let expected = FsSnapshot::capture_file_contents(
+                &[
+                    PathBuf::from("/project/Folder"),
+                    PathBuf::from("/project/Folder/init.meta.json"),
+                ],
+                &vfs,
+            )
+            .unwrap();
+            let staged = FsSnapshot::new().with_added_file("init.meta.json", b"{ }".to_vec());
+
+            vfs.write(format!("/project/Folder/{init_name}"), b"")
+                .unwrap();
+
+            let error = staged
+                .write_single_file_to_vfs("/project/Folder", &vfs, &expected)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{init_name}");
+            assert_eq!(
+                &**vfs.read("/project/Folder/init.meta.json").unwrap(),
+                b"{}"
+            );
+        }
+    }
+
+    /// A write is only a change when a staged file differs from what was
+    /// captured, including files that don't exist yet.
+    #[test]
+    fn changes_files_compares_staged_files_with_captured_contents() {
+        let base = PathBuf::from("/project");
+        let expected = HashMap::from([
+            (PathBuf::from("/project/a"), Some(b"old".to_vec())),
+            (PathBuf::from("/project/missing"), None),
+        ]);
+        let cases = [
+            (FsSnapshot::new(), false),
+            (
+                FsSnapshot::new().with_added_file("a", b"old".to_vec()),
+                false,
+            ),
+            (
+                FsSnapshot::new().with_added_file("a", b"new".to_vec()),
+                true,
+            ),
+            (
+                FsSnapshot::new().with_added_file("missing", Vec::new()),
+                true,
+            ),
+            (
+                FsSnapshot::new().with_added_file("uncaptured", b"x".to_vec()),
+                true,
+            ),
+        ];
+        for (index, (snapshot, changes)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                snapshot.changes_files(&base, &expected),
+                changes,
+                "case {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_staged_files_do_not_prevent_a_single_file_update() {
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot("/project", VfsSnapshot::empty_dir())
+            .unwrap();
+        backend
+            .load_snapshot("/project/a", VfsSnapshot::file("old a"))
+            .unwrap();
+        backend
+            .load_snapshot("/project/b", VfsSnapshot::file("old b"))
+            .unwrap();
+        let vfs = Vfs::new(backend);
+        let expected = FsSnapshot::capture_file_contents(
+            &[PathBuf::from("/project/a"), PathBuf::from("/project/b")],
+            &vfs,
+        )
+        .unwrap();
+        let staged = FsSnapshot::new()
+            .with_added_file("a", b"new a".to_vec())
+            .with_added_file("b", b"old b".to_vec());
+        staged
+            .write_single_file_to_vfs("/project", &vfs, &expected)
+            .unwrap();
+        assert_eq!(&**vfs.read("/project/a").unwrap(), b"new a");
+        assert_eq!(&**vfs.read("/project/b").unwrap(), b"old b");
     }
 }

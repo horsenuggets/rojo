@@ -1,0 +1,73 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Props/init.meta.json
+---
+{
+    "children": [
+        {
+            "className": "Part",
+            "name": "Base",
+            "properties": {
+                "Anchored": true
+            },
+            "attributes": {
+                "Count": {
+                    "Float32": 3.0
+                },
+                "Rojo_Id": "base-id"
+            }
+        },
+        {
+            "className": "Folder",
+            "name": "Nested",
+            "children": [
+                {
+                    "className": "IntValue",
+                    "name": "Value",
+                    "properties": {
+                        "Value": 5.0
+                    }
+                }
+            ]
+        },
+        {
+            "className": "Part",
+            "name": "Dup",
+            "properties": {
+                "Transparency": 0.25
+            }
+        },
+        {
+            "className": "Part",
+            "name": "Dup",
+            "properties": {
+                "Transparency": 0.5
+            }
+        },
+        {
+            "className": "Folder",
+            "name": "a/b"
+        },
+        {
+            "className": "StringValue",
+            "name": "Note",
+            "properties": {
+                "Value": "hi"
+            }
+        },
+        {
+            "className": "ObjectValue",
+            "name": "Pointer",
+            "attributes": {
+                "Rojo_Target_Value": "base-id"
+            }
+        },
+        {
+            "className": "ObjectValue",
+            "name": "OutPointer",
+            "attributes": {
+                "Rojo_Target_Value": "target-id"
+            }
+        }
+    ]
+}
