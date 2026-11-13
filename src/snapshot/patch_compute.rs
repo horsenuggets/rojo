@@ -8,7 +8,7 @@ use rbx_dom_weak::{
     ustr, HashMapExt as _, UstrMap, UstrSet,
 };
 
-use crate::{variant_eq::variant_eq, RojoRef, REF_POINTER_ATTRIBUTE_PREFIX};
+use crate::{variant_eq::variant_eq, RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX};
 
 use super::{
     patch::{PatchAdd, PatchSet, PatchUpdate},
@@ -17,10 +17,33 @@ use super::{
 
 #[profiling::function]
 pub fn compute_patch_set(snapshot: Option<InstanceSnapshot>, tree: &RojoTree, id: Ref) -> PatchSet {
+    compute_patch_set_with(snapshot, tree, id, false)
+}
+
+/// Like [`compute_patch_set`], for a snapshot from `snapshot_shallow_from_vfs`.
+/// Children with their own source files were left out of that read, so they're
+/// kept rather than treated as removed.
+pub fn compute_shallow_patch_set(
+    snapshot: Option<InstanceSnapshot>,
+    tree: &RojoTree,
+    id: Ref,
+) -> PatchSet {
+    compute_patch_set_with(snapshot, tree, id, true)
+}
+
+fn compute_patch_set_with(
+    snapshot: Option<InstanceSnapshot>,
+    tree: &RojoTree,
+    id: Ref,
+    keep_sourced_children: bool,
+) -> PatchSet {
     let mut patch_set = PatchSet::new();
 
     if let Some(snapshot) = snapshot {
-        let mut context = ComputePatchContext::default();
+        let mut context = ComputePatchContext {
+            keep_sourced_children,
+            ..Default::default()
+        };
 
         compute_patch_set_internal(&mut context, snapshot, tree, id, &mut patch_set);
 
@@ -38,6 +61,7 @@ pub fn compute_patch_set(snapshot: Option<InstanceSnapshot>, tree: &RojoTree, id
 #[derive(Default)]
 struct ComputePatchContext {
     snapshot_id_to_instance_id: HashMap<Ref, Ref>,
+    keep_sourced_children: bool,
 }
 
 fn rewrite_refs_in_updates(context: &ComputePatchContext, updates: &mut [PatchUpdate]) {
@@ -116,6 +140,11 @@ fn compute_property_patches(
         Some(take(&mut snapshot.class_name))
     };
 
+    // Applying a patch gives an instance the ID in its `Rojo_Id` attribute, so a
+    // fresh snapshot only matches the tree once it carries that ID as well.
+    if let Some(specified_id) = attribute_specified_id(snapshot) {
+        snapshot.metadata.specified_id = Some(specified_id);
+    }
     let changed_metadata = if &snapshot.metadata == instance.metadata() {
         None
     } else {
@@ -271,7 +300,30 @@ fn compute_children_patches(
             continue;
         }
 
+        if context.keep_sourced_children
+            && tree
+                .get_metadata(*instance_child_id)
+                .is_some_and(|metadata| metadata.instigating_source.is_some())
+        {
+            continue;
+        }
+
         patch_set.removed_instances.push(*instance_child_id);
+    }
+}
+
+/// Returns the ID a snapshot's `Rojo_Id` attribute gives it, read the same way
+/// patch application reads it.
+fn attribute_specified_id(snapshot: &InstanceSnapshot) -> Option<RojoRef> {
+    let Some(Variant::Attributes(attributes)) = snapshot.properties.get(&ustr("Attributes")) else {
+        return None;
+    };
+    match attributes.get(REF_ID_ATTRIBUTE_NAME)? {
+        Variant::String(id) => Some(RojoRef::new(id.clone())),
+        Variant::BinaryString(id) => std::str::from_utf8(id.as_ref())
+            .ok()
+            .map(|id| RojoRef::new(id.to_owned())),
+        _ => None,
     }
 }
 
@@ -326,6 +378,44 @@ mod test {
     use super::*;
 
     use std::borrow::Cow;
+
+    use rbx_dom_weak::types::Attributes;
+
+    use crate::snapshot::apply_patch_set;
+
+    /// An unchanged instance whose ID comes from its `Rojo_Id` attribute must not
+    /// look changed, or two-way sync would treat every write to it as a conflict.
+    #[test]
+    fn attribute_ids_do_not_report_metadata_changes() {
+        for id in [
+            Variant::String("target".into()),
+            Variant::BinaryString(b"target".to_vec().into()),
+        ] {
+            let mut attributes = Attributes::new();
+            attributes.insert(REF_ID_ATTRIBUTE_NAME.into(), id);
+            let child = InstanceSnapshot::new()
+                .name("Target")
+                .class_name("Part")
+                .properties(UstrMap::from_iter([(
+                    ustr("Attributes"),
+                    Variant::Attributes(attributes),
+                )]));
+            let root = InstanceSnapshot::new().name("Root").children(vec![child]);
+            let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root"));
+            let root_id = tree.get_root_id();
+            let patch = compute_patch_set(Some(root.clone()), &tree, root_id);
+            apply_patch_set(&mut tree, patch);
+            let target = tree.root().children()[0];
+            assert_eq!(
+                tree.get_specified_id(&RojoRef::new("target".into())),
+                Some(target)
+            );
+            assert_eq!(
+                compute_patch_set(Some(root), &tree, root_id),
+                PatchSet::new()
+            );
+        }
+    }
 
     /// This test makes sure that rewriting refs in instance update patches to
     /// instances that already exists works. We should be able to correlate the

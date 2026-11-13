@@ -5,7 +5,7 @@ use insta::assert_yaml_snapshot;
 use rbx_dom_weak::{types::Ref, ustr, UstrMap};
 use rojo_insta_ext::RedactionMap;
 
-use crate::snapshot::{compute_patch_set, InstanceSnapshot, RojoTree};
+use crate::snapshot::{compute_patch_set, compute_shallow_patch_set, InstanceSnapshot, RojoTree};
 
 #[test]
 fn set_name_and_class_name() {
@@ -140,6 +140,55 @@ fn remove_child() {
     let patch_value = redactions.redacted_yaml(patch_set);
 
     assert_yaml_snapshot!(patch_value);
+}
+
+/// Walks every combination of whether a child has its own source file, whether
+/// the new snapshot still contains it, and whether the comparison is shallow.
+/// Only a shallow comparison may keep a missing child, and only one that has
+/// its own source, since a shallow read never includes those.
+#[test]
+fn shallow_patches_keep_only_children_with_their_own_source() {
+    for bits in 0..8u8 {
+        let sourced = bits & 1 != 0;
+        let in_snapshot = bits & 2 != 0;
+        let shallow = bits & 4 != 0;
+
+        let mut child = InstanceSnapshot::new().name("Child").class_name("Folder");
+        if sourced {
+            child.metadata = child
+                .metadata
+                .instigating_source(std::path::PathBuf::from("/root/Child"));
+        }
+        let tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("ROOT")
+                .class_name("Folder")
+                .children(vec![child.clone()]),
+        );
+        let child_id = tree.root().children()[0];
+
+        let mut snapshot = InstanceSnapshot::new()
+            .name("ROOT")
+            .class_name("Folder")
+            .property(ustr("Changed"), "yes");
+        if in_snapshot {
+            snapshot.children.push(child);
+        }
+
+        let patch = if shallow {
+            compute_shallow_patch_set(Some(snapshot), &tree, tree.get_root_id())
+        } else {
+            compute_patch_set(Some(snapshot), &tree, tree.get_root_id())
+        };
+
+        let removed = patch.removed_instances.contains(&child_id);
+        let kept_by_shallow_read = shallow && sourced;
+        let expect_removed = !(in_snapshot || kept_by_shallow_read);
+        assert_eq!(removed, expect_removed, "bits {bits:03b}");
+        // The root's own change is always found, shallow or not.
+        assert_eq!(patch.updated_instances.len(), 1, "bits {bits:03b}");
+        assert!(patch.added_instances.is_empty(), "bits {bits:03b}");
+    }
 }
 
 fn empty_tree() -> RojoTree {

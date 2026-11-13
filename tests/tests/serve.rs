@@ -228,6 +228,44 @@ fn edit_init() {
     });
 }
 
+/// Folders don't track init files that don't exist yet, so creating one must
+/// still reach the folder through its nearest tracked ancestor path.
+#[test]
+fn add_init_to_folder() {
+    run_serve_test("add_init_to_folder", |session, _redactions| {
+        let root_id = session.get_api_rojo().unwrap().root_instance_id;
+        let folder_state = || {
+            let read_response = session.get_api_read(root_id).unwrap();
+            let folder = read_response
+                .instances
+                .values()
+                .find(|instance| instance.name == "Folder")
+                .expect("the folder instance should exist");
+            let child_names: Vec<String> = folder
+                .children
+                .iter()
+                .map(|id| read_response.instances[id].name.to_string())
+                .collect();
+            (folder.class_name.to_string(), child_names)
+        };
+
+        assert_eq!(
+            folder_state(),
+            ("Folder".to_owned(), vec!["Child".to_owned()])
+        );
+
+        fs::write(session.path().join("src/Folder/init.luau"), b"return 1").unwrap();
+        session
+            .get_api_socket_packet(SocketPacketType::Messages, 0)
+            .unwrap();
+
+        assert_eq!(
+            folder_state(),
+            ("ModuleScript".to_owned(), vec!["Child".to_owned()])
+        );
+    });
+}
+
 #[test]
 fn move_folder_of_stuff() {
     run_serve_test("move_folder_of_stuff", |session, mut redactions| {

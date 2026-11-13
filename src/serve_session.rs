@@ -12,13 +12,13 @@ use memofs::Vfs;
 use thiserror::Error;
 
 use crate::{
-    change_processor::ChangeProcessor,
+    change_processor::{ChangeProcessor, TreeMutation},
     message_queue::MessageQueue,
     project::{Project, ProjectError, ProjectNode},
     session_id::SessionId,
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstanceContext, InstanceSnapshot,
-        PatchSet, RequireContext, RojoTree,
+        RequireContext, RojoTree,
     },
     snapshot_middleware::snapshot_from_vfs,
 };
@@ -56,7 +56,7 @@ pub struct ServeSession {
     /// This will be defined if a folder with a `default.project.json` file was
     /// used for starting the serve session, or if the user specified a full
     /// path to a `.project.json` file.
-    root_project: Project,
+    root_project: Arc<Project>,
 
     /// A randomly generated ID for this serve session. It's used to ensure that
     /// a client doesn't begin connecting to a different server part way through
@@ -84,7 +84,7 @@ pub struct ServeSession {
 
     /// A channel to send mutation requests on. These will be handled by the
     /// ChangeProcessor and trigger changes in the tree.
-    tree_mutation_sender: Sender<PatchSet>,
+    tree_mutation_sender: Sender<TreeMutation>,
 }
 
 impl ServeSession {
@@ -115,7 +115,7 @@ impl ServeSession {
 
         log::trace!("Starting new ServeSession at path {}", start_path.display());
 
-        let root_project = Project::load_initial_project(&vfs, start_path)?;
+        let root_project = Arc::new(Project::load_initial_project(&vfs, start_path)?);
 
         let mut tree = RojoTree::new(InstanceSnapshot::new());
 
@@ -162,6 +162,7 @@ impl ServeSession {
             Arc::clone(&message_queue),
             tree_mutation_receiver,
             pool,
+            Arc::clone(&root_project),
         );
 
         Ok(Self {
@@ -184,7 +185,7 @@ impl ServeSession {
         self.tree.lock().unwrap()
     }
 
-    pub fn tree_mutation_sender(&self) -> Sender<PatchSet> {
+    pub fn tree_mutation_sender(&self) -> Sender<TreeMutation> {
         self.tree_mutation_sender.clone()
     }
 

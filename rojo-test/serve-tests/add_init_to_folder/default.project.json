@@ -1,0 +1,6 @@
+{
+  "name": "add_init_to_folder",
+  "tree": {
+    "$path": "src"
+  }
+}

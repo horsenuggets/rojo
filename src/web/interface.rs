@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 use strum::Display;
 
 use crate::{
+    rojo_ref::without_link_attributes,
     session_id::SessionId,
     snapshot::{
-        AppliedPatchSet, InstanceMetadata as RojoInstanceMetadata, InstanceWithMeta, RojoTree,
+        AppliedPatchSet, InstanceMetadata as RojoInstanceMetadata, InstanceWithMeta, PatchSet,
+        RojoTree,
     },
 };
 
@@ -62,6 +64,22 @@ impl<'a> SubscribeMessage<'a> {
                 let changed_properties = update
                     .changed_properties
                     .into_iter()
+                    .map(|(key, value)| {
+                        // MessagePack nil map entries disappear in Luau. Send the reflection
+                        // default explicitly while keeping absent properties absent in the DOM.
+                        let value = value.or_else(|| {
+                            let instance = tree.get_instance(update.id)?;
+                            let database = rbx_reflection_database::get().unwrap();
+                            database
+                                .classes
+                                .get(instance.class_name().as_str())?
+                                .default_properties
+                                .get(key.as_str())
+                                .cloned()
+                        });
+                        let value = value.map(|value| without_link_attributes(&value).into_owned());
+                        (key, value)
+                    })
                     .filter(|(_key, value)| property_filter(value.as_ref()))
                     .collect();
 
@@ -129,7 +147,7 @@ impl Instance<'_> {
             .properties()
             .iter()
             .filter(|(_key, value)| property_filter(Some(value)))
-            .map(|(key, value)| (*key, Cow::Borrowed(value)))
+            .map(|(key, value)| (*key, without_link_attributes(value)))
             .collect();
 
         Instance {
@@ -180,6 +198,9 @@ pub struct ReadResponse<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct WriteRequest {
     pub session_id: SessionId,
+    /// The last server revision applied before this Studio batch began.
+    #[serde(default)]
+    pub message_cursor: Option<u32>,
     pub removed: Vec<Ref>,
 
     #[serde(default)]
@@ -191,7 +212,20 @@ pub struct WriteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct WriteResponse {
     pub session_id: SessionId,
+    pub accepted: PatchSet,
+    pub conflicts: PatchSet,
+    pub errors: Vec<WriteError>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteError {
+    pub id: Ref,
+    pub property: Option<String>,
+    pub message: String,
+}
+
+pub type WriteResult = (PatchSet, PatchSet, Vec<WriteError>);
 
 /// Packet type enum for different websocket message types
 #[derive(Debug, Serialize, Deserialize, Display, Eq, PartialEq)]
@@ -311,4 +345,40 @@ pub enum ErrorResponseKind {
     BadRequest,
     Forbidden,
     InternalError,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{apply_patch_set, InstanceSnapshot, PatchUpdate};
+    use rbx_dom_weak::ustr;
+
+    #[test]
+    fn absent_properties_have_explicit_wire_defaults_without_mutating_the_tree() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Part"));
+        let id = tree.get_root_id();
+        let applied = apply_patch_set(
+            &mut tree,
+            PatchSet {
+                updated_instances: vec![PatchUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_properties: UstrMap::from_iter([(ustr("Transparency"), None)]),
+                    changed_metadata: None,
+                }],
+                ..PatchSet::new()
+            },
+        );
+        let message = SubscribeMessage::from_patch_update(&tree, applied);
+        assert_eq!(
+            message.updated[0].changed_properties[&ustr("Transparency")],
+            Some(Variant::Float32(0.0))
+        );
+        assert!(!tree
+            .get_instance(id)
+            .unwrap()
+            .properties()
+            .contains_key(&ustr("Transparency")));
+    }
 }

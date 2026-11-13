@@ -16,9 +16,7 @@ body:
           Parent: id-7
           Properties:
             Attributes:
-              Attributes:
-                Rojo_Target_PrimaryPart:
-                  String: project target
+              Attributes: {}
             NeedsPivotMigration:
               Bool: false
             PrimaryPart:
@@ -31,18 +29,14 @@ body:
           changedName: ~
           changedProperties:
             Attributes:
-              Attributes:
-                Rojo_Id:
-                  String: model target 2
+              Attributes: {}
           id: id-7
         - changedClassName: ~
           changedMetadata: ~
           changedName: ~
           changedProperties:
             Attributes:
-              Attributes:
-                Rojo_Target_PrimaryPart:
-                  String: model target 2
+              Attributes: {}
             PrimaryPart: ~
           id: id-8
 packetType: messages
