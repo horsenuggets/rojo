@@ -101,7 +101,11 @@ impl BuildCommand {
         vfs.set_watch_enabled(self.watch);
 
         let started = Instant::now();
-        let session = ServeSession::new_with_pool(vfs, project_path, Some(pool))?;
+        let session = if self.watch {
+            ServeSession::new_with_pool(vfs, project_path, Some(pool))?
+        } else {
+            pool.install(|| ServeSession::new(vfs, project_path))?
+        };
         log::debug!("Loaded project in {:?}", started.elapsed());
         let mut cursor = session.message_queue().cursor();
 
@@ -228,4 +232,37 @@ fn write_model(
     println!("Built project to {}", filename);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_watching_build_releases_worker_pool() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("test.project.json");
+        std::fs::write(
+            &project,
+            r#"{"name":"Test","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
+        let weak_pool = Arc::downgrade(&pool);
+        BuildCommand {
+            project,
+            output: Some(temp.path().join("test.rbxm")),
+            plugin: None,
+            jobs: None,
+            watch: false,
+        }
+        .run_with_pool(pool)
+        .unwrap();
+        assert!(weak_pool.upgrade().is_none());
+    }
 }
