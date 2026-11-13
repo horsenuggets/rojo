@@ -23,7 +23,7 @@ mod snapshot;
 mod std_backend;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::{io, str};
 
 pub use in_memory_fs::InMemoryFs;
@@ -67,17 +67,17 @@ impl<T> IoResultExt<T> for io::Result<T> {
 /// Backend that can be used to create a `Vfs`.
 ///
 /// This trait is sealed and cannot not be implemented outside this crate.
-pub trait VfsBackend: sealed::Sealed + Send + 'static {
-    fn read(&mut self, path: &Path) -> io::Result<Vec<u8>>;
+pub trait VfsBackend: sealed::Sealed + Send + Sync + 'static {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn write(&mut self, path: &Path, data: &[u8]) -> io::Result<()>;
-    fn exists(&mut self, path: &Path) -> io::Result<bool>;
-    fn read_dir(&mut self, path: &Path) -> io::Result<ReadDir>;
+    fn exists(&self, path: &Path) -> io::Result<bool>;
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir>;
     fn create_dir(&mut self, path: &Path) -> io::Result<()>;
     fn create_dir_all(&mut self, path: &Path) -> io::Result<()>;
-    fn metadata(&mut self, path: &Path) -> io::Result<Metadata>;
+    fn metadata(&self, path: &Path) -> io::Result<Metadata>;
     fn remove_file(&mut self, path: &Path) -> io::Result<()>;
     fn remove_dir_all(&mut self, path: &Path) -> io::Result<()>;
-    fn canonicalize(&mut self, path: &Path) -> io::Result<PathBuf>;
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
 
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent>;
     fn watch(&mut self, path: &Path) -> io::Result<()>;
@@ -159,15 +159,8 @@ impl VfsInner {
         Ok(Arc::new(contents))
     }
 
-    fn read_to_string<P: AsRef<Path>>(&mut self, path: P) -> io::Result<Arc<String>> {
-        let path = path.as_ref();
-        let contents = self.backend.read(path)?;
-
-        if self.watch_enabled {
-            self.backend.watch(path)?;
-        }
-
-        let contents_str = str::from_utf8(&contents).map_err(|_| {
+    fn string_from_contents(path: &Path, contents: &[u8]) -> io::Result<Arc<String>> {
+        let contents_str = str::from_utf8(contents).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("File was not valid UTF-8: {}", path.display()),
@@ -177,7 +170,7 @@ impl VfsInner {
         Ok(Arc::new(contents_str.into()))
     }
 
-    fn exists<P: AsRef<Path>>(&mut self, path: P) -> io::Result<bool> {
+    fn exists<P: AsRef<Path>>(&self, path: P) -> io::Result<bool> {
         let path = path.as_ref();
         self.backend.exists(path)
     }
@@ -221,12 +214,12 @@ impl VfsInner {
         self.backend.remove_dir_all(path)
     }
 
-    fn metadata<P: AsRef<Path>>(&mut self, path: P) -> io::Result<Metadata> {
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
         let path = path.as_ref();
         self.backend.metadata(path)
     }
 
-    fn canonicalize<P: AsRef<Path>>(&mut self, path: P) -> io::Result<PathBuf> {
+    fn canonicalize<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
         let path = path.as_ref();
         self.backend.canonicalize(path)
     }
@@ -246,11 +239,12 @@ impl VfsInner {
 
 /// A virtual filesystem with a configurable backend.
 ///
-/// All operations on the Vfs take a lock on an internal backend. For performing
-/// large batches of operations, it might be more performant to call `lock()`
+/// Read-only operations share a lock on the internal backend. Mutations and reads
+/// that register watches take an exclusive lock. For performing large batches of
+/// operations, it might be more performant to call `lock()`
 /// and use [`VfsLock`](struct.VfsLock.html) instead.
 pub struct Vfs {
-    inner: Mutex<VfsInner>,
+    inner: RwLock<VfsInner>,
 }
 
 impl Vfs {
@@ -270,14 +264,35 @@ impl Vfs {
         };
 
         Self {
-            inner: Mutex::new(lock),
+            inner: RwLock::new(lock),
         }
     }
 
-    /// Manually lock the Vfs, useful for large batches of operations.
+    // Never upgrade a held read lock. Watching can change before the write lock is
+    // acquired, so check it again while keeping I/O and registration atomic.
+    fn read_with_watch<T>(
+        &self,
+        path: &Path,
+        read: impl FnOnce(&dyn VfsBackend, &Path) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let inner = self.inner.read().unwrap();
+        if !inner.watch_enabled {
+            return read(inner.backend.as_ref(), path);
+        }
+        drop(inner);
+
+        let mut inner = self.inner.write().unwrap();
+        let result = read(inner.backend.as_ref(), path)?;
+        if inner.watch_enabled {
+            inner.backend.watch(path)?;
+        }
+        Ok(result)
+    }
+
+    /// Manually lock the Vfs exclusively, useful for large batches of operations.
     pub fn lock(&self) -> VfsLock<'_> {
         VfsLock {
-            inner: self.inner.lock().unwrap(),
+            inner: self.inner.write().unwrap(),
         }
     }
 
@@ -287,7 +302,7 @@ impl Vfs {
     /// on platforms like macOS where registering file watches has significant
     /// performance cost.
     pub fn set_watch_enabled(&self, enabled: bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         inner.watch_enabled = enabled;
     }
 
@@ -300,7 +315,8 @@ impl Vfs {
     #[inline]
     pub fn read<P: AsRef<Path>>(&self, path: P) -> io::Result<Arc<Vec<u8>>> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().read(path)
+        self.read_with_watch(path, |backend, path| backend.read(path))
+            .map(Arc::new)
     }
 
     /// Read a file from the VFS (or from the underlying backend if it isn't
@@ -312,7 +328,8 @@ impl Vfs {
     #[inline]
     pub fn read_to_string<P: AsRef<Path>>(&self, path: P) -> io::Result<Arc<String>> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().read_to_string(path)
+        let contents = self.read_with_watch(path, |backend, path| backend.read(path))?;
+        VfsInner::string_from_contents(path, &contents)
     }
 
     /// Read a file from the VFS (or the underlying backend if it isn't
@@ -325,7 +342,7 @@ impl Vfs {
     #[inline]
     pub fn read_to_string_lf_normalized<P: AsRef<Path>>(&self, path: P) -> io::Result<Arc<String>> {
         let path = path.as_ref();
-        let contents = self.inner.lock().unwrap().read_to_string(path)?;
+        let contents = self.read_to_string(path)?;
 
         Ok(contents.replace("\r\n", "\n").into())
     }
@@ -339,7 +356,7 @@ impl Vfs {
     pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(&self, path: P, contents: C) -> io::Result<()> {
         let path = path.as_ref();
         let contents = contents.as_ref();
-        self.inner.lock().unwrap().write(path, contents)
+        self.inner.write().unwrap().write(path, contents)
     }
 
     /// Read all of the children of a directory.
@@ -350,7 +367,7 @@ impl Vfs {
     #[inline]
     pub fn read_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<ReadDir> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().read_dir(path)
+        self.read_with_watch(path, |backend, path| backend.read_dir(path))
     }
 
     /// Return whether the given path exists.
@@ -361,7 +378,7 @@ impl Vfs {
     #[inline]
     pub fn exists<P: AsRef<Path>>(&self, path: P) -> io::Result<bool> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().exists(path)
+        self.inner.read().unwrap().exists(path)
     }
 
     /// Creates a directory at the provided location.
@@ -374,7 +391,7 @@ impl Vfs {
     #[inline]
     pub fn create_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().create_dir(path)
+        self.inner.write().unwrap().create_dir(path)
     }
 
     /// Creates a directory at the provided location, recursively creating
@@ -386,7 +403,7 @@ impl Vfs {
     #[inline]
     pub fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().create_dir_all(path)
+        self.inner.write().unwrap().create_dir_all(path)
     }
 
     /// Remove a file.
@@ -397,7 +414,7 @@ impl Vfs {
     #[inline]
     pub fn remove_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().remove_file(path)
+        self.inner.write().unwrap().remove_file(path)
     }
 
     /// Remove a directory and all of its descendants.
@@ -408,7 +425,7 @@ impl Vfs {
     #[inline]
     pub fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().remove_dir_all(path)
+        self.inner.write().unwrap().remove_dir_all(path)
     }
 
     /// Query metadata about the given path.
@@ -419,7 +436,7 @@ impl Vfs {
     #[inline]
     pub fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().metadata(path)
+        self.inner.read().unwrap().metadata(path)
     }
 
     /// Normalize a path via the underlying backend.
@@ -432,19 +449,19 @@ impl Vfs {
     #[inline]
     pub fn canonicalize<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
         let path = path.as_ref();
-        self.inner.lock().unwrap().canonicalize(path)
+        self.inner.read().unwrap().canonicalize(path)
     }
 
     /// Retrieve a handle to the event receiver for this `Vfs`.
     #[inline]
     pub fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent> {
-        self.inner.lock().unwrap().event_receiver()
+        self.inner.read().unwrap().event_receiver()
     }
 
     /// Commit an event to this `Vfs`.
     #[inline]
     pub fn commit_event(&self, event: &VfsEvent) -> io::Result<()> {
-        self.inner.lock().unwrap().commit_event(event)
+        self.inner.write().unwrap().commit_event(event)
     }
 }
 
@@ -452,7 +469,7 @@ impl Vfs {
 ///
 /// Implements roughly the same API as [`Vfs`](struct.Vfs.html).
 pub struct VfsLock<'a> {
-    inner: MutexGuard<'a, VfsInner>,
+    inner: RwLockWriteGuard<'a, VfsInner>,
 }
 
 impl VfsLock<'_> {
@@ -584,9 +601,317 @@ impl VfsLock<'_> {
 
 #[cfg(test)]
 mod test {
-    use crate::{InMemoryFs, StdBackend, Vfs, VfsSnapshot};
+    use crate::{
+        InMemoryFs, Metadata, NoopBackend, ReadDir, StdBackend, Vfs, VfsBackend, VfsEvent,
+        VfsSnapshot,
+    };
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    struct ReadProbe {
+        block_watch: bool,
+        fs: InMemoryFs,
+        gate: Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+        calls: Arc<Mutex<Vec<String>>>,
+        watch_error: bool,
+    }
+
+    impl super::sealed::Sealed for ReadProbe {}
+
+    impl ReadProbe {
+        fn new() -> Self {
+            let mut fs = InMemoryFs::new();
+            fs.load_snapshot("file", VfsSnapshot::file("hello\r\n"))
+                .unwrap();
+            fs.load_snapshot("invalid", VfsSnapshot::file(vec![0xff]))
+                .unwrap();
+            fs.load_snapshot("dir", VfsSnapshot::empty_dir()).unwrap();
+            Self {
+                block_watch: false,
+                fs,
+                gate: None,
+                calls: Arc::new(Mutex::new(Vec::new())),
+                watch_error: false,
+            }
+        }
+
+        fn record(&self, operation: &str) {
+            self.calls.lock().unwrap().push(operation.into());
+            if (operation == "watch") == self.block_watch {
+                if let Some((entered, release)) = &self.gate {
+                    entered.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+            }
+        }
+    }
+
+    impl VfsBackend for ReadProbe {
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            self.record("read");
+            self.fs.read(path)
+        }
+
+        fn exists(&self, path: &Path) -> io::Result<bool> {
+            self.record("exists");
+            self.fs.exists(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<ReadDir> {
+            self.record("read_dir");
+            self.fs.read_dir(path)
+        }
+
+        fn metadata(&self, path: &Path) -> io::Result<Metadata> {
+            self.record("metadata");
+            self.fs.metadata(path)
+        }
+
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            self.record("canonicalize");
+            self.fs.canonicalize(path)
+        }
+
+        fn write(&mut self, path: &Path, data: &[u8]) -> io::Result<()> {
+            self.calls.lock().unwrap().push("write".into());
+            self.fs.write(path, data)
+        }
+
+        fn create_dir(&mut self, path: &Path) -> io::Result<()> {
+            self.fs.create_dir(path)
+        }
+
+        fn create_dir_all(&mut self, path: &Path) -> io::Result<()> {
+            self.fs.create_dir_all(path)
+        }
+
+        fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+            self.fs.remove_file(path)
+        }
+
+        fn remove_dir_all(&mut self, path: &Path) -> io::Result<()> {
+            self.fs.remove_dir_all(path)
+        }
+
+        fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent> {
+            self.fs.event_receiver()
+        }
+
+        fn watch(&mut self, _path: &Path) -> io::Result<()> {
+            self.record("watch");
+            if self.watch_error {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Watch denied",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unwatch(&mut self, _path: &Path) -> io::Result<()> {
+            self.calls.lock().unwrap().push("unwatch".into());
+            Ok(())
+        }
+    }
+
+    fn read_operation(vfs: &Vfs, operation: usize) {
+        match operation {
+            0 => assert_eq!(vfs.read("file").unwrap().as_slice(), b"hello\r\n"),
+            1 => assert_eq!(vfs.read_to_string("file").unwrap().as_str(), "hello\r\n"),
+            2 => assert_eq!(
+                vfs.read_to_string_lf_normalized("file").unwrap().as_str(),
+                "hello\n"
+            ),
+            3 => assert_eq!(vfs.read_dir("dir").unwrap().count(), 0),
+            4 => assert!(vfs.exists("file").unwrap()),
+            5 => assert!(vfs.metadata("file").unwrap().is_file()),
+            6 => assert_eq!(vfs.canonicalize("file").unwrap(), PathBuf::from("file")),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn read_only_operations_share_lock_during_backend_io() {
+        for watch_enabled in [false, true] {
+            let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+            let (release_tx, release_rx) = crossbeam_channel::unbounded();
+            let mut backend = ReadProbe::new();
+            let calls = Arc::clone(&backend.calls);
+            backend.gate = Some((entered_tx, release_rx));
+            let vfs = Arc::new(Vfs::new(backend));
+            vfs.set_watch_enabled(watch_enabled);
+            let operations = if watch_enabled { 4..7 } else { 0..7 };
+            let count = operations.len();
+
+            let threads: Vec<_> = operations
+                .map(|operation| {
+                    let vfs = Arc::clone(&vfs);
+                    thread::spawn(move || read_operation(&vfs, operation))
+                })
+                .collect();
+
+            // Each worker must enter actual backend I/O before any read is released.
+            // Release and join even on failure so serialization cannot hang the test.
+            let shared =
+                (0..count).all(|_| entered_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+            let read_locked = vfs.inner.try_read().is_ok();
+            let write_blocked = vfs.inner.try_write().is_err();
+            for _ in 0..count {
+                release_tx.send(()).unwrap();
+            }
+            for worker in threads {
+                worker.join().unwrap();
+            }
+            assert!(shared, "All read operations must coexist in backend I/O");
+            assert!(read_locked, "Backend I/O must hold a shared lock");
+            assert!(
+                write_blocked,
+                "Mutations must be excluded during backend I/O"
+            );
+            assert!(!calls.lock().unwrap().iter().any(|call| call == "watch"));
+        }
+    }
+
+    #[test]
+    fn watched_io_holds_exclusive_lock_through_registration() {
+        for (operation, block_watch) in
+            (0..4).flat_map(|operation| [false, true].map(|block_watch| (operation, block_watch)))
+        {
+            let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+            let (release_tx, release_rx) = crossbeam_channel::unbounded();
+            let mut backend = ReadProbe::new();
+            let calls = Arc::clone(&backend.calls);
+            backend.block_watch = block_watch;
+            backend.gate = Some((entered_tx, release_rx));
+            let vfs = Arc::new(Vfs::new(backend));
+            let worker_vfs = Arc::clone(&vfs);
+            let worker = thread::spawn(move || read_operation(&worker_vfs, operation));
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            let read_blocked = vfs.inner.try_read().is_err();
+            let write_blocked = vfs.inner.try_write().is_err();
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+            assert!(entered);
+            assert!(read_blocked);
+            assert!(write_blocked);
+            vfs.write("file", "updated").unwrap();
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(&calls[1..], &["watch", "write"]);
+        }
+    }
+
+    #[test]
+    fn explicit_vfs_lock_remains_exclusive_and_supports_batches() {
+        let vfs = Vfs::new(ReadProbe::new());
+        let mut locked = vfs.lock();
+        locked.set_watch_enabled(false);
+        assert!(vfs.inner.try_read().is_err());
+        assert!(vfs.inner.try_write().is_err());
+        locked.write("file", "updated").unwrap();
+        assert_eq!(locked.read("file").unwrap().as_slice(), b"updated");
+        assert!(locked.metadata("file").unwrap().is_file());
+        assert_eq!(locked.read_dir("dir").unwrap().count(), 0);
+        assert_eq!(locked.normalize("file").unwrap(), PathBuf::from("file"));
+        drop(locked);
+        assert_eq!(vfs.read_to_string("file").unwrap().as_str(), "updated");
+    }
+
+    #[test]
+    fn watching_and_read_errors_preserve_order_and_enablement() {
+        let mut backend = ReadProbe::new();
+        backend.watch_error = true;
+        let calls = Arc::clone(&backend.calls);
+        let vfs = Vfs::new(backend);
+        assert_eq!(
+            vfs.read("file").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            vfs.read_to_string("invalid").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            vfs.read_dir("dir").err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        calls.lock().unwrap().clear();
+        assert_eq!(
+            vfs.read("missing").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(*calls.lock().unwrap(), ["read"]);
+
+        vfs.set_watch_enabled(false);
+        calls.lock().unwrap().clear();
+        assert_eq!(
+            vfs.read_to_string("invalid").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(vfs.read_to_string("file").unwrap().as_str(), "hello\r\n");
+        assert_eq!(vfs.read_dir("dir").unwrap().count(), 0);
+        assert_eq!(*calls.lock().unwrap(), ["read", "read", "read_dir"]);
+        vfs.set_watch_enabled(true);
+        assert_eq!(
+            vfs.read("file").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_is_watched_and_remove_events_unwatch() {
+        let backend = ReadProbe::new();
+        let calls = Arc::clone(&backend.calls);
+        let mut external_fs = backend.fs.clone();
+        let vfs = Vfs::new(backend);
+        assert_eq!(
+            vfs.read_to_string("invalid").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(*calls.lock().unwrap(), ["read", "watch"]);
+        calls.lock().unwrap().clear();
+
+        let receiver = vfs.event_receiver();
+        external_fs.raise_event(VfsEvent::Remove(PathBuf::from("file")));
+        let event = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(&event, VfsEvent::Remove(path) if path == Path::new("file")));
+        vfs.commit_event(&event).unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["unwatch"]);
+        assert!(vfs.exists("file").unwrap());
+        vfs.remove_file("file").unwrap();
+        assert!(!vfs.exists("file").unwrap());
+    }
+
+    #[test]
+    fn noop_errors_are_unchanged_without_watching() {
+        let vfs = Vfs::new(NoopBackend::new());
+        vfs.set_watch_enabled(false);
+        assert_eq!(vfs.read("file").unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(
+            vfs.read_to_string("file").unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(
+            vfs.read_dir("dir").err().unwrap().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(vfs.exists("file").unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(
+            vfs.metadata("file").unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(
+            vfs.canonicalize("file").unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+    }
 
     /// https://github.com/rojo-rbx/rojo/issues/899
     #[test]
@@ -640,7 +965,7 @@ mod test {
         let contents = "Lorem ipsum dolor sit amet.".to_string();
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("file.txt");
-        fs_err::write(&file_path, contents.to_string()).unwrap();
+        fs_err::write(&file_path, &contents).unwrap();
 
         let vfs = Vfs::new(StdBackend::new().unwrap());
         let canonicalized = vfs.canonicalize(&file_path).unwrap();

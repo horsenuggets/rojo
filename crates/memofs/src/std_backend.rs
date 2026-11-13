@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::{collections::HashSet, io};
@@ -11,7 +11,7 @@ use crate::{DirEntry, Metadata, ReadDir, VfsBackend, VfsEvent};
 
 /// `VfsBackend` that uses `std::fs` and the `notify` crate.
 pub struct StdBackend {
-    watcher: RecommendedWatcher,
+    watcher: Mutex<RecommendedWatcher>,
     watcher_receiver: Receiver<VfsEvent>,
     watches: HashSet<PathBuf>,
 }
@@ -47,7 +47,7 @@ impl StdBackend {
         });
 
         Ok(Self {
-            watcher,
+            watcher: Mutex::new(watcher),
             watcher_receiver: rx,
             watches: HashSet::new(),
         })
@@ -55,7 +55,7 @@ impl StdBackend {
 }
 
 impl VfsBackend for StdBackend {
-    fn read(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         fs_err::read(path)
     }
 
@@ -63,11 +63,11 @@ impl VfsBackend for StdBackend {
         fs_err::write(path, data)
     }
 
-    fn exists(&mut self, path: &Path) -> io::Result<bool> {
+    fn exists(&self, path: &Path) -> io::Result<bool> {
         std::fs::exists(path)
     }
 
-    fn read_dir(&mut self, path: &Path) -> io::Result<ReadDir> {
+    fn read_dir(&self, path: &Path) -> io::Result<ReadDir> {
         let entries: Result<Vec<_>, _> = fs_err::read_dir(path)?.collect();
         let mut entries = entries?;
 
@@ -98,7 +98,7 @@ impl VfsBackend for StdBackend {
         fs_err::remove_dir_all(path)
     }
 
-    fn metadata(&mut self, path: &Path) -> io::Result<Metadata> {
+    fn metadata(&self, path: &Path) -> io::Result<Metadata> {
         let inner = fs_err::metadata(path)?;
 
         Ok(Metadata {
@@ -106,7 +106,7 @@ impl VfsBackend for StdBackend {
         })
     }
 
-    fn canonicalize(&mut self, path: &Path) -> io::Result<PathBuf> {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         dunce::canonicalize(path)
     }
 
@@ -124,6 +124,8 @@ impl VfsBackend for StdBackend {
         } else {
             self.watches.insert(path.to_path_buf());
             self.watcher
+                .get_mut()
+                .unwrap()
                 .watch(path, RecursiveMode::Recursive)
                 .map_err(io::Error::other)
         }
@@ -131,6 +133,10 @@ impl VfsBackend for StdBackend {
 
     fn unwatch(&mut self, path: &Path) -> io::Result<()> {
         self.watches.remove(path);
-        self.watcher.unwatch(path).map_err(io::Error::other)
+        self.watcher
+            .get_mut()
+            .unwrap()
+            .unwatch(path)
+            .map_err(io::Error::other)
     }
 }
