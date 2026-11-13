@@ -332,12 +332,10 @@ fn find_require_replacements(
         }
 
         if let Some(replacement) = resolve_alias_require(
-            &content,
+            (&content, range),
             script_dir,
             aliases,
             luaurc_dir,
-            range.start,
-            range.end,
             path_mappings,
             project_root,
             is_init,
@@ -604,16 +602,15 @@ fn token_end(token: &Token) -> usize {
 
 /// Resolve a single alias require and produce a Replacement.
 fn resolve_alias_require(
-    alias_path: &str,
+    call: (&str, Range<usize>),
     script_dir: &Path,
     aliases: &HashMap<String, String>,
     luaurc_dir: &Path,
-    call_start: usize,
-    call_end: usize,
     path_mappings: &[(PathBuf, Vec<String>)],
     project_root: &Path,
     is_init: bool,
 ) -> Option<Replacement> {
+    let (alias_path, call_range) = call;
     let without_at = &alias_path[1..];
 
     let (alias_name, sub_path) = match without_at.find('/') {
@@ -653,8 +650,8 @@ fn resolve_alias_require(
         );
 
         Some(Replacement {
-            start: call_start,
-            end: call_end,
+            start: call_range.start,
+            end: call_range.end,
             new_text: format!(r#"require("{require_path}")"#),
         })
     } else {

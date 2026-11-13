@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Context;
-use memofs::Vfs;
+use memofs::{DirEntry, Vfs};
 use rbx_dom_weak::{types::Variant, ustr};
 use serde::{Deserialize, Serialize};
 
@@ -60,9 +60,10 @@ pub fn snapshot_csv_init(
     vfs: &Vfs,
     init_path: &Path,
     name: &str,
+    entries: Option<Vec<DirEntry>>,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
     let folder_path = init_path.parent().unwrap();
-    let dir_snapshot = snapshot_dir_no_meta(context, vfs, folder_path, name)?.unwrap();
+    let dir_snapshot = snapshot_dir_no_meta(context, vfs, folder_path, name, entries)?.unwrap();
 
     if dir_snapshot.class_name != "Folder" {
         anyhow::bail!(
@@ -381,6 +382,7 @@ Ack,Ack!,,An exclamation of despair,¡Ay!"#,
             &vfs,
             Path::new("/root/init.csv"),
             "root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -419,6 +421,7 @@ Ack,Ack!,,An exclamation of despair,¡Ay!"#,
             &vfs,
             Path::new("/root/init.csv"),
             "root",
+            None,
         )
         .unwrap()
         .unwrap();

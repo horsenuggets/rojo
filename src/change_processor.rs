@@ -51,6 +51,7 @@ impl ChangeProcessor {
         vfs: Arc<Vfs>,
         message_queue: Arc<MessageQueue<AppliedPatchSet>>,
         tree_mutation_receiver: Receiver<PatchSet>,
+        pool: Option<Arc<rayon::ThreadPool>>,
     ) -> Self {
         let (shutdown_sender, shutdown_receiver) = crossbeam_channel::bounded(1);
         let vfs_receiver = vfs.event_receiver();
@@ -68,7 +69,11 @@ impl ChangeProcessor {
                 loop {
                     select! {
                         recv(vfs_receiver) -> event => {
-                            task.handle_vfs_event(event?);
+                            let event = event?;
+                            match &pool {
+                                Some(pool) => pool.install(|| task.handle_vfs_event(event)),
+                                None => task.handle_vfs_event(event),
+                            }
                         },
                         recv(tree_mutation_receiver) -> patch_set => {
                             task.handle_tree_event(patch_set?);
