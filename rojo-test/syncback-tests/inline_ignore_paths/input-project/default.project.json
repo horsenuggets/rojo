@@ -1,0 +1,13 @@
+{
+  "name": "inline_ignore_paths",
+  "tree": {
+    "$className": "Folder",
+    "src": {
+      "$path": "src"
+    }
+  },
+  "syncbackRules": {
+    "instancesAsDirectories": true,
+    "ignorePaths": ["src/Props/Keep", "src/Meta/init.meta.json"]
+  }
+}

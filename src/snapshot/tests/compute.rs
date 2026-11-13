@@ -185,9 +185,25 @@ fn shallow_patches_keep_only_children_with_their_own_source() {
         let kept_by_shallow_read = shallow && sourced;
         let expect_removed = !(in_snapshot || kept_by_shallow_read);
         assert_eq!(removed, expect_removed, "bits {bits:03b}");
+        // A shallow snapshot's child is an inline child, so it never pairs with
+        // a file-backed sibling of the same name and is added instead.
+        let expect_added = usize::from(in_snapshot && kept_by_shallow_read);
+        assert_eq!(patch.added_instances.len(), expect_added, "bits {bits:03b}");
         // The root's own change is always found, shallow or not.
-        assert_eq!(patch.updated_instances.len(), 1, "bits {bits:03b}");
-        assert!(patch.added_instances.is_empty(), "bits {bits:03b}");
+        assert!(
+            patch
+                .updated_instances
+                .iter()
+                .any(|update| update.id == tree.get_root_id()),
+            "bits {bits:03b}"
+        );
+        assert!(
+            patch
+                .updated_instances
+                .iter()
+                .all(|update| update.id != child_id || !kept_by_shallow_read),
+            "bits {bits:03b}"
+        );
     }
 }
 

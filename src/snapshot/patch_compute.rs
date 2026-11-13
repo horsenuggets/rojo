@@ -266,6 +266,14 @@ fn compute_children_patches(
                         .get_instance(**instance_child_id)
                         .expect("Instance did not exist in tree");
 
+                    // A shallow read never contains children with their own files,
+                    // so one of those must not stand in for a same-named inline child.
+                    if context.keep_sourced_children
+                        && instance_child.metadata().instigating_source.is_some()
+                    {
+                        return false;
+                    }
+
                     if snapshot_child.name == instance_child.name()
                         && snapshot_child.class_name == instance_child.class_name()
                     {

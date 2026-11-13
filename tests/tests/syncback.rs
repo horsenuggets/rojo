@@ -51,6 +51,12 @@ syncback_tests! {
     ignore_trees_adding => [],
     // Ensures that `ignoreTrees` works for removals
     ignore_trees_removing => [],
+    // Ensures that excluded paths keep a subtree out of the inline layout, so
+    // neither the metadata nor a child file is lost or duplicated
+    inline_ignore_paths => ["src/Props/init.meta.json", "src/Props/Keep/init.meta.json", "src/Meta/Child/init.meta.json"],
+    // Ensures that an inline folder stored in init.meta.jsonc is rewritten in
+    // place instead of gaining a second metadata file
+    inline_jsonc_rewrite => ["src/Holder/init.meta.jsonc"],
     // Ensures that a project already matching the place still moves into the
     // inline layout, instead of being skipped as unchanged
     inline_relayout_unchanged => ["src/Holder/init.meta.json"],

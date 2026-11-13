@@ -1,0 +1,18 @@
+---
+source: tests/tests/syncback.rs
+assertion_line: 35
+expression: src/Holder/init.meta.jsonc
+---
+{
+    "className": "Configuration",
+    "children": [
+        {
+            "className": "Folder",
+            "name": "Child"
+        },
+        {
+            "className": "Folder",
+            "name": "Second"
+        }
+    ]
+}
