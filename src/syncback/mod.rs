@@ -18,14 +18,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
-    path::Path,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
 use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{InstanceWithMeta, RojoTree},
-    snapshot_middleware::Middleware,
+    snapshot_middleware::{dir_init_files, Middleware},
     syncback::ref_properties::{collect_referents, link_referents},
     Project,
 };
@@ -110,22 +110,64 @@ pub fn syncback_instance(
         }
     }
     let mut output = middleware.syncback(&snapshot)?.fs_snapshot;
+
+    // Directory scripts are serialized to the default initializer name, but
+    // the directory may use another one, like `init.lua`. Writing both would
+    // be a multi-file change and leave two competing initializers.
+    if let Some(tracked) = source_file(&old_inst).filter(|tracked| *tracked != path) {
+        for (_, name) in dir_init_files() {
+            let staged = path.join(name);
+            if staged != tracked {
+                output.retarget_added_file(&staged, &tracked);
+            }
+        }
+    }
+
+    // These match the paths the metadata serializers write to, which are based
+    // on the file stem (`Foo.meta.json` for `Foo.server.luau`).
     let (json_path, jsonc_path) = if middleware.is_dir() {
         (path.join("init.meta.json"), path.join("init.meta.jsonc"))
     } else {
+        let parent = path
+            .parent()
+            .context("The instance's source has no parent directory")?;
+        let stem = snapshot.file_stem();
         (
-            path.with_extension("meta.json"),
-            path.with_extension("meta.jsonc"),
+            parent.join(format!("{stem}.meta.json")),
+            parent.join(format!("{stem}.meta.jsonc")),
         )
     };
-    if vfs
+    let jsonc_exists = vfs
         .metadata(&jsonc_path)
         .with_not_found()?
-        .is_some_and(|metadata| metadata.is_file())
-    {
+        .is_some_and(|metadata| metadata.is_file());
+    if jsonc_exists {
         output.retarget_added_file(&json_path, &jsonc_path);
     }
     Ok(output)
+}
+
+/// Returns the file holding an instance's own source, which for a directory
+/// script is its initializer (`init.luau`, `init.server.lua`, ...). Returns
+/// `None` for plain directories, which have no source file.
+pub fn source_file(instance: &InstanceWithMeta) -> Option<PathBuf> {
+    let metadata = instance.metadata();
+    let path = metadata.instigating_source.as_ref()?.path();
+    match metadata.middleware? {
+        Middleware::Dir => None,
+        middleware if middleware.is_dir() => metadata
+            .relevant_paths
+            .iter()
+            .find(|candidate| {
+                candidate.parent() == Some(path)
+                    && candidate
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| dir_init_files().iter().any(|(_, init)| *init == name))
+            })
+            .cloned(),
+        _ => Some(path.to_path_buf()),
+    }
 }
 
 pub fn syncback_loop(

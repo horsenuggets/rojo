@@ -111,10 +111,13 @@ pub fn syncback_csv<'sync>(
         // about, so shifting is fine.
         meta.properties.shift_remove(&ustr("Contents"));
 
-        if !meta.is_empty() {
-            let parent = snapshot.path.parent_err()?;
+        let meta_path = snapshot
+            .path
+            .parent_err()?
+            .join(format!("{}.meta.json", snapshot.file_stem()));
+        if !meta.is_empty() || super::lua::metadata_exists(snapshot.vfs(), &meta_path) {
             fs_snapshot.add_file(
-                parent.join(format!("{}.meta.json", snapshot.file_stem())),
+                meta_path,
                 crate::json::to_vec_pretty(&meta).context("cannot serialize metadata")?,
             )
         }
@@ -150,9 +153,10 @@ pub fn syncback_csv_init<'sync>(
         // LocalizationTables have relatively few properties that we care
         // about, so shifting is fine.
         meta.properties.shift_remove(&ustr("Contents"));
-        if !meta.is_empty() {
+        let meta_path = snapshot.path.join("init.meta.json");
+        if !meta.is_empty() || super::lua::metadata_exists(snapshot.vfs(), &meta_path) {
             dir_syncback.fs_snapshot.add_file(
-                snapshot.path.join("init.meta.json"),
+                meta_path,
                 crate::json::to_vec_pretty(&meta)
                     .context("could not serialize new init.meta.json")?,
             );

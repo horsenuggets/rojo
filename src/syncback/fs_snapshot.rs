@@ -216,6 +216,21 @@ impl FsSnapshot {
         Ok(())
     }
 
+    /// Returns whether writing this snapshot would change any file's contents,
+    /// compared with the contents captured in `expected`.
+    pub fn changes_files<P: AsRef<Path>>(
+        &self,
+        base: P,
+        expected: &HashMap<PathBuf, Option<Vec<u8>>>,
+    ) -> bool {
+        let base = base.as_ref();
+        self.added_files.iter().any(|(path, contents)| {
+            expected
+                .get(&base.join(path))
+                .is_none_or(|previous| previous.as_deref() != Some(contents.as_slice()))
+        })
+    }
+
     /// Returns whether this `FsSnapshot` is empty or not.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -381,6 +396,43 @@ mod tests {
             assert_eq!(
                 &**vfs.read("/project/Folder/init.meta.json").unwrap(),
                 b"{}"
+            );
+        }
+    }
+
+    /// A write is only a change when a staged file differs from what was
+    /// captured, including files that don't exist yet.
+    #[test]
+    fn changes_files_compares_staged_files_with_captured_contents() {
+        let base = PathBuf::from("/project");
+        let expected = HashMap::from([
+            (PathBuf::from("/project/a"), Some(b"old".to_vec())),
+            (PathBuf::from("/project/missing"), None),
+        ]);
+        let cases = [
+            (FsSnapshot::new(), false),
+            (
+                FsSnapshot::new().with_added_file("a", b"old".to_vec()),
+                false,
+            ),
+            (
+                FsSnapshot::new().with_added_file("a", b"new".to_vec()),
+                true,
+            ),
+            (
+                FsSnapshot::new().with_added_file("missing", Vec::new()),
+                true,
+            ),
+            (
+                FsSnapshot::new().with_added_file("uncaptured", b"x".to_vec()),
+                true,
+            ),
+        ];
+        for (index, (snapshot, changes)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                snapshot.changes_files(&base, &expected),
+                changes,
+                "case {index}"
             );
         }
     }

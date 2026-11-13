@@ -21,7 +21,7 @@ use crate::{
     },
     syncback::{
         can_write_property, decide_property_write, get_property_filter, is_json_compatible,
-        syncback_instance, FsSnapshot, PropertyWriteDecision,
+        source_file, syncback_instance, FsSnapshot, PropertyWriteDecision,
     },
     web::interface::{WriteError, WriteResult},
 };
@@ -747,8 +747,35 @@ impl JobThreadContext {
                 return;
             }
         };
+        let source = source_file(&owner);
         if !accepted_properties.contains_key(&ustr("Source")) {
-            staged.retain_added_files(|candidate| candidate != path);
+            // A directory script's source lives in its initializer, not at the
+            // directory path, so both are left out when Source wasn't edited.
+            staged.retain_added_files(|candidate| {
+                candidate != path && Some(candidate) != source.as_deref()
+            });
+        } else if let Some(source) = source
+            .as_deref()
+            .filter(|_| inline_owner.is_none() && accepted_name.is_none())
+            .filter(|_| accepted_properties.len() == 1)
+        {
+            // Only Source changed, which lives in the source file alone. Leaving
+            // metadata out keeps its formatting and the write to one file.
+            staged.retain_added_files(|candidate| candidate == source);
+        }
+        // Every accepted value differs from the disk, so a write that changes no
+        // file means the edit can't be represented and must not report Saved.
+        if !staged.changes_files(self.project.folder_location(), &expected) {
+            errors.push(WriteError {
+                id,
+                property: None,
+                message: "These changes cannot be represented on disk".into(),
+            });
+            conflicts.updated_instances.retain(|patch| patch.id != id);
+            conflicts
+                .updated_instances
+                .extend(disk_restoration(tree, owner_id, update, snapshot).updated_instances);
+            return;
         }
         let latest = match snapshot_shallow_from_vfs(&owner.metadata().context, &self.vfs, path) {
             Ok(snapshot) => snapshot,
@@ -1214,6 +1241,148 @@ mod tests {
             },
             id,
         )
+    }
+
+    /// Builds a job whose tree holds the instance at `source` as the root's
+    /// only child, with `files` loaded under `/project`.
+    fn script_job(files: Vec<(&str, VfsSnapshot)>, source: &str) -> (JobThreadContext, Ref) {
+        let mut entries = files;
+        entries.push((
+            "default.project.json",
+            VfsSnapshot::file(r#"{"name":"Test","tree":{"$className":"Folder"}}"#),
+        ));
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot("/project", VfsSnapshot::dir(entries))
+            .unwrap();
+        let vfs = Arc::new(Vfs::new(imfs));
+        vfs.set_watch_enabled(false);
+        let project = Project::load_exact(
+            &vfs,
+            &PathBuf::from("/project/default.project.json"),
+            Some("Test"),
+        )
+        .unwrap();
+        let child = snapshot_from_vfs(&Default::default(), &vfs, Path::new(source))
+            .unwrap()
+            .unwrap();
+        let tree = RojoTree::new(InstanceSnapshot::new().name("Root").children(vec![child]));
+        let id = tree.root().children()[0];
+        (
+            JobThreadContext {
+                tree: Arc::new(Mutex::new(tree)),
+                vfs,
+                message_queue: Arc::new(MessageQueue::new()),
+                project: Arc::new(project),
+            },
+            id,
+        )
+    }
+
+    fn property_update(id: Ref, key: &str, value: Variant) -> PatchSet {
+        PatchSet {
+            removed_instances: Vec::new(),
+            added_instances: Vec::new(),
+            updated_instances: vec![PatchUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_properties: UstrMap::from_iter([(ustr(key), Some(value))]),
+                changed_metadata: None,
+            }],
+        }
+    }
+
+    fn read_text(vfs: &Vfs, path: &str) -> Option<String> {
+        vfs.read(path)
+            .with_not_found()
+            .unwrap()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// Directory scripts keep the initializer they already use. A metadata-only
+    /// edit writes only the metadata, and a Source edit writes only the tracked
+    /// `init.server.lua`, never a second `init.server.luau`.
+    #[test]
+    fn directory_script_writes_keep_the_tracked_initializer() {
+        let files = || {
+            vec![(
+                "Saver",
+                VfsSnapshot::dir([
+                    ("init.server.lua", VfsSnapshot::file("print('saver')")),
+                    (
+                        "init.meta.json",
+                        VfsSnapshot::file(r#"{"properties":{"Disabled":true}}"#),
+                    ),
+                ]),
+            )]
+        };
+
+        let (job, id) = script_job(files(), "/project/Saver");
+        let (accepted, _, errors) =
+            job.handle_tree_event(property_update(id, "Disabled", Variant::Bool(false)));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(accepted.updated_instances.len(), 1);
+        let meta = read_text(&job.vfs, "/project/Saver/init.meta.json").unwrap();
+        assert!(!meta.contains("Disabled"), "{meta}");
+        assert_eq!(
+            read_text(&job.vfs, "/project/Saver/init.server.lua").as_deref(),
+            Some("print('saver')")
+        );
+        assert_eq!(read_text(&job.vfs, "/project/Saver/init.server.luau"), None);
+
+        let (job, id) = script_job(files(), "/project/Saver");
+        let (accepted, _, errors) = job.handle_tree_event(property_update(
+            id,
+            "Source",
+            Variant::String("print(1)".into()),
+        ));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(accepted.updated_instances.len(), 1);
+        assert_eq!(
+            read_text(&job.vfs, "/project/Saver/init.server.lua").as_deref(),
+            Some("print(1)")
+        );
+        assert_eq!(read_text(&job.vfs, "/project/Saver/init.server.luau"), None);
+    }
+
+    /// Adjacent JSONC metadata is named after the script's stem, so edits go to
+    /// `Foo.meta.jsonc` rather than a competing `Foo.meta.json`. Clearing its
+    /// last value rewrites it instead of writing nothing and reporting Saved.
+    #[test]
+    fn adjacent_jsonc_metadata_is_rewritten_when_its_last_value_clears() {
+        let (job, id) = script_job(
+            vec![
+                ("Foo.server.luau", VfsSnapshot::file("print('foo')")),
+                (
+                    "Foo.meta.jsonc",
+                    VfsSnapshot::file(
+                        "{\n  // kept as JSONC\n  \"properties\": {\"Disabled\": true}\n}",
+                    ),
+                ),
+            ],
+            "/project/Foo.server.luau",
+        );
+
+        let (accepted, conflicts, errors) =
+            job.handle_tree_event(property_update(id, "Disabled", Variant::Bool(false)));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(conflicts, PatchSet::new());
+        assert_eq!(accepted.updated_instances.len(), 1);
+        let meta = read_text(&job.vfs, "/project/Foo.meta.jsonc").unwrap();
+        assert!(!meta.contains("Disabled"), "{meta}");
+        assert_eq!(read_text(&job.vfs, "/project/Foo.meta.json"), None);
+        assert_eq!(
+            read_text(&job.vfs, "/project/Foo.server.luau").as_deref(),
+            Some("print('foo')")
+        );
+        let reloaded = snapshot_from_vfs(
+            &Default::default(),
+            &job.vfs,
+            Path::new("/project/Foo.server.luau"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reloaded.properties.get(&ustr("Disabled")), None);
     }
 
     /// Writing a folder's own properties reads only its own metadata. A child
