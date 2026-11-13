@@ -2,10 +2,12 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, VecDeque},
     path::Path,
+    sync::Arc,
 };
 
 use anyhow::{bail, Context};
 use memofs::Vfs;
+use rayon::prelude::*;
 use rbx_dom_weak::{
     types::{Attributes, Ref, Variant},
     ustr, HashMapExt as _, Instance, Ustr, UstrMap, UstrSet,
@@ -44,6 +46,17 @@ pub fn snapshot_project(
     };
 
     let mut context = context.clone();
+    let canonical_path = vfs.canonicalize(path)?;
+    let active_projects = context
+        .active_projects
+        .get_or_insert_with(|| Arc::new(Vec::new()));
+    if active_projects.contains(&canonical_path) {
+        bail!(
+            "Project dependency cycle includes \"{}\".",
+            canonical_path.display()
+        );
+    }
+    Arc::make_mut(active_projects).push(canonical_path);
     context.clear_sync_rules();
 
     let rules = project.glob_ignore_paths.iter().map(|glob| PathIgnoreRule {
@@ -221,18 +234,32 @@ pub fn snapshot_project_node(
         }
     };
 
-    for (child_name, child_project_node) in &node.children {
-        if let Some(child) = snapshot_project_node(
+    let project_children: Vec<_> = node.children.iter().collect();
+    let snapshot_child = |(child_name, child_project_node): &(&String, &ProjectNode)| {
+        snapshot_project_node(
             context,
             project_path,
             child_name,
             child_project_node,
             vfs,
             Some(&class_name),
-        )? {
-            children.push(child);
-        }
-    }
+        )
+    };
+    let project_children: Vec<_> =
+        if project_children.len() >= 8 && rayon::current_num_threads() > 1 {
+            project_children
+                .par_iter()
+                .map(snapshot_child)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<anyhow::Result<_>>()?
+        } else {
+            project_children
+                .iter()
+                .map(snapshot_child)
+                .collect::<anyhow::Result<_>>()?
+        };
+    children.extend(project_children.into_iter().flatten());
 
     for (key, unresolved) in &node.properties {
         let value = unresolved
@@ -758,6 +785,190 @@ mod test {
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn project_cycles_do_not_hide_earlier_parallel_errors() {
+        for invalid_first in [false, true] {
+            let mut children = serde_json::Map::new();
+            children.insert("$className".into(), serde_json::json!("Folder"));
+            for index in 0..16 {
+                children.insert(
+                    format!("Child{index:02}"),
+                    serde_json::json!({ "$className": "Folder" }),
+                );
+            }
+            if invalid_first {
+                children.insert("Child00".into(), serde_json::json!({}));
+            }
+            children.insert(
+                "Child15".into(),
+                serde_json::json!({ "$path": "default.project.json" }),
+            );
+            let source = serde_json::json!({ "name": "CycleTest", "tree": children }).to_string();
+            let mut imfs = InMemoryFs::new();
+            imfs.load_snapshot("/root/default.project.json", VfsSnapshot::file(source))
+                .unwrap();
+            let vfs = Vfs::new(imfs);
+            for workers in [1, 4] {
+                let error = rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        snapshot_from_vfs(
+                            &InstanceContext::default(),
+                            &vfs,
+                            Path::new("/root/default.project.json"),
+                        )
+                    })
+                    .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains(if invalid_first {
+                        "Child00"
+                    } else {
+                        "dependency cycle"
+                    }),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_project_reuse_and_saved_context_are_not_cycles() {
+        let mut children = serde_json::Map::new();
+        children.insert("$className".into(), serde_json::json!("Folder"));
+        for index in 0..16 {
+            children.insert(
+                format!("Child{index:02}"),
+                serde_json::json!({ "$path": "shared.project.json" }),
+            );
+        }
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        serde_json::json!({ "name": "ReuseTest", "tree": children }).to_string(),
+                    ),
+                ),
+                (
+                    "shared.project.json",
+                    VfsSnapshot::file(r#"{ "name": "Shared", "tree": { "$className": "Model" } }"#),
+                ),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let snapshot = pool
+            .install(|| {
+                snapshot_from_vfs(
+                    &InstanceContext::default(),
+                    &vfs,
+                    Path::new("/root/default.project.json"),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.children.len(), 16);
+        for child in &snapshot.children {
+            assert!(child.metadata.context.active_projects.is_none());
+            let reloaded = pool
+                .install(|| {
+                    snapshot_from_vfs(
+                        &child.metadata.context,
+                        &vfs,
+                        Path::new("/root/shared.project.json"),
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.class_name.as_str(), "Model");
+        }
+    }
+
+    #[test]
+    fn parallel_project_children_preserve_order_and_class_inference() {
+        let mut children = serde_json::Map::new();
+        children.insert("$className".into(), serde_json::json!("DataModel"));
+        for index in 0..16 {
+            children.insert(
+                format!("Child{index:02}"),
+                serde_json::json!({
+                    "$className": "StarterPlayer", "StarterPlayerScripts": {}
+                }),
+            );
+        }
+        let node: ProjectNode = serde_json::from_value(children.into()).unwrap();
+        let vfs = Vfs::new(InMemoryFs::new());
+        let mut expected = None;
+        for workers in [1, 2, 4] {
+            let snapshot = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| {
+                    snapshot_project_node(
+                        &InstanceContext::default(),
+                        Path::new("/test.project.json"),
+                        "Root",
+                        &node,
+                        &vfs,
+                        None,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            for (index, child) in snapshot.children.iter().enumerate() {
+                assert_eq!(child.name, format!("Child{index:02}"));
+                assert_eq!(
+                    child.children[0].class_name.as_str(),
+                    "StarterPlayerScripts"
+                );
+            }
+            let actual = serde_json::to_value(snapshot).unwrap();
+            match &expected {
+                None => expected = Some(actual),
+                Some(expected) => assert_eq!(*expected, actual),
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_project_children_report_first_ordered_error() {
+        let mut children = serde_json::Map::new();
+        children.insert("$className".into(), serde_json::json!("Folder"));
+        for index in 0..16 {
+            children.insert(format!("Child{index:02}"), serde_json::json!({}));
+        }
+        let node: ProjectNode = serde_json::from_value(children.into()).unwrap();
+        let vfs = Vfs::new(InMemoryFs::new());
+        for workers in [1, 2, 4] {
+            let error = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| {
+                    snapshot_project_node(
+                        &InstanceContext::default(),
+                        Path::new("/test.project.json"),
+                        "Root",
+                        &node,
+                        &vfs,
+                        None,
+                    )
+                })
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("Child00"));
+        }
+    }
 
     #[ignore = "Functionality moved to root snapshot middleware"]
     #[test]

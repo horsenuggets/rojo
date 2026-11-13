@@ -68,6 +68,70 @@ gen_build_tests! {
     plugin_init,
 }
 
+#[test]
+fn parallel_build_matches_serial_build() {
+    let input = tempdir().unwrap();
+    fs::write(
+        input.path().join("default.project.json"),
+        r#"{
+        "name": "ParallelBuildTest",
+        "tree": { "$className": "DataModel", "ReplicatedStorage": { "$path": "Source" } }
+    }"#,
+    )
+    .unwrap();
+    for group in 0..16 {
+        let directory = input.path().join(format!("Source/Group{group:02}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("init.meta.json"),
+            r#"{ "className": "Model" }"#,
+        )
+        .unwrap();
+        for child in 0..16 {
+            fs::write(
+                directory.join(format!("Child{child:02}.luau")),
+                format!("return {group} * 16 + {child}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let mut expected = None;
+    for workers in [1, 2, 4] {
+        let output_path = input.path().join(format!("output-{workers}.rbxl"));
+        let output = Command::new(ROJO_PATH)
+            .arg("build")
+            .arg(input.path())
+            .arg("--jobs")
+            .arg(workers.to_string())
+            .arg("--output")
+            .arg(&output_path)
+            .current_dir(get_working_dir_path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(output_path).unwrap();
+        match &expected {
+            None => expected = Some(bytes),
+            Some(expected) => assert_eq!(*expected, bytes),
+        }
+    }
+}
+
+#[test]
+fn build_rejects_zero_workers() {
+    let output = Command::new(ROJO_PATH)
+        .args(["build", "--jobs", "0", "-o", "unused.rbxl"])
+        .current_dir(get_working_dir_path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--jobs"));
+}
+
 fn run_build_test(test_name: &str) {
     let working_dir = get_working_dir_path();
 

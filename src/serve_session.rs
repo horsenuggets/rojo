@@ -101,6 +101,14 @@ impl ServeSession {
     /// currently loaded from the filesystem directly instead of through
     /// the in-memory filesystem layer.
     pub fn new<P: AsRef<Path>>(vfs: Vfs, start_path: P) -> Result<Self, ServeSessionError> {
+        Self::new_with_pool(vfs, start_path, None)
+    }
+
+    pub(crate) fn new_with_pool<P: AsRef<Path>>(
+        vfs: Vfs,
+        start_path: P,
+        pool: Option<Arc<rayon::ThreadPool>>,
+    ) -> Result<Self, ServeSessionError> {
         let start_time = Instant::now();
         let start_path = vfs.canonicalize(start_path.as_ref())?;
         let start_path = start_path.as_path();
@@ -126,7 +134,11 @@ impl ServeSession {
         }));
 
         log::trace!("Generating snapshot of instances from VFS");
-        let snapshot = snapshot_from_vfs(&instance_context, &vfs, start_path)?;
+        let load = || snapshot_from_vfs(&instance_context, &vfs, start_path);
+        let snapshot = match &pool {
+            Some(pool) => pool.install(load),
+            None => load(),
+        }?;
 
         log::trace!("Computing initial patch set");
         let patch_set = compute_patch_set(snapshot, &tree, root_id);
@@ -149,6 +161,7 @@ impl ServeSession {
             Arc::clone(&vfs),
             Arc::clone(&message_queue),
             tree_mutation_receiver,
+            pool,
         );
 
         Ok(Self {
@@ -298,6 +311,71 @@ mod test {
     use super::*;
 
     use memofs::StdBackend;
+
+    #[test]
+    fn watch_reload_keeps_build_pool_and_discovers_new_initializer() {
+        use memofs::{InMemoryFs, VfsEvent, VfsSnapshot};
+        for workers in [1, 4] {
+            let mut imfs = InMemoryFs::new();
+            imfs.load_snapshot(
+                "/root",
+                VfsSnapshot::dir([
+                    (
+                        "default.project.json",
+                        VfsSnapshot::file(
+                            r#"{ "name": "WatchTest", "tree": { "$path": "Source" } }"#,
+                        ),
+                    ),
+                    (
+                        "Source",
+                        VfsSnapshot::dir((0..16).map(|index| {
+                            (
+                                format!("Child{index:02}.luau"),
+                                VfsSnapshot::file("return 1"),
+                            )
+                        })),
+                    ),
+                ]),
+            )
+            .unwrap();
+            let pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .unwrap(),
+            );
+            let session = ServeSession::new_with_pool(
+                Vfs::new(imfs.clone()),
+                "/root",
+                Some(Arc::clone(&pool)),
+            )
+            .unwrap();
+            assert_eq!(Arc::strong_count(&pool), 2);
+            let cursor = session.message_queue().cursor();
+            imfs.load_snapshot("/root/Source/init.luau", VfsSnapshot::file("return 42"))
+                .unwrap();
+            imfs.raise_event(VfsEvent::Create("/root/Source/init.luau".into()));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    session.message_queue().subscribe(cursor),
+                )
+                .await
+                .expect("Watch reload timed out")
+                .unwrap();
+            });
+            let tree = session.tree();
+            assert_eq!(tree.inner().root().class.as_str(), "ModuleScript");
+            assert_eq!(tree.inner().root().children().len(), 16);
+            drop(tree);
+            drop(session);
+            assert_eq!(Arc::strong_count(&pool), 1);
+        }
+    }
 
     #[test]
     fn tree_is_keyed_by_canonical_paths() {

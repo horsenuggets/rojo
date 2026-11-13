@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Context;
 use memofs::{DirEntry, Vfs};
+use rayon::prelude::*;
 
 use crate::{
     snapshot::{
@@ -26,8 +27,9 @@ pub fn snapshot_dir(
     vfs: &Vfs,
     path: &Path,
     name: &str,
+    entries: Option<Vec<DirEntry>>,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
-    let mut snapshot = match snapshot_dir_no_meta(context, vfs, path, name)? {
+    let mut snapshot = match snapshot_dir_no_meta(context, vfs, path, name, entries)? {
         Some(snapshot) => snapshot,
         None => return Ok(None),
     };
@@ -46,23 +48,33 @@ pub fn snapshot_dir_no_meta(
     vfs: &Vfs,
     path: &Path,
     name: &str,
+    entries: Option<Vec<DirEntry>>,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
-    let passes_filter_rules =
-        |child: &DirEntry| !is_path_ignored(&context.path_ignore_rules, child.path());
-
-    let mut snapshot_children = Vec::new();
-
-    for entry in vfs.read_dir(path)? {
-        let entry = entry?;
-
-        if !passes_filter_rules(&entry) {
-            continue;
-        }
-
-        if let Some(child_snapshot) = snapshot_from_vfs(context, vfs, entry.path())? {
-            snapshot_children.push(child_snapshot);
-        }
-    }
+    let entries = match entries {
+        Some(entries) => entries,
+        None => vfs.read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?,
+    };
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|child| !is_path_ignored(&context.path_ignore_rules, child.path()))
+        .collect();
+    let snapshot_child = |entry: &DirEntry| snapshot_from_vfs(context, vfs, entry.path());
+    // Preserve filesystem ordering, including which error is reported first.
+    // Small directories keep the original short-circuiting traversal.
+    let children: Vec<_> = if entries.len() >= 8 && rayon::current_num_threads() > 1 {
+        entries
+            .par_iter()
+            .map(snapshot_child)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        entries
+            .iter()
+            .map(snapshot_child)
+            .collect::<anyhow::Result<_>>()?
+    };
+    let snapshot_children: Vec<_> = children.into_iter().flatten().collect();
 
     let normalized_path = vfs.canonicalize(path)?;
     let relevant_paths = vec![
@@ -310,6 +322,85 @@ mod test {
     use memofs::{InMemoryFs, VfsSnapshot};
 
     #[test]
+    fn parallel_children_preserve_nested_order_and_sources() {
+        let mut imfs = InMemoryFs::new();
+        let groups = (0..16).map(|group| {
+            let scripts = (0..16).map(|script| {
+                (
+                    format!("Child{script:02}.luau"),
+                    VfsSnapshot::file(format!("return {group} * 16 + {script}")),
+                )
+            });
+            (format!("Group{group:02}"), VfsSnapshot::dir(scripts))
+        });
+        imfs.load_snapshot("/root", VfsSnapshot::dir(groups))
+            .unwrap();
+        let vfs = Vfs::new(imfs);
+        vfs.set_watch_enabled(false);
+        let load = |workers| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| {
+                    snapshot_from_vfs(&InstanceContext::default(), &vfs, Path::new("/root"))
+                        .unwrap()
+                        .unwrap()
+                })
+        };
+        let serial = load(1);
+        for workers in [2, 4] {
+            let parallel = load(workers);
+            assert_eq!(
+                serde_json::to_value(&serial).unwrap(),
+                serde_json::to_value(&parallel).unwrap()
+            );
+            for (group, child) in parallel.children.iter().enumerate() {
+                assert_eq!(child.name, format!("Group{group:02}"));
+                for (script, child) in child.children.iter().enumerate() {
+                    assert_eq!(child.name, format!("Child{script:02}"));
+                    assert_eq!(
+                        child.properties[&rbx_dom_weak::ustr("Source")],
+                        rbx_dom_weak::types::Variant::String(format!(
+                            "return {group} * 16 + {script}"
+                        ))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_children_report_first_ordered_error() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir((0..16).map(|index| {
+                (
+                    format!("Child{index:02}.model.json"),
+                    VfsSnapshot::file("not json"),
+                )
+            })),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+        for workers in [1, 2, 4] {
+            let error = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| {
+                    snapshot_from_vfs(&InstanceContext::default(), &vfs, Path::new("/root"))
+                })
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("Child00.model.json"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn empty_folder() {
         let mut imfs = InMemoryFs::new();
         imfs.load_snapshot("/foo", VfsSnapshot::empty_dir())
@@ -317,10 +408,15 @@ mod test {
 
         let vfs = Vfs::new(imfs);
 
-        let instance_snapshot =
-            snapshot_dir(&InstanceContext::default(), &vfs, Path::new("/foo"), "foo")
-                .unwrap()
-                .unwrap();
+        let instance_snapshot = snapshot_dir(
+            &InstanceContext::default(),
+            &vfs,
+            Path::new("/foo"),
+            "foo",
+            None,
+        )
+        .unwrap()
+        .unwrap();
 
         insta::assert_yaml_snapshot!(instance_snapshot);
     }
@@ -336,10 +432,15 @@ mod test {
 
         let vfs = Vfs::new(imfs);
 
-        let instance_snapshot =
-            snapshot_dir(&InstanceContext::default(), &vfs, Path::new("/foo"), "foo")
-                .unwrap()
-                .unwrap();
+        let instance_snapshot = snapshot_dir(
+            &InstanceContext::default(),
+            &vfs,
+            Path::new("/foo"),
+            "foo",
+            None,
+        )
+        .unwrap()
+        .unwrap();
 
         insta::assert_yaml_snapshot!(instance_snapshot);
     }

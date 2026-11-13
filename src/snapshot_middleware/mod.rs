@@ -26,7 +26,7 @@ use std::{
 };
 
 use anyhow::Context;
-use memofs::{IoResultExt, Vfs};
+use memofs::{DirEntry, IoResultExt, Vfs};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -74,15 +74,18 @@ pub fn snapshot_from_vfs(
     };
 
     if meta.is_dir() {
-        let (middleware, dir_name, init_path) = get_dir_middleware(vfs, path)?;
+        // A readable default project can live in a searchable but non-listable
+        // directory. Fall back to the original direct probes in that case.
+        let entries = vfs
+            .read_dir(path)
+            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+            .ok();
+        let (middleware, dir_name, init_path) = get_dir_middleware(vfs, path, entries.as_deref())?;
         // TODO: Support user defined init paths
         // If and when we do, make sure to go support it in
         // `Project::set_file_name`, as right now it special-cases
         // `default.project.json` as an `init` path.
-        match middleware {
-            Middleware::Dir => middleware.snapshot(context, vfs, path, dir_name),
-            _ => middleware.snapshot(context, vfs, &init_path, dir_name),
-        }
+        middleware.snapshot_with_entries(context, vfs, &init_path, dir_name, entries)
     } else {
         let file_name = path
             .file_name()
@@ -112,6 +115,7 @@ pub fn snapshot_from_vfs(
 fn get_dir_middleware<'path>(
     vfs: &Vfs,
     dir_path: &'path Path,
+    entries: Option<&[DirEntry]>,
 ) -> anyhow::Result<(Middleware, &'path str, PathBuf)> {
     let dir_name = dir_path
         .file_name()
@@ -138,7 +142,24 @@ fn get_dir_middleware<'path>(
         ]
     });
 
+    // Names only narrow the candidates. Probe the original paths to preserve the
+    // filesystem's case sensitivity and follow symlinks before checking file type.
+    let has_candidate = |name: &str| {
+        entries.is_none_or(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|entry_name| entry_name.eq_ignore_ascii_case(name))
+            })
+        })
+    };
+
     for default_project_name in DEFAULT_PROJECT_NAMES {
+        if !has_candidate(default_project_name) {
+            continue;
+        }
         let project_path = dir_path.join(default_project_name);
         if vfs
             .metadata(&project_path)
@@ -150,6 +171,9 @@ fn get_dir_middleware<'path>(
     }
 
     for (middleware, name) in order {
+        if !has_candidate(name) {
+            continue;
+        }
         let test_path = dir_path.join(name);
         if vfs
             .metadata(&test_path)
@@ -244,6 +268,17 @@ impl Middleware {
         path: &Path,
         name: &str,
     ) -> anyhow::Result<Option<InstanceSnapshot>> {
+        self.snapshot_with_entries(context, vfs, path, name, None)
+    }
+
+    fn snapshot_with_entries(
+        &self,
+        context: &InstanceContext,
+        vfs: &Vfs,
+        path: &Path,
+        name: &str,
+        entries: Option<Vec<DirEntry>>,
+    ) -> anyhow::Result<Option<InstanceSnapshot>> {
         let mut output = match self {
             Self::Csv => snapshot_csv(context, vfs, path, name),
             Self::JsonModel => snapshot_json_model(context, vfs, path, name),
@@ -272,26 +307,26 @@ impl Middleware {
             Self::Yaml => snapshot_yaml(context, vfs, path, name),
             Self::Ignore => Ok(None),
 
-            Self::Dir => snapshot_dir(context, vfs, path, name),
+            Self::Dir => snapshot_dir(context, vfs, path, name, entries),
             Self::ServerScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::Server)
+                snapshot_lua_init(context, vfs, path, name, ScriptType::Server, entries)
             }
             Self::ClientScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::Client)
+                snapshot_lua_init(context, vfs, path, name, ScriptType::Client, entries)
             }
             Self::PluginScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::Plugin)
+                snapshot_lua_init(context, vfs, path, name, ScriptType::Plugin, entries)
             }
             Self::ModuleScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::Module)
+                snapshot_lua_init(context, vfs, path, name, ScriptType::Module, entries)
             }
             Self::LegacyServerScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::LegacyServer)
+                snapshot_lua_init(context, vfs, path, name, ScriptType::LegacyServer, entries)
             }
             Self::LegacyClientScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::LegacyClient)
+                snapshot_lua_init(context, vfs, path, name, ScriptType::LegacyClient, entries)
             }
-            Self::CsvDir => snapshot_csv_init(context, vfs, path, name),
+            Self::CsvDir => snapshot_csv_init(context, vfs, path, name, entries),
         };
         if let Ok(Some(ref mut snapshot)) = output {
             snapshot.metadata.middleware = Some(*self);
@@ -395,7 +430,11 @@ impl Middleware {
         };
 
         if meta.is_dir() {
-            let (middleware, _, _) = get_dir_middleware(vfs, path)?;
+            let entries = vfs
+                .read_dir(path)
+                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+                .ok();
+            let (middleware, _, _) = get_dir_middleware(vfs, path, entries.as_deref())?;
             Ok(Some(middleware))
         } else {
             for rule in sync_rules.iter().chain(default_sync_rules()) {
@@ -489,7 +528,13 @@ mod test {
             .unwrap();
 
         let vfs = Vfs::new(imfs);
-        let (middleware, _, _) = get_dir_middleware(&vfs, Path::new("/root")).unwrap();
+        let path = Path::new("/root");
+        let entries = vfs
+            .read_dir(path)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let (middleware, _, _) = get_dir_middleware(&vfs, path, Some(&entries)).unwrap();
         middleware
     }
 
@@ -533,6 +578,276 @@ mod test {
         ]);
 
         assert_eq!(middleware, Middleware::Dir);
+    }
+
+    #[test]
+    fn initializer_priority_is_preserved() {
+        let order = [
+            (Middleware::Project, "default.project.json"),
+            (Middleware::Project, "default.project.jsonc"),
+            (Middleware::ModuleScriptDir, "init.luau"),
+            (Middleware::ModuleScriptDir, "init.lua"),
+            (Middleware::ServerScriptDir, "init.server.luau"),
+            (Middleware::ServerScriptDir, "init.server.lua"),
+            (Middleware::ClientScriptDir, "init.client.luau"),
+            (Middleware::ClientScriptDir, "init.client.lua"),
+            (Middleware::LegacyServerScriptDir, "init.legacy.luau"),
+            (Middleware::LegacyServerScriptDir, "init.legacy.lua"),
+            (Middleware::LegacyClientScriptDir, "init.local.luau"),
+            (Middleware::LegacyClientScriptDir, "init.local.lua"),
+            (Middleware::PluginScriptDir, "init.plugin.luau"),
+            (Middleware::PluginScriptDir, "init.plugin.lua"),
+            (Middleware::CsvDir, "init.csv"),
+        ];
+        let path = Path::new("/root");
+
+        for (index, &(expected, name)) in order.iter().enumerate() {
+            let mut imfs = InMemoryFs::new();
+            imfs.load_snapshot(
+                path,
+                VfsSnapshot::dir(
+                    order[index..]
+                        .iter()
+                        .rev()
+                        .map(|&(_, name)| (name, VfsSnapshot::file(""))),
+                ),
+            )
+            .unwrap();
+            let vfs = Vfs::new(imfs);
+            let mut entries = vfs
+                .read_dir(path)
+                .unwrap()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap();
+            entries.reverse();
+            let (middleware, dir_name, init_path) =
+                get_dir_middleware(&vfs, path, Some(&entries)).unwrap();
+
+            assert_eq!(middleware, expected);
+            assert_eq!(dir_name, "root");
+            assert_eq!(init_path, path.join(name));
+        }
+    }
+
+    #[test]
+    fn initializer_directories_do_not_hide_lower_priority_files() {
+        let middleware = middleware_for_dir(vec![
+            ("default.project.json", VfsSnapshot::empty_dir()),
+            ("init.luau", VfsSnapshot::empty_dir()),
+            ("init.lua", VfsSnapshot::empty_dir()),
+            ("init.server.luau", VfsSnapshot::file("")),
+        ]);
+
+        assert_eq!(middleware, Middleware::ServerScriptDir);
+    }
+
+    #[test]
+    fn initializer_spelling_remains_case_sensitive() {
+        for name in ["INIT.LUAU", "Init.lua", "DEFAULT.PROJECT.JSON", "INIT.CSV"] {
+            assert_eq!(
+                middleware_for_dir(vec![(name, VfsSnapshot::file(""))]),
+                Middleware::Dir,
+            );
+        }
+
+        assert_eq!(
+            middleware_for_dir(vec![
+                ("INIT.LUAU", VfsSnapshot::file("")),
+                ("init.server.lua", VfsSnapshot::file("")),
+            ]),
+            Middleware::ServerScriptDir,
+        );
+    }
+
+    #[test]
+    fn initializer_lookup_respects_native_filesystem_case_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+        std::fs::write(path.join("INIT.LUAU"), "return {}").unwrap();
+        let expected = if path.join("init.luau").is_file() {
+            Middleware::ModuleScriptDir
+        } else {
+            Middleware::Dir
+        };
+        let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+        let entries = vfs
+            .read_dir(path)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let (middleware, _, init_path) = get_dir_middleware(&vfs, path, Some(&entries)).unwrap();
+
+        assert_eq!(middleware, expected);
+        if expected == Middleware::ModuleScriptDir {
+            assert_eq!(init_path, path.join("init.luau"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_project_in_non_listable_directory_remains_readable() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("root");
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("default.project.json"),
+            r#"{ "name": "PermissionTest", "tree": { "$className": "Folder" } }"#,
+        )
+        .unwrap();
+        let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+        vfs.set_watch_enabled(false);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o111)).unwrap();
+        let listing_denied = vfs.read_dir(&directory).is_err();
+        let snapshot = snapshot_from_vfs(&InstanceContext::new(), &vfs, &directory);
+        let middleware = Middleware::middleware_for_path(&vfs, &[], &directory);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        if listing_denied {
+            assert_eq!(snapshot.unwrap().unwrap().class_name, "Folder");
+            assert_eq!(middleware.unwrap(), Some(Middleware::Project));
+        }
+    }
+
+    #[test]
+    fn newly_created_initializer_is_not_hidden_by_old_directory_listing() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot("/root", VfsSnapshot::empty_dir())
+            .unwrap();
+        let vfs = Vfs::new(imfs);
+        let original = snapshot_from_vfs(&InstanceContext::new(), &vfs, Path::new("/root"))
+            .unwrap()
+            .unwrap();
+        assert!(original
+            .metadata
+            .relevant_paths
+            .contains(&Path::new("/root/init.luau").to_path_buf()));
+        vfs.write("/root/init.luau", "return 42").unwrap();
+        let reloaded = snapshot_from_vfs(&original.metadata.context, &vfs, Path::new("/root"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.class_name, "ModuleScript");
+        vfs.remove_file("/root/init.luau").unwrap();
+        assert_eq!(
+            snapshot_from_vfs(&reloaded.metadata.context, &vfs, Path::new("/root"))
+                .unwrap()
+                .unwrap()
+                .class_name,
+            "Folder"
+        );
+    }
+
+    #[test]
+    fn nested_initializers_use_their_own_entries() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([(
+                "nested",
+                VfsSnapshot::dir([
+                    ("init.luau", VfsSnapshot::file("return {}")),
+                    ("child.txt", VfsSnapshot::file("hello")),
+                ]),
+            )]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+        let snapshot = snapshot_from_vfs(&InstanceContext::new(), &vfs, Path::new("/root"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(snapshot.metadata.middleware, Some(Middleware::Dir));
+        assert_eq!(snapshot.children.len(), 1);
+        let nested = &snapshot.children[0];
+        assert_eq!(nested.name, "nested");
+        assert_eq!(nested.class_name, "ModuleScript");
+        assert_eq!(
+            nested.metadata.middleware,
+            Some(Middleware::ModuleScriptDir)
+        );
+        assert_eq!(nested.children.len(), 1);
+        assert_eq!(nested.children[0].name, "child");
+    }
+
+    #[test]
+    fn snapshot_wrapper_and_collected_entries_assign_middleware() {
+        for (middleware, initializer, contents, class_name) in [
+            (Middleware::Dir, None, "", "Folder"),
+            (
+                Middleware::ModuleScriptDir,
+                Some("init.luau"),
+                "return {}",
+                "ModuleScript",
+            ),
+            (
+                Middleware::CsvDir,
+                Some("init.csv"),
+                "Key,Source\nGreeting,Hello\n",
+                "LocalizationTable",
+            ),
+        ] {
+            let mut files = vec![("child.txt", VfsSnapshot::file("hello"))];
+            if let Some(name) = initializer {
+                files.push((name, VfsSnapshot::file(contents)));
+            }
+            let mut imfs = InMemoryFs::new();
+            imfs.load_snapshot("/root", VfsSnapshot::dir(files))
+                .unwrap();
+            let vfs = Vfs::new(imfs);
+            let context = InstanceContext::new();
+            let path = Path::new("/root");
+            let init_path = initializer.map_or_else(|| path.to_path_buf(), |name| path.join(name));
+            let wrapped = middleware
+                .snapshot(&context, &vfs, &init_path, "root")
+                .unwrap()
+                .unwrap();
+            let collected = snapshot_from_vfs(&context, &vfs, path).unwrap().unwrap();
+
+            for snapshot in [wrapped, collected] {
+                assert_eq!(snapshot.metadata.middleware, Some(middleware));
+                assert_eq!(snapshot.class_name, class_name);
+                assert_eq!(snapshot.children.len(), 1);
+                assert_eq!(snapshot.children[0].name, "child");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initializer_lookup_follows_file_and_directory_symlinks() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let linked_root = temp.path().join("linked-root");
+        let target = temp.path().join("module.luau");
+        let directory_target = temp.path().join("directory");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&directory_target).unwrap();
+        fs::write(&target, "return {}").unwrap();
+        fs::write(root.join("child.txt"), "hello").unwrap();
+        symlink(&target, root.join("init.luau")).unwrap();
+        symlink(&directory_target, root.join("default.project.json")).unwrap();
+        symlink(&root, &linked_root).unwrap();
+        let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+        let entries = vfs
+            .read_dir(&linked_root)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let (middleware, _, init_path) =
+            get_dir_middleware(&vfs, &linked_root, Some(&entries)).unwrap();
+
+        assert_eq!(middleware, Middleware::ModuleScriptDir);
+        assert_eq!(init_path, linked_root.join("init.luau"));
+        let snapshot = snapshot_from_vfs(&InstanceContext::new(), &vfs, &linked_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.class_name, "ModuleScript");
+        assert_eq!(
+            snapshot.metadata.middleware,
+            Some(Middleware::ModuleScriptDir),
+        );
+        assert!(snapshot.children.iter().any(|child| child.name == "child"));
     }
 
     #[test]

@@ -1,7 +1,10 @@
 use std::{
     io::{BufWriter, Write},
     mem::forget,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{bail, Context};
@@ -39,6 +42,10 @@ pub struct BuildCommand {
     #[clap(long, short, conflicts_with = "output")]
     pub plugin: Option<PathBuf>,
 
+    /// Maximum number of workers used to load the project.
+    #[clap(long, short = 'j')]
+    pub jobs: Option<NonZeroUsize>,
+
     /// Whether to automatically rebuild when any input files change.
     #[clap(long)]
     pub watch: bool,
@@ -46,6 +53,18 @@ pub struct BuildCommand {
 
 impl BuildCommand {
     pub fn run(self) -> anyhow::Result<()> {
+        let workers = self
+            .jobs
+            .map(NonZeroUsize::get)
+            .unwrap_or_else(|| num_cpus::get().min(8));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .context("Failed to create the build worker pool")?;
+        self.run_with_pool(Arc::new(pool))
+    }
+
+    fn run_with_pool(self, pool: Arc<rayon::ThreadPool>) -> anyhow::Result<()> {
         let (output_path, output_kind) = match (self.output, self.plugin) {
             (None, None) => {
                 BuildCommand::command()
@@ -81,7 +100,9 @@ impl BuildCommand {
         let vfs = Vfs::new_default()?;
         vfs.set_watch_enabled(self.watch);
 
-        let session = ServeSession::new(vfs, project_path)?;
+        let started = Instant::now();
+        let session = ServeSession::new_with_pool(vfs, project_path, Some(pool))?;
+        log::debug!("Loaded project in {:?}", started.elapsed());
         let mut cursor = session.message_queue().cursor();
 
         write_model(&session, &output_path, output_kind)?;
@@ -161,6 +182,7 @@ fn write_model(
     output: &Path,
     output_kind: OutputKind,
 ) -> anyhow::Result<()> {
+    let started = Instant::now();
     println!("Building project '{}'", session.project_name());
 
     let tree = session.tree();
@@ -197,6 +219,7 @@ fn write_model(
     }
 
     file.flush()?;
+    log::debug!("Serialized project in {:?}", started.elapsed());
 
     let filename = output
         .file_name()
