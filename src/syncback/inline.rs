@@ -7,6 +7,11 @@ use std::collections::{HashMap, HashSet};
 
 use rbx_dom_weak::{types::Ref, Ustr, WeakDom};
 
+use crate::{
+    snapshot::{InstigatingSource, RojoTree},
+    snapshot_middleware::Middleware,
+};
+
 const SCRIPT_BASE_CLASS: &str = "LuaSourceContainer";
 
 /// Returns whether instances of `class` hold Luau source, including any class
@@ -60,6 +65,47 @@ pub fn script_containers(dom: &WeakDom) -> HashSet<Ref> {
         }
     }
     containers
+}
+
+/// Returns every instance in `tree` whose subtree is on disk in an outdated
+/// layout: some file-backed instance in it belongs inside its directory
+/// parent's `init.meta.json`, because that parent's subtree has no scripts.
+/// Syncback skips subtrees whose content is unchanged, so without this an
+/// existing project would never move into the inline layout.
+pub fn needs_relayout(tree: &RojoTree) -> HashSet<Ref> {
+    let containers = script_containers(tree.inner());
+    let mut relayout = HashSet::new();
+    let mut pending = vec![tree.get_root_id()];
+    while let Some(referent) = pending.pop() {
+        let Some(instance) = tree.get_instance(referent) else {
+            continue;
+        };
+        pending.extend(instance.children().iter().copied());
+
+        let parent = instance.parent();
+        let misplaced = matches!(
+            instance.metadata().instigating_source,
+            Some(InstigatingSource::Path(_))
+        ) && !containers.contains(&parent)
+            && tree.get_metadata(parent).is_some_and(|metadata| {
+                metadata.middleware == Some(Middleware::Dir)
+                    && matches!(
+                        metadata.instigating_source,
+                        Some(InstigatingSource::Path(_))
+                    )
+            });
+        if misplaced {
+            // Every ancestor's subtree includes the misplaced instance.
+            let mut current = parent;
+            while relayout.insert(current) {
+                match tree.get_instance(current) {
+                    Some(ancestor) if ancestor.parent().is_some() => current = ancestor.parent(),
+                    _ => break,
+                }
+            }
+        }
+    }
+    relayout
 }
 
 /// Returns whether `id` is a script or has a script descendant.

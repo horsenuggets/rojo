@@ -229,6 +229,11 @@ pub fn syncback_loop(
 
     let project_path = project.folder_location();
 
+    let relayout = if instances_as_directories(project) {
+        inline::needs_relayout(old_tree)
+    } else {
+        HashSet::new()
+    };
     let script_containers = inline::script_containers(&new_tree);
     let syncback_data = SyncbackData {
         vfs,
@@ -253,7 +258,9 @@ pub fn syncback_loop(
         let inst_path = snapshot.get_new_inst_path(snapshot.new);
         // We can quickly check that two subtrees are identical and if they are,
         // skip reconciling them.
-        if let Some(old_ref) = snapshot.old {
+        // Unchanged content can still be in an outdated layout, so those
+        // subtrees are reconciled to move files into their new places.
+        if let Some(old_ref) = snapshot.old.filter(|old| !relayout.contains(old)) {
             match (old_hashes.get(&old_ref), new_hashes.get(&snapshot.new)) {
                 (Some(old), Some(new)) => {
                     if old == new {

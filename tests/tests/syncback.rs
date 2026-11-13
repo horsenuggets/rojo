@@ -51,6 +51,9 @@ syncback_tests! {
     ignore_trees_adding => [],
     // Ensures that `ignoreTrees` works for removals
     ignore_trees_removing => [],
+    // Ensures that a project already matching the place still moves into the
+    // inline layout, instead of being skipped as unchanged
+    inline_relayout_unchanged => ["src/Holder/init.meta.json"],
     // Ensures that directories switch between inline children and a file for
     // each child as scripts leave or enter their subtree
     inline_layout_changes => ["src/Collapse/init.meta.json", "src/Expand/Holder/Added.server.luau", "src/Expand/Holder/Brick/init.meta.json"],
