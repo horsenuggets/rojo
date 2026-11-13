@@ -7,6 +7,9 @@ local PatchSet = require(script.Parent.Parent.PatchSet)
 local setProperty = require(script.Parent.setProperty)
 local decodeValue = require(script.Parent.decodeValue)
 
+-- How the server encodes a reference that points at nothing.
+local NULL_REF = "00000000000000000000000000000000"
+
 --[[
 	Add the given ID and all of its descendants in virtualInstances to the given
 	PatchSet, marked for addition.
@@ -130,6 +133,15 @@ function applyDeferredRefs(instanceMap, deferredRefs, unappliedPatch)
 		local _, refId = next(entry.virtualValue)
 
 		if refId == nil then
+			continue
+		end
+
+		-- A null reference clears the property rather than pointing at an
+		-- instance, so there's nothing to look up.
+		if refId == NULL_REF then
+			if not setProperty(entry.instance, entry.propertyName, nil) then
+				markFailed(entry.id, entry.propertyName, entry.virtualValue)
+			end
 			continue
 		end
 

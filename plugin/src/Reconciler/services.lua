@@ -34,6 +34,22 @@ function services.isEngineOwned(instance)
 	return success and result
 end
 
+-- Workspace.CurrentCamera belongs to the local Studio session rather than the
+-- place, and syncback never writes it.
+function services.isCurrentCamera(instance)
+	local success, result = pcall(function()
+		local parent = instance.Parent
+		return parent ~= nil and parent:IsA("Workspace") and parent.CurrentCamera == instance
+	end)
+	return success and result
+end
+
+-- Returns whether Rojo must never remove or replace `instance`, whether it's
+-- found unknown while diffing or a patch from the server asks for it.
+function services.isProtected(instance)
+	return services.isEngineOwned(instance) or services.isCurrentCamera(instance)
+end
+
 -- Returns the service of `className` under `parent`, creating it when Studio
 -- hasn't yet. Returns nil if `parent` isn't a DataModel or the class isn't a
 -- service. Creating a lazy service matches what applying the patch would do,

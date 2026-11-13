@@ -18,16 +18,6 @@ local function isEmpty(table)
 	return next(table) == nil
 end
 
--- Workspace.CurrentCamera belongs to the local Studio session rather than the
--- place, and syncback never writes it, so it's never treated as unknown.
-local function isCurrentCamera(instance)
-	local success, result = pcall(function()
-		local parent = instance.Parent
-		return parent ~= nil and parent:IsA("Workspace") and parent.CurrentCamera == instance
-	end)
-	return success and result
-end
-
 local function shouldDeleteUnknownInstances(virtualInstance)
 	if virtualInstance.Metadata ~= nil then
 		return not virtualInstance.Metadata.ignoreUnknownInstances
@@ -165,7 +155,7 @@ local function diff(instanceMap, virtualInstances, rootId)
 					-- such as the Rojo session lock value.
 					return childInstance.Archivable == false
 				end)
-				if (success and skip) or isCurrentCamera(childInstance) or services.isEngineOwned(childInstance) then
+				if (success and skip) or services.isProtected(childInstance) then
 					continue
 				end
 

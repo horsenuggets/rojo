@@ -6,6 +6,33 @@ return function()
 
 	local container = Instance.new("Folder")
 
+	it("should clear a reference when the server sends a null ref", function()
+		local target = Instance.new("Folder")
+		local pointer = Instance.new("ObjectValue")
+		pointer.Value = target
+		local instanceMap = InstanceMap.new()
+		instanceMap:insert("POINTER", pointer)
+		instanceMap:insert("TARGET", target)
+
+		local unapplied = applyPatch(instanceMap, {
+			removed = {},
+			added = {},
+			updated = {
+				{
+					id = "POINTER",
+					changedProperties = {
+						Value = { Ref = "00000000000000000000000000000000" },
+					},
+				},
+			},
+		})
+
+		assert(PatchSet.isEmpty(unapplied), "expected the null ref to apply")
+		expect(pointer.Value).to.equal(nil)
+		pointer:Destroy()
+		target:Destroy()
+	end)
+
 	local tempContainer = Instance.new("Folder")
 	local function wasRemoved(instance)
 		-- If an instance was destroyed, its parent property is locked.

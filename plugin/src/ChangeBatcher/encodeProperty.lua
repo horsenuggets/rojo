@@ -2,6 +2,8 @@ local Packages = script.Parent.Parent.Parent.Packages
 local Log = require(Packages.Log)
 local RbxDom = require(Packages.RbxDom)
 
+local unmanagedAttributes = require(script.Parent.Parent.Reconciler.unmanagedAttributes)
+
 return function(instance, propertyName, propertyDescriptor, instanceMap)
 	local readSuccess, readResult = propertyDescriptor:read(instance)
 
@@ -23,6 +25,18 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 		end
 
 		return true, { Ref = referentId }
+	end
+
+	-- Attributes the filesystem can't hold, like infinity, would otherwise be
+	-- encoded as sentinel values and saved. The server keeps its own copies.
+	if dataType == "Attributes" and type(readResult) == "table" then
+		local managed = {}
+		for name, value in readResult do
+			if not unmanagedAttributes.isUnmanaged(name, value) then
+				managed[name] = value
+			end
+		end
+		readResult = managed
 	end
 
 	local callSuccess, encodeSuccess, encodeResult = pcall(RbxDom.EncodedValue.encode, readResult, dataType)

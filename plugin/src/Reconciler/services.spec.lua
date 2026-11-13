@@ -1,6 +1,7 @@
 return function()
 	local InstanceMap = require(script.Parent.Parent.InstanceMap)
 
+	local applyPatch = require(script.Parent.applyPatch)
 	local diff = require(script.Parent.diff)
 	local hydrate = require(script.Parent.hydrate)
 	local services = require(script.Parent.services)
@@ -57,6 +58,54 @@ return function()
 			expect(instanceMap.fromIds.TEAMS).to.equal(teams)
 		end)
 		teams.Name = originalName
+		assert(success, err)
+	end)
+
+	it("should keep protected instances when a patch removes or replaces them", function()
+		local Workspace = game:GetService("Workspace")
+		local camera = Workspace.CurrentCamera
+		local createdCamera = nil
+		if camera == nil then
+			createdCamera = Instance.new("Camera")
+			createdCamera.Parent = Workspace
+			Workspace.CurrentCamera = createdCamera
+			camera = createdCamera
+		end
+		local cameraParent = camera.Parent
+		local replicatedStorage = game:GetService("ReplicatedStorage")
+		local folder = Instance.new("Folder")
+		folder.Parent = Workspace
+
+		local success, err = pcall(function()
+			local instanceMap = InstanceMap.new()
+			instanceMap:insert("CAMERA", camera)
+			instanceMap:insert("STORAGE", replicatedStorage)
+			instanceMap:insert("FOLDER", folder)
+
+			local unapplied = applyPatch(instanceMap, {
+				removed = { "CAMERA", replicatedStorage, "FOLDER" },
+				added = {},
+				updated = {
+					{ id = "STORAGE", changedClassName = "Folder", changedProperties = {} },
+				},
+			})
+
+			expect(camera.Parent).to.equal(cameraParent)
+			expect(replicatedStorage.Parent).to.equal(game)
+			expect(folder.Parent).to.equal(nil)
+			expect(instanceMap.fromIds.CAMERA).to.equal(nil)
+			expect(instanceMap.fromIds.FOLDER).to.equal(nil)
+			expect(#unapplied.removed).to.equal(0)
+			-- The class change is reported as not applied instead of replacing
+			-- the service.
+			expect(#unapplied.updated).to.equal(1)
+			expect(unapplied.updated[1].id).to.equal("STORAGE")
+		end)
+
+		folder:Destroy()
+		if createdCamera then
+			createdCamera:Destroy()
+		end
 		assert(success, err)
 	end)
 

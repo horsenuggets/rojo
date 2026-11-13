@@ -37,7 +37,8 @@ body:
           changedProperties:
             Attributes:
               Attributes: {}
-            PrimaryPart: ~
+            PrimaryPart:
+              Ref: "00000000000000000000000000000000"
           id: id-8
 packetType: messages
 sessionId: id-1

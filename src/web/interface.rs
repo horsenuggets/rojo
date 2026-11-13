@@ -69,10 +69,16 @@ impl<'a> SubscribeMessage<'a> {
                         // default explicitly while keeping absent properties absent in the DOM.
                         let value = value.or_else(|| {
                             let instance = tree.get_instance(update.id)?;
+                            let class_name = instance.class_name();
+                            // References have no reflection default, and an explicit
+                            // null reference is the only way to clear one.
+                            if is_ref_property(class_name.as_str(), key.as_str()) {
+                                return Some(Variant::Ref(Ref::none()));
+                            }
                             let database = rbx_reflection_database::get().unwrap();
                             database
                                 .classes
-                                .get(instance.class_name().as_str())?
+                                .get(class_name.as_str())?
                                 .default_properties
                                 .get(key.as_str())
                                 .cloned()
@@ -160,6 +166,26 @@ impl Instance<'_> {
             metadata: Some(InstanceMetadata::from_rojo_metadata(source.metadata())),
         }
     }
+}
+
+/// Returns whether `class_name.prop_name` holds a reference, checking the
+/// classes it inherits from.
+fn is_ref_property(class_name: &str, prop_name: &str) -> bool {
+    let database = rbx_reflection_database::get().unwrap();
+    let mut current = class_name;
+    while let Some(class) = database.classes.get(current) {
+        if let Some(property) = class.properties.get(prop_name) {
+            return matches!(
+                property.data_type,
+                rbx_reflection::DataType::Value(VariantType::Ref)
+            );
+        }
+        match class.superclass {
+            Some(superclass) => current = superclass,
+            None => break,
+        }
+    }
+    false
 }
 
 fn property_filter(value: Option<&Variant>) -> bool {
@@ -352,6 +378,35 @@ mod tests {
     use super::*;
     use crate::snapshot::{apply_patch_set, InstanceSnapshot, PatchUpdate};
     use rbx_dom_weak::ustr;
+
+    #[test]
+    fn removed_references_are_sent_as_explicit_null_refs() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("ObjectValue"));
+        let id = tree.get_root_id();
+        let applied = apply_patch_set(
+            &mut tree,
+            PatchSet {
+                updated_instances: vec![PatchUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_properties: UstrMap::from_iter([(ustr("Value"), None)]),
+                    changed_metadata: None,
+                }],
+                ..PatchSet::new()
+            },
+        );
+        let message = SubscribeMessage::from_patch_update(&tree, applied);
+        assert_eq!(
+            message.updated[0].changed_properties[&ustr("Value")],
+            Some(Variant::Ref(Ref::none()))
+        );
+        // Inherited reference properties count too, like Model.PrimaryPart.
+        assert!(is_ref_property("Model", "PrimaryPart"));
+        assert!(is_ref_property("ObjectValue", "Value"));
+        assert!(!is_ref_property("Part", "Transparency"));
+        assert!(!is_ref_property("NotARealClass", "Value"));
+    }
 
     #[test]
     fn absent_properties_have_explicit_wire_defaults_without_mutating_the_tree() {

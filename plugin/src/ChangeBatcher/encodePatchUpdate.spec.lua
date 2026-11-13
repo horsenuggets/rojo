@@ -1,6 +1,21 @@
 return function()
 	local encodePatchUpdate = require(script.Parent.encodePatchUpdate)
 
+	it("should never encode attributes the filesystem can't hold", function()
+		local part = Instance.new("Part")
+		part:SetAttribute("Health", 5)
+		part:SetAttribute("Far", math.huge)
+		part:SetAttribute("Broken", 0 / 0)
+		part:SetAttribute("Rojo_Id", "linked")
+		local update = encodePatchUpdate(part, "PART", { Attributes = true })
+		local attributes = update.changedProperties.Attributes.Attributes
+		expect(attributes.Health ~= nil).to.equal(true)
+		expect(attributes.Far).to.equal(nil)
+		expect(attributes.Broken).to.equal(nil)
+		expect(attributes.Rojo_Id).to.equal(nil)
+		part:Destroy()
+	end)
+
 	it("should return an update when there are property changes", function()
 		local part = Instance.new("Part")
 		local properties = {

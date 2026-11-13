@@ -15,6 +15,7 @@ local invariant = require(script.Parent.Parent.invariant)
 local decodeValue = require(script.Parent.decodeValue)
 local reify = require(script.Parent.reify)
 local reifyInstance, applyDeferredRefs = reify.reifyInstance, reify.applyDeferredRefs
+local services = require(script.Parent.services)
 local setProperty = require(script.Parent.setProperty)
 local unmanagedAttributes = require(script.Parent.unmanagedAttributes)
 
@@ -29,7 +30,20 @@ local function applyPatch(instanceMap, patch)
 
 	for _, removedIdOrInstance in ipairs(patch.removed) do
 		local removeInstanceSuccess = pcall(function()
-			if Types.RbxId(removedIdOrInstance) then
+			local instance = if Types.RbxId(removedIdOrInstance)
+				then instanceMap.fromIds[removedIdOrInstance]
+				else removedIdOrInstance
+
+			-- Removals from the server pass through here without diffing, so
+			-- engine-owned instances and the current camera are protected here
+			-- too. Rojo just stops tracking them.
+			if instance ~= nil and services.isProtected(instance) then
+				Log.debug("Not removing protected instance {}", instance:GetFullName())
+				instanceMap:removeInstance(instance)
+				for _, descendant in instance:GetDescendants() do
+					instanceMap:removeInstance(descendant)
+				end
+			elseif Types.RbxId(removedIdOrInstance) then
 				instanceMap:destroyId(removedIdOrInstance)
 			else
 				instanceMap:destroyInstance(removedIdOrInstance)
@@ -104,6 +118,13 @@ local function applyPatch(instanceMap, patch)
 		-- If the instance's className changed, we have a bumpy ride ahead while
 		-- we recreate this instance and move all of its children into the new
 		-- version atomically...ish.
+		-- Changing the class recreates the instance and unparents the original,
+		-- which must never happen to engine-owned instances or the camera.
+		if update.changedClassName ~= nil and services.isProtected(instance) then
+			table.insert(unappliedPatch.updated, update)
+			continue
+		end
+
 		if update.changedClassName ~= nil then
 			-- If the instance's name also changed, we'll do it here, since this
 			-- branch will skip the rest of the loop iteration.
