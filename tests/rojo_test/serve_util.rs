@@ -135,9 +135,15 @@ impl TestServeSession {
     pub fn wait_to_come_online(&mut self) -> ServerInfoResponse {
         const BASE_DURATION_MS: f32 = 30.0;
         const EXP_BACKOFF_FACTOR: f32 = 1.3;
-        const MAX_TRIES: u32 = 5;
+        const MAX_RETRY_MS: f32 = 500.0;
+        // A fixed retry count gave the server well under a second, which a busy
+        // machine can exceed. Exiting early is still detected on every attempt.
+        const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
-        for i in 1..=MAX_TRIES {
+        let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        let mut i = 0;
+        while std::time::Instant::now() < deadline {
+            i += 1;
             match self.rojo_process.0.try_wait() {
                 Ok(Some(status)) => panic!("Rojo process exited with status {}", status),
                 Ok(None) => { /* The process is still running, as expected */ }
@@ -147,7 +153,8 @@ impl TestServeSession {
             let info = match self.get_api_rojo() {
                 Ok(info) => info,
                 Err(err) => {
-                    let retry_time_ms = BASE_DURATION_MS * (i as f32).powf(EXP_BACKOFF_FACTOR);
+                    let retry_time_ms =
+                        (BASE_DURATION_MS * (i as f32).powf(EXP_BACKOFF_FACTOR)).min(MAX_RETRY_MS);
                     let retry_time = Duration::from_millis(retry_time_ms as u64);
 
                     log::info!("Server error, retrying in {:?}: {}", retry_time, err);
@@ -161,7 +168,10 @@ impl TestServeSession {
             return info;
         }
 
-        panic!("Rojo server did not respond after {} tries.", MAX_TRIES);
+        panic!(
+            "Rojo server did not respond within {:?} ({} tries).",
+            STARTUP_TIMEOUT, i
+        );
     }
 
     pub fn get_api_rojo(&self) -> Result<ServerInfoResponse, reqwest::Error> {
