@@ -38,6 +38,7 @@ Making a new release? Simply add the new header with the version and date undern
 * Reused directory listings to avoid probing absent initializer files for every instance.
 * Detected recursive project dependencies and directory symlink cycles without hiding
   earlier ordered errors.
+* Fixed the plugin release check to build the root-level plugin project.
 
 ## `7.7.1-horse.0.13`
 

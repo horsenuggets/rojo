@@ -57,6 +57,9 @@ pub fn snapshot_project(
         );
     }
     Arc::make_mut(active_projects).push(canonical_path);
+    // Project ignore rules can make revisiting a directory finite. Project
+    // ancestry still rejects recursive project references across this boundary.
+    context.active_directories = None;
     context.clear_sync_rules();
 
     let rules = project.glob_ignore_paths.iter().map(|glob| PathIgnoreRule {
@@ -831,6 +834,69 @@ mod test {
                     }),
                     "{message}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_project_can_revisit_a_directory_when_it_excludes_itself() {
+        for watch in [false, true] {
+            for excludes_self in [false, true] {
+                let mut imfs = InMemoryFs::new();
+                imfs.load_snapshot("/root/Source", VfsSnapshot::empty_dir())
+                    .unwrap();
+                let ignores: Vec<&str> = if excludes_self {
+                    vec!["view.project.json"]
+                } else {
+                    vec![]
+                };
+                imfs.load_snapshot(
+                    "/root/Source/view.project.json",
+                    VfsSnapshot::file(
+                        serde_json::json!({
+                            "name": "View",
+                            "globIgnorePaths": ignores,
+                            "tree": { "$path": "." }
+                        })
+                        .to_string(),
+                    ),
+                )
+                .unwrap();
+                for index in 0..8 {
+                    imfs.load_snapshot(
+                        format!("/root/Source/value{index}.txt"),
+                        VfsSnapshot::file("text"),
+                    )
+                    .unwrap();
+                }
+                let vfs = Vfs::new(imfs);
+                vfs.set_watch_enabled(watch);
+                for workers in [1, 4] {
+                    let result = rayon::ThreadPoolBuilder::new()
+                        .num_threads(workers)
+                        .build()
+                        .unwrap()
+                        .install(|| {
+                            snapshot_from_vfs(
+                                &InstanceContext::default(),
+                                &vfs,
+                                Path::new("/root/Source"),
+                            )
+                        });
+                    if excludes_self {
+                        let snapshot = result.unwrap().unwrap();
+                        let view = snapshot
+                            .children
+                            .iter()
+                            .find(|child| child.name == "View")
+                            .unwrap();
+                        assert_eq!(view.children.len(), 8);
+                        assert!(view.metadata.context.active_directories.is_none());
+                    } else {
+                        assert!(format!("{:#}", result.unwrap_err())
+                            .contains("Project dependency cycle"));
+                    }
+                }
             }
         }
     }
