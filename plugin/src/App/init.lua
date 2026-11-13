@@ -438,6 +438,10 @@ function App:tryAutoReconnect()
 end
 
 function App:checkSyncReminder()
+	if not Config.syncRemindersEnabled then
+		return
+	end
+
 	local syncReminderMode = Settings:get("syncReminderMode")
 	if syncReminderMode == "None" then
 		return
@@ -474,7 +478,8 @@ end
 
 function App:startSyncReminderPolling()
 	if
-		self.syncReminderPollingThread ~= nil
+		not Config.syncRemindersEnabled
+		or self.syncReminderPollingThread ~= nil
 		or Settings:get("syncReminderMode") == "None"
 		or not Settings:get("syncReminderPolling")
 	then
@@ -507,6 +512,10 @@ function App:stopSyncReminderPolling()
 end
 
 function App:sendSyncReminder(message: string, shownActions: { string })
+	if not Config.syncRemindersEnabled then
+		return
+	end
+
 	local syncReminderMode = Settings:get("syncReminderMode")
 	if syncReminderMode == "None" then
 		return
@@ -635,6 +644,24 @@ function App:startSession()
 		apiContext = apiContext,
 		twoWaySync = Settings:get("twoWaySync"),
 	})
+
+	serveSession:setSyncResultCallback(function(status, result)
+		if status == "Failed" then
+			local messages = {}
+			for _, err in result.errors do
+				table.insert(messages, `{err.property or "Instance"}: {err.message}`)
+			end
+			self:addNotification({
+				text = "Could not save Studio changes:\n" .. table.concat(messages, "\n"),
+				timeout = 8,
+			})
+		elseif status == "Conflicted" then
+			self:addNotification({
+				text = "Filesystem values won a conflict and were restored in Studio.",
+				timeout = 8,
+			})
+		end
+	end)
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
 		self:setState({
@@ -814,6 +841,8 @@ function App:startSession()
 			patchTree = PatchTree.build(patch, instanceMap, { "Property", "Current", "Incoming" }),
 			confirmData = {
 				serverInfo = serverInfo,
+				patch = patch,
+				instanceMap = instanceMap,
 			},
 			toolbarIcon = Assets.Images.PluginButton,
 		})

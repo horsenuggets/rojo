@@ -41,19 +41,24 @@ return function()
 		local part = Instance.new("Part")
 		local properties = {
 			Position = true,
+			Size = true,
 			Color = true,
 		}
 
 		part.Position = Vector3.new(0, 100, 0)
+		part.Size = Vector3.new(2, 100, 4)
 		part.Color = Color3.new(0.8, 0.2, 0.9)
 
 		local update = encodePatchUpdate(part, "PART", properties)
-		local position = update.changedProperties.Position
+		local size = update.changedProperties.Size
 		local color = update.changedProperties.Color
 
-		expect(position.Vector3[1]).to.equal(0)
-		expect(position.Vector3[2]).to.equal(100)
-		expect(position.Vector3[3]).to.equal(0)
+		-- Position doesn't serialize; it's carried by CFrame.
+		expect(update.changedProperties.Position).to.equal(nil)
+
+		expect(size.Vector3[1]).to.equal(2)
+		expect(size.Vector3[2]).to.equal(100)
+		expect(size.Vector3[3]).to.equal(4)
 
 		expect(color.Color3[1]).to.be.near(0.8, 0.01)
 		expect(color.Color3[2]).to.be.near(0.2, 0.01)

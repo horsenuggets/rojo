@@ -16,6 +16,7 @@ local decodeValue = require(script.Parent.decodeValue)
 local reify = require(script.Parent.reify)
 local reifyInstance, applyDeferredRefs = reify.reifyInstance, reify.applyDeferredRefs
 local setProperty = require(script.Parent.setProperty)
+local unmanagedAttributes = require(script.Parent.unmanagedAttributes)
 
 local function applyPatch(instanceMap, patch)
 	-- Tracks any portions of the patch that could not be applied to the DOM.
@@ -217,6 +218,10 @@ local function applyPatch(instanceMap, patch)
 					unappliedUpdate.changedProperties[propertyName] = propertyValue
 					partiallyApplied = true
 					continue
+				end
+
+				if propertyName == "Attributes" and type(decodedValue) == "table" then
+					decodedValue = unmanagedAttributes.merge(decodedValue, instance:GetAttributes())
 				end
 
 				local setPropertySuccess = setProperty(instance, propertyName, decodedValue)

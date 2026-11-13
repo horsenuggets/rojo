@@ -136,6 +136,10 @@ function ApiContext:disconnect()
 	self.__wsClient = nil
 end
 
+function ApiContext:getMessageCursor()
+	return self.__messageCursor
+end
+
 function ApiContext:setMessageCursor(index)
 	self.__messageCursor = index
 end
@@ -174,7 +178,7 @@ function ApiContext:read(ids)
 	end)
 end
 
-function ApiContext:write(patch)
+function ApiContext:write(patch, messageCursor)
 	local url = ("%s/api/write"):format(self.__baseUrl)
 
 	local updated = {}
@@ -201,6 +205,7 @@ function ApiContext:write(patch)
 
 	local body = {
 		sessionId = self.__sessionId,
+		messageCursor = messageCursor or self.__messageCursor,
 		removed = patch.removed,
 		updated = updated,
 		added = added,
@@ -212,7 +217,9 @@ function ApiContext:write(patch)
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(responseBody)
-			Log.info("Write response: {:?}", responseBody)
+			if responseBody.sessionId ~= self.__sessionId then
+				return Promise.reject("Server changed ID")
+			end
 
 			return responseBody
 		end)

@@ -11,9 +11,21 @@ local getProperty = require(script.Parent.getProperty)
 local Error = require(script.Parent.Error)
 local decodeValue = require(script.Parent.decodeValue)
 local trueEquals = require(script.Parent.trueEquals)
+local services = require(script.Parent.services)
+local unmanagedAttributes = require(script.Parent.unmanagedAttributes)
 
 local function isEmpty(table)
 	return next(table) == nil
+end
+
+-- Workspace.CurrentCamera belongs to the local Studio session rather than the
+-- place, and syncback never writes it, so it's never treated as unknown.
+local function isCurrentCamera(instance)
+	local success, result = pcall(function()
+		local parent = instance.Parent
+		return parent ~= nil and parent:IsA("Workspace") and parent.CurrentCamera == instance
+	end)
+	return success and result
 end
 
 local function shouldDeleteUnknownInstances(virtualInstance)
@@ -88,6 +100,16 @@ local function diff(instanceMap, virtualInstances, rootId)
 					end
 				else
 					decodeSuccess, decodedValue = decodeValue(virtualValue, instanceMap)
+					-- Compare against what applying would produce, which keeps the
+					-- attributes the filesystem can't hold.
+					if
+						decodeSuccess
+						and propertyName == "Attributes"
+						and type(decodedValue) == "table"
+						and type(existingValue) == "table"
+					then
+						decodedValue = unmanagedAttributes.merge(decodedValue, existingValue)
+					end
 				end
 
 				if decodeSuccess then
@@ -143,7 +165,7 @@ local function diff(instanceMap, virtualInstances, rootId)
 					-- such as the Rojo session lock value.
 					return childInstance.Archivable == false
 				end)
-				if success and skip then
+				if (success and skip) or isCurrentCamera(childInstance) or services.isEngineOwned(childInstance) then
 					continue
 				end
 
@@ -168,6 +190,13 @@ local function diff(instanceMap, virtualInstances, rootId)
 			local childInstance = instanceMap.fromIds[childId]
 
 			if childInstance == nil then
+				-- Children of a DataModel are services. Hydration already resolved
+				-- every one a plugin can reach, and the rest can't be created.
+				if instance:IsA("DataModel") then
+					Log.debug("Skipping unreachable service {}", virtualInstances[childId].ClassName)
+					continue
+				end
+
 				-- This instance is present in the virtual DOM, but doesn't
 				-- exist in the real DOM.
 				markIdAdded(childId)

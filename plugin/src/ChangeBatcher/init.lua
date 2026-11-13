@@ -17,7 +17,7 @@ local BATCH_INTERVAL = 0.2
 function ChangeBatcher.new(instanceMap, onChangesFlushed)
 	local self
 
-	local renderSteppedConnection = RunService.RenderStepped:Connect(function(dt)
+	local renderSteppedConnection = RunService.Heartbeat:Connect(function(dt)
 		self:__cycle(dt)
 	end)
 
@@ -54,11 +54,7 @@ function ChangeBatcher:__cycle(dt)
 	if self.__accumulator >= BATCH_INTERVAL then
 		self.__accumulator -= BATCH_INTERVAL
 
-		local patch = self:__flush()
-
-		if patch then
-			self.__onChangesFlushed(patch)
-		end
+		self:__flush()
 	end
 
 	self.__instanceMap:unpauseAllInstances()
@@ -75,7 +71,7 @@ function ChangeBatcher:__flush()
 		return nil
 	end
 
-	return patch
+	return self.__onChangesFlushed(patch)
 end
 
 return ChangeBatcher
