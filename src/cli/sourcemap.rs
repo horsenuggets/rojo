@@ -74,6 +74,12 @@ impl SourcemapCommand {
     pub fn run(self) -> anyhow::Result<()> {
         let project_path = dunce::canonicalize(resolve_path(&self.project)?)?;
 
+        // Initial snapshotting also uses Rayon, so configure it before loading.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_cpus::get().min(6))
+            .build_global()
+            .ok();
+
         log::trace!("Constructing filesystem with StdBackend");
         let vfs = Vfs::new_default()?;
         vfs.set_watch_enabled(self.watch);
@@ -87,14 +93,6 @@ impl SourcemapCommand {
         } else {
             filter_non_scripts
         };
-
-        // Pre-build a rayon threadpool with a low number of threads to avoid
-        // dynamic creation overhead on systems with a high number of cpus.
-        log::trace!("Setting rayon global threadpool");
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_cpus::get().min(6))
-            .build_global()
-            .ok();
 
         log::trace!("Writing initial sourcemap");
         write_sourcemap(&session, self.output.as_deref(), filter, self.absolute)?;
@@ -325,8 +323,8 @@ mod test {
                 match value {
                     Content::Seq(ref mut vec) => {
                         for path in vec.iter().map(|i| i.as_str().unwrap()) {
-                            assert_eq!(fs_err::canonicalize(path).is_ok(), true, "path was not valid");
-                            assert_eq!(Path::new(path).is_absolute(), true, "path was not absolute");
+                            assert!(fs_err::canonicalize(path).is_ok(), "path was not valid");
+                            assert!(Path::new(path).is_absolute(), "path was not absolute");
 
                             paths_count += 1;
                         }

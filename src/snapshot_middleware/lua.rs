@@ -1,7 +1,7 @@
 use std::{path::Path, str};
 
 use anyhow::Context as _;
-use memofs::Vfs;
+use memofs::{DirEntry, Vfs};
 use rbx_dom_weak::{
     types::{Enum, Variant},
     ustr, HashMapExt as _, UstrMap,
@@ -129,9 +129,10 @@ pub fn snapshot_lua_init(
     init_path: &Path,
     name: &str,
     script_type: ScriptType,
+    entries: Option<Vec<DirEntry>>,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
     let folder_path = init_path.parent().unwrap();
-    let dir_snapshot = snapshot_dir_no_meta(context, vfs, folder_path, name)?.unwrap();
+    let dir_snapshot = snapshot_dir_no_meta(context, vfs, folder_path, name, entries)?.unwrap();
 
     if dir_snapshot.class_name != "Folder" {
         anyhow::bail!(
@@ -434,6 +435,7 @@ mod test {
             Path::new("/root/init.lua"),
             "root",
             ScriptType::Module,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -466,6 +468,7 @@ mod test {
             Path::new("/root/init.lua"),
             "root",
             ScriptType::Module,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -495,6 +498,7 @@ mod test {
             Path::new("/root/init.luau"),
             "root",
             ScriptType::Module,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -527,6 +531,7 @@ mod test {
             Path::new("/root/init.plugin.luau"),
             "root",
             ScriptType::Plugin,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -556,6 +561,7 @@ mod test {
             Path::new("/root/init.legacy.luau"),
             "root",
             ScriptType::LegacyServer,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -592,6 +598,7 @@ mod test {
             Path::new("/root/init.local.luau"),
             "root",
             ScriptType::LegacyClient,
+            None,
         )
         .unwrap()
         .unwrap();

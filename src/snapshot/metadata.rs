@@ -107,10 +107,11 @@ impl InstanceMetadata {
     }
 
     pub fn context(self, context: &InstanceContext) -> Self {
-        Self {
-            context: context.clone(),
-            ..self
-        }
+        let mut context = context.clone();
+        // Active traversal ancestry must not survive into a later watch reload.
+        context.active_projects = None;
+        context.active_directories = None;
+        Self { context, ..self }
     }
 
     pub fn specified_id(self, id: Option<RojoRef>) -> Self {
@@ -173,6 +174,13 @@ pub struct InstanceContext {
     /// snapshotting. Only enabled during `rojo build`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub require_context: Option<Arc<RequireContext>>,
+
+    // Branch-local project ancestry prevents speculative parallel work from recursing
+    // forever through a project cycle while an earlier sibling reports an error.
+    #[serde(skip)]
+    pub(crate) active_projects: Option<Arc<Vec<PathBuf>>>,
+    #[serde(skip)]
+    pub(crate) active_directories: Option<Arc<Vec<PathBuf>>>,
 }
 
 impl InstanceContext {
@@ -182,6 +190,8 @@ impl InstanceContext {
             emit_legacy_scripts: emit_legacy_scripts_default().unwrap(),
             sync_rules: Vec::new(),
             require_context: None,
+            active_projects: None,
+            active_directories: None,
         }
     }
 

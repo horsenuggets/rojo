@@ -34,6 +34,7 @@ fn place_setup<P: AsRef<Path>>(input_path: P) -> (TempDir, BuildCommand) {
     let output = Some(dir.path().join("output.rbxlx"));
 
     let options = BuildCommand {
+        jobs: None,
         project: input,
         watch: false,
         plugin: None,
