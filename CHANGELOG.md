@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.0.14`
+
 * Added bounded parallel project loading, concurrent non-watching filesystem reads, and
   `rojo build --jobs` to control build workers, including watch-mode reloads.
 * Reused directory listings to avoid probing absent initializer files for every instance.
