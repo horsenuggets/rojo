@@ -74,12 +74,16 @@ pub fn snapshot_from_vfs(
     };
 
     if meta.is_dir() {
-        // A readable default project can live in a searchable but non-listable
-        // directory. Fall back to the original direct probes in that case.
-        let entries = vfs
-            .read_dir(path)
-            .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
-            .ok();
+        // Watched discovery must not recursively watch an entire project root.
+        // Only non-watching builds can discard enumeration errors and fall back
+        // to direct probes for searchable but non-listable directories.
+        let entries = if vfs.is_watch_enabled() {
+            None
+        } else {
+            vfs.read_dir(path)
+                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+                .ok()
+        };
         let (middleware, dir_name, init_path) = get_dir_middleware(vfs, path, entries.as_deref())?;
         // TODO: Support user defined init paths
         // If and when we do, make sure to go support it in
@@ -430,11 +434,7 @@ impl Middleware {
         };
 
         if meta.is_dir() {
-            let entries = vfs
-                .read_dir(path)
-                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
-                .ok();
-            let (middleware, _, _) = get_dir_middleware(vfs, path, entries.as_deref())?;
+            let (middleware, _, _) = get_dir_middleware(vfs, path, None)?;
             Ok(Some(middleware))
         } else {
             for rule in sync_rules.iter().chain(default_sync_rules()) {
@@ -706,6 +706,53 @@ mod test {
             assert_eq!(snapshot.unwrap().unwrap().class_name, "Folder");
             assert_eq!(middleware.unwrap(), Some(Middleware::Project));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_cycles_preserve_ordered_errors_and_allow_sibling_reuse() {
+        use std::{fs, os::unix::fs::symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.rbxm"), "invalid").unwrap();
+        for index in 0..6 {
+            fs::write(root.join(format!("b{index}.txt")), "text").unwrap();
+        }
+        symlink(&root, root.join("cycle1")).unwrap();
+        symlink(&root, root.join("cycle2")).unwrap();
+        for workers in [1, 4] {
+            let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+            vfs.set_watch_enabled(false);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            let error = pool
+                .install(|| snapshot_from_vfs(&InstanceContext::new(), &vfs, &root))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("a.rbxm"));
+        }
+        fs::remove_file(root.join("a.rbxm")).unwrap();
+        let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+        vfs.set_watch_enabled(false);
+        let error = snapshot_from_vfs(&InstanceContext::new(), &vfs, &root).unwrap_err();
+        assert!(format!("{error:#}").contains("Directory dependency cycle"));
+        fs::remove_file(root.join("cycle1")).unwrap();
+        fs::remove_file(root.join("cycle2")).unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::write(shared.join("value.txt"), "text").unwrap();
+        symlink(&shared, root.join("shared1")).unwrap();
+        symlink(&shared, root.join("shared2")).unwrap();
+        let snapshot = snapshot_from_vfs(&InstanceContext::new(), &vfs, &root)
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.metadata.context.active_directories.is_none());
+        let reloaded = snapshot_from_vfs(&snapshot.metadata.context, &vfs, &root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.children.len(), 8);
     }
 
     #[test]

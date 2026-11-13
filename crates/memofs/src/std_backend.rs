@@ -122,12 +122,13 @@ impl VfsBackend for StdBackend {
         {
             Ok(())
         } else {
-            self.watches.insert(path.to_path_buf());
             self.watcher
                 .get_mut()
                 .unwrap()
                 .watch(path, RecursiveMode::Recursive)
-                .map_err(io::Error::other)
+                .map_err(io::Error::other)?;
+            self.watches.insert(path.to_path_buf());
+            Ok(())
         }
     }
 
@@ -138,5 +139,22 @@ impl VfsBackend for StdBackend {
             .unwrap()
             .unwatch(path)
             .map_err(io::Error::other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_watch_registration_can_be_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing");
+        let mut backend = StdBackend::new().unwrap();
+        assert!(backend.watch(&path).is_err());
+        assert!(!backend.watches.contains(&path));
+        std::fs::create_dir(&path).unwrap();
+        backend.watch(&path).unwrap();
+        assert!(backend.watches.contains(&path));
     }
 }

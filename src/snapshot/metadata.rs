@@ -110,6 +110,7 @@ impl InstanceMetadata {
         let mut context = context.clone();
         // Active traversal ancestry must not survive into a later watch reload.
         context.active_projects = None;
+        context.active_directories = None;
         Self { context, ..self }
     }
 
@@ -178,6 +179,8 @@ pub struct InstanceContext {
     // forever through a project cycle while an earlier sibling reports an error.
     #[serde(skip)]
     pub(crate) active_projects: Option<Arc<Vec<PathBuf>>>,
+    #[serde(skip)]
+    pub(crate) active_directories: Option<Arc<Vec<PathBuf>>>,
 }
 
 impl InstanceContext {
@@ -188,6 +191,7 @@ impl InstanceContext {
             sync_rules: Vec::new(),
             require_context: None,
             active_projects: None,
+            active_directories: None,
         }
     }
 

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -50,6 +51,19 @@ pub fn snapshot_dir_no_meta(
     name: &str,
     entries: Option<Vec<DirEntry>>,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
+    let normalized_path = vfs.canonicalize(path)?;
+    let mut context = context.clone();
+    let active_directories = context
+        .active_directories
+        .get_or_insert_with(|| Arc::new(Vec::new()));
+    if active_directories.contains(&normalized_path) {
+        anyhow::bail!(
+            "Directory dependency cycle includes \"{}\".",
+            path.display()
+        );
+    }
+    Arc::make_mut(active_directories).push(normalized_path.clone());
+
     let entries = match entries {
         Some(entries) => entries,
         None => vfs.read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?,
@@ -58,7 +72,7 @@ pub fn snapshot_dir_no_meta(
         .into_iter()
         .filter(|child| !is_path_ignored(&context.path_ignore_rules, child.path()))
         .collect();
-    let snapshot_child = |entry: &DirEntry| snapshot_from_vfs(context, vfs, entry.path());
+    let snapshot_child = |entry: &DirEntry| snapshot_from_vfs(&context, vfs, entry.path());
     // Preserve filesystem ordering, including which error is reported first.
     // Small directories keep the original short-circuiting traversal.
     let children: Vec<_> = if entries.len() >= 8 && rayon::current_num_threads() > 1 {
@@ -76,7 +90,6 @@ pub fn snapshot_dir_no_meta(
     };
     let snapshot_children: Vec<_> = children.into_iter().flatten().collect();
 
-    let normalized_path = vfs.canonicalize(path)?;
     let relevant_paths = vec![
         normalized_path.clone(),
         // TODO: We shouldn't need to know about Lua existing in this
@@ -105,7 +118,7 @@ pub fn snapshot_dir_no_meta(
             InstanceMetadata::new()
                 .instigating_source(path)
                 .relevant_paths(relevant_paths)
-                .context(context),
+                .context(&context),
         );
 
     Ok(Some(snapshot))

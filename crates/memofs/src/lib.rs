@@ -306,6 +306,11 @@ impl Vfs {
         inner.watch_enabled = enabled;
     }
 
+    /// Returns whether reads automatically register filesystem watches.
+    pub fn is_watch_enabled(&self) -> bool {
+        self.inner.read().unwrap().watch_enabled
+    }
+
     /// Read a file from the VFS, or the underlying backend if it isn't
     /// resident.
     ///
