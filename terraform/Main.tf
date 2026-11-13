@@ -4,7 +4,7 @@ terraform {
 
     required_providers {
         github = {
-            source  = "integrations/github"
+            source = "integrations/github"
             version = "~> 6.0"
         }
     }
@@ -15,7 +15,7 @@ provider "github" {
 }
 
 module "repo" {
-    source     = "../submodules/luau-cicd/Terraform/Modules/LuauRepo"
+    source = "../submodules/luau-cicd/Terraform/Modules/LuauRepo"
     repository = "rojo"
 
     # Upstream sync PRs land with a merge commit to keep upstream history on main.
