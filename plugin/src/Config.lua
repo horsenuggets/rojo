@@ -24,4 +24,5 @@ return strict("Config", {
 	protocolVersion = 5,
 	defaultHost = "localhost",
 	defaultPort = "34872",
+	syncRemindersEnabled = false,
 })
