@@ -13,7 +13,10 @@ use crate::{
     json,
     resolution::UnresolvedValue,
     snapshot::{InstanceContext, InstanceSnapshot},
-    syncback::{filter_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
+    syncback::{
+        filter_properties_preallocated, is_json_compatible, FsSnapshot, SyncbackReturn,
+        SyncbackSnapshot,
+    },
     RojoRef,
 };
 
@@ -112,7 +115,7 @@ fn json_model_from_pair<'sync>(
                 for (attr_name, attr_value) in attrs.iter() {
                     // We (probably) don't want to preserve internal attributes,
                     // only user defined ones.
-                    if attr_name.starts_with("RBX") {
+                    if attr_name.starts_with("RBX") || !is_json_compatible(attr_value) {
                         continue;
                     }
                     attributes.insert(

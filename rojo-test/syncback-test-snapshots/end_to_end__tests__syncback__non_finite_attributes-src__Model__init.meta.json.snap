@@ -1,0 +1,12 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Model/init.meta.json
+---
+{
+    "className": "Configuration",
+    "attributes": {
+        "Finite": {
+            "Float32": 1.0
+        }
+    }
+}

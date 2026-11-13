@@ -1,6 +1,9 @@
 use indexmap::IndexMap;
 use memofs::Vfs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     snapshot::{InstanceWithMeta, RojoTree},
@@ -24,6 +27,12 @@ pub struct SyncbackData<'sync> {
     pub(super) old_tree: &'sync RojoTree,
     pub(super) new_tree: &'sync WeakDom,
     pub(super) project: &'sync Project,
+    /// Whether this rewrites one instance's files for two-way sync, where the
+    /// new tree only holds what that instance's own files store.
+    pub(super) scoped: bool,
+    /// Instances in the new tree that are scripts or have script descendants,
+    /// when they were computed ahead of time for the whole tree.
+    pub(super) script_containers: Option<&'sync HashSet<Ref>>,
 }
 
 pub struct SyncbackSnapshot<'sync> {
@@ -234,6 +243,22 @@ impl<'sync> SyncbackSnapshot<'sync> {
     #[inline]
     pub fn project(&self) -> &'sync Project {
         self.data.project
+    }
+
+    /// Returns whether this syncback rewrites a single instance for two-way
+    /// sync rather than reconciling a whole place.
+    #[inline]
+    pub fn is_scoped(&self) -> bool {
+        self.data.scoped
+    }
+
+    /// Returns whether the provided Instance in the new tree is a script or
+    /// has a script descendant.
+    pub fn contains_script(&self, new_ref: Ref) -> bool {
+        match self.data.script_containers {
+            Some(containers) => containers.contains(&new_ref),
+            None => super::inline::contains_script(self.new_tree(), new_ref),
+        }
     }
 
     /// Returns the underlying VFS being used for syncback.

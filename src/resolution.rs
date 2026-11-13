@@ -64,7 +64,7 @@ impl UnresolvedValue {
                     return Self::FullyQualified(variant);
                 }
                 Variant::Bool(bool) => AmbiguousValue::Bool(bool),
-                Variant::Float32(n) => AmbiguousValue::Number(n as f64),
+                Variant::Float32(n) => AmbiguousValue::Number(widen(n)),
                 Variant::Float64(n) => AmbiguousValue::Number(n),
                 Variant::Int32(n) => AmbiguousValue::Number(n as f64),
                 Variant::Int64(n) => AmbiguousValue::Number(n as f64),
@@ -79,27 +79,27 @@ impl UnresolvedValue {
                 },
                 Variant::ContentId(content) => AmbiguousValue::String(content.into_string()),
                 Variant::Vector2(vector) => {
-                    AmbiguousValue::Array2([vector.x as f64, vector.y as f64])
+                    AmbiguousValue::Array2([widen(vector.x), widen(vector.y)])
                 }
                 Variant::Vector3(vector) => {
-                    AmbiguousValue::Array3([vector.x as f64, vector.y as f64, vector.z as f64])
+                    AmbiguousValue::Array3([widen(vector.x), widen(vector.y), widen(vector.z)])
                 }
                 Variant::Color3(color) => {
-                    AmbiguousValue::Array3([color.r as f64, color.g as f64, color.b as f64])
+                    AmbiguousValue::Array3([widen(color.r), widen(color.g), widen(color.b)])
                 }
                 Variant::CFrame(cf) => AmbiguousValue::Array12([
-                    cf.position.x as f64,
-                    cf.position.y as f64,
-                    cf.position.z as f64,
-                    cf.orientation.x.x as f64,
-                    cf.orientation.x.y as f64,
-                    cf.orientation.x.z as f64,
-                    cf.orientation.y.x as f64,
-                    cf.orientation.y.y as f64,
-                    cf.orientation.y.z as f64,
-                    cf.orientation.z.x as f64,
-                    cf.orientation.z.y as f64,
-                    cf.orientation.z.z as f64,
+                    widen(cf.position.x),
+                    widen(cf.position.y),
+                    widen(cf.position.z),
+                    widen(cf.orientation.x.x),
+                    widen(cf.orientation.x.y),
+                    widen(cf.orientation.x.z),
+                    widen(cf.orientation.y.x),
+                    widen(cf.orientation.y.y),
+                    widen(cf.orientation.y.z),
+                    widen(cf.orientation.z.x),
+                    widen(cf.orientation.z.y),
+                    widen(cf.orientation.z.z),
                 ]),
                 Variant::Attributes(attr) => AmbiguousValue::Attributes(attr),
                 Variant::Font(font) => AmbiguousValue::Font(font),
@@ -129,6 +129,13 @@ impl UnresolvedValue {
             _ => Self::FullyQualified(variant),
         }
     }
+}
+
+/// Widens an `f32` through its shortest decimal form, so `0.6` is written as
+/// `0.6` instead of `0.6000000238418579`. Narrowing the result back to `f32`
+/// always gives the original value.
+fn widen(value: f32) -> f64 {
+    value.to_string().parse().unwrap_or(value as f64)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -350,6 +357,52 @@ mod test {
     fn resolve_unambiguous(json_value: &str) -> Variant {
         let unresolved: UnresolvedValue = json::from_str(json_value).unwrap();
         unresolved.resolve_unambiguous().unwrap()
+    }
+
+    #[test]
+    fn float32_values_are_written_in_their_shortest_form() {
+        let unresolved =
+            UnresolvedValue::from_variant(Variant::Float32(0.6), "Part", "Transparency");
+        assert_eq!(json::to_string_pretty(&unresolved).unwrap().trim(), "0.6");
+
+        let size = UnresolvedValue::from_variant(
+            Variant::Vector3(Vector3::new(179.694, 0.1, 2.0)),
+            "Part",
+            "Size",
+        );
+        assert_eq!(
+            json::to_string_pretty(&size)
+                .unwrap()
+                .split_whitespace()
+                .collect::<String>(),
+            "[179.694,0.1,2.0]"
+        );
+    }
+
+    /// Shortening must never change the value. Checks values across the whole
+    /// `f32` range, including subnormals and both signs, survive a trip through
+    /// JSON text and back to the exact same bits.
+    #[test]
+    fn float32_values_round_trip_exactly() {
+        let mut bits: u32 = 1;
+        for _ in 0..200_000 {
+            bits = bits.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let value = f32::from_bits(bits);
+            if !value.is_finite() {
+                continue;
+            }
+            let text = json::to_string_pretty(&UnresolvedValue::from_variant(
+                Variant::Float32(value),
+                "Part",
+                "Transparency",
+            ))
+            .unwrap();
+            assert_eq!(
+                resolve("Part", "Transparency", &text),
+                Variant::Float32(value),
+                "{value:e} was written as {text}"
+            );
+        }
     }
 
     #[test]

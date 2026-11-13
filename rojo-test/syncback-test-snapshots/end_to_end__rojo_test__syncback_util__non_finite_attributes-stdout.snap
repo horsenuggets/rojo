@@ -1,0 +1,12 @@
+---
+source: tests/rojo_test/syncback_util.rs
+expression: "String::from_utf8_lossy(&output.stdout)"
+---
+Writing default.project.json
+Writing src/Directory/Child/.gitkeep
+Writing src/Directory/init.meta.json
+Writing src/Model/Value.model.json
+Writing src/Model/init.meta.json
+Writing src/Directory
+Writing src/Directory/Child
+Writing src/Model

@@ -1,0 +1,12 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Model/Value.model.json
+---
+{
+    "className": "IntValue",
+    "attributes": {
+        "Finite": {
+            "Float32": 1.0
+        }
+    }
+}

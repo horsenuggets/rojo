@@ -26,6 +26,14 @@ pub fn snapshot_csv(
     path: &Path,
     name: &str,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
+    let mut snapshot = snapshot_csv_contents(vfs, path, name)?;
+    AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
+    Ok(Some(snapshot))
+}
+
+/// Snapshots a CSV file without its adjacent metadata, which for `init.csv`
+/// would belong to a same-named child rather than the folder.
+fn snapshot_csv_contents(vfs: &Vfs, path: &Path, name: &str) -> anyhow::Result<InstanceSnapshot> {
     let contents = vfs.read(path)?;
 
     let table_contents = convert_localization_csv(&contents).with_context(|| {
@@ -35,7 +43,7 @@ pub fn snapshot_csv(
         )
     })?;
 
-    let mut snapshot = InstanceSnapshot::new()
+    Ok(InstanceSnapshot::new()
         .name(name)
         .class_name("LocalizationTable")
         .property(ustr("Contents"), table_contents)
@@ -43,11 +51,7 @@ pub fn snapshot_csv(
             InstanceMetadata::new()
                 .instigating_source(path)
                 .relevant_paths(vec![vfs.canonicalize(path)?]),
-        );
-
-    AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
-
-    Ok(Some(snapshot))
+        ))
 }
 
 /// Attempts to snapshot an 'init' csv contained inside of a folder with
@@ -76,12 +80,11 @@ pub fn snapshot_csv_init(
         );
     }
 
-    let mut init_snapshot = snapshot_csv(context, vfs, init_path, &dir_snapshot.name)?.unwrap();
+    let mut init_snapshot = snapshot_csv_contents(vfs, init_path, &dir_snapshot.name)?;
 
     init_snapshot.children = dir_snapshot.children;
     init_snapshot.metadata = dir_snapshot.metadata;
-    // The directory snapshot middleware includes all possible init paths
-    // so we don't need to add it here.
+    super::lua::track_init_file(&mut init_snapshot, init_path);
 
     DirectoryMetadata::read_and_apply_all(vfs, folder_path, &mut init_snapshot)?;
 

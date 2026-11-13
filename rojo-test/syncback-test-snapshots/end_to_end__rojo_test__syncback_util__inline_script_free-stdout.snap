@@ -1,0 +1,16 @@
+---
+source: tests/rojo_test/syncback_util.rs
+expression: "String::from_utf8_lossy(&output.stdout)"
+---
+Writing src/InPointer/init.meta.json
+Writing src/Mixed/Data/init.meta.json
+Writing src/Mixed/Module.luau
+Writing src/Mixed/Scripts/Marker/init.meta.json
+Writing src/Mixed/Scripts/Runner.server.luau
+Writing src/Props/init.meta.json
+Writing src/InPointer
+Writing src/Mixed
+Writing src/Mixed/Data
+Writing src/Mixed/Scripts
+Writing src/Mixed/Scripts/Marker
+Writing src/Props

@@ -39,6 +39,21 @@ pub fn snapshot_lua(
     name: &str,
     script_type: ScriptType,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
+    let mut snapshot = snapshot_lua_source(context, vfs, path, name, script_type)?;
+    AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
+    Ok(Some(snapshot))
+}
+
+/// Snapshots a Lua file without its adjacent metadata. Init scripts use this
+/// because `<folder>/<folder>.meta.json` belongs to a same-named child script,
+/// not to the folder, whose metadata lives in `init.meta.json`.
+fn snapshot_lua_source(
+    context: &InstanceContext,
+    vfs: &Vfs,
+    path: &Path,
+    name: &str,
+    script_type: ScriptType,
+) -> anyhow::Result<InstanceSnapshot> {
     let run_context_enums = &rbx_reflection_database::get()
         .unwrap()
         .enums
@@ -102,7 +117,7 @@ pub fn snapshot_lua(
         );
     }
 
-    let mut snapshot = InstanceSnapshot::new()
+    Ok(InstanceSnapshot::new()
         .name(name)
         .class_name(class_name)
         .properties(properties)
@@ -111,11 +126,7 @@ pub fn snapshot_lua(
                 .instigating_source(path)
                 .relevant_paths(vec![vfs.canonicalize(path)?])
                 .context(context),
-        );
-
-    AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
-
-    Ok(Some(snapshot))
+        ))
 }
 
 /// Attempts to snapshot an 'init' Lua script contained inside of a folder with
@@ -148,7 +159,7 @@ pub fn snapshot_lua_init(
     }
 
     let mut init_snapshot =
-        snapshot_lua(context, vfs, init_path, &dir_snapshot.name, script_type)?.unwrap();
+        snapshot_lua_source(context, vfs, init_path, &dir_snapshot.name, script_type)?;
 
     // Filter out the init file itself from the directory's children by its
     // source path. A different child may legitimately be named `init`.
@@ -165,12 +176,21 @@ pub fn snapshot_lua_init(
         })
         .collect();
     init_snapshot.metadata = dir_snapshot.metadata;
-    // The directory snapshot middleware includes all possible init paths
-    // so we don't need to add it here.
+    track_init_file(&mut init_snapshot, init_path);
 
     DirectoryMetadata::read_and_apply_all(vfs, folder_path, &mut init_snapshot)?;
 
     Ok(Some(init_snapshot))
+}
+
+/// Records the init file that defines a directory instance, since the directory
+/// middleware only tracks the directory itself.
+pub(super) fn track_init_file(snapshot: &mut InstanceSnapshot, init_path: &Path) {
+    let paths = &mut snapshot.metadata.relevant_paths;
+    if let (Some(directory), Some(file_name)) = (paths.first(), init_path.file_name()) {
+        let tracked = directory.join(file_name);
+        paths.insert(1, tracked);
+    }
 }
 
 pub fn syncback_lua<'sync>(
@@ -443,6 +463,43 @@ mod test {
         insta::with_settings!({ sort_maps => true }, {
             insta::assert_yaml_snapshot!(instance_snapshot);
         });
+    }
+
+    #[test]
+    fn init_script_ignores_metadata_of_same_named_child() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([(
+                "Saver",
+                VfsSnapshot::dir([
+                    ("init.server.luau", VfsSnapshot::file("-- parent")),
+                    ("Saver.server.luau", VfsSnapshot::file("-- child")),
+                    (
+                        "Saver.meta.json",
+                        VfsSnapshot::file(r#"{"properties": {"Disabled": true}}"#),
+                    ),
+                ]),
+            )]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+
+        let parent = crate::snapshot_middleware::snapshot_from_vfs(
+            &InstanceContext::new(),
+            &vfs,
+            Path::new("/root/Saver"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(parent.class_name, "Script");
+        assert_eq!(parent.properties.get(&ustr("Disabled")), None);
+        assert_eq!(parent.children.len(), 1);
+        assert_eq!(
+            parent.children[0].properties.get(&ustr("Disabled")),
+            Some(&Variant::Bool(true))
+        );
     }
 
     #[test]

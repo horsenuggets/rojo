@@ -265,6 +265,28 @@ fn output_paths(middleware: Middleware, stem: &str) -> Vec<String> {
     paths
 }
 
+/// Orders sibling file names so the `~N` suffixes from [`unique_child_stems`]
+/// compare numerically. Duplicates then come back in the order they had in the
+/// place (`Model`, `Model~2`, ..., `Model~10`), which is what matching them
+/// against Studio's children by order relies on. Other names sort as before.
+pub fn sibling_order_key(file_name: &str) -> (Cow<'_, str>, u64) {
+    if let Some(tilde) = file_name.rfind('~') {
+        let after = &file_name[tilde + 1..];
+        let digits_end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        let (digits, rest) = after.split_at(digits_end);
+        // The suffix is followed by the extension, if any, never more of the name.
+        if !digits.is_empty() && (rest.is_empty() || rest.starts_with('.')) {
+            if let Ok(suffix) = digits.parse::<u64>() {
+                let base = format!("{}{rest}", &file_name[..tilde]);
+                return (Cow::Owned(base), suffix);
+            }
+        }
+    }
+    (Cow::Borrowed(file_name), 1)
+}
+
 /// Assigns each child of `parent` a file stem whose generated output paths are
 /// safe and unique among its siblings, ignoring case. The first available stem
 /// is kept, and later collisions get `~2`, `~3`, and so on.
@@ -324,6 +346,55 @@ mod test {
         refs.iter()
             .map(|referent| stems[referent].clone())
             .collect()
+    }
+
+    fn sorted_by_sibling_order(names: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        names.sort_by_cached_key(|name| {
+            let (base, suffix) = sibling_order_key(name);
+            (base.into_owned(), suffix)
+        });
+        names
+    }
+
+    #[test]
+    fn sibling_order_compares_duplicate_suffixes_numerically() {
+        assert_eq!(
+            sorted_by_sibling_order(&["Model~10", "Model~2", "Model", "Model~3"]),
+            ["Model", "Model~2", "Model~3", "Model~10"]
+        );
+        assert_eq!(
+            sorted_by_sibling_order(&[
+                "Leaf~10.model.json",
+                "Leaf.model.json",
+                "Leaf~2.model.json"
+            ]),
+            ["Leaf.model.json", "Leaf~2.model.json", "Leaf~10.model.json"]
+        );
+        assert_eq!(
+            sorted_by_sibling_order(&["Plane.003~10", "Plane.003", "Plane.003~2"]),
+            ["Plane.003", "Plane.003~2", "Plane.003~10"]
+        );
+    }
+
+    #[test]
+    fn sibling_order_leaves_other_names_alone() {
+        for name in ["a~b", "x~2y", "~", "Model~", "plain.txt", "init.meta.json"] {
+            assert_eq!(sibling_order_key(name), (Cow::Borrowed(name), 1), "{name}");
+        }
+    }
+
+    /// Stems from `unique_child_stems` must sort back into child order, since
+    /// serve matches duplicate siblings against Studio by that order.
+    #[test]
+    fn duplicate_stems_sort_back_into_child_order() {
+        let children: Vec<(&str, &str)> = (0..25).map(|_| ("Model", "Model")).collect();
+        let stems = stems_for(&children);
+        let mut shuffled = stems.clone();
+        shuffled.sort();
+        shuffled.reverse();
+        let shuffled: Vec<&str> = shuffled.iter().map(String::as_str).collect();
+        assert_eq!(sorted_by_sibling_order(&shuffled), stems);
     }
 
     #[test]
