@@ -160,6 +160,20 @@ fn syncback_from_studio_writes_the_uploaded_place() {
         assert_eq!(post_part("retry", index, part.to_vec()), StatusCode::OK);
     }
 
+    // A request from the failed attempt that was still in flight is rejected
+    // instead of resetting the retry.
+    assert_eq!(
+        post_part("failed-attempt", 0, vec![1, 2, 3]),
+        StatusCode::BAD_REQUEST
+    );
+
+    let oversized_finish = client
+        .post(format!("{base}/api/syncback/finish"))
+        .body(vec![0; 16 * 1024 * 1024 + 1])
+        .send()
+        .unwrap();
+    assert_eq!(oversized_finish.status(), StatusCode::BAD_REQUEST);
+
     let finish = client
         .post(format!("{base}/api/syncback/finish"))
         .body(

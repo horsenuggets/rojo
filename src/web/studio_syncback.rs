@@ -7,6 +7,7 @@
 //! session would push the project into Studio.
 
 use std::{
+    collections::HashSet,
     convert::Infallible,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -15,7 +16,7 @@ use std::{
 use anyhow::Context;
 use futures::channel::oneshot;
 use hyper::{
-    body::{self, HttpBody as _},
+    body::HttpBody as _,
     server::{conn::AddrStream, Server},
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, StatusCode,
@@ -49,31 +50,47 @@ struct Shared {
     place_sender: Mutex<Option<oneshot::Sender<AssembledPlace>>>,
 }
 
+/// The finish request only carries the manifest, which lists the top-level
+/// children of each service, so it stays far below this.
+const FINISH_SIZE: usize = 16 * 1024 * 1024;
+
 /// The parts of the newest upload attempt. Only one attempt is kept, so a retry
 /// after a failure starts clean, and memory is bounded by one upload.
 #[derive(Default)]
 struct Upload {
-    id: String,
+    id: Option<String>,
     parts: UploadParts,
+
+    /// Attempts that a newer one replaced. A failed attempt can still have
+    /// requests in flight, and those must not reset the retry that replaced it.
+    retired: HashSet<String>,
 }
 
 impl Upload {
-    /// Returns the parts for `id`, discarding an older attempt's parts first.
-    fn parts_for(&mut self, id: &str) -> &mut UploadParts {
-        if self.id != id {
-            self.id = id.to_owned();
+    /// Returns the parts for `id`. A new ID replaces the current attempt, and a
+    /// replaced ID is rejected.
+    fn parts_for(&mut self, id: &str) -> anyhow::Result<&mut UploadParts> {
+        if self.retired.contains(id) {
+            anyhow::bail!("Upload \"{id}\" was replaced by a newer attempt.");
+        }
+        if self.id.as_deref() != Some(id) {
+            if let Some(old) = self.id.replace(id.to_owned()) {
+                self.retired.insert(old);
+            }
             self.parts = UploadParts::default();
         }
-        &mut self.parts
+        Ok(&mut self.parts)
     }
 }
 
 /// Serves the syncback routes on `address` until the plugin finishes an
 /// upload, then returns the place it uploaded.
 ///
-/// `on_listening` is called once the address is bound.
+/// `allowed_hosts` are extra `Host`/`Origin` values to accept, like `rojo serve`
+/// takes from the project. `on_listening` is called once the address is bound.
 pub fn receive_place(
     address: SocketAddr,
+    allowed_hosts: &[String],
     project_name: String,
     services: Vec<StudioService>,
     on_listening: impl FnOnce(),
@@ -88,7 +105,7 @@ pub fn receive_place(
         upload: Mutex::new(Upload::default()),
         place_sender: Mutex::new(Some(place_sender)),
     });
-    let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &[]);
+    let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), allowed_hosts);
 
     let make_service = make_service_fn(move |_conn: &AddrStream| {
         let shared = Arc::clone(&shared);
@@ -201,7 +218,10 @@ async fn handle_part(shared: Arc<Shared>, request: Request<Body>) -> Response<Bo
     };
 
     let mut upload = shared.upload.lock().unwrap();
-    if let Err(err) = upload.parts_for(upload_id).insert(index, data) {
+    let inserted = upload
+        .parts_for(upload_id)
+        .and_then(|parts| parts.insert(index, data));
+    if let Err(err) = inserted {
         return bad_request(format!("{err:#}"));
     }
     msgpack_ok(())
@@ -214,7 +234,7 @@ async fn read_limited(mut body: Body, limit: usize) -> anyhow::Result<Vec<u8>> {
     while let Some(chunk) = body.data().await {
         let chunk = chunk?;
         if data.len() + chunk.len() > limit {
-            anyhow::bail!("Parts can be at most {limit} bytes.");
+            anyhow::bail!("The request body is larger than the limit of {limit} bytes.");
         }
         data.extend_from_slice(&chunk);
     }
@@ -222,7 +242,7 @@ async fn read_limited(mut body: Body, limit: usize) -> anyhow::Result<Vec<u8>> {
 }
 
 async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
-    let data = match body::to_bytes(request.into_body()).await {
+    let data = match read_limited(request.into_body(), FINISH_SIZE).await {
         Ok(data) => data,
         Err(err) => return bad_request(format!("Could not read the request. {err}")),
     };
@@ -239,7 +259,7 @@ async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<
         .lock()
         .unwrap()
         .parts_for(&request.upload_id)
-        .join(request.part_count);
+        .and_then(|parts| parts.join(request.part_count));
     let bytes = match joined {
         Ok(bytes) => bytes,
         Err(err) => return bad_request(format!("{err:#}")),
@@ -289,4 +309,41 @@ async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<
 
 fn bad_request(details: impl Into<String>) -> Response<Body> {
     msgpack(ErrorResponse::bad_request(details), StatusCode::BAD_REQUEST)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn a_new_attempt_starts_with_no_parts() {
+        let mut upload = Upload::default();
+        upload.parts_for("a").unwrap().insert(5, vec![1]).unwrap();
+        upload.parts_for("b").unwrap().insert(0, vec![2]).unwrap();
+
+        assert_eq!(upload.parts_for("b").unwrap().join(1).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn late_requests_from_a_replaced_attempt_never_touch_the_retry() {
+        let mut upload = Upload::default();
+        upload.parts_for("a").unwrap().insert(0, vec![1]).unwrap();
+        upload.parts_for("b").unwrap().insert(0, vec![2]).unwrap();
+
+        // A part and a finish from attempt "a" arrive after "b" started.
+        assert!(upload.parts_for("a").is_err());
+        assert_eq!(upload.parts_for("b").unwrap().join(1).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn every_replaced_attempt_stays_retired() {
+        let mut upload = Upload::default();
+        for id in ["a", "b", "c", "d"] {
+            upload.parts_for(id).unwrap();
+        }
+        for id in ["a", "b", "c"] {
+            assert!(upload.parts_for(id).is_err(), "{id} should be retired");
+        }
+        assert!(upload.parts_for("d").is_ok());
+    }
 }
