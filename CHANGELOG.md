@@ -33,7 +33,25 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## `7.7.1-horse.0.15`
 
+* Skip empty binary properties the reflection database has no default for, such as the
+  `SerializedOverrides` that newer Studio versions write on every instance, so syncback
+  doesn't add an empty value to every instance's metadata.
+* Stop inline syncback from giving an instance an ID inherited from the old tree when it
+  has its own `Rojo_Id` attribute or another instance holds that ID, which happened when
+  duplicate-named siblings were reordered and made `rojo build` resolve Ref properties to
+  the wrong instance.
+* Parse JSON numbers exactly, so unchanged metadata values keep their text instead of
+  alternating between two spellings of the same number on every syncback.
 * Write `sourcemap.json` files minified again, as upstream Rojo does.
+* Bump the server and plugin protocol version to 6, since two-way sync writes now carry
+  cursors and return explicit results that older peers don't understand.
+* Never replace protected instances, like the current camera or services, through sync
+  fallback, and keep their updates reported as unapplied.
+* Reject two-way sync writes that would change a file excluded by `ignorePaths`, and
+  writes to instances whose metadata is split across `init.meta.json` and
+  `init.meta.jsonc`.
+* Reject changing the two-way sync setting through `shared.Rojo` while a sync
+  confirmation is pending.
 * Serialize `className` first in directory metadata, including when other keys are present.
 * Disable update notifications, update checks, and sync reminders in the fork's Studio plugin.
 * Persist supported two-way-sync properties with filesystem authority on conflicts and
@@ -50,16 +68,18 @@ Making a new release? Simply add the new header with the version and date undern
 * Cut `rojo serve` memory for large projects by sharing sync rules between instances and
   no longer tracking absent `init` file paths for every directory (about 75% less heap on
   a 720,000-instance place).
-* Skip non-finite attributes in every JSON metadata writer so syncback output stays
-  readable.
+* Write non-finite numbers (NaN and infinity) in attributes and number properties in a
+  tagged form like `{"Float64": "inf"}`, so values such as an `inf` duration survive
+  syncback, build, and two-way sync. Composite values with a non-finite component, like a
+  `Vector3` with NaN, are still skipped so every JSON metadata writer stays readable.
 * Studio's write response is logged by `rojo serve` instead of the Studio output.
 * Stop syncing `Rojo_Id` and `Rojo_Target_*` link attributes into Studio. Serve resolves
   them into references, and Studio attribute edits keep the ones on disk.
 * Never add or remove services, the current camera, or engine-made instances (classes
   that can't be created, like `TouchInterest`) during sync, and use `GetService` for
   services Studio hasn't created yet.
-* Keep attributes the filesystem can't hold (`RBX` attributes, NaN and infinity) in Studio
-  when diffing and applying.
+* Keep attributes the filesystem can't hold (`RBX` attributes and composite values with a
+  non-finite component) in Studio when diffing and applying.
 * Restore the original order of duplicate-named siblings (`Model`, `Model~2`, ...,
   `Model~10`) so serve matches them to the right Studio instances.
 * Don't apply `<folder>/<folder>.meta.json` to an `init` script or `init.csv`, since it

@@ -24,7 +24,7 @@ use crate::{
     snapshot_middleware::Middleware,
     syncback::{
         filter_properties, get_property_filter, instances_as_directories, is_json_compatible,
-        FsSnapshot, SyncbackReturn, SyncbackSnapshot,
+        is_unset_binary_string, FsSnapshot, SyncbackReturn, SyncbackSnapshot,
     },
     variant_eq::variant_eq,
     RojoRef,
@@ -639,7 +639,7 @@ fn project_node_property_syncback(
             prop_name,
             &filtered_properties,
             ignored_properties.as_ref(),
-            has_default,
+            reset_is_known(has_default, new_inst.properties.get(prop_name)),
         ) {
             return true;
         }
@@ -681,6 +681,14 @@ fn should_remove_stale_property(
     }
 
     has_default
+}
+
+/// Returns whether a property missing from the filtered properties was reset,
+/// rather than missing for an unknown reason. Besides properties with a known
+/// default, an empty `BinaryString` is filtered out as unset, so an existing
+/// nonempty entry must be cleared or the next build would restore the old bytes.
+fn reset_is_known(has_default: bool, current: Option<&Variant>) -> bool {
+    has_default || current.is_some_and(is_unset_binary_string)
 }
 
 fn project_node_property_syncback_path(
@@ -1500,6 +1508,30 @@ mod test {
                         "filtered={is_filtered} ignored={is_ignored} has_default={has_default}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Clearing a binary property without a reflection default to empty bytes
+    /// must remove its old project entry, while other values without a
+    /// default stay conservative.
+    #[test]
+    fn reset_is_known_truth_table() {
+        let empty = Variant::BinaryString(Vec::new().into());
+        let nonempty = Variant::BinaryString(vec![1].into());
+        let other = Variant::Int32(0);
+        for &has_default in &[false, true] {
+            for (current, cleared) in [
+                (None, false),
+                (Some(&empty), true),
+                (Some(&nonempty), false),
+                (Some(&other), false),
+            ] {
+                assert_eq!(
+                    reset_is_known(has_default, current),
+                    has_default || cleared,
+                    "has_default={has_default} current={current:?}"
+                );
             }
         }
     }

@@ -16,6 +16,7 @@ local encodePatchUpdate = require(script.Parent.ChangeBatcher.encodePatchUpdate)
 local InstanceMap = require(script.Parent.InstanceMap)
 local PatchSet = require(script.Parent.PatchSet)
 local Reconciler = require(script.Parent.Reconciler)
+local ReconcilerServices = require(script.Parent.Reconciler.services)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
@@ -548,7 +549,12 @@ function ServeSession:__applyPatch(patch)
 	end
 
 	if Settings:get("enableSyncFallback") and not PatchSet.isEmpty(unappliedPatch) then
-		-- Some changes did not apply, let's try replacing them instead
+		-- Some changes did not apply, let's try replacing them instead. Protected
+		-- instances are never replaced, so their updates stay unapplied.
+		local replaceableUpdates, protectedUpdates =
+			ReconcilerServices.splitReplaceableUpdates(unappliedPatch.updated, self.__instanceMap)
+		unappliedPatch.updated = replaceableUpdates
+
 		local addedIdList = PatchSet.addedIdList(unappliedPatch)
 		local updatedIdList = PatchSet.updatedIdList(unappliedPatch)
 
@@ -570,6 +576,9 @@ function ServeSession:__applyPatch(patch)
 		if updateSuccess then
 			table.clear(unappliedPatch.updated)
 			PatchSet.assign(unappliedPatch, unappliedUpdateRefs)
+		end
+		for _, update in protectedUpdates do
+			table.insert(unappliedPatch.updated, update)
 		end
 	end
 

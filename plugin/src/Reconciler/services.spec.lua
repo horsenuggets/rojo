@@ -109,6 +109,47 @@ return function()
 		assert(success, err)
 	end)
 
+	it("should keep protected updates out of sync fallback replacement", function()
+		local Workspace = game:GetService("Workspace")
+		local camera = Workspace.CurrentCamera
+		local createdCamera = nil
+		if camera == nil then
+			createdCamera = Instance.new("Camera")
+			createdCamera.Parent = Workspace
+			Workspace.CurrentCamera = createdCamera
+			camera = createdCamera
+		end
+		local folder = Instance.new("Folder")
+		folder.Parent = Workspace
+
+		local success, err = pcall(function()
+			local instanceMap = InstanceMap.new()
+			instanceMap:insert("CAMERA", camera)
+			instanceMap:insert("STORAGE", game:GetService("ReplicatedStorage"))
+			instanceMap:insert("FOLDER", folder)
+
+			local replaceable, protected = services.splitReplaceableUpdates({
+				{ id = "CAMERA", changedClassName = "Folder", changedProperties = {} },
+				{ id = "FOLDER", changedClassName = "Model", changedProperties = {} },
+				{ id = "STORAGE", changedClassName = "Folder", changedProperties = {} },
+				{ id = "MISSING", changedProperties = {} },
+			}, instanceMap)
+
+			expect(#replaceable).to.equal(2)
+			expect(replaceable[1].id).to.equal("FOLDER")
+			expect(replaceable[2].id).to.equal("MISSING")
+			expect(#protected).to.equal(2)
+			expect(protected[1].id).to.equal("CAMERA")
+			expect(protected[2].id).to.equal("STORAGE")
+		end)
+
+		folder:Destroy()
+		if createdCamera then
+			createdCamera:Destroy()
+		end
+		assert(success, err)
+	end)
+
 	it("should never add or remove children of the DataModel", function()
 		local instanceMap = InstanceMap.new()
 		local virtualInstances = {

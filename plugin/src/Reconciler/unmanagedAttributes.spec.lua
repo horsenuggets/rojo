@@ -17,9 +17,9 @@ return function()
 			{ "Rojo_Id", "id", true },
 			{ "Rojo_Target_PrimaryPart", "id", true },
 			{ "Rojo_Other", "x", false },
-			{ "EmitDuration", nan, true },
-			{ "Far", math.huge, true },
-			{ "Near", -math.huge, true },
+			{ "EmitDuration", nan, false },
+			{ "Far", math.huge, false },
+			{ "Near", -math.huge, false },
 			{ "Broken", Vector3.new(nan, 0, 0), true },
 			{ "Range", NumberRange.new(0, math.huge), true },
 		}
@@ -62,7 +62,7 @@ return function()
 		-- Scripts can't set reserved `RBX` attributes, and the attribute writer
 		-- already skips them, so the fixture covers the other unmanaged kinds.
 		part:SetAttribute("Health", 100)
-		part:SetAttribute("EmitDuration", nan)
+		part:SetAttribute("Offset", Vector3.new(nan, 0, 0))
 		part:SetAttribute("Rojo_Id", "old")
 		local instanceMap = InstanceMap.new()
 		instanceMap:insert("PART", part)
@@ -101,9 +101,36 @@ return function()
 			},
 		})
 		expect(part:GetAttribute("Health")).to.equal(5)
-		local duration = part:GetAttribute("EmitDuration")
-		expect(duration ~= duration).to.equal(true)
+		local offset = part:GetAttribute("Offset")
+		expect(offset.X ~= offset.X).to.equal(true)
 		expect(part:GetAttribute("Rojo_Id")).to.equal("old")
+		part:Destroy()
+	end)
+
+	it("should apply and diff infinite number attributes from the filesystem", function()
+		local part = Instance.new("Part")
+		local instanceMap = InstanceMap.new()
+		instanceMap:insert("PART", part)
+		local virtual = {
+			PART = {
+				ClassName = "Part",
+				Name = part.Name,
+				Properties = {
+					Attributes = { Attributes = { EmitDuration = { Float64 = math.huge } } },
+				},
+				Children = {},
+			},
+		}
+
+		local ok, patch = diff(instanceMap, virtual, "PART")
+		assert(ok, tostring(patch))
+		expect(#patch.updated).to.equal(1)
+		applyPatch(instanceMap, patch)
+		expect(part:GetAttribute("EmitDuration")).to.equal(math.huge)
+
+		ok, patch = diff(instanceMap, virtual, "PART")
+		assert(ok, tostring(patch))
+		expect(#patch.updated).to.equal(0)
 		part:Destroy()
 	end)
 end

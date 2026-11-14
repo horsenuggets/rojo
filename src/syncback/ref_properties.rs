@@ -191,6 +191,22 @@ fn write_id_attributes(links: &RefLinks, dom: &mut WeakDom) -> anyhow::Result<()
     Ok(())
 }
 
+/// Returns every ID that an instance in `dom` holds through its `Rojo_Id`
+/// attribute. After `link_referents`, these are the IDs that Ref properties
+/// in `dom` point at.
+pub fn attribute_ids(dom: &WeakDom) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let mut pending = vec![dom.root_ref()];
+    while let Some(referent) = pending.pop() {
+        let inst = dom.get_by_ref(referent).unwrap();
+        pending.extend(inst.children().iter().copied());
+        if let Some(id) = get_existing_id(inst) {
+            ids.insert(id.to_owned());
+        }
+    }
+    ids
+}
+
 fn get_existing_id(inst: &Instance) -> Option<&str> {
     if let Variant::Attributes(attrs) = inst.properties.get(&ustr("Attributes"))? {
         let id = attrs.get(REF_ID_ATTRIBUTE_NAME)?;

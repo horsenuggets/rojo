@@ -26,8 +26,10 @@ use crate::{
 /// Server version to report over the API, not exposed outside this crate.
 pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Current protocol version, which is required to match.
-pub const PROTOCOL_VERSION: u64 = 5;
+/// Current protocol version, which is required to match. Version 6 added write
+/// cursors to write requests and accepted, conflicted, and failed results to write
+/// responses, which older peers neither send nor understand.
+pub const PROTOCOL_VERSION: u64 = 6;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
