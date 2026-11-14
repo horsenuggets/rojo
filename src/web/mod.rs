@@ -6,6 +6,7 @@ mod api;
 mod assets;
 pub mod interface;
 mod origin;
+pub mod studio_syncback;
 mod ui;
 mod util;
 
