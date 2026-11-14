@@ -50,6 +50,23 @@ function services.isProtected(instance)
 	return services.isEngineOwned(instance) or services.isCurrentCamera(instance)
 end
 
+-- Splits unapplied updates into those sync fallback may replace and those
+-- targeting protected instances. Fallback replacement unparents the original
+-- instance, so protected updates must stay unapplied instead.
+function services.splitReplaceableUpdates(updates, instanceMap)
+	local replaceable = {}
+	local protected = {}
+	for _, update in updates do
+		local instance = instanceMap.fromIds[update.id]
+		if instance ~= nil and services.isProtected(instance) then
+			table.insert(protected, update)
+		else
+			table.insert(replaceable, update)
+		end
+	end
+	return replaceable, protected
+end
+
 -- Returns the service of `className` under `parent`, creating it when Studio
 -- hasn't yet. Returns nil if `parent` isn't a DataModel or the class isn't a
 -- service. Creating a lazy service matches what applying the patch would do,
