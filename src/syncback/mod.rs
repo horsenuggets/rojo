@@ -1,4 +1,5 @@
 mod file_names;
+pub mod from_studio;
 mod fs_snapshot;
 mod hash;
 mod inline;
