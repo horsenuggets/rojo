@@ -329,7 +329,7 @@ function SharedAPI.register(app)
 		host = if host then tostring(host) else address.host
 		port = if port then tostring(port) else address.port
 
-		const _, result = StudioSyncback.run(`http://{host}:{port}`):await()
+		const _, result = StudioSyncback.run(StudioSyncback.baseUrl(host, port)):await()
 		return result
 	end
 
