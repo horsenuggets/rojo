@@ -18,7 +18,12 @@ use crate::{
     RojoRef,
 };
 
-/// Splits serializable values into metadata properties and attributes.
+/// Splits serializable values into metadata properties and attributes, sorted
+/// by name.
+///
+/// Instance properties live in a hash map whose order changes from run to run,
+/// so sorting is what makes a fresh syncback of the same place write the same
+/// files every time.
 ///
 /// Internal `RBX` attributes and values JSON cannot hold, like a Vector3 with
 /// a NaN component, are left out so the file can always be read back.
@@ -29,6 +34,9 @@ pub fn serialize_values<'a>(
     IndexMap<Ustr, UnresolvedValue>,
     IndexMap<String, UnresolvedValue>,
 ) {
+    let mut values: Vec<_> = values.into_iter().collect();
+    values.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+
     let mut properties = IndexMap::new();
     let mut attributes = IndexMap::new();
     for (name, value) in values {
@@ -329,8 +337,6 @@ impl AdjacentMetadata {
         snapshot: &SyncbackSnapshot,
         path: PathBuf,
     ) -> anyhow::Result<Option<Self>> {
-        let mut properties = IndexMap::new();
-        let mut attributes = IndexMap::new();
         // TODO make this more granular.
         // I am breaking the cycle of bad TODOs. This is in reference to the fact
         // that right now, this will just not write any metadata at all for
@@ -359,29 +365,10 @@ impl AdjacentMetadata {
             .and_then(|inst| inst.metadata().schema.clone());
 
         let class = &snapshot.new_inst().class;
-        for (name, value) in snapshot.get_path_filtered_properties(snapshot.new).unwrap() {
-            match value {
-                Variant::Attributes(attrs) => {
-                    for (attr_name, attr_value) in attrs.iter() {
-                        // We (probably) don't want to preserve internal
-                        // attributes, only user defined ones.
-                        if attr_name.starts_with("RBX") || !is_json_compatible(attr_value) {
-                            continue;
-                        }
-                        attributes.insert(
-                            attr_name.clone(),
-                            UnresolvedValue::from_variant_unambiguous(attr_value.clone()),
-                        );
-                    }
-                }
-                _ => {
-                    properties.insert(
-                        name,
-                        UnresolvedValue::from_variant(value.clone(), class, &name),
-                    );
-                }
-            }
-        }
+        let (mut properties, mut attributes) = serialize_values(
+            class,
+            snapshot.get_path_filtered_properties(snapshot.new).unwrap(),
+        );
         if let Some(parent) = path.parent() {
             let meta_path = parent.join(format!("{}.meta.json", snapshot.file_stem()));
             ExistingMetadata::read(snapshot.vfs(), &meta_path).apply(
@@ -842,6 +829,80 @@ mod test {
         let attribute_keys: Vec<_> = attributes.keys().map(String::as_str).collect();
         assert_eq!(property_keys, ["Locked", "Anchored", "Size", "Color"]);
         assert_eq!(attribute_keys, ["Zeta", "Alpha", "New"]);
+    }
+
+    /// Returns every ordering of `items`, standing in for the orders a hash
+    /// map can iterate in.
+    fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut result = Vec::new();
+        for index in 0..items.len() {
+            let mut rest = items.to_vec();
+            let first = rest.remove(index);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, first.clone());
+                result.push(tail);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn serialized_values_are_sorted_whatever_the_input_order() {
+        let mut attrs = Attributes::new();
+        attrs.insert("Zeta".into(), Variant::Bool(true));
+        attrs.insert("Alpha".into(), Variant::Bool(true));
+        let attrs = Variant::Attributes(attrs);
+        let anchored = Variant::Bool(true);
+        let transparency = Variant::Float32(0.5);
+        let texture_content = Variant::String("a".into());
+        let texture_pack_content = Variant::String("b".into());
+        let values = [
+            (ustr("Transparency"), &transparency),
+            (ustr("TexturePackContent"), &texture_pack_content),
+            (ustr("Attributes"), &attrs),
+            (ustr("TextureContent"), &texture_content),
+            (ustr("Anchored"), &anchored),
+        ];
+
+        let orderings = permutations(&values);
+        assert_eq!(orderings.len(), 120, "every ordering of five values");
+        for ordering in orderings {
+            let (properties, attributes) = serialize_values("Part", ordering);
+            let property_keys: Vec<_> = properties.keys().map(|key| key.as_str()).collect();
+            let attribute_keys: Vec<_> = attributes.keys().map(String::as_str).collect();
+            assert_eq!(
+                property_keys,
+                [
+                    "Anchored",
+                    "TextureContent",
+                    "TexturePackContent",
+                    "Transparency"
+                ]
+            );
+            assert_eq!(attribute_keys, ["Alpha", "Zeta"]);
+        }
+    }
+
+    #[test]
+    fn new_keys_follow_existing_keys_in_sorted_order() {
+        let order = ExistingKeyOrder {
+            properties: vec!["Locked".into(), "Anchored".into()],
+            attributes: Vec::new(),
+        };
+        let value = Variant::Bool(true);
+        let names = ["Size", "Anchored", "Color", "Locked"];
+        for ordering in permutations(&names) {
+            let (mut properties, mut attributes) = serialize_values(
+                "Part",
+                ordering.into_iter().map(|name| (ustr(name), &value)),
+            );
+            order.apply(&mut properties, &mut attributes);
+            let property_keys: Vec<_> = properties.keys().map(|key| key.as_str()).collect();
+            assert_eq!(property_keys, ["Locked", "Anchored", "Color", "Size"]);
+        }
     }
 
     #[test]
