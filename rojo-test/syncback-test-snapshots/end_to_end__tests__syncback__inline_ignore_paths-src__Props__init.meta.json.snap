@@ -1,0 +1,11 @@
+---
+source: tests/tests/syncback.rs
+assertion_line: 35
+expression: src/Props/init.meta.json
+---
+{
+    "className": "Configuration",
+    "attributes": {
+        "Edited": true
+    }
+}

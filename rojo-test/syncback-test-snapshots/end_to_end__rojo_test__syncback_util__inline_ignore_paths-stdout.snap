@@ -1,0 +1,8 @@
+---
+source: tests/rojo_test/syncback_util.rs
+assertion_line: 101
+expression: "String::from_utf8_lossy(&output.stdout)"
+---
+Writing src/Props/init.meta.json
+Writing src/Meta
+Writing src/Props

@@ -31,6 +31,70 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.0.15`
+
+* Skip empty binary properties the reflection database has no default for, such as the
+  `SerializedOverrides` that newer Studio versions write on every instance, so syncback
+  doesn't add an empty value to every instance's metadata.
+* Stop inline syncback from giving an instance an ID inherited from the old tree when it
+  has its own `Rojo_Id` attribute or another instance holds that ID, which happened when
+  duplicate-named siblings were reordered and made `rojo build` resolve Ref properties to
+  the wrong instance.
+* Parse JSON numbers exactly, so unchanged metadata values keep their text instead of
+  alternating between two spellings of the same number on every syncback.
+* Write `sourcemap.json` files minified again, as upstream Rojo does.
+* Bump the server and plugin protocol version to 6, since two-way sync writes now carry
+  cursors and return explicit results that older peers don't understand.
+* Never replace protected instances, like the current camera or services, through sync
+  fallback, and keep their updates reported as unapplied.
+* Reject two-way sync writes that would change a file excluded by `ignorePaths`, and
+  writes to instances whose metadata is split across `init.meta.json` and
+  `init.meta.jsonc`.
+* Reject changing the two-way sync setting through `shared.Rojo` while a sync
+  confirmation is pending.
+* Serialize `className` first in directory metadata, including when other keys are present.
+* Disable update notifications, update checks, and sync reminders in the fork's Studio plugin.
+* Persist supported two-way-sync properties with filesystem authority on conflicts and
+  explicit results for saved, conflicted, unsupported, and failed writes.
+* Restore filesystem values for stale Studio batches and pending file-watcher changes.
+* Atomically replace single-file two-way-sync updates and reject multi-file updates before
+  writing, preserving unrepresented files when Studio removes a directory.
+* With `instancesAsDirectories`, syncback writes each script-free subtree into its
+  directory's `init.meta.json` under `children`, and switches back to a file per child
+  once a script appears in it. Two-way sync edits, renames, and deletions of those
+  instances rewrite only that file.
+* Stop reporting every instance with a `Rojo_Id` attribute as changed, which made
+  two-way sync reject all writes to referenced instances.
+* Cut `rojo serve` memory for large projects by sharing sync rules between instances and
+  no longer tracking absent `init` file paths for every directory (about 75% less heap on
+  a 720,000-instance place).
+* Write non-finite numbers (NaN and infinity) in attributes and number properties in a
+  tagged form like `{"Float64": "inf"}`, so values such as an `inf` duration survive
+  syncback, build, and two-way sync. Composite values with a non-finite component, like a
+  `Vector3` with NaN, are still skipped so every JSON metadata writer stays readable.
+* Studio's write response is logged by `rojo serve` instead of the Studio output.
+* Stop syncing `Rojo_Id` and `Rojo_Target_*` link attributes into Studio. Serve resolves
+  them into references, and Studio attribute edits keep the ones on disk.
+* Never add or remove services, the current camera, or engine-made instances (classes
+  that can't be created, like `TouchInterest`) during sync, and use `GetService` for
+  services Studio hasn't created yet.
+* Keep attributes the filesystem can't hold (`RBX` attributes and composite values with a
+  non-finite component) in Studio when diffing and applying.
+* Restore the original order of duplicate-named siblings (`Model`, `Model~2`, ...,
+  `Model~10`) so serve matches them to the right Studio instances.
+* Don't apply `<folder>/<folder>.meta.json` to an `init` script or `init.csv`, since it
+  belongs to a same-named child.
+* Rewriting a metadata file through two-way sync keeps its key order and the text of
+  unchanged values, and writes changed 32-bit numbers in their shortest form.
+* Two-way sync writes and file-watcher updates to an instance's own files read only that
+  instance, not its folder's whole subtree, so edits to large folders stay fast.
+* Reject edits to project-defined instances, including the DataModel, before reading
+  anything, and stop the plugin from sending DataModel changes.
+* Sync results keep one record per write that moves from pending to its outcome.
+* Add `shared.Rojo.getConfirmationSummary()` to inspect a pending sync confirmation.
+* Replace the notification sound, whose asset stopped loading as audio, with one bundled
+  with Studio.
+
 ## `7.7.1-horse.0.14`
 
 * Added bounded parallel project loading, concurrent non-watching filesystem reads, and

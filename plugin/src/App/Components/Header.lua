@@ -74,7 +74,7 @@ local function VersionIndicator(props)
 end
 
 local function Header(props)
-	return Theme.with(function(theme)
+	return Theme.with(function()
 		return e("Frame", {
 			Size = UDim2.new(1, 0, 0, 32),
 			LayoutOrder = props.layoutOrder,
@@ -82,10 +82,10 @@ local function Header(props)
 		}, {
 			Logo = e("ImageLabel", {
 				Image = Assets.Images.Logo,
-				ImageColor3 = theme.Header.LogoColor,
 				ImageTransparency = props.transparency,
+				ScaleType = Enum.ScaleType.Fit,
 
-				Size = UDim2.new(0, 60, 0, 27),
+				Size = UDim2.new(0, 32, 0, 32),
 
 				LayoutOrder = 1,
 				BackgroundTransparency = 1,

@@ -1,4 +1,12 @@
 {
+  "[hcl]": {
+    "editor.defaultFormatter": "jkillian.custom-local-formatters",
+    "editor.detectIndentation": false,
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "file",
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  },
   "[terraform]": {
     "editor.defaultFormatter": "jkillian.custom-local-formatters",
     "editor.detectIndentation": false,
@@ -41,8 +49,9 @@
   },
   "customLocalFormatters.formatters": [
     {
-      "command": "go -C submodules/tf4fmt run ./src/cmd/tf4fmt -",
+      "command": "go -C submodules/hcl4fmt run ./src/cmd/hcl4fmt -",
       "languages": [
+        "hcl",
         "terraform",
         "terraform-mock",
         "terraform-search",

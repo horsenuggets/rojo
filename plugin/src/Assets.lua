@@ -16,10 +16,10 @@ local Assets = {
 		},
 	},
 	Images = {
-		Logo = "rbxassetid://5990772764",
-		PluginButton = "rbxassetid://3405341609",
-		PluginButtonConnected = "rbxassetid://9529783993",
-		PluginButtonWarning = "rbxassetid://9529784530",
+		Logo = "rbxassetid://70875160573040",
+		PluginButton = "rbxassetid://70875160573040",
+		PluginButtonConnected = "rbxassetid://70875160573040",
+		PluginButtonWarning = "rbxassetid://70875160573040",
 		Icons = {
 			Close = "rbxassetid://6012985953",
 			Back = "rbxassetid://6017213752",
@@ -64,7 +64,9 @@ local Assets = {
 		},
 	},
 	Sounds = {
-		Notification = "rbxassetid://203785492",
+		-- Bundled with Studio, so it always loads. The previous audio asset
+		-- stopped resolving as audio and logged an error on every notification.
+		Notification = "rbxasset://sounds/volume_slider.ogg",
 	},
 	StartSession = "",
 	SessionActive = "",

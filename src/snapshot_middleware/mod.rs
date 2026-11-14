@@ -58,6 +58,33 @@ pub use self::{
     util::PathExt,
 };
 
+/// Snapshots `path` without the children that are stored in their own files.
+/// Directories keep children written into their metadata. The result must be
+/// compared with `compute_shallow_patch_set`, which doesn't treat the children
+/// left out here as removed.
+pub fn snapshot_shallow_from_vfs(
+    context: &InstanceContext,
+    vfs: &Vfs,
+    path: &Path,
+) -> anyhow::Result<Option<InstanceSnapshot>> {
+    let mut shallow = context.clone();
+    shallow.shallow = true;
+    let mut snapshot = snapshot_from_vfs(&shallow, vfs, path)?;
+    // The flag only steers this read. Leaving it set would differ from the
+    // tree's metadata and could later make a real snapshot skip children.
+    if let Some(snapshot) = &mut snapshot {
+        clear_shallow(snapshot);
+    }
+    Ok(snapshot)
+}
+
+fn clear_shallow(snapshot: &mut InstanceSnapshot) {
+    snapshot.metadata.context.shallow = false;
+    for child in &mut snapshot.children {
+        clear_shallow(child);
+    }
+}
+
 /// Returns an `InstanceSnapshot` for the provided path.
 /// This will inspect the path and find the appropriate middleware for it,
 /// taking user-written rules into account. Then, it will attempt to convert
@@ -110,6 +137,29 @@ pub fn snapshot_from_vfs(
     }
 }
 
+/// The `init` files that turn a directory into something other than a Folder,
+/// in priority order. For compatibility, that order should be left unchanged.
+pub(crate) fn dir_init_files() -> &'static [(Middleware, &'static str)] {
+    static INIT_PATHS: OnceLock<Vec<(Middleware, &str)>> = OnceLock::new();
+    INIT_PATHS.get_or_init(|| {
+        vec![
+            (Middleware::ModuleScriptDir, "init.luau"),
+            (Middleware::ModuleScriptDir, "init.lua"),
+            (Middleware::ServerScriptDir, "init.server.luau"),
+            (Middleware::ServerScriptDir, "init.server.lua"),
+            (Middleware::ClientScriptDir, "init.client.luau"),
+            (Middleware::ClientScriptDir, "init.client.lua"),
+            (Middleware::LegacyServerScriptDir, "init.legacy.luau"),
+            (Middleware::LegacyServerScriptDir, "init.legacy.lua"),
+            (Middleware::LegacyClientScriptDir, "init.local.luau"),
+            (Middleware::LegacyClientScriptDir, "init.local.lua"),
+            (Middleware::PluginScriptDir, "init.plugin.luau"),
+            (Middleware::PluginScriptDir, "init.plugin.lua"),
+            (Middleware::CsvDir, "init.csv"),
+        ]
+    })
+}
+
 /// Gets the appropriate middleware for a directory by checking for `init`
 /// files. This uses an intrinsic priority list and for compatibility,
 /// that order should be left unchanged.
@@ -127,24 +177,7 @@ fn get_dir_middleware<'path>(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("File name was not valid UTF-8: {}", dir_path.display()))?;
 
-    static INIT_PATHS: OnceLock<Vec<(Middleware, &str)>> = OnceLock::new();
-    let order = INIT_PATHS.get_or_init(|| {
-        vec![
-            (Middleware::ModuleScriptDir, "init.luau"),
-            (Middleware::ModuleScriptDir, "init.lua"),
-            (Middleware::ServerScriptDir, "init.server.luau"),
-            (Middleware::ServerScriptDir, "init.server.lua"),
-            (Middleware::ClientScriptDir, "init.client.luau"),
-            (Middleware::ClientScriptDir, "init.client.lua"),
-            (Middleware::LegacyServerScriptDir, "init.legacy.luau"),
-            (Middleware::LegacyServerScriptDir, "init.legacy.lua"),
-            (Middleware::LegacyClientScriptDir, "init.local.luau"),
-            (Middleware::LegacyClientScriptDir, "init.local.lua"),
-            (Middleware::PluginScriptDir, "init.plugin.luau"),
-            (Middleware::PluginScriptDir, "init.plugin.lua"),
-            (Middleware::CsvDir, "init.csv"),
-        ]
-    });
+    let order = dir_init_files();
 
     // Names only narrow the candidates. Probe the original paths to preserve the
     // filesystem's case sensitivity and follow symlinks before checking file type.
@@ -764,7 +797,13 @@ mod test {
         let original = snapshot_from_vfs(&InstanceContext::new(), &vfs, Path::new("/root"))
             .unwrap()
             .unwrap();
-        assert!(original
+        // Absent init files aren't tracked. Change processing reaches the folder
+        // through its own path, the nearest tracked ancestor of a new init file.
+        assert_eq!(
+            original.metadata.relevant_paths.first(),
+            Some(&Path::new("/root").to_path_buf())
+        );
+        assert!(!original
             .metadata
             .relevant_paths
             .contains(&Path::new("/root/init.luau").to_path_buf()));

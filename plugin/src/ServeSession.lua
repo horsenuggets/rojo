@@ -16,6 +16,7 @@ local encodePatchUpdate = require(script.Parent.ChangeBatcher.encodePatchUpdate)
 local InstanceMap = require(script.Parent.InstanceMap)
 local PatchSet = require(script.Parent.PatchSet)
 local Reconciler = require(script.Parent.Reconciler)
+local ReconcilerServices = require(script.Parent.Reconciler.services)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
@@ -60,6 +61,21 @@ ServeSession.__index = ServeSession
 
 ServeSession.Status = Status
 
+function ServeSession.getWriteStatus(result)
+	assert(t.table(result))
+
+	if #result.errors > 0 then
+		return "Failed"
+	end
+
+	local conflicts = result.conflicts
+	if #conflicts.removed_instances > 0 or #conflicts.added_instances > 0 or #conflicts.updated_instances > 0 then
+		return "Conflicted"
+	end
+
+	return "Saved"
+end
+
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
@@ -75,11 +91,13 @@ function ServeSession.new(options)
 			return
 		end
 
-		self.__changeBatcher:add(instance, propertyName)
+		self:__queueChange(instance, propertyName)
 	end
 
 	local function onChangesFlushed(patch)
-		self.__apiContext:write(patch)
+		local cursor = self.__pendingWriteCursor
+		self.__pendingWriteCursor = nil
+		return self:__writePatch(patch, cursor)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged)
@@ -106,6 +124,8 @@ function ServeSession.new(options)
 		__changeBatcher = changeBatcher,
 		__statusChangedCallback = nil,
 		__connections = connections,
+		__syncResults = {},
+		__syncResultCallback = nil,
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
@@ -129,6 +149,69 @@ end
 
 function ServeSession:getStatus()
 	return self.__status
+end
+
+function ServeSession:__queueChange(instance, propertyName)
+	-- Retain the revision preceding the first local change, even if a websocket
+	-- update arrives before this batch is sent.
+	if next(self.__changeBatcher.__pendingPropertyChanges) == nil then
+		self.__pendingWriteCursor = self.__apiContext:getMessageCursor()
+	end
+	self.__changeBatcher:add(instance, propertyName)
+end
+
+function ServeSession:__writePatch(patch, messageCursor)
+	-- One record per write, which moves from Pending to its outcome, so a write
+	-- is never reported as both pending and finished.
+	local record = {
+		status = "Pending",
+		patch = patch,
+	}
+	table.insert(self.__syncResults, record)
+
+	local function finish(status, result)
+		record.status = status
+		record.result = result
+		if self.__syncResultCallback ~= nil then
+			self.__syncResultCallback(status, result)
+		end
+	end
+
+	return self.__apiContext
+		:write(patch, messageCursor)
+		:andThen(function(result)
+			finish(ServeSession.getWriteStatus(result), result)
+			return result
+		end)
+		:catch(function(err)
+			finish("Failed", {
+				errors = {
+					{
+						message = tostring(err),
+					},
+				},
+			})
+		end)
+end
+
+function ServeSession:getSyncResults()
+	local results = {}
+	for index, record in self.__syncResults do
+		results[index] = table.clone(record)
+	end
+	return results
+end
+
+function ServeSession:flushChanges()
+	return self.__changeBatcher:__flush()
+end
+
+function ServeSession:setSyncResultCallback(callback)
+	self.__syncResultCallback = callback
+end
+
+function ServeSession:clearSyncResults()
+	table.clear(self.__syncResults)
 end
 
 function ServeSession:onStatusChanged(callback)
@@ -466,7 +549,12 @@ function ServeSession:__applyPatch(patch)
 	end
 
 	if Settings:get("enableSyncFallback") and not PatchSet.isEmpty(unappliedPatch) then
-		-- Some changes did not apply, let's try replacing them instead
+		-- Some changes did not apply, let's try replacing them instead. Protected
+		-- instances are never replaced, so their updates stay unapplied.
+		local replaceableUpdates, protectedUpdates =
+			ReconcilerServices.splitReplaceableUpdates(unappliedPatch.updated, self.__instanceMap)
+		unappliedPatch.updated = replaceableUpdates
+
 		local addedIdList = PatchSet.addedIdList(unappliedPatch)
 		local updatedIdList = PatchSet.updatedIdList(unappliedPatch)
 
@@ -488,6 +576,9 @@ function ServeSession:__applyPatch(patch)
 		if updateSuccess then
 			table.clear(unappliedPatch.updated)
 			PatchSet.assign(unappliedPatch, unappliedUpdateRefs)
+		end
+		for _, update in protectedUpdates do
+			table.insert(unappliedPatch.updated, update)
 		end
 	end
 

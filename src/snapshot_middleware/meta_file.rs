@@ -12,10 +12,235 @@ use serde::{Deserialize, Serialize};
 use crate::{
     json,
     resolution::UnresolvedValue,
-    snapshot::InstanceSnapshot,
+    snapshot::{InstanceMetadata, InstanceSnapshot},
     syncback::{is_json_compatible, SyncbackSnapshot},
+    variant_eq::variant_eq,
     RojoRef,
 };
+
+/// Splits serializable values into metadata properties and attributes.
+///
+/// Internal `RBX` attributes and values JSON cannot hold, like a Vector3 with
+/// a NaN component, are left out so the file can always be read back.
+pub fn serialize_values<'a>(
+    class: &str,
+    values: impl IntoIterator<Item = (Ustr, &'a Variant)>,
+) -> (
+    IndexMap<Ustr, UnresolvedValue>,
+    IndexMap<String, UnresolvedValue>,
+) {
+    let mut properties = IndexMap::new();
+    let mut attributes = IndexMap::new();
+    for (name, value) in values {
+        match value {
+            Variant::Attributes(attrs) => {
+                for (attr_name, attr_value) in attrs.iter() {
+                    if attr_name.starts_with("RBX") || !is_json_compatible(attr_value) {
+                        continue;
+                    }
+                    attributes.insert(
+                        attr_name.clone(),
+                        UnresolvedValue::from_variant_unambiguous(attr_value.clone()),
+                    );
+                }
+            }
+            _ => {
+                properties.insert(
+                    name,
+                    UnresolvedValue::from_variant(value.clone(), class, &name),
+                );
+            }
+        }
+    }
+    (properties, attributes)
+}
+
+/// The key order of a metadata file that already exists. Rewriting the file in
+/// this order keeps unchanged keys where they were, so an edit to one property
+/// shows up as a one-line diff instead of the whole file being reshuffled.
+#[derive(Debug, Default, PartialEq)]
+struct ExistingKeyOrder {
+    properties: Vec<String>,
+    attributes: Vec<String>,
+}
+
+/// The values a metadata file already holds, as written.
+#[derive(Debug, Default, Deserialize)]
+struct ExistingValues {
+    #[serde(default)]
+    properties: IndexMap<Ustr, UnresolvedValue>,
+    #[serde(default)]
+    attributes: IndexMap<String, UnresolvedValue>,
+}
+
+/// A metadata file that already exists, used to rewrite it with the smallest
+/// possible diff: keys keep their order, and values that didn't change keep
+/// exactly the text they had.
+#[derive(Debug, Default)]
+struct ExistingMetadata {
+    order: ExistingKeyOrder,
+    values: ExistingValues,
+}
+
+impl ExistingMetadata {
+    /// Reads `path` or its `.jsonc` sibling. A missing or unreadable file
+    /// leaves everything as it was produced.
+    fn read(vfs: &Vfs, path: &Path) -> Self {
+        let jsonc = path.with_extension("jsonc");
+        for candidate in [path, jsonc.as_path()] {
+            if let Ok(Some(contents)) = vfs.read(candidate).with_not_found() {
+                let Ok(text) = str::from_utf8(&contents) else {
+                    continue;
+                };
+                if let Some(order) = ExistingKeyOrder::parse(text) {
+                    return Self {
+                        order,
+                        values: json::from_str(text).unwrap_or_default(),
+                    };
+                }
+            }
+        }
+        Self::default()
+    }
+
+    fn apply(
+        &self,
+        class: &str,
+        properties: &mut IndexMap<Ustr, UnresolvedValue>,
+        attributes: &mut IndexMap<String, UnresolvedValue>,
+    ) {
+        for (key, value) in properties.iter_mut() {
+            if let Some(old) = self.values.properties.get(key) {
+                if same_value(
+                    old.clone().resolve(class, key),
+                    value.clone().resolve(class, key),
+                ) {
+                    *value = old.clone();
+                }
+            }
+        }
+        for (key, value) in attributes.iter_mut() {
+            if let Some(old) = self.values.attributes.get(key) {
+                if same_value(
+                    old.clone().resolve_unambiguous(),
+                    value.clone().resolve_unambiguous(),
+                ) {
+                    *value = old.clone();
+                }
+            }
+        }
+        self.order.apply(properties, attributes);
+    }
+}
+
+fn same_value(old: anyhow::Result<Variant>, new: anyhow::Result<Variant>) -> bool {
+    matches!((old, new), (Ok(old), Ok(new)) if variant_eq(&old, &new))
+}
+
+impl ExistingKeyOrder {
+    /// Reads key order from the syntax tree, since parsing into a JSON value
+    /// sorts object keys.
+    fn parse(text: &str) -> Option<Self> {
+        use jsonc_parser::ast::Value;
+
+        let parsed =
+            jsonc_parser::parse_to_ast(text, &Default::default(), &Default::default()).ok()?;
+        let Some(Value::Object(root)) = parsed.value else {
+            return None;
+        };
+        let keys = |value: &Value| match value {
+            Value::Object(object) => object
+                .properties
+                .iter()
+                .map(|property| property.name.clone().into_string())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut order = Self::default();
+        for property in &root.properties {
+            match property.name.clone().into_string().as_str() {
+                "properties" => order.properties = keys(&property.value),
+                "attributes" => order.attributes = keys(&property.value),
+                _ => {}
+            }
+        }
+        Some(order)
+    }
+
+    /// Sorts existing keys into their old positions and leaves new keys after
+    /// them in the order they were produced.
+    fn apply(
+        &self,
+        properties: &mut IndexMap<Ustr, UnresolvedValue>,
+        attributes: &mut IndexMap<String, UnresolvedValue>,
+    ) {
+        let position = |keys: &[String], key: &str| {
+            keys.iter()
+                .position(|existing| existing == key)
+                .unwrap_or(usize::MAX)
+        };
+        properties.sort_by_key(|key, _| position(&self.properties, key.as_str()));
+        attributes.sort_by_key(|key, _| position(&self.attributes, key.as_str()));
+    }
+}
+
+/// A descendant stored inside its ancestor's `init.meta.json` instead of in
+/// its own files. The fields mirror the children of a `.model.json` file.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineInstance {
+    pub class_name: Ustr,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub properties: IndexMap<Ustr, UnresolvedValue>,
+
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub attributes: IndexMap<String, UnresolvedValue>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<InlineInstance>,
+}
+
+impl InlineInstance {
+    fn into_snapshot(self, path: &Path) -> anyhow::Result<InstanceSnapshot> {
+        let class_name = self.class_name;
+        let name = self.name.unwrap_or_else(|| class_name.to_string());
+
+        let mut properties = rbx_dom_weak::UstrMap::default();
+        for (key, unresolved) in self.properties {
+            let value = unresolved
+                .resolve(&class_name, &key)
+                .with_context(|| format!("error applying meta file {}", path.display()))?;
+            properties.insert(key, value);
+        }
+        if !self.attributes.is_empty() {
+            let mut attributes = Attributes::new();
+            for (key, unresolved) in self.attributes {
+                attributes.insert(key, unresolved.resolve_unambiguous()?);
+            }
+            properties.insert("Attributes".into(), attributes.into());
+        }
+
+        let children = self
+            .children
+            .into_iter()
+            .map(|child| child.into_snapshot(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(InstanceSnapshot::new()
+            .name(name)
+            .class_name(class_name)
+            .properties(properties)
+            .children(children)
+            .metadata(InstanceMetadata::new().specified_id(self.id.map(RojoRef::new))))
+    }
+}
 
 /// Represents metadata in a sibling file with the same basename.
 ///
@@ -157,6 +382,14 @@ impl AdjacentMetadata {
                 }
             }
         }
+        if let Some(parent) = path.parent() {
+            let meta_path = parent.join(format!("{}.meta.json", snapshot.file_stem()));
+            ExistingMetadata::read(snapshot.vfs(), &meta_path).apply(
+                class,
+                &mut properties,
+                &mut attributes,
+            );
+        }
 
         Ok(Some(Self {
             ignore_unknown_instances: if ignore_unknown_instances {
@@ -168,7 +401,12 @@ impl AdjacentMetadata {
             properties,
             attributes,
             path,
-            id: None,
+            id: snapshot.old_inst().and_then(|inst| {
+                inst.metadata()
+                    .specified_id
+                    .as_ref()
+                    .map(ToString::to_string)
+            }),
             schema,
         }))
     }
@@ -262,6 +500,9 @@ impl AdjacentMetadata {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<Ustr>,
+
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     schema: Option<String>,
 
@@ -281,8 +522,10 @@ pub struct DirectoryMetadata {
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub attributes: IndexMap<String, UnresolvedValue>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub class_name: Option<Ustr>,
+    /// Descendants written into this file instead of their own files. They
+    /// follow any children that come from files in the directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<InlineInstance>,
 
     #[serde(skip)]
     pub path: PathBuf,
@@ -340,8 +583,6 @@ impl DirectoryMetadata {
         snapshot: &SyncbackSnapshot,
         path: PathBuf,
     ) -> anyhow::Result<Option<Self>> {
-        let mut properties = IndexMap::new();
-        let mut attributes = IndexMap::new();
         // TODO make this more granular.
         // I am breaking the cycle of bad TODOs. This is in reference to the fact
         // that right now, this will just not write any metadata at all for
@@ -370,29 +611,15 @@ impl DirectoryMetadata {
             .and_then(|inst| inst.metadata().schema.clone());
 
         let class = &snapshot.new_inst().class;
-        for (name, value) in snapshot.get_path_filtered_properties(snapshot.new).unwrap() {
-            match value {
-                Variant::Attributes(attrs) => {
-                    for (name, value) in attrs.iter() {
-                        // We (probably) don't want to preserve internal
-                        // attributes, only user defined ones.
-                        if name.starts_with("RBX") {
-                            continue;
-                        }
-                        attributes.insert(
-                            name.to_owned(),
-                            UnresolvedValue::from_variant_unambiguous(value.clone()),
-                        );
-                    }
-                }
-                _ => {
-                    properties.insert(
-                        name,
-                        UnresolvedValue::from_variant(value.clone(), class, &name),
-                    );
-                }
-            }
-        }
+        let (mut properties, mut attributes) = serialize_values(
+            class,
+            snapshot.get_path_filtered_properties(snapshot.new).unwrap(),
+        );
+        ExistingMetadata::read(snapshot.vfs(), &path.join("init.meta.json")).apply(
+            class,
+            &mut properties,
+            &mut attributes,
+        );
 
         Ok(Some(Self {
             ignore_unknown_instances: if ignore_unknown_instances {
@@ -403,9 +630,15 @@ impl DirectoryMetadata {
             name: snapshot.name_override(),
             properties,
             attributes,
+            children: Vec::new(),
             class_name: None,
             path,
-            id: None,
+            id: snapshot.old_inst().and_then(|inst| {
+                inst.metadata()
+                    .specified_id
+                    .as_ref()
+                    .map(ToString::to_string)
+            }),
             schema,
         }))
     }
@@ -417,7 +650,15 @@ impl DirectoryMetadata {
         self.apply_properties(snapshot)?;
         self.apply_id(snapshot)?;
         self.apply_schema(snapshot)?;
+        self.apply_children(snapshot)?;
 
+        Ok(())
+    }
+
+    fn apply_children(&mut self, snapshot: &mut InstanceSnapshot) -> anyhow::Result<()> {
+        for child in std::mem::take(&mut self.children) {
+            snapshot.children.push(child.into_snapshot(&self.path)?);
+        }
         Ok(())
     }
 
@@ -495,10 +736,12 @@ impl DirectoryMetadata {
     /// - `ignore_unknown_instances` is None
     /// - `name` is None
     /// - `class_name` is either None or not Some("Folder")
+    /// - There are no inline children
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
             && self.properties.is_empty()
+            && self.children.is_empty()
             && self.ignore_unknown_instances.is_none()
             && self.name.is_none()
             && if let Some(class) = &self.class_name {
@@ -541,8 +784,83 @@ pub fn file_meta(vfs: &Vfs, path: &Path, name: &str) -> anyhow::Result<Option<Ad
 #[cfg(test)]
 mod test {
     use memofs::{InMemoryFs, VfsSnapshot};
+    use rbx_dom_weak::ustr;
 
     use super::*;
+
+    #[test]
+    fn existing_key_order_follows_the_file_including_jsonc() {
+        let order = ExistingKeyOrder::parse(
+            r#"{
+                // Comments and trailing commas are allowed.
+                "className": "Part",
+                "properties": { "Locked": true, "Anchored": true, "Size": [1, 2, 3], },
+                "attributes": { "Zeta": 1, "Alpha": 2 },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(order.properties, ["Locked", "Anchored", "Size"]);
+        assert_eq!(order.attributes, ["Zeta", "Alpha"]);
+
+        assert_eq!(
+            ExistingKeyOrder::parse(r#"{ "className": "Folder" }"#),
+            Some(ExistingKeyOrder::default())
+        );
+        assert_eq!(ExistingKeyOrder::parse("[]"), None);
+        assert_eq!(ExistingKeyOrder::parse("{ not json"), None);
+    }
+
+    #[test]
+    fn existing_key_order_keeps_old_keys_in_place_and_new_keys_last() {
+        let order = ExistingKeyOrder {
+            properties: vec!["Locked".into(), "Anchored".into()],
+            attributes: vec!["Zeta".into(), "Alpha".into()],
+        };
+        let mut properties: IndexMap<Ustr, UnresolvedValue> =
+            ["Size", "Anchored", "Color", "Locked"]
+                .into_iter()
+                .map(|key| {
+                    (
+                        ustr(key),
+                        UnresolvedValue::from_variant_unambiguous(Variant::Bool(true)),
+                    )
+                })
+                .collect();
+        let mut attributes: IndexMap<String, UnresolvedValue> = ["Alpha", "New", "Zeta"]
+            .into_iter()
+            .map(|key| {
+                (
+                    key.to_owned(),
+                    UnresolvedValue::from_variant_unambiguous(Variant::Bool(true)),
+                )
+            })
+            .collect();
+
+        order.apply(&mut properties, &mut attributes);
+
+        let property_keys: Vec<_> = properties.keys().map(|key| key.as_str()).collect();
+        let attribute_keys: Vec<_> = attributes.keys().map(String::as_str).collect();
+        assert_eq!(property_keys, ["Locked", "Anchored", "Size", "Color"]);
+        assert_eq!(attribute_keys, ["Zeta", "Alpha", "New"]);
+    }
+
+    #[test]
+    fn directory_class_name_serializes_first() {
+        let metadata = DirectoryMetadata {
+            class_name: Some(ustr("AudioListener")),
+            schema: Some("https://example.invalid/schema.json".into()),
+            id: None,
+            ignore_unknown_instances: None,
+            name: None,
+            properties: IndexMap::new(),
+            attributes: IndexMap::new(),
+            children: Vec::new(),
+            path: PathBuf::new(),
+        };
+        let serialized = crate::json::to_string_pretty(&metadata).unwrap();
+        assert!(serialized.starts_with("{\n    \"className\": \"AudioListener\""));
+        assert!(serialized.contains("\n    \"$schema\":"));
+    }
 
     #[test]
     fn adjacent_read_json() {

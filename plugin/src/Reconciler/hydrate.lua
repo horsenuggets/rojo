@@ -8,6 +8,7 @@ local Log = require(Packages.Log)
 
 local invariant = require(script.Parent.Parent.invariant)
 local countMatchingProperties = require(script.Parent.countMatchingProperties)
+local services = require(script.Parent.services)
 
 -- When several existing children share a Name and ClassName we disambiguate
 -- them by scoring how well each one's properties match the virtual instance.
@@ -71,6 +72,13 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 		local bucketsByClassName = buckets[virtualChild.Name]
 		local bucket = bucketsByClassName and bucketsByClassName[virtualChild.ClassName]
 		if bucket == nil then
+			local service = services.getService(rootInstance, virtualChild.ClassName)
+			if service ~= nil and not visited[service] then
+				visited[service] = true
+				hydrateInner(stats, instanceMap, virtualInstances, childId, service)
+				continue
+			end
+
 			-- No existing instance matches; diff will mark this id for creation.
 			Log.trace(
 				"hydrate: no existing instance matches {} ({}) for id {}",

@@ -229,6 +229,52 @@ return function()
 		expect(patch.removed[1]).to.equal(unknownChild)
 	end)
 
+	it("should never remove the current camera while removing other unknown children", function()
+		local Workspace = game:GetService("Workspace")
+		local currentCamera = Workspace.CurrentCamera
+		local createdCamera = nil
+		if currentCamera == nil then
+			createdCamera = Instance.new("Camera")
+			createdCamera.Parent = Workspace
+			Workspace.CurrentCamera = createdCamera
+			currentCamera = createdCamera
+		end
+		local otherCamera = Instance.new("Camera")
+		otherCamera.Name = "OtherCamera"
+		otherCamera.Parent = Workspace
+		local unknownPart = Instance.new("Part")
+		unknownPart.Parent = Workspace
+
+		local success, err = pcall(function()
+			local knownInstances = InstanceMap.new()
+			knownInstances:insert("ROOT", Workspace)
+			local ok, patch = diff(knownInstances, {
+				ROOT = {
+					ClassName = "Workspace",
+					Name = Workspace.Name,
+					Properties = {},
+					Children = {},
+				},
+			}, "ROOT")
+			assert(ok, tostring(patch))
+
+			local removed = {}
+			for _, instance in patch.removed do
+				removed[instance] = true
+			end
+			expect(removed[currentCamera]).to.equal(nil)
+			expect(removed[otherCamera]).to.equal(true)
+			expect(removed[unknownPart]).to.equal(true)
+		end)
+
+		otherCamera:Destroy()
+		unknownPart:Destroy()
+		if createdCamera then
+			createdCamera:Destroy()
+		end
+		assert(success, err)
+	end)
+
 	it("should generate an empty patch if unknown children should be ignored", function()
 		local knownInstances = InstanceMap.new()
 		local virtualInstances = {

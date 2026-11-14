@@ -1,12 +1,16 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::Arc,
 };
 
 use anyhow::Context;
-use memofs::{DirEntry, Vfs};
+use memofs::{DirEntry, IoResultExt as _, Vfs};
 use rayon::prelude::*;
+use rbx_dom_weak::{
+    types::{Ref, Variant},
+    ustr, Ustr,
+};
 
 use crate::{
     snapshot::{
@@ -14,12 +18,17 @@ use crate::{
         InstigatingSource,
     },
     syncback::{
-        hash_instance, instances_as_directories, unique_child_stems, FsSnapshot, SyncbackReturn,
-        SyncbackSnapshot,
+        directory_middleware_for_instance, extension_for_middleware, filter_properties,
+        hash_instance, instances_as_directories, is_valid_path, sibling_order_key,
+        unique_child_stems, FsSnapshot, SyncbackReturn, SyncbackSnapshot,
     },
+    REF_ID_ATTRIBUTE_NAME,
 };
 
-use super::{meta_file::DirectoryMetadata, snapshot_from_vfs};
+use super::{
+    meta_file::{serialize_values, DirectoryMetadata, InlineInstance},
+    snapshot_from_vfs,
+};
 
 const EMPTY_DIR_KEEP_NAME: &str = ".gitkeep";
 
@@ -65,13 +74,26 @@ pub fn snapshot_dir_no_meta(
     Arc::make_mut(active_directories).push(normalized_path.clone());
 
     let entries = match entries {
+        // A shallow read only wants this directory's own metadata.
+        _ if context.shallow => Vec::new(),
         Some(entries) => entries,
         None => vfs.read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?,
     };
-    let entries: Vec<_> = entries
+    let mut entries: Vec<_> = entries
         .into_iter()
         .filter(|child| !is_path_ignored(&context.path_ignore_rules, child.path()))
         .collect();
+    // Restore the original order of duplicate-named siblings, which syncback
+    // numbers `~2`, `~3`, ... and a plain listing would put `~10` before `~2`.
+    entries.sort_by_cached_key(|entry| {
+        let name = entry
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (base, suffix) = sibling_order_key(&name);
+        (base.into_owned(), suffix)
+    });
     let snapshot_child = |entry: &DirEntry| snapshot_from_vfs(&context, vfs, entry.path());
     // Preserve filesystem ordering, including which error is reported first.
     // Small directories keep the original short-circuiting traversal.
@@ -90,25 +112,11 @@ pub fn snapshot_dir_no_meta(
     };
     let snapshot_children: Vec<_> = children.into_iter().flatten().collect();
 
-    let relevant_paths = vec![
-        normalized_path.clone(),
-        // TODO: We shouldn't need to know about Lua existing in this
-        // middleware. Should we figure out a way for that function to add
-        // relevant paths to this middleware?
-        normalized_path.join("init.lua"),
-        normalized_path.join("init.luau"),
-        normalized_path.join("init.server.lua"),
-        normalized_path.join("init.server.luau"),
-        normalized_path.join("init.client.lua"),
-        normalized_path.join("init.client.luau"),
-        normalized_path.join("init.legacy.lua"),
-        normalized_path.join("init.legacy.luau"),
-        normalized_path.join("init.local.lua"),
-        normalized_path.join("init.local.luau"),
-        normalized_path.join("init.plugin.lua"),
-        normalized_path.join("init.plugin.luau"),
-        normalized_path.join("init.csv"),
-    ];
+    // Init files that don't exist yet are not listed. Change processing walks up
+    // from an unknown path to the nearest tracked ancestor, so creating one still
+    // resnapshots this directory, and every listed path costs memory for each
+    // directory in the tree.
+    let relevant_paths = vec![normalized_path.clone()];
 
     let snapshot = InstanceSnapshot::new()
         .name(name)
@@ -129,20 +137,51 @@ pub fn syncback_dir<'sync>(
 ) -> anyhow::Result<SyncbackReturn<'sync>> {
     let new_inst = snapshot.new_inst();
 
-    let mut dir_syncback = syncback_dir_no_meta(snapshot)?;
-
     let mut meta = DirectoryMetadata::from_syncback_snapshot(snapshot, snapshot.path.clone())?;
+    // Inline children only exist in the metadata, so they need a file to land in.
+    let inline = meta.is_some() && should_inline(snapshot);
+    let mut dir_syncback = if inline {
+        syncback_dir_inline(snapshot)
+    } else {
+        syncback_dir_no_meta(snapshot)?
+    };
+
+    let is_file = |path: &Path| -> anyhow::Result<bool> {
+        Ok(snapshot
+            .vfs()
+            .metadata(path)
+            .with_not_found()?
+            .is_some_and(|metadata| metadata.is_file()))
+    };
+    let json_path = snapshot.path.join("init.meta.json");
+    let jsonc_path = snapshot.path.join("init.meta.jsonc");
+    // An existing JSONC file is rewritten in place. A second init.meta.json next
+    // to it would be read too and load its inline children twice.
+    let meta_path = if is_file(&jsonc_path)? && !is_file(&json_path)? {
+        jsonc_path.clone()
+    } else {
+        json_path
+    };
+    let was_inline = has_inline_children(snapshot);
+
+    let mut wrote_meta = false;
     if let Some(meta) = &mut meta {
         if new_inst.class != "Folder" {
             meta.class_name = Some(new_inst.class);
         }
+        if inline {
+            meta.children = inline_children(snapshot, snapshot.new, snapshot.old);
+        }
 
-        if !meta.is_empty() {
+        // Metadata that used to hold inline children is rewritten even when it
+        // ends up empty, or the removed children would load again from it.
+        if !meta.is_empty() || (inline && was_inline) {
             dir_syncback.fs_snapshot.add_file(
-                snapshot.path.join("init.meta.json"),
+                &meta_path,
                 crate::json::to_vec_pretty(&meta)
                     .context("could not serialize new init.meta.json")?,
             );
+            wrote_meta = true;
         }
     }
 
@@ -150,13 +189,311 @@ pub fn syncback_dir<'sync>(
         .as_ref()
         .map(DirectoryMetadata::is_empty)
         .unwrap_or_default();
-    if new_inst.children().is_empty() && metadata_empty {
+
+    // Children that were stored inline are now written as their own files, so
+    // the old entries must not survive to load a second copy of each of them.
+    if !inline && was_inline {
+        let mut stale = Vec::new();
+        if meta_path != jsonc_path {
+            stale.push(jsonc_path);
+        }
+        if metadata_empty {
+            stale.push(meta_path);
+        }
+        for path in stale {
+            if is_file(&path)? {
+                dir_syncback.fs_snapshot.remove_file(path);
+            }
+        }
+    }
+
+    if new_inst.children().is_empty() && metadata_empty && !wrote_meta {
         dir_syncback
             .fs_snapshot
             .add_file(snapshot.path.join(EMPTY_DIR_KEEP_NAME), Vec::new())
     }
 
     Ok(dir_syncback)
+}
+
+/// Returns whether a directory should store its whole subtree in its
+/// `init.meta.json` instead of writing a file for each descendant.
+fn should_inline(snapshot: &SyncbackSnapshot) -> bool {
+    // Two-way sync rewrites one file at a time, so it keeps whichever layout
+    // the directory already has on disk.
+    if snapshot.is_scoped() {
+        return has_inline_children(snapshot);
+    }
+    if !instances_as_directories(snapshot.project()) || snapshot.contains_script(snapshot.new) {
+        return false;
+    }
+    if let Some(old_inst) = snapshot.old_inst() {
+        // Project-defined children are written by the project file.
+        let has_project_children = old_inst.children().iter().any(|child| {
+            snapshot.get_old_instance(*child).is_some_and(|child| {
+                matches!(
+                    child.metadata().instigating_source,
+                    Some(InstigatingSource::ProjectNode { .. })
+                )
+            })
+        });
+        if has_project_children {
+            return false;
+        }
+    }
+    // Ignored subtrees are skipped per path, which an inline descendant lacks.
+    let inst_path = snapshot.get_new_inst_path(snapshot.new);
+    let prefix = format!("{inst_path}/");
+    if snapshot.ignore_tree().is_some_and(|ignored| {
+        ignored
+            .iter()
+            .any(|tree| inst_path.is_empty() || tree.starts_with(&prefix))
+    }) {
+        return false;
+    }
+    // A failure to read the rules keeps the per-path layout, which is checked.
+    !inline_blocked_by_ignore_paths(snapshot).unwrap_or(true)
+}
+
+/// Returns whether `ignorePaths` excludes this directory's metadata or any path
+/// its descendants are or would be written to. Inlining moves descendants into
+/// the metadata, past the per-path checks syncback applies to each file, so an
+/// excluded metadata file would drop the subtree and an excluded child would
+/// leave its old file next to an inline copy.
+fn inline_blocked_by_ignore_paths(snapshot: &SyncbackSnapshot) -> anyhow::Result<bool> {
+    let Some(rules) = &snapshot.project().syncback_rules else {
+        return Ok(false);
+    };
+    let globs = Some(rules.compile_globs()?);
+    let base = snapshot.project().folder_location();
+    let allowed = |path: &Path| is_valid_path(&globs, base, path);
+
+    if !allowed(&snapshot.path.join("init.meta.json"))
+        || !allowed(&snapshot.path.join("init.meta.jsonc"))
+    {
+        return Ok(true);
+    }
+
+    // Paths the descendants are written to today.
+    if let Some(old) = snapshot.old {
+        let mut pending = vec![old];
+        while let Some(referent) = pending.pop() {
+            let Some(instance) = snapshot.get_old_instance(referent) else {
+                continue;
+            };
+            pending.extend(instance.children().iter().copied());
+            if referent == old {
+                continue;
+            }
+            if let Some(InstigatingSource::Path(path)) = &instance.metadata().instigating_source {
+                if !allowed(path) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    // Paths the descendants would be written to as their own files.
+    let dom = snapshot.new_tree();
+    let mut pending = vec![(snapshot.new, snapshot.path.clone())];
+    while let Some((referent, directory)) = pending.pop() {
+        let parent = dom.get_by_ref(referent).unwrap();
+        let stems = unique_child_stems(dom, parent);
+        for child_ref in parent.children() {
+            let child = dom.get_by_ref(*child_ref).unwrap();
+            let middleware = directory_middleware_for_instance(child);
+            let stem = &stems[child_ref];
+            let (path, meta) = if middleware.is_dir() {
+                let path = directory.join(stem);
+                let meta = path.join("init.meta.json");
+                (path, meta)
+            } else {
+                let extension = extension_for_middleware(middleware);
+                (
+                    directory.join(format!("{stem}.{extension}")),
+                    directory.join(format!("{stem}.meta.json")),
+                )
+            };
+            if !allowed(&path) || !allowed(&meta) {
+                return Ok(true);
+            }
+            if middleware.is_dir() {
+                pending.push((*child_ref, path));
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Returns whether the existing directory stores any of its children inline.
+fn has_inline_children(snapshot: &SyncbackSnapshot) -> bool {
+    snapshot.old_inst().is_some_and(|old_inst| {
+        old_inst.children().iter().any(|child| {
+            snapshot
+                .get_old_instance(*child)
+                .is_some_and(|child| child.metadata().instigating_source.is_none())
+        })
+    })
+}
+
+/// Syncs back a directory whose descendants all live in its metadata. Any
+/// file-backed children it used to have are removed.
+fn syncback_dir_inline<'sync>(snapshot: &SyncbackSnapshot<'sync>) -> SyncbackReturn<'sync> {
+    let mut removed_children = Vec::new();
+    if !snapshot.is_scoped() {
+        if let Some(old_inst) = snapshot.old_inst() {
+            for child in old_inst.children() {
+                let child = snapshot.get_old_instance(*child).unwrap();
+                if matches!(
+                    child.metadata().instigating_source,
+                    Some(InstigatingSource::Path(_))
+                ) {
+                    removed_children.push(child);
+                }
+            }
+        }
+    }
+
+    SyncbackReturn {
+        fs_snapshot: FsSnapshot::new().with_added_dir(&snapshot.path),
+        children: Vec::new(),
+        removed_children,
+    }
+}
+
+/// Serializes the children of `new` for its parent's metadata. Each is paired
+/// with an existing instance so manually specified IDs survive rewrites.
+fn inline_children(snapshot: &SyncbackSnapshot, new: Ref, old: Option<Ref>) -> Vec<InlineInstance> {
+    let new_children = snapshot.get_new_instance(new).unwrap().children();
+    let old_children: Vec<_> = old
+        .and_then(|old| snapshot.get_old_instance(old))
+        .map(|old| {
+            old.children()
+                .iter()
+                .filter_map(|child| snapshot.get_old_instance(*child))
+                .filter(|child| match child.metadata().instigating_source {
+                    None => true,
+                    // A scoped rewrite only covers instances already stored inline,
+                    // so a file-backed sibling must not lend one of them its ID.
+                    Some(InstigatingSource::Path(_)) => !snapshot.is_scoped(),
+                    Some(InstigatingSource::ProjectNode { .. }) => false,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pairs = pair_children(snapshot, new_children, &old_children);
+
+    new_children
+        .iter()
+        .zip(pairs)
+        .map(|(child, old_child)| {
+            let instance = snapshot.get_new_instance(*child).unwrap();
+            let mut values = filter_properties(snapshot.project(), instance)
+                .into_iter()
+                .collect::<Vec<_>>();
+            // Hash map order would reshuffle the file on every rewrite.
+            values.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+            let (properties, attributes) = serialize_values(&instance.class, values);
+            // An instance's own `Rojo_Id` attribute is saved with its other
+            // attributes and is what Ref properties point at, so an ID inherited
+            // from the paired old instance only survives when the instance has
+            // no attribute and no other instance claims that ID. Reordered
+            // duplicate-named siblings can pair with each other's old instances,
+            // and writing both IDs would make two instances share one.
+            let id = old_child
+                .and_then(|old| old.metadata().specified_id.as_ref())
+                .map(ToString::to_string)
+                .filter(|id| {
+                    rojo_id_attribute(instance).is_none() && !snapshot.is_attribute_id(id)
+                });
+
+            InlineInstance {
+                class_name: instance.class,
+                name: Some(instance.name.clone()),
+                id,
+                properties,
+                attributes,
+                children: inline_children(snapshot, *child, old_child.map(|old| old.id())),
+            }
+        })
+        .collect()
+}
+
+/// Pairs each new child with an old one, preferring the same position, then the
+/// same name and class, then the same position and class to follow renames.
+fn pair_children<'sync>(
+    snapshot: &SyncbackSnapshot<'sync>,
+    new_children: &[Ref],
+    old_children: &[InstanceWithMeta<'sync>],
+) -> Vec<Option<InstanceWithMeta<'sync>>> {
+    let new: Vec<_> = new_children
+        .iter()
+        .map(|child| {
+            let child = snapshot.get_new_instance(*child).unwrap();
+            (child.name.as_str(), child.class)
+        })
+        .collect();
+    let old: Vec<_> = old_children
+        .iter()
+        .map(|child| (child.name(), child.class_name()))
+        .collect();
+    pair_indices(&new, &old)
+        .into_iter()
+        .map(|pair| pair.map(|old_index| old_children[old_index]))
+        .collect()
+}
+
+/// Pairs children by name and class, returning the old index for each new one.
+/// Every pass is linear so rewriting a large inline folder stays cheap.
+fn pair_indices(new: &[(&str, Ustr)], old: &[(&str, Ustr)]) -> Vec<Option<usize>> {
+    let mut taken = vec![false; old.len()];
+    let mut pairs: Vec<Option<usize>> = vec![None; new.len()];
+    let shared = new.len().min(old.len());
+
+    for index in 0..shared {
+        if new[index] == old[index] {
+            taken[index] = true;
+            pairs[index] = Some(index);
+        }
+    }
+
+    // Queues keep duplicates in child order, so the nth `Model` pairs with the
+    // nth remaining old `Model`.
+    let mut queues: HashMap<(&str, Ustr), VecDeque<usize>> = HashMap::new();
+    for (old_index, key) in old.iter().enumerate() {
+        if !taken[old_index] {
+            queues.entry(*key).or_default().push_back(old_index);
+        }
+    }
+    for (index, pair) in pairs.iter_mut().enumerate() {
+        if pair.is_some() {
+            continue;
+        }
+        if let Some(old_index) = queues.get_mut(&new[index]).and_then(VecDeque::pop_front) {
+            taken[old_index] = true;
+            *pair = Some(old_index);
+        }
+    }
+
+    // A renamed child keeps its position and class.
+    for index in 0..shared {
+        if pairs[index].is_none() && !taken[index] && new[index].1 == old[index].1 {
+            taken[index] = true;
+            pairs[index] = Some(index);
+        }
+    }
+
+    pairs
+}
+
+fn rojo_id_attribute(instance: &rbx_dom_weak::Instance) -> Option<&str> {
+    match instance.properties.get(&ustr("Attributes")) {
+        Some(Variant::Attributes(attributes)) => match attributes.get(REF_ID_ATTRIBUTE_NAME) {
+            Some(Variant::String(id)) => Some(id),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub fn syncback_dir_no_meta<'sync>(
@@ -333,6 +670,139 @@ mod test {
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    fn keys(items: &[(&'static str, &'static str)]) -> Vec<(&'static str, Ustr)> {
+        items
+            .iter()
+            .map(|(name, class)| (*name, ustr(class)))
+            .collect()
+    }
+
+    #[test]
+    fn pairing_prefers_position_then_name_then_renames() {
+        let old = keys(&[
+            ("A", "Part"),
+            ("B", "Part"),
+            ("C", "Folder"),
+            ("Old", "Part"),
+        ]);
+        let new = keys(&[
+            ("B", "Part"),
+            ("A", "Part"),
+            ("C", "Folder"),
+            ("New", "Part"),
+        ]);
+        // C keeps its slot, A and B find each other by name, and Old is renamed.
+        assert_eq!(
+            pair_indices(&new, &old),
+            [Some(1), Some(0), Some(2), Some(3)]
+        );
+        // A class change is never treated as a rename.
+        let old = keys(&[("X", "Part")]);
+        let new = keys(&[("Y", "Folder")]);
+        assert_eq!(pair_indices(&new, &old), [None]);
+    }
+
+    #[test]
+    fn pairing_keeps_duplicates_in_order() {
+        let old = keys(&[
+            ("A", "Part"),
+            ("B", "Part"),
+            ("Model", "Model"),
+            ("Model", "Model"),
+        ]);
+        let new = keys(&[("Model", "Model"), ("Model", "Model")]);
+        // Neither Model kept its slot, so each takes the next remaining one in order.
+        assert_eq!(pair_indices(&new, &old), [Some(2), Some(3)]);
+    }
+
+    /// Large folders of identical children are common in maps, so pairing must
+    /// stay linear rather than rescanning the old children for each new one.
+    #[test]
+    fn pairing_large_duplicate_groups_stays_linear() {
+        let old: Vec<_> = (0..200_000).map(|_| ("Part", ustr("Part"))).collect();
+        let mut new = vec![("Moved", ustr("Folder"))];
+        new.extend(old.iter().copied());
+        let pairs = pair_indices(&new, &old);
+        // Slots that still line up keep their pair, and the one Part pushed past
+        // the end takes the only old Part left.
+        assert_eq!(pairs[0], None);
+        assert!((1..old.len()).all(|index| pairs[index] == Some(index)));
+        assert_eq!(pairs[old.len()], Some(0));
+    }
+
+    /// Two-way sync removing the last inline child must still rewrite the
+    /// metadata, as a single-file write, without staging a `.gitkeep`.
+    #[test]
+    fn removing_the_last_inline_child_rewrites_the_metadata() {
+        use crate::{
+            project::Project,
+            snapshot::RojoTree,
+            syncback::{syncback_instance, FsSnapshot},
+        };
+        use std::path::PathBuf;
+
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{"name":"Test","tree":{"$className":"Folder"},"syncbackRules":{"instancesAsDirectories":true}}"#,
+                    ),
+                ),
+                (
+                    "Holder",
+                    VfsSnapshot::dir([(
+                        "init.meta.json",
+                        VfsSnapshot::file(
+                            r#"{"children":[{"className":"Folder","name":"Child"}]}"#,
+                        ),
+                    )]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+        vfs.set_watch_enabled(false);
+        let project = Project::load_exact(
+            &vfs,
+            &PathBuf::from("/project/default.project.json"),
+            Some("Test"),
+        )
+        .unwrap();
+        let holder = snapshot_from_vfs(&InstanceContext::new(), &vfs, Path::new("/project/Holder"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(holder.children.len(), 1);
+        let tree = RojoTree::new(InstanceSnapshot::new().name("Root").children(vec![holder]));
+        let holder_id = tree.root().children()[0];
+        let expected = FsSnapshot::capture_file_contents(
+            &tree.get_metadata(holder_id).unwrap().relevant_paths,
+            &vfs,
+        )
+        .unwrap();
+
+        let new_tree = rbx_dom_weak::WeakDom::new(
+            rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Holder"),
+        );
+        let staged = syncback_instance(&vfs, &tree, &project, holder_id, new_tree).unwrap();
+        staged
+            .write_single_file_to_vfs(project.folder_location(), &vfs, &expected)
+            .unwrap();
+
+        assert!(vfs
+            .metadata("/project/Holder/.gitkeep")
+            .with_not_found()
+            .unwrap()
+            .is_none());
+        let reloaded =
+            snapshot_from_vfs(&InstanceContext::new(), &vfs, Path::new("/project/Holder"))
+                .unwrap()
+                .unwrap();
+        assert!(reloaded.children.is_empty());
+    }
 
     #[test]
     fn parallel_children_preserve_nested_order_and_sources() {

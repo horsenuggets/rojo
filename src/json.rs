@@ -163,6 +163,23 @@ mod tests {
         assert_eq!(to_vec_pretty(&value).unwrap(), text.as_bytes());
     }
 
+    /// Metadata keeps the text of unchanged numbers by parsing and writing
+    /// them again, so a parse that's off by one bit changes the file on every
+    /// syncback. These came from real CFrames whose text alternated forever.
+    #[test]
+    fn numbers_round_trip_through_their_text() {
+        for text in [
+            "3.7252898543727042e-9",
+            "3.725289854372704e-9",
+            "-6.630593851753017e-10",
+            "-6.630593851753016e-10",
+        ] {
+            let number: f64 = from_str(text).unwrap();
+            assert_eq!(number, text.parse::<f64>().unwrap(), "{text}");
+            assert_eq!(serde_json::to_string(&number).unwrap(), text, "{text}");
+        }
+    }
+
     #[test]
     fn test_parse_value() {
         let value = parse_value(r#"{"foo": "bar"}"#).unwrap();

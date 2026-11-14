@@ -189,13 +189,30 @@ function InstanceMap:__connectSignals(instance)
 			instance:GetPropertyChangedSignal("Parent"):Connect(function()
 				self:__maybeFireInstanceChanged(instance, "Parent")
 			end),
+
+			instance.AttributeChanged:Connect(function()
+				self:__maybeFireInstanceChanged(instance, "Attributes")
+			end),
+
+			instance.AncestryChanged:Connect(function()
+				self:__maybeFireInstanceChanged(instance, "Parent")
+			end),
 		}
 
 		self.instancesToSignal[instance] = signals
 	else
-		self.instancesToSignal[instance] = instance.Changed:Connect(function(propertyName)
-			self:__maybeFireInstanceChanged(instance, propertyName)
-		end)
+		self.instancesToSignal[instance] = {
+			instance.Changed:Connect(function(propertyName)
+				self:__maybeFireInstanceChanged(instance, propertyName)
+			end),
+			instance.AttributeChanged:Connect(function()
+				self:__maybeFireInstanceChanged(instance, "Attributes")
+			end),
+
+			instance.AncestryChanged:Connect(function()
+				self:__maybeFireInstanceChanged(instance, "Parent")
+			end),
+		}
 	end
 end
 

@@ -9,17 +9,19 @@ use hyper_tungstenite::{is_upgrade_request, tungstenite::Message, upgrade, Hyper
 use opener::OpenError;
 use rbx_dom_weak::{
     types::{Ref, Variant},
-    InstanceBuilder, UstrMap, WeakDom,
+    ustr, InstanceBuilder, UstrMap, WeakDom,
 };
 
 use crate::{
+    change_processor::TreeMutation,
+    rojo_ref::merge_link_attributes,
     serve_session::ServeSession,
     snapshot::{InstanceWithMeta, PatchSet, PatchUpdate},
     web::{
         interface::{
             ErrorResponse, Instance, MessagesPacket, OpenResponse, ReadResponse,
             ServerInfoResponse, SocketPacket, SocketPacketBody, SocketPacketType, SubscribeMessage,
-            WriteRequest, WriteResponse, PROTOCOL_VERSION, SERVER_VERSION,
+            WriteError, WriteRequest, WriteResponse, PROTOCOL_VERSION, SERVER_VERSION,
         },
         origin::canonical,
         util::{deserialize_msgpack, msgpack, msgpack_ok, serialize_msgpack},
@@ -160,27 +162,90 @@ impl ApiService {
             );
         }
 
-        let updated_instances = request
-            .updated
-            .into_iter()
-            .map(|update| PatchUpdate {
-                id: update.id,
-                changed_class_name: update.changed_class_name,
-                changed_name: update.changed_name,
-                changed_properties: update.changed_properties,
-                changed_metadata: None,
+        let mut errors: Vec<_> = request
+            .added
+            .into_keys()
+            .map(|id| WriteError {
+                id,
+                property: None,
+                message: "Creating instances through two-way sync is not supported yet".into(),
             })
             .collect();
+        errors.extend(
+            request
+                .updated
+                .iter()
+                .filter(|update| update.changed_metadata.is_some())
+                .map(|update| WriteError {
+                    id: update.id,
+                    property: Some("metadata".into()),
+                    message: "Changing metadata through two-way sync is not supported".into(),
+                }),
+        );
+        let updated_instances = {
+            // Studio never receives link attributes, so its attribute edits are
+            // completed with the ones the instance already has before persisting.
+            let tree = self.serve_session.tree();
+            request
+                .updated
+                .into_iter()
+                .map(|update| {
+                    let existing = tree.get_instance(update.id);
+                    let mut changed_properties = update.changed_properties;
+                    if let Some(Some(studio)) = changed_properties.get_mut(&ustr("Attributes")) {
+                        let current = existing
+                            .and_then(|instance| instance.properties().get(&ustr("Attributes")));
+                        *studio = merge_link_attributes(studio, current);
+                    }
+                    PatchUpdate {
+                        id: update.id,
+                        changed_class_name: update.changed_class_name,
+                        changed_name: update.changed_name,
+                        changed_properties,
+                        changed_metadata: None,
+                    }
+                })
+                .collect()
+        };
 
+        let (result_sender, result_receiver) = crossbeam_channel::bounded(1);
         tree_mutation_sender
-            .send(PatchSet {
-                removed_instances: Vec::new(),
-                added_instances: Vec::new(),
-                updated_instances,
+            .send(TreeMutation {
+                message_cursor: request.message_cursor,
+                patch_set: PatchSet {
+                    removed_instances: request.removed,
+                    added_instances: Vec::new(),
+                    updated_instances,
+                },
+                result_sender,
             })
             .unwrap();
+        let (accepted, conflicts, write_errors) =
+            match tokio::task::spawn_blocking(move || result_receiver.recv()).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(err)) => {
+                    return msgpack(
+                        ErrorResponse::internal_error(format!("Write processing failed: {err}")),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
+                Err(err) => {
+                    return msgpack(
+                        ErrorResponse::internal_error(format!("Write processing failed: {err}")),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
+            };
 
-        msgpack_ok(WriteResponse { session_id })
+        errors.extend(write_errors);
+        let response = WriteResponse {
+            session_id,
+            accepted,
+            conflicts,
+            errors,
+        };
+        log::info!("Write response {response:?}");
+        msgpack_ok(response)
     }
 
     async fn handle_api_read(&self, request: Request<Body>) -> Response<Body> {

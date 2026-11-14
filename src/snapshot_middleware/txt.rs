@@ -56,10 +56,13 @@ pub fn syncback_txt<'sync>(
         // shifting is fine.
         meta.properties.shift_remove(&ustr("Value"));
 
-        if !meta.is_empty() {
-            let parent = snapshot.path.parent_err()?;
+        let meta_path = snapshot
+            .path
+            .parent_err()?
+            .join(format!("{}.meta.json", snapshot.file_stem()));
+        if !meta.is_empty() || super::lua::metadata_exists(snapshot.vfs(), &meta_path) {
             fs_snapshot.add_file(
-                parent.join(format!("{}.meta.json", snapshot.file_stem())),
+                meta_path,
                 crate::json::to_vec_pretty(&meta).context("could not serialize metadata")?,
             );
         }

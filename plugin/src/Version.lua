@@ -27,6 +27,7 @@ local function compare(a, b)
 end
 
 local Version = {}
+Version.updateChecksEnabled = false
 
 --[[
 	Compares two versions of the form {major, minor, revision}.
@@ -126,6 +127,10 @@ Version._apiBlocked = nil :: boolean?
 Version._apiProbed = false
 
 function Version.isApiBlocked(): boolean
+	if not Version.updateChecksEnabled then
+		return false
+	end
+
 	if Version._apiBlocked ~= nil then
 		return Version._apiBlocked
 	end
@@ -153,6 +158,10 @@ function Version.retrieveLatestCompatible(options: {
 	version: { number },
 	includePrereleases: boolean?,
 }): LatestReleaseInfo?
+	if not Version.updateChecksEnabled then
+		return nil
+	end
+
 	if Version._cachedLatestCompatible and os.clock() - Version._cachedLatestCompatible.timestamp < 60 * 60 * 24 then
 		Log.debug("Using cached latest compatible version")
 		return Version._cachedLatestCompatible.value
@@ -230,6 +239,10 @@ function Version.retrieveLatestCompatible(options: {
 end
 
 function Version.getUpdateMessage(): string?
+	if not Version.updateChecksEnabled then
+		return nil
+	end
+
 	if not Settings:get("checkForUpdates") then
 		return
 	end

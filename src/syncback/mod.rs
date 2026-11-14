@@ -1,13 +1,15 @@
 mod file_names;
 mod fs_snapshot;
 mod hash;
+mod inline;
 mod property_filter;
 mod ref_properties;
 mod snapshot;
+mod write_decision;
 
 use anyhow::Context;
 use indexmap::IndexMap;
-use memofs::Vfs;
+use memofs::{IoResultExt, Vfs};
 use rbx_dom_weak::{
     types::{Ref, Variant},
     ustr, Instance, Ustr, UstrSet, WeakDom,
@@ -16,26 +18,28 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
-    path::Path,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
 use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{InstanceWithMeta, RojoTree},
-    snapshot_middleware::Middleware,
-    syncback::ref_properties::{collect_referents, link_referents},
+    snapshot_middleware::{dir_init_files, Middleware},
+    syncback::ref_properties::{attribute_ids, collect_referents, link_referents},
     Project,
 };
 
 pub use file_names::{
-    directory_middleware_for_instance, extension_for_middleware, name_for_inst, unique_child_stems,
-    validate_file_name,
+    directory_middleware_for_instance, extension_for_middleware, name_for_inst, sibling_order_key,
+    unique_child_stems, validate_file_name,
 };
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
+pub(crate) use property_filter::{can_write_property, is_unset_binary_string};
 pub use property_filter::{filter_properties, filter_properties_preallocated, is_json_compatible};
 pub use snapshot::{SyncbackData, SyncbackSnapshot};
+pub use write_decision::{decide_property_write, PropertyWriteDecision};
 
 /// The name of an enviroment variable to use to override the behavior of
 /// syncback on model files.
@@ -49,6 +53,158 @@ const DEBUG_MODEL_FORMAT_VAR: &str = "ROJO_SYNCBACK_DEBUG";
 
 /// A glob that can be used to tell if a path contains a `.git` folder.
 static GIT_IGNORE_GLOB: OnceLock<Glob> = OnceLock::new();
+
+/// Serializes one file-backed instance without rewriting its descendants.
+pub fn syncback_instance(
+    vfs: &Vfs,
+    old_tree: &RojoTree,
+    project: &Project,
+    id: Ref,
+    new_tree: WeakDom,
+) -> anyhow::Result<FsSnapshot> {
+    let old_inst = old_tree
+        .get_instance(id)
+        .context("Cannot sync an unknown instance")?;
+    let source = old_inst
+        .metadata()
+        .instigating_source
+        .as_ref()
+        .context("The instance has no filesystem source")?;
+    let path = source.path().to_path_buf();
+    let middleware = old_inst
+        .metadata()
+        .middleware
+        .context("The instance has no known filesystem middleware")?;
+    if matches!(
+        middleware,
+        Middleware::Rbxm | Middleware::Rbxmx | Middleware::JsonModel
+    ) {
+        anyhow::bail!("Model-file updates require subtree serialization");
+    }
+    let attribute_ids = attribute_ids(&new_tree);
+    let snapshot = SyncbackSnapshot {
+        data: SyncbackData {
+            vfs,
+            old_tree,
+            new_tree: &new_tree,
+            project,
+            scoped: true,
+            script_containers: None,
+            attribute_ids: &attribute_ids,
+        },
+        old: Some(id),
+        new: new_tree.root_ref(),
+        path: path.clone(),
+        middleware: Some(middleware),
+    };
+    if let Some(rules) = &project.syncback_rules {
+        let globs = rules.compile_globs()?;
+        if !is_valid_path(&Some(globs), project.folder_location(), &path) {
+            anyhow::bail!("This path is excluded by the project's syncback rules");
+        }
+        let instance_path = snapshot.get_old_inst_path(id);
+        if rules
+            .ignore_trees
+            .iter()
+            .any(|ignored| instance_path.starts_with(ignored.as_str()))
+        {
+            anyhow::bail!("This instance is excluded by the project's syncback rules");
+        }
+    }
+    let mut output = middleware.syncback(&snapshot)?.fs_snapshot;
+
+    // Directory scripts are serialized to the default initializer name, but
+    // the directory may use another one, like `init.lua`. Writing both would
+    // be a multi-file change and leave two competing initializers.
+    if let Some(tracked) = source_file(&old_inst).filter(|tracked| *tracked != path) {
+        for (_, name) in dir_init_files() {
+            let staged = path.join(name);
+            if staged != tracked {
+                output.retarget_added_file(&staged, &tracked);
+            }
+        }
+    }
+
+    // These match the paths the metadata serializers write to, which are based
+    // on the file stem (`Foo.meta.json` for `Foo.server.luau`).
+    let (json_path, jsonc_path) = if middleware.is_dir() {
+        (path.join("init.meta.json"), path.join("init.meta.jsonc"))
+    } else {
+        let parent = path
+            .parent()
+            .context("The instance's source has no parent directory")?;
+        let stem = snapshot.file_stem();
+        (
+            parent.join(format!("{stem}.meta.json")),
+            parent.join(format!("{stem}.meta.jsonc")),
+        )
+    };
+    let is_file = |path: &Path| -> anyhow::Result<bool> {
+        Ok(vfs
+            .metadata(path)
+            .with_not_found()?
+            .is_some_and(|metadata| metadata.is_file()))
+    };
+    if is_file(&jsonc_path)? {
+        // Both files are applied when reading, so rewriting only one of them
+        // can't clear a value the other still sets.
+        if is_file(&json_path)? {
+            anyhow::bail!(
+                "Both {} and {} hold this instance's metadata, so it can't be safely rewritten",
+                json_path.display(),
+                jsonc_path.display()
+            );
+        }
+        output.retarget_added_file(&json_path, &jsonc_path);
+    }
+    Ok(output)
+}
+
+/// Returns an error if a staged scoped write would add, change, or remove a path
+/// the project's syncback rules exclude. Run this on the final write targets, after
+/// retargeting and filtering, since those decide which files actually change.
+pub fn validate_write_targets(project: &Project, staged: &FsSnapshot) -> anyhow::Result<()> {
+    let Some(rules) = &project.syncback_rules else {
+        return Ok(());
+    };
+    let globs = Some(rules.compile_globs()?);
+    let base = project.folder_location();
+    let excluded = staged
+        .added_paths()
+        .into_iter()
+        .chain(staged.removed_paths())
+        .find(|path| !is_valid_path(&globs, base, path));
+    match excluded {
+        Some(path) => anyhow::bail!(
+            "{} is excluded by the project's syncback rules",
+            path.display()
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Returns the file holding an instance's own source, which for a directory
+/// script is its initializer (`init.luau`, `init.server.lua`, ...). Returns
+/// `None` for plain directories, which have no source file.
+pub fn source_file(instance: &InstanceWithMeta) -> Option<PathBuf> {
+    let metadata = instance.metadata();
+    let path = metadata.instigating_source.as_ref()?.path();
+    match metadata.middleware? {
+        Middleware::Dir => None,
+        middleware if middleware.is_dir() => metadata
+            .relevant_paths
+            .iter()
+            .find(|candidate| {
+                candidate.parent() == Some(path)
+                    && candidate
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| dir_init_files().iter().any(|(_, init)| *init == name))
+            })
+            .cloned(),
+        _ => Some(path.to_path_buf()),
+    }
+}
 
 pub fn syncback_loop(
     vfs: &Vfs,
@@ -151,11 +307,21 @@ pub fn syncback_loop(
 
     let project_path = project.folder_location();
 
+    let relayout = if instances_as_directories(project) {
+        inline::needs_relayout(old_tree)
+    } else {
+        HashSet::new()
+    };
+    let script_containers = inline::script_containers(&new_tree);
+    let attribute_ids = attribute_ids(&new_tree);
     let syncback_data = SyncbackData {
         vfs,
         old_tree,
         new_tree: &new_tree,
         project,
+        scoped: false,
+        script_containers: Some(&script_containers),
+        attribute_ids: &attribute_ids,
     };
 
     let mut snapshots = vec![SyncbackSnapshot {
@@ -172,7 +338,9 @@ pub fn syncback_loop(
         let inst_path = snapshot.get_new_inst_path(snapshot.new);
         // We can quickly check that two subtrees are identical and if they are,
         // skip reconciling them.
-        if let Some(old_ref) = snapshot.old {
+        // Unchanged content can still be in an outdated layout, so those
+        // subtrees are reconciled to move files into their new places.
+        if let Some(old_ref) = snapshot.old.filter(|old| !relayout.contains(old)) {
             match (old_hashes.get(&old_ref), new_hashes.get(&snapshot.new)) {
                 (Some(old), Some(new)) => {
                     if old == new {
@@ -255,7 +423,12 @@ pub fn syncback_loop(
                 syncback.removed_children.len()
             );
             'remove: for inst in &syncback.removed_children {
-                let path = inst.metadata().instigating_source.as_ref().unwrap().path();
+                // Instances stored inside a parent's metadata have no files of
+                // their own and disappear when that metadata is rewritten.
+                let Some(source) = inst.metadata().instigating_source.as_ref() else {
+                    continue;
+                };
+                let path = source.path();
                 let inst_path = snapshot.get_old_inst_path(inst.id());
                 if !is_valid_path(&ignore_patterns, project_path, path) {
                     log::debug!(
@@ -452,7 +625,11 @@ impl SyncbackRules {
     }
 }
 
-fn is_valid_path(globs: &Option<Vec<IgnorableGlob>>, base_path: &Path, path: &Path) -> bool {
+pub(crate) fn is_valid_path(
+    globs: &Option<Vec<IgnorableGlob>>,
+    base_path: &Path,
+    path: &Path,
+) -> bool {
     let git_glob = GIT_IGNORE_GLOB.get_or_init(|| Glob::new(".git/**").unwrap());
     let test_path = match path.strip_prefix(base_path) {
         Ok(suffix) => suffix,
@@ -572,6 +749,283 @@ fn strip_unknown_root_children(new: &mut WeakDom, old: &RojoTree) {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::snapshot::{InstanceMetadata, InstanceSnapshot};
+    use rbx_dom_weak::{types::Attributes, UstrMap};
+
+    #[test]
+    fn scoped_instance_write_preserves_properties_and_orders_class_name_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let project_path = temp.path().join("default.project.json");
+        vfs.write(
+            &project_path,
+            r#"{"name":"Test","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        let project = Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+        let instance_path = temp.path().join("Wire");
+        let root = InstanceSnapshot::new()
+            .name("Wire")
+            .class_name("Part")
+            .properties(UstrMap::from_iter([(
+                ustr("Transparency"),
+                Variant::Float32(0.25),
+            )]))
+            .metadata(
+                InstanceMetadata::new()
+                    .instigating_source(instance_path.clone())
+                    .middleware(Middleware::Dir),
+            );
+        let tree = RojoTree::new(root);
+        let new_tree = WeakDom::new(
+            rbx_dom_weak::InstanceBuilder::new("Part")
+                .with_name("Wire")
+                .with_properties([(ustr("Transparency"), Variant::Float32(0.75))]),
+        );
+        let snapshot =
+            syncback_instance(&vfs, &tree, &project, tree.get_root_id(), new_tree).unwrap();
+        snapshot.write_to_vfs(temp.path(), &vfs).unwrap();
+        let contents = std::fs::read_to_string(instance_path.join("init.meta.json")).unwrap();
+        assert!(contents.starts_with("{\n    \"className\": \"Part\""));
+        assert!(contents.contains("\"Transparency\": 0.75"));
+    }
+
+    #[test]
+    fn scoped_instance_write_keeps_existing_key_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let project_path = temp.path().join("default.project.json");
+        vfs.write(
+            &project_path,
+            r#"{"name":"Test","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        let project = Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+        let instance_path = temp.path().join("Zone");
+        std::fs::create_dir(&instance_path).unwrap();
+        std::fs::write(
+            instance_path.join("init.meta.json"),
+            r#"{
+                "className": "Part",
+                "properties": {
+                    "Locked": true,
+                    "Anchored": true,
+                    "Size": [1.100000023841858, 2.0, 3.0],
+                    "Transparency": 0.25
+                },
+                "attributes": { "Zeta": 1, "Alpha": 2 }
+            }"#,
+        )
+        .unwrap();
+
+        let root = InstanceSnapshot::new()
+            .name("Zone")
+            .class_name("Part")
+            .metadata(
+                InstanceMetadata::new()
+                    .instigating_source(instance_path.clone())
+                    .middleware(Middleware::Dir),
+            );
+        let tree = RojoTree::new(root);
+        let attributes: Attributes = [
+            ("Alpha".to_owned(), Variant::Float64(2.0)),
+            ("Beta".to_owned(), Variant::Float64(3.0)),
+            ("Zeta".to_owned(), Variant::Float64(1.0)),
+        ]
+        .into_iter()
+        .collect();
+        let new_tree = WeakDom::new(
+            rbx_dom_weak::InstanceBuilder::new("Part")
+                .with_name("Zone")
+                .with_properties([
+                    (ustr("CastShadow"), Variant::Bool(false)),
+                    (ustr("Transparency"), Variant::Float32(0.6)),
+                    (ustr("Anchored"), Variant::Bool(true)),
+                    (ustr("Locked"), Variant::Bool(true)),
+                    (
+                        ustr("Size"),
+                        Variant::Vector3(rbx_dom_weak::types::Vector3::new(1.1, 2.0, 3.0)),
+                    ),
+                    (ustr("Attributes"), Variant::Attributes(attributes)),
+                ]),
+        );
+        let snapshot =
+            syncback_instance(&vfs, &tree, &project, tree.get_root_id(), new_tree).unwrap();
+        snapshot.write_to_vfs(temp.path(), &vfs).unwrap();
+        let contents = std::fs::read_to_string(instance_path.join("init.meta.json")).unwrap();
+
+        let position = |key: &str| {
+            contents
+                .find(&format!("\"{key}\""))
+                .unwrap_or_else(|| panic!("{key} missing from {contents}"))
+        };
+        assert!(position("Locked") < position("Anchored"), "{contents}");
+        assert!(
+            position("Anchored") < position("Transparency"),
+            "{contents}"
+        );
+        assert!(
+            position("Transparency") < position("CastShadow"),
+            "{contents}"
+        );
+        assert!(position("Zeta") < position("Alpha"), "{contents}");
+        assert!(position("Alpha") < position("Beta"), "{contents}");
+        // The changed value is written in its shortest form, and the unchanged
+        // one keeps its original text even though it'd be written shorter now.
+        assert!(contents.contains("\"Transparency\": 0.6,"), "{contents}");
+        assert!(contents.contains("1.100000023841858"), "{contents}");
+    }
+
+    #[test]
+    fn scoped_instance_write_retargets_existing_jsonc_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let project_path = temp.path().join("default.project.json");
+        vfs.write(
+            &project_path,
+            r#"{"name":"Test","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        let project = Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+        let instance_path = temp.path().join("Wire");
+        vfs.create_dir_all(&instance_path).unwrap();
+        vfs.write(
+            instance_path.join("init.meta.jsonc"),
+            r#"{
+                // Existing JSONC metadata must not produce a competing JSON file.
+                "className": "Part",
+                "id": "wire-id",
+                "properties": { "Transparency": 0.25 }
+            }"#,
+        )
+        .unwrap();
+        let root = InstanceSnapshot::new()
+            .name("Wire")
+            .class_name("Part")
+            .properties(UstrMap::from_iter([(
+                ustr("Transparency"),
+                Variant::Float32(0.25),
+            )]))
+            .metadata(
+                InstanceMetadata::new()
+                    .instigating_source(instance_path.clone())
+                    .specified_id(Some(crate::RojoRef::new("wire-id".into())))
+                    .middleware(Middleware::Dir),
+            );
+        let tree = RojoTree::new(root);
+        let new_tree = WeakDom::new(
+            rbx_dom_weak::InstanceBuilder::new("Part")
+                .with_name("Wire")
+                .with_properties([(ustr("Transparency"), Variant::Float32(0.75))]),
+        );
+        let snapshot =
+            syncback_instance(&vfs, &tree, &project, tree.get_root_id(), new_tree).unwrap();
+        assert_eq!(
+            snapshot.added_files(),
+            vec![instance_path.join("init.meta.jsonc").as_path()]
+        );
+        snapshot.write_to_vfs(temp.path(), &vfs).unwrap();
+        assert!(!instance_path.join("init.meta.json").exists());
+        let contents = std::fs::read_to_string(instance_path.join("init.meta.jsonc")).unwrap();
+        assert!(contents.starts_with("{\n    \"className\": \"Part\""));
+        assert!(contents.contains("\"id\": \"wire-id\""));
+        assert!(contents.contains("\"Transparency\": 0.75"));
+    }
+
+    /// A new sibling can shift which old instance each duplicate-named child
+    /// pairs with, so the first `Part` inherits the old `Part`'s inline ID
+    /// while the second one, which a Ref property points at, holds that same
+    /// ID through its `Rojo_Id` attribute.
+    #[test]
+    fn inline_ids_never_duplicate_an_attribute_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let holder = src.join("Holder");
+        std::fs::create_dir_all(&holder).unwrap();
+        let project_path = temp.path().join("default.project.json");
+        std::fs::write(
+            &project_path,
+            r#"{
+                "name": "Test",
+                "tree": { "$path": "src" },
+                "syncbackRules": { "instancesAsDirectories": true }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            holder.join("init.meta.json"),
+            r#"{
+                "className": "Folder",
+                "children": [
+                    { "className": "Part", "name": "Part", "id": "shared" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let session = crate::serve_session::ServeSession::new(vfs, &project_path).unwrap();
+
+        let mut new_tree = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("Folder"));
+        let root = new_tree.insert(
+            new_tree.root_ref(),
+            rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Holder"),
+        );
+        new_tree.insert(root, rbx_dom_weak::InstanceBuilder::new("Part"));
+        let mut attributes = Attributes::new();
+        attributes.insert(
+            crate::REF_ID_ATTRIBUTE_NAME.into(),
+            Variant::String("shared".into()),
+        );
+        let target = new_tree.insert(
+            root,
+            rbx_dom_weak::InstanceBuilder::new("Part").with_property("Attributes", attributes),
+        );
+        new_tree.insert(
+            root,
+            rbx_dom_weak::InstanceBuilder::new("ObjectValue")
+                .with_property("Value", Variant::Ref(target)),
+        );
+
+        let snapshot = {
+            let mut old_tree = session.tree();
+            syncback_loop(
+                session.vfs(),
+                &mut old_tree,
+                new_tree,
+                session.root_project(),
+            )
+            .unwrap()
+        };
+        snapshot.write_to_vfs(temp.path(), session.vfs()).unwrap();
+
+        let contents = std::fs::read_to_string(holder.join("init.meta.json")).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let children = metadata["children"].as_array().unwrap();
+        let ids: Vec<_> = children
+            .iter()
+            .map(|child| {
+                (
+                    child["id"].as_str(),
+                    child["attributes"][crate::REF_ID_ATTRIBUTE_NAME].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![(None, None), (None, Some("shared")), (None, None)],
+            "{contents}"
+        );
+        assert_eq!(
+            children[2]["attributes"]["Rojo_Target_Value"].as_str(),
+            Some("shared"),
+            "{contents}"
+        );
+    }
 
     fn rules(ignore_paths: &[&str], create_ignore_dir_paths: Option<bool>) -> SyncbackRules {
         SyncbackRules {

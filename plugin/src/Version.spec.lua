@@ -1,6 +1,15 @@
 return function()
 	local Version = require(script.Parent.Version)
 
+	it("should not fetch or show update notifications for the fork", function()
+		expect(Version.updateChecksEnabled).to.equal(false)
+		expect(Version.getUpdateMessage()).to.equal(nil)
+		expect(Version.retrieveLatestCompatible({
+			version = { 7, 7, 1, "-horse.0.14" },
+			includePrereleases = true,
+		})).to.equal(nil)
+	end)
+
 	it("should compare equal versions", function()
 		expect(Version.compare({ 1, 2, 3 }, { 1, 2, 3 })).to.equal(0)
 		expect(Version.compare({ 1, 2, 3, "rc1" }, { 1, 2, 3, "rc1" })).to.equal(0)

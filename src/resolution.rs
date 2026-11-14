@@ -20,13 +20,73 @@ use crate::REF_POINTER_ATTRIBUTE_PREFIX;
 #[serde(untagged)]
 pub enum UnresolvedValue {
     FullyQualified(Variant),
+    NonFinite(NonFiniteNumber),
     Ambiguous(AmbiguousValue),
+}
+
+/// A number JSON can't hold, written with its type and a string such as
+/// `{"Float64": "inf"}`. Roblox often uses `math.huge` to mean "forever".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NonFiniteNumber {
+    Float32(NonFinite),
+    Float64(NonFinite),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NonFinite {
+    #[serde(rename = "inf")]
+    Infinity,
+    #[serde(rename = "-inf")]
+    NegativeInfinity,
+    #[serde(rename = "nan")]
+    NaN,
+}
+
+impl NonFinite {
+    fn new(value: f64) -> Option<Self> {
+        if value.is_nan() {
+            Some(Self::NaN)
+        } else if value == f64::INFINITY {
+            Some(Self::Infinity)
+        } else if value == f64::NEG_INFINITY {
+            Some(Self::NegativeInfinity)
+        } else {
+            None
+        }
+    }
+
+    fn value(self) -> f64 {
+        match self {
+            Self::Infinity => f64::INFINITY,
+            Self::NegativeInfinity => f64::NEG_INFINITY,
+            Self::NaN => f64::NAN,
+        }
+    }
+}
+
+impl NonFiniteNumber {
+    /// Returns the non-finite form of `variant`, if it's a non-finite number.
+    fn from_variant(variant: &Variant) -> Option<Self> {
+        match *variant {
+            Variant::Float32(value) => NonFinite::new(value.into()).map(Self::Float32),
+            Variant::Float64(value) => NonFinite::new(value).map(Self::Float64),
+            _ => None,
+        }
+    }
+
+    fn into_variant(self) -> Variant {
+        match self {
+            Self::Float32(value) => Variant::Float32(value.value() as f32),
+            Self::Float64(value) => Variant::Float64(value.value()),
+        }
+    }
 }
 
 impl UnresolvedValue {
     pub fn resolve(self, class_name: &str, prop_name: &str) -> anyhow::Result<Variant> {
         match self {
             UnresolvedValue::FullyQualified(full) => Ok(full),
+            UnresolvedValue::NonFinite(number) => Ok(number.into_variant()),
             UnresolvedValue::Ambiguous(partial) => partial.resolve(class_name, prop_name),
         }
     }
@@ -34,6 +94,7 @@ impl UnresolvedValue {
     pub fn resolve_unambiguous(self) -> anyhow::Result<Variant> {
         match self {
             UnresolvedValue::FullyQualified(full) => Ok(full),
+            UnresolvedValue::NonFinite(number) => Ok(number.into_variant()),
             UnresolvedValue::Ambiguous(partial) => partial.resolve_unambiguous(),
         }
     }
@@ -41,6 +102,9 @@ impl UnresolvedValue {
     /// Creates an `UnresolvedValue` from a variant, using a class and property
     /// name to potentially allow for ambiguous Enum variants.
     pub fn from_variant(variant: Variant, class_name: &str, prop_name: &str) -> Self {
+        if let Some(number) = NonFiniteNumber::from_variant(&variant) {
+            return Self::NonFinite(number);
+        }
         let descriptor = find_descriptor(class_name, prop_name);
         if descriptor.is_some() {
             // We can only use an ambiguous syntax if the property is known
@@ -64,7 +128,7 @@ impl UnresolvedValue {
                     return Self::FullyQualified(variant);
                 }
                 Variant::Bool(bool) => AmbiguousValue::Bool(bool),
-                Variant::Float32(n) => AmbiguousValue::Number(n as f64),
+                Variant::Float32(n) => AmbiguousValue::Number(widen(n)),
                 Variant::Float64(n) => AmbiguousValue::Number(n),
                 Variant::Int32(n) => AmbiguousValue::Number(n as f64),
                 Variant::Int64(n) => AmbiguousValue::Number(n as f64),
@@ -79,27 +143,27 @@ impl UnresolvedValue {
                 },
                 Variant::ContentId(content) => AmbiguousValue::String(content.into_string()),
                 Variant::Vector2(vector) => {
-                    AmbiguousValue::Array2([vector.x as f64, vector.y as f64])
+                    AmbiguousValue::Array2([widen(vector.x), widen(vector.y)])
                 }
                 Variant::Vector3(vector) => {
-                    AmbiguousValue::Array3([vector.x as f64, vector.y as f64, vector.z as f64])
+                    AmbiguousValue::Array3([widen(vector.x), widen(vector.y), widen(vector.z)])
                 }
                 Variant::Color3(color) => {
-                    AmbiguousValue::Array3([color.r as f64, color.g as f64, color.b as f64])
+                    AmbiguousValue::Array3([widen(color.r), widen(color.g), widen(color.b)])
                 }
                 Variant::CFrame(cf) => AmbiguousValue::Array12([
-                    cf.position.x as f64,
-                    cf.position.y as f64,
-                    cf.position.z as f64,
-                    cf.orientation.x.x as f64,
-                    cf.orientation.x.y as f64,
-                    cf.orientation.x.z as f64,
-                    cf.orientation.y.x as f64,
-                    cf.orientation.y.y as f64,
-                    cf.orientation.y.z as f64,
-                    cf.orientation.z.x as f64,
-                    cf.orientation.z.y as f64,
-                    cf.orientation.z.z as f64,
+                    widen(cf.position.x),
+                    widen(cf.position.y),
+                    widen(cf.position.z),
+                    widen(cf.orientation.x.x),
+                    widen(cf.orientation.x.y),
+                    widen(cf.orientation.x.z),
+                    widen(cf.orientation.y.x),
+                    widen(cf.orientation.y.y),
+                    widen(cf.orientation.y.z),
+                    widen(cf.orientation.z.x),
+                    widen(cf.orientation.z.y),
+                    widen(cf.orientation.z.z),
                 ]),
                 Variant::Attributes(attr) => AmbiguousValue::Attributes(attr),
                 Variant::Font(font) => AmbiguousValue::Font(font),
@@ -116,6 +180,9 @@ impl UnresolvedValue {
     /// Creates an `UnresolvedValue` from a variant, only returning ambiguous
     /// values if they're able to be resolved in a context-free environment.
     pub fn from_variant_unambiguous(variant: Variant) -> Self {
+        if let Some(number) = NonFiniteNumber::from_variant(&variant) {
+            return Self::NonFinite(number);
+        }
         match variant {
             Variant::String(str) => Self::Ambiguous(AmbiguousValue::String(str)),
             Variant::Float64(number) => Self::Ambiguous(AmbiguousValue::Number(number)),
@@ -129,6 +196,13 @@ impl UnresolvedValue {
             _ => Self::FullyQualified(variant),
         }
     }
+}
+
+/// Widens an `f32` through its shortest decimal form, so `0.6` is written as
+/// `0.6` instead of `0.6000000238418579`. Narrowing the result back to `f32`
+/// always gives the original value.
+fn widen(value: f32) -> f64 {
+    value.to_string().parse().unwrap_or(value as f64)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -350,6 +424,109 @@ mod test {
     fn resolve_unambiguous(json_value: &str) -> Variant {
         let unresolved: UnresolvedValue = json::from_str(json_value).unwrap();
         unresolved.resolve_unambiguous().unwrap()
+    }
+
+    #[test]
+    fn float32_values_are_written_in_their_shortest_form() {
+        let unresolved =
+            UnresolvedValue::from_variant(Variant::Float32(0.6), "Part", "Transparency");
+        assert_eq!(json::to_string_pretty(&unresolved).unwrap().trim(), "0.6");
+
+        let size = UnresolvedValue::from_variant(
+            Variant::Vector3(Vector3::new(179.694, 0.1, 2.0)),
+            "Part",
+            "Size",
+        );
+        assert_eq!(
+            json::to_string_pretty(&size)
+                .unwrap()
+                .split_whitespace()
+                .collect::<String>(),
+            "[179.694,0.1,2.0]"
+        );
+    }
+
+    /// Shortening must never change the value. Checks values across the whole
+    /// `f32` range, including subnormals and both signs, survive a trip through
+    /// JSON text and back to the exact same bits.
+    #[test]
+    fn float32_values_round_trip_exactly() {
+        let mut bits: u32 = 1;
+        for _ in 0..200_000 {
+            bits = bits.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let value = f32::from_bits(bits);
+            if !value.is_finite() {
+                continue;
+            }
+            let text = json::to_string_pretty(&UnresolvedValue::from_variant(
+                Variant::Float32(value),
+                "Part",
+                "Transparency",
+            ))
+            .unwrap();
+            assert_eq!(
+                resolve("Part", "Transparency", &text),
+                Variant::Float32(value),
+                "{value:e} was written as {text}"
+            );
+        }
+    }
+
+    /// Walks every non-finite value in both float types through property and
+    /// attribute writes, checking the text and that it reads back exactly.
+    #[test]
+    fn non_finite_numbers_round_trip_through_tagged_text() {
+        let cases = [
+            (f64::INFINITY, "\"inf\""),
+            (f64::NEG_INFINITY, "\"-inf\""),
+            (f64::NAN, "\"nan\""),
+        ];
+        let same = |a: &Variant, b: &Variant| match (a, b) {
+            (Variant::Float32(a), Variant::Float32(b)) => a.to_bits() == b.to_bits(),
+            (Variant::Float64(a), Variant::Float64(b)) => a.to_bits() == b.to_bits(),
+            _ => false,
+        };
+        for (value, text) in cases {
+            for (variant, tag, class, prop) in [
+                (
+                    Variant::Float32(value as f32),
+                    "Float32",
+                    "Part",
+                    "Transparency",
+                ),
+                (Variant::Float64(value), "Float64", "NumberValue", "Value"),
+            ] {
+                let expected = format!("{{\"{tag}\":{text}}}");
+                for unresolved in [
+                    UnresolvedValue::from_variant(variant.clone(), class, prop),
+                    UnresolvedValue::from_variant_unambiguous(variant.clone()),
+                ] {
+                    let written = serde_json::to_string(&unresolved).unwrap();
+                    assert_eq!(written, expected);
+                    let read: UnresolvedValue = json::from_str(&written).unwrap();
+                    assert!(
+                        same(&read.clone().resolve(class, prop).unwrap(), &variant),
+                        "{written}"
+                    );
+                    assert!(
+                        same(&read.resolve_unambiguous().unwrap(), &variant),
+                        "{written}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A plain string must never be mistaken for a tagged non-finite number.
+    #[test]
+    fn non_finite_spellings_stay_strings_when_untagged() {
+        for text in ["inf", "-inf", "nan"] {
+            assert_eq!(
+                resolve_unambiguous(&format!("\"{text}\"")),
+                Variant::String(text.into())
+            );
+        }
+        assert_eq!(resolve_unambiguous("1e308"), Variant::Float64(1e308));
     }
 
     #[test]

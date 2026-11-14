@@ -101,6 +101,42 @@ fn remove_property() {
     assert_yaml_snapshot!("remove_property_appied_patch", applied_patch_value);
 }
 
+#[test]
+fn null_references_are_applied_and_sent_to_studio() {
+    use rbx_dom_weak::types::{Ref, Variant};
+
+    let mut tree = empty_tree();
+    let id = tree.get_root_id();
+    tree.get_instance_mut(id)
+        .unwrap()
+        .properties_mut()
+        .insert(ustr("Target"), Variant::Ref(Ref::new()));
+    let applied = apply_patch_set(
+        &mut tree,
+        PatchSet {
+            updated_instances: vec![PatchUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_properties: UstrMap::from_iter([(
+                    ustr("Target"),
+                    Some(Variant::Ref(Ref::none())),
+                )]),
+                changed_metadata: None,
+            }],
+            ..PatchSet::new()
+        },
+    );
+    assert_eq!(
+        tree.get_instance(id).unwrap().properties()[&ustr("Target")],
+        Variant::Ref(Ref::none())
+    );
+    assert_eq!(
+        applied.updated[0].changed_properties[&ustr("Target")],
+        Some(Variant::Ref(Ref::none()))
+    );
+}
+
 fn empty_tree() -> RojoTree {
     RojoTree::new(InstanceSnapshot::new().name("ROOT").class_name("ROOT"))
 }

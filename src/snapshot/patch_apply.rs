@@ -206,10 +206,6 @@ fn apply_update_child(context: &mut PatchApplyContext, tree: &mut RojoTree, patc
             // instance IDs if they referred to an instance that was created as
             // part of this patch.
             Some(Variant::Ref(referent)) => {
-                if referent.is_none() {
-                    continue;
-                }
-
                 // If our ID is not found in this map, then it either refers to
                 // an existing instance NOT added by this patch, or there was an
                 // error. See `PatchApplyContext::snapshot_id_to_instance_id`

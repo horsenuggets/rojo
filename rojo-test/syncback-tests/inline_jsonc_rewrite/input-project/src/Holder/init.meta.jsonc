@@ -1,0 +1,10 @@
+{
+    // Comments make this a JSONC file.
+    "className": "Configuration",
+    "children": [
+        {
+            "className": "Folder",
+            "name": "Child"
+        }
+    ]
+}

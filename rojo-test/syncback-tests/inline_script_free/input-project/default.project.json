@@ -1,0 +1,12 @@
+{
+  "name": "inline_script_free",
+  "tree": {
+    "$className": "Folder",
+    "src": {
+      "$path": "src"
+    }
+  },
+  "syncbackRules": {
+    "instancesAsDirectories": true
+  }
+}
