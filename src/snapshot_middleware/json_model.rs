@@ -13,10 +13,8 @@ use crate::{
     json,
     resolution::UnresolvedValue,
     snapshot::{InstanceContext, InstanceSnapshot},
-    syncback::{
-        filter_properties_preallocated, is_json_compatible, FsSnapshot, SyncbackReturn,
-        SyncbackSnapshot,
-    },
+    snapshot_middleware::meta_file::serialize_values,
+    syncback::{filter_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
     RojoRef,
 };
 
@@ -106,32 +104,7 @@ fn json_model_from_pair<'sync>(
         .expect("all new referents passed to json_model_from_pair should exist");
 
     filter_properties_preallocated(snapshot.project(), new_inst, prop_buffer);
-
-    let mut properties = IndexMap::new();
-    let mut attributes = IndexMap::new();
-    for (name, value) in prop_buffer.drain(..) {
-        match value {
-            Variant::Attributes(attrs) => {
-                for (attr_name, attr_value) in attrs.iter() {
-                    // We (probably) don't want to preserve internal attributes,
-                    // only user defined ones.
-                    if attr_name.starts_with("RBX") || !is_json_compatible(attr_value) {
-                        continue;
-                    }
-                    attributes.insert(
-                        attr_name.clone(),
-                        UnresolvedValue::from_variant_unambiguous(attr_value.clone()),
-                    );
-                }
-            }
-            _ => {
-                properties.insert(
-                    name,
-                    UnresolvedValue::from_variant(value.clone(), &new_inst.class, &name),
-                );
-            }
-        }
-    }
+    let (properties, attributes) = serialize_values(&new_inst.class, prop_buffer.drain(..));
 
     let mut children = Vec::with_capacity(new_inst.children().len());
 
