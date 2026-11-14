@@ -34,6 +34,15 @@ Making a new release? Simply add the new header with the version and date undern
 ## `7.7.1-horse.0.15`
 
 * Write `sourcemap.json` files minified again, as upstream Rojo does.
+* Bump the server and plugin protocol version to 6, since two-way sync writes now carry
+  cursors and return explicit results that older peers don't understand.
+* Never replace protected instances, like the current camera or services, through sync
+  fallback, and keep their updates reported as unapplied.
+* Reject two-way sync writes that would change a file excluded by `ignorePaths`, and
+  writes to instances whose metadata is split across `init.meta.json` and
+  `init.meta.jsonc`.
+* Reject changing the two-way sync setting through `shared.Rojo` while a sync
+  confirmation is pending.
 * Serialize `className` first in directory metadata, including when other keys are present.
 * Disable update notifications, update checks, and sync reminders in the fork's Studio plugin.
 * Persist supported two-way-sync properties with filesystem authority on conflicts and

@@ -21,7 +21,7 @@ use crate::{
     },
     syncback::{
         can_write_property, decide_property_write, get_property_filter, is_json_compatible,
-        source_file, syncback_instance, FsSnapshot, PropertyWriteDecision,
+        source_file, syncback_instance, validate_write_targets, FsSnapshot, PropertyWriteDecision,
     },
     web::interface::{WriteError, WriteResult},
 };
@@ -469,6 +469,7 @@ impl JobThreadContext {
         }
         let new_tree = inline_subtree(tree, owner, &InlineEdit::Remove(id));
         let staged = syncback_instance(&self.vfs, tree, &self.project, owner, new_tree)?;
+        validate_write_targets(&self.project, &staged)?;
         let latest = self.snapshot_owner(tree, owner)?;
         if snapshots_differ(snapshot, latest.as_ref()) {
             return Ok(InlineRemoval::Restore(Box::new(latest)));
@@ -762,6 +763,18 @@ impl JobThreadContext {
             // Only Source changed, which lives in the source file alone. Leaving
             // metadata out keeps its formatting and the write to one file.
             staged.retain_added_files(|candidate| candidate == source);
+        }
+        if let Err(err) = validate_write_targets(&self.project, &staged) {
+            errors.push(WriteError {
+                id,
+                property: None,
+                message: format!("{err:#}"),
+            });
+            conflicts.updated_instances.retain(|patch| patch.id != id);
+            conflicts
+                .updated_instances
+                .extend(disk_restoration(tree, owner_id, update, snapshot).updated_instances);
+            return;
         }
         // Every accepted value differs from the disk, so a write that changes no
         // file means the edit can't be represented and must not report Saved.
@@ -1951,6 +1964,55 @@ mod tests {
         assert_eq!(
             job.vfs.read("/project/Part/init.meta.json").unwrap(),
             before
+        );
+    }
+
+    /// Ignoring only an instance's metadata file must still stop a property
+    /// edit, since the write would land in that file.
+    #[test]
+    fn scoped_write_rejects_an_ignored_metadata_target() {
+        let (mut job, id) = part_job();
+        Arc::get_mut(&mut job.project).unwrap().syncback_rules = Some(
+            serde_json::from_value(serde_json::json!({"ignorePaths":["Part/init.meta.json"]}))
+                .unwrap(),
+        );
+        let before = job.vfs.read("/project/Part/init.meta.json").unwrap();
+        let (accepted, conflicts, errors) = job.handle_tree_event(transparency_update(id, 0.75));
+        assert!(accepted.updated_instances.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("excluded"), "{errors:?}");
+        assert_eq!(conflicts.updated_instances.len(), 1);
+        assert_eq!(
+            job.vfs.read("/project/Part/init.meta.json").unwrap(),
+            before
+        );
+    }
+
+    /// Both metadata files apply when read, so rewriting one can't reliably
+    /// change a value and the write is rejected without touching either.
+    #[test]
+    fn scoped_write_rejects_combined_json_and_jsonc_metadata() {
+        let (job, id) = part_job();
+        job.vfs
+            // Repeats a value the tree already holds, so the disk still matches it.
+            .write(
+                "/project/Part/init.meta.jsonc",
+                br#"{"properties":{"CanCollide":false}}"#,
+            )
+            .unwrap();
+        let json_before = job.vfs.read("/project/Part/init.meta.json").unwrap();
+        let jsonc_before = job.vfs.read("/project/Part/init.meta.jsonc").unwrap();
+        let (accepted, _, errors) = job.handle_tree_event(transparency_update(id, 0.75));
+        assert!(accepted.updated_instances.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("Both"), "{errors:?}");
+        assert_eq!(
+            job.vfs.read("/project/Part/init.meta.json").unwrap(),
+            json_before
+        );
+        assert_eq!(
+            job.vfs.read("/project/Part/init.meta.jsonc").unwrap(),
+            jsonc_before
         );
     }
 

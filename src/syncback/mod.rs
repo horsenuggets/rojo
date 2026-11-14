@@ -137,14 +137,48 @@ pub fn syncback_instance(
             parent.join(format!("{stem}.meta.jsonc")),
         )
     };
-    let jsonc_exists = vfs
-        .metadata(&jsonc_path)
-        .with_not_found()?
-        .is_some_and(|metadata| metadata.is_file());
-    if jsonc_exists {
+    let is_file = |path: &Path| -> anyhow::Result<bool> {
+        Ok(vfs
+            .metadata(path)
+            .with_not_found()?
+            .is_some_and(|metadata| metadata.is_file()))
+    };
+    if is_file(&jsonc_path)? {
+        // Both files are applied when reading, so rewriting only one of them
+        // can't clear a value the other still sets.
+        if is_file(&json_path)? {
+            anyhow::bail!(
+                "Both {} and {} hold this instance's metadata, so it can't be safely rewritten",
+                json_path.display(),
+                jsonc_path.display()
+            );
+        }
         output.retarget_added_file(&json_path, &jsonc_path);
     }
     Ok(output)
+}
+
+/// Returns an error if a staged scoped write would add, change, or remove a path
+/// the project's syncback rules exclude. Run this on the final write targets, after
+/// retargeting and filtering, since those decide which files actually change.
+pub fn validate_write_targets(project: &Project, staged: &FsSnapshot) -> anyhow::Result<()> {
+    let Some(rules) = &project.syncback_rules else {
+        return Ok(());
+    };
+    let globs = Some(rules.compile_globs()?);
+    let base = project.folder_location();
+    let excluded = staged
+        .added_paths()
+        .into_iter()
+        .chain(staged.removed_paths())
+        .find(|path| !is_valid_path(&globs, base, path));
+    match excluded {
+        Some(path) => anyhow::bail!(
+            "{} is excluded by the project's syncback rules",
+            path.display()
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Returns the file holding an instance's own source, which for a directory

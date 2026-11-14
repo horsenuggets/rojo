@@ -43,6 +43,18 @@ const SharedAPI = {}
 
 local registeredApp = nil
 
+-- A session captures its two-way sync option when it starts connecting, so the
+-- setting can only change while no session is starting, confirming, or running.
+const ACTIVE_SESSION_STATUSES = {
+	Confirming = true,
+	Connected = true,
+	Connecting = true,
+}
+
+function SharedAPI.canConfigureTwoWaySync(appStatus)
+	return not ACTIVE_SESSION_STATUSES[appStatus]
+end
+
 function SharedAPI.register(app)
 	if not RunService:IsEdit() then
 		return
@@ -172,7 +184,14 @@ function SharedAPI.register(app)
 	end
 
 	function api.setTwoWaySync(enabled)
-		if registeredApp.state.appStatus == "Connected" or registeredApp.state.appStatus == "Connecting" then
+		if registeredApp == nil then
+			return {
+				success = false,
+				error = "Rojo plugin is not loaded",
+			}
+		end
+
+		if not SharedAPI.canConfigureTwoWaySync(registeredApp.state.appStatus) then
 			return {
 				success = false,
 				error = "Two-way sync must be configured before connecting",
