@@ -52,27 +52,6 @@ return function()
 			workspace:Destroy()
 		end)
 
-		it("should report the zero-based manifest index of the current camera", function()
-			local camera = named("Camera", "Camera")
-			local service = makeService("Workspace", { named("Part", "A"), camera })
-			local services = { { name = "Workspace", className = "Workspace" } }
-			local function find()
-				return service
-			end
-
-			local _, _, _, cameraIndex = StudioSyncback.collect(services, find, camera)
-			expect(cameraIndex).to.equal(1)
-
-			local _, _, _, noCamera = StudioSyncback.collect(services, find, nil)
-			expect(noCamera).to.equal(nil)
-
-			camera.Archivable = false
-			local _, _, _, unarchivable = StudioSyncback.collect(services, find, camera)
-			expect(unarchivable).to.equal(nil)
-
-			service:Destroy()
-		end)
-
 		it("should keep the manifest and instances the same length", function()
 			local service = makeService("Workspace", {
 				named("Part", "A"),
@@ -91,6 +70,50 @@ return function()
 			end
 
 			service:Destroy()
+		end)
+	end)
+
+	describe("cameraPath", function()
+		local function expectPath(path, expected)
+			expect(path).to.be.ok()
+			expect(#path).to.equal(#expected)
+			for index, value in expected do
+				expect(path[index]).to.equal(value)
+			end
+		end
+
+		it("should point at an uploaded camera by its upload index", function()
+			local part, camera = named("Part", "A"), named("Camera", "Camera")
+			expectPath(StudioSyncback.cameraPath({ part, camera }, camera), { 1 })
+		end)
+
+		it("should find a nested camera, counting only archivable siblings", function()
+			local folder = named("Folder", "Cameras")
+			named("Part", "Skipped", false).Parent = folder
+			named("Part", "Kept").Parent = folder
+			local camera = named("Camera", "Nested")
+			camera.Parent = folder
+
+			expectPath(StudioSyncback.cameraPath({ named("Part", "First"), folder }, camera), { 1, 1 })
+			folder:Destroy()
+		end)
+
+		it("should be nil when the camera isn't part of the upload", function()
+			local folder = named("Folder", "Hidden", false)
+			local camera = named("Camera", "Camera")
+			camera.Parent = folder
+			local uploaded = named("Folder", "Uploaded")
+
+			expect(StudioSyncback.cameraPath({ uploaded }, nil)).to.equal(nil)
+			expect(StudioSyncback.cameraPath({ uploaded }, camera)).to.equal(nil)
+			expect(StudioSyncback.cameraPath({ folder }, camera)).to.equal(nil)
+
+			camera.Parent = uploaded
+			camera.Archivable = false
+			expect(StudioSyncback.cameraPath({ uploaded }, camera)).to.equal(nil)
+
+			folder:Destroy()
+			uploaded:Destroy()
 		end)
 	end)
 

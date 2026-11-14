@@ -8,6 +8,7 @@
 	manifest that tells the server which service each child belongs to.
 ]]
 
+const HttpService = game:GetService("HttpService")
 const SerializationService = game:GetService("SerializationService")
 
 const Packages = script.Parent.Parent.Packages
@@ -25,15 +26,12 @@ const StudioSyncback = {}
 --[[
 	Collects the archivable children of each service, in order, along with the
 	manifest describing them. `findService` returns the place's instance for a
-	class name, or nil when the place doesn't have that service. The last result
-	is the zero-based manifest index of `currentCamera`, since the server can't
-	read Workspace.CurrentCamera itself.
+	class name, or nil when the place doesn't have that service.
 ]]
-function StudioSyncback.collect(services, findService, currentCamera)
+function StudioSyncback.collect(services, findService)
 	const instances = {}
 	const manifest = {}
 	const missing = {}
-	local cameraIndex = nil
 
 	for _, service in services do
 		const instance = findService(service.className)
@@ -44,9 +42,6 @@ function StudioSyncback.collect(services, findService, currentCamera)
 
 		for _, child in instance:GetChildren() do
 			if child.Archivable then
-				if child == currentCamera then
-					cameraIndex = #manifest
-				end
 				table.insert(instances, child)
 				table.insert(manifest, {
 					service = service.name,
@@ -57,7 +52,48 @@ function StudioSyncback.collect(services, findService, currentCamera)
 		end
 	end
 
-	return instances, manifest, missing, cameraIndex
+	return instances, manifest, missing
+end
+
+--[[
+	Locates `camera` within the uploaded instances, since the server can't read
+	Workspace.CurrentCamera itself. The path starts with the zero-based index of
+	the uploaded instance containing the camera, followed by zero-based child
+	indices down to it. Only archivable children are counted, because those are
+	the only ones Studio serializes. Returns nil when the camera isn't uploaded.
+]]
+function StudioSyncback.cameraPath(instances, camera)
+	const uploadIndex = {}
+	for index, instance in instances do
+		uploadIndex[instance] = index - 1
+	end
+
+	const path = {}
+	local node = camera
+	while node ~= nil and uploadIndex[node] == nil do
+		const parent = node.Parent
+		if parent == nil or not node.Archivable then
+			return nil
+		end
+
+		local childIndex = 0
+		for _, sibling in parent:GetChildren() do
+			if sibling == node then
+				break
+			end
+			if sibling.Archivable then
+				childIndex += 1
+			end
+		end
+		table.insert(path, 1, childIndex)
+		node = parent
+	end
+
+	if node == nil or not node.Archivable then
+		return nil
+	end
+	table.insert(path, 1, uploadIndex[node])
+	return path
 end
 
 --[[
@@ -95,7 +131,7 @@ local function findService(className)
 	return if ok then service else nil
 end
 
-local function uploadParts(baseUrl, syncbackId, contents, ranges)
+local function uploadParts(baseUrl, syncbackId, uploadId, contents, ranges)
 	local cursor = 0
 
 	-- Each worker uploads one part at a time until none are left.
@@ -107,7 +143,7 @@ local function uploadParts(baseUrl, syncbackId, contents, ranges)
 		end
 
 		const range = ranges[index]
-		const url = `{baseUrl}/api/syncback/part/{syncbackId}/{index - 1}`
+		const url = `{baseUrl}/api/syncback/part/{syncbackId}/{uploadId}/{index - 1}`
 		return Http.post(url, string.sub(contents, range[1], range[2])):andThen(worker)
 	end
 
@@ -133,33 +169,38 @@ function StudioSyncback.run(baseUrl)
 				)
 			end
 
-			const instances, manifest, missing, cameraIndex =
-				StudioSyncback.collect(info.services, findService, workspace.CurrentCamera)
-			if #instances == 0 then
-				return Promise.reject("None of the services the project maps have anything to sync back.")
-			end
+			const instances, manifest, missing = StudioSyncback.collect(info.services, findService)
+			const cameraPath = StudioSyncback.cameraPath(instances, workspace.CurrentCamera)
+			-- A fresh ID per attempt keeps parts from an earlier failed attempt out
+			-- of this one.
+			const uploadId = HttpService:GenerateGUID(false)
 
 			const startTime = os.clock()
 			local contents, serializeTime, ranges
 
 			-- SerializeInstancesAsync yields, which a Promise executor is allowed to do.
 			return Promise.new(function(resolve)
-				contents = buffer.tostring(SerializationService:SerializeInstancesAsync(instances))
+				-- An empty upload is still sent, so syncback can remove what the
+				-- emptied services used to contain.
+				contents = if #instances == 0
+					then ""
+					else buffer.tostring(SerializationService:SerializeInstancesAsync(instances))
 				serializeTime = os.clock() - startTime
 				ranges = StudioSyncback.partRanges(#contents, info.partSize)
 				resolve()
 			end)
 				:andThen(function()
-					return uploadParts(baseUrl, info.syncbackId, contents, ranges)
+					return uploadParts(baseUrl, info.syncbackId, uploadId, contents, ranges)
 				end)
 				:andThen(function()
 					return Http.post(
 						baseUrl .. "/api/syncback/finish",
 						Http.msgpackEncode({
 							syncbackId = info.syncbackId,
+							uploadId = uploadId,
 							partCount = #ranges,
 							manifest = manifest,
-							currentCamera = cameraIndex,
+							currentCamera = cameraPath,
 						})
 					)
 				end)
