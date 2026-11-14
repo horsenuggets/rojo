@@ -25,6 +25,8 @@ API:
 > shared.Rojo.getConfirmationSummary(limit?) - Describe the pending sync confirmation
 > shared.Rojo.getNotifications() - Get current write and connection notifications
 > shared.Rojo.clearSyncResults() - Clear recorded write outcomes
+> shared.Rojo.syncbackFromStudio(host?, port?) - Send the open place to
+  `rojo syncback --from-studio`
 
 --]]
 
@@ -37,6 +39,7 @@ const Log = require(Packages.Log)
 
 const Config = require(script.Parent.Config)
 const Settings = require(script.Parent.Settings)
+const StudioSyncback = require(script.Parent.StudioSyncback)
 const summarizePatch = require(script.Parent.summarizePatch)
 
 const SharedAPI = {}
@@ -312,6 +315,22 @@ function SharedAPI.register(app)
 			success = false,
 			error = `Timed out after {timeout} seconds, current ` .. `status is {registeredApp.state.appStatus}`,
 		}
+	end
+
+	function api.syncbackFromStudio(host, port)
+		if registeredApp == nil then
+			return {
+				success = false,
+				error = "Rojo plugin is not loaded",
+			}
+		end
+
+		const address = api.getAddress()
+		host = if host then tostring(host) else address.host
+		port = if port then tostring(port) else address.port
+
+		const _, result = StudioSyncback.run(`http://{host}:{port}`):await()
+		return result
 	end
 
 	function api.clearKnownProjects()

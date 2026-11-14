@@ -23,6 +23,8 @@ use crate::{
     },
 };
 
+pub use crate::syncback::from_studio::{ManifestEntry, StudioService};
+
 /// Server version to report over the API, not exposed outside this crate.
 pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -327,6 +329,46 @@ pub struct RefPatchRequest {
 pub struct RefPatchResponse<'a> {
     pub session_id: SessionId,
     pub patch: SubscribeMessage<'a>,
+}
+
+/// Response to `GET /api/syncback` from a `rojo syncback --from-studio` server.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncbackInfoResponse {
+    pub server_version: String,
+    pub protocol_version: u64,
+    pub syncback_id: SessionId,
+    pub project_name: String,
+    pub services: Vec<StudioService>,
+
+    /// The largest part, in bytes, the plugin should upload in one request.
+    pub part_size: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncbackFinishRequest {
+    pub syncback_id: SessionId,
+
+    /// Chosen by the plugin for each attempt, so parts left over from a failed
+    /// attempt never mix with a retry.
+    pub upload_id: String,
+    pub part_count: u32,
+    pub manifest: Vec<ManifestEntry>,
+
+    /// Where `Workspace.CurrentCamera` is, if it was sent. The first element is a
+    /// zero-based manifest index, and the rest are zero-based child indices below
+    /// that instance.
+    #[serde(default)]
+    pub current_camera: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncbackFinishResponse {
+    pub syncback_id: SessionId,
+    pub instance_count: usize,
+    pub dropped: Vec<ManifestEntry>,
 }
 
 /// General response type returned from all Rojo routes

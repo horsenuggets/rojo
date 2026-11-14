@@ -31,6 +31,14 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Add `rojo syncback --from-studio`, which syncs back the place open in Studio without
+  saving a file first. Run it, then call `shared.Rojo.syncbackFromStudio()` in Studio. The
+  plugin serializes every service the project maps in one call, so references between
+  services are kept, and uploads it in parallel parts. Instances Studio skips are listed,
+  and the current camera is left out like it is for place files.
+* Show the server's error details in the plugin instead of the raw response body when a
+  request fails.
+
 ## `7.7.1-horse.0.16`
 
 * Sort properties and attributes by name when syncback writes metadata and `.model.json`

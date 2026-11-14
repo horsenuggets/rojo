@@ -69,7 +69,10 @@ function Error.fromResponse(response)
 		return Error.new(Error.Kind.Timeout)
 	end
 
-	return Error.new(Error.Kind.Unknown, string.format("%s: %s", tostring(response.code), tostring(response.body)))
+	local err = Error.new(Error.Kind.Unknown, string.format("%s: %s", tostring(response.code), tostring(response.body)))
+	-- Kept so callers can decode a structured error body instead of showing raw bytes.
+	err.response = response
+	return err
 end
 
 return Error

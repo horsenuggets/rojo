@@ -50,23 +50,7 @@ impl ServeCommand {
 
         let session = Arc::new(ServeSession::new(vfs, project_path)?);
 
-        let ip = self
-            .address
-            .or_else(|| session.serve_address())
-            .unwrap_or(DEFAULT_BIND_ADDRESS.into());
-
-        let explicit_port = self.port.is_some();
-
-        let port = self
-            .port
-            .or_else(|| session.project_port())
-            .unwrap_or(DEFAULT_PORT);
-
-        let port = if explicit_port {
-            port
-        } else {
-            find_available_port(ip, port)?
-        };
+        let (ip, port) = resolve_bind_address(&session, self.address, self.port)?;
 
         // The CLI flag, when given, replaces the project's list rather than
         // merging with it, matching how --address and --port override theirs.
@@ -84,6 +68,26 @@ impl ServeCommand {
 
         Ok(())
     }
+}
+
+/// Picks the address and port to listen on. Flags win over the project's
+/// preferences. An explicit port is used as-is, while the default one moves up
+/// to the next free port, so a second server can run next to `rojo serve`.
+pub(super) fn resolve_bind_address(
+    session: &ServeSession,
+    address: Option<IpAddr>,
+    port: Option<u16>,
+) -> anyhow::Result<(IpAddr, u16)> {
+    let ip = address
+        .or_else(|| session.serve_address())
+        .unwrap_or(DEFAULT_BIND_ADDRESS.into());
+
+    let port = match port {
+        Some(port) => port,
+        None => find_available_port(ip, session.project_port().unwrap_or(DEFAULT_PORT))?,
+    };
+
+    Ok((ip, port))
 }
 
 fn find_available_port(ip: IpAddr, starting_port: u16) -> anyhow::Result<u16> {
