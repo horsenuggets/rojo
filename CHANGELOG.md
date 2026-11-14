@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.0`
+
 * Add `rojo syncback --from-studio`, which syncs back the place open in Studio without
   saving a file first. Run it, then call `shared.Rojo.syncbackFromStudio()` in Studio. The
   plugin serializes every service the project maps in one call, so references between
