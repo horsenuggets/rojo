@@ -1,3 +1,5 @@
+local msgpack = require(script.Parent.Parent.msgpack)
+
 local Error = {}
 Error.__index = Error
 
@@ -26,7 +28,11 @@ setmetatable(Error.Kind, {
 
 function Error.new(type, extraMessage)
 	extraMessage = extraMessage or ""
-	local message = type.message:gsub("{{message}}", extraMessage)
+	-- A function replacement keeps "%" in the message from being read as a
+	-- capture reference.
+	local message = type.message:gsub("{{message}}", function()
+		return extraMessage
+	end)
 
 	local err = {
 		type = type,
@@ -69,10 +75,30 @@ function Error.fromResponse(response)
 		return Error.new(Error.Kind.Timeout)
 	end
 
-	local err = Error.new(Error.Kind.Unknown, string.format("%s: %s", tostring(response.code), tostring(response.body)))
-	-- Kept so callers can decode a structured error body instead of showing raw bytes.
+	-- Rojo servers send errors as MessagePack with a readable `details` field,
+	-- which is shown instead of the raw bytes when it's there.
+	local details = Error.detailsFromBody(response.body)
+	local err = Error.new(
+		Error.Kind.Unknown,
+		string.format("%s: %s", tostring(response.code), details or tostring(response.body))
+	)
+	err.details = details
 	err.response = response
 	return err
+end
+
+--[[
+	Returns the `details` of a Rojo error body, or nil when the body isn't one.
+]]
+function Error.detailsFromBody(body)
+	if type(body) ~= "string" or body == "" then
+		return nil
+	end
+	local ok, decoded = pcall(msgpack.decode, body)
+	if ok and type(decoded) == "table" and type(decoded.details) == "string" then
+		return decoded.details
+	end
+	return nil
 end
 
 return Error

@@ -15,7 +15,7 @@ use std::{
 use anyhow::Context;
 use futures::channel::oneshot;
 use hyper::{
-    body::{self, HttpBody as _},
+    body::HttpBody as _,
     server::{conn::AddrStream, Server},
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, StatusCode,
@@ -28,7 +28,7 @@ use crate::{
     web::{
         interface::{
             ErrorResponse, SyncbackFinishRequest, SyncbackFinishResponse, SyncbackInfoResponse,
-            PROTOCOL_VERSION, SERVER_VERSION,
+            SyncbackStartRequest, SyncbackStartResponse, PROTOCOL_VERSION, SERVER_VERSION,
         },
         origin,
         util::{deserialize_msgpack, msgpack, msgpack_ok},
@@ -49,31 +49,48 @@ struct Shared {
     place_sender: Mutex<Option<oneshot::Sender<AssembledPlace>>>,
 }
 
-/// The parts of the newest upload attempt. Only one attempt is kept, so a retry
-/// after a failure starts clean, and memory is bounded by one upload.
+/// The finish request only carries the manifest, which lists the top-level
+/// children of each service, so it stays far below this.
+const FINISH_SIZE: usize = 16 * 1024 * 1024;
+
+/// The parts of the current upload attempt.
+///
+/// The server numbers attempts as they start, so their order is settled before
+/// any part is sent. Requests still in flight from an earlier attempt carry an
+/// older number and are rejected without touching the current one, and only one
+/// attempt's parts are ever held.
 #[derive(Default)]
 struct Upload {
-    id: String,
+    /// The current attempt, or 0 before the first one starts.
+    current: u64,
     parts: UploadParts,
 }
 
 impl Upload {
-    /// Returns the parts for `id`, discarding an older attempt's parts first.
-    fn parts_for(&mut self, id: &str) -> &mut UploadParts {
-        if self.id != id {
-            self.id = id.to_owned();
-            self.parts = UploadParts::default();
+    /// Starts a new attempt, replacing the current one, and returns its number.
+    fn start(&mut self) -> u64 {
+        self.current += 1;
+        self.parts = UploadParts::default();
+        self.current
+    }
+
+    /// Returns the parts for attempt `id`, which must be the current one.
+    fn parts_for(&mut self, id: u64) -> anyhow::Result<&mut UploadParts> {
+        if self.current == 0 || id != self.current {
+            anyhow::bail!("Upload {id} isn't the current upload attempt.");
         }
-        &mut self.parts
+        Ok(&mut self.parts)
     }
 }
 
 /// Serves the syncback routes on `address` until the plugin finishes an
 /// upload, then returns the place it uploaded.
 ///
-/// `on_listening` is called once the address is bound.
+/// `allowed_hosts` are extra `Host`/`Origin` values to accept, like `rojo serve`
+/// takes from the project. `on_listening` is called once the address is bound.
 pub fn receive_place(
     address: SocketAddr,
+    allowed_hosts: &[String],
     project_name: String,
     services: Vec<StudioService>,
     on_listening: impl FnOnce(),
@@ -88,7 +105,7 @@ pub fn receive_place(
         upload: Mutex::new(Upload::default()),
         place_sender: Mutex::new(Some(place_sender)),
     });
-    let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &[]);
+    let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), allowed_hosts);
 
     let make_service = make_service_fn(move |_conn: &AddrStream| {
         let shared = Arc::clone(&shared);
@@ -166,6 +183,7 @@ async fn route(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
             services: shared.services.clone(),
             part_size: PART_SIZE,
         }),
+        (&Method::POST, "/api/syncback/start") => handle_start(shared, request).await,
         (&Method::POST, "/api/syncback/finish") => handle_finish(shared, request).await,
         (&Method::POST, path) if path.starts_with("/api/syncback/part/") => {
             handle_part(shared, request).await
@@ -180,6 +198,26 @@ async fn route(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
     }
 }
 
+/// Handles `POST /api/syncback/start`, which begins a new upload attempt and
+/// discards any earlier one.
+async fn handle_start(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
+    let data = match read_limited(request.into_body(), FINISH_SIZE).await {
+        Ok(data) => data,
+        Err(err) => return bad_request(format!("Could not read the request. {err}")),
+    };
+    let request: SyncbackStartRequest = match deserialize_msgpack(&data) {
+        Ok(request) => request,
+        Err(err) => return bad_request(format!("Invalid body. {err}")),
+    };
+    if request.syncback_id != shared.syncback_id {
+        return bad_request("Wrong syncback ID");
+    }
+
+    msgpack_ok(SyncbackStartResponse {
+        upload_id: shared.upload.lock().unwrap().start(),
+    })
+}
+
 /// Handles `POST /api/syncback/part/{syncbackId}/{uploadId}/{index}`, whose body
 /// is the raw bytes of one part.
 async fn handle_part(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
@@ -191,9 +229,18 @@ async fn handle_part(shared: Arc<Shared>, request: Request<Body>) -> Response<Bo
     if id != shared.syncback_id.to_string() {
         return bad_request("Wrong syncback ID");
     }
+    let Ok(upload_id) = upload_id.parse::<u64>() else {
+        return bad_request(format!("Malformed upload ID \"{upload_id}\""));
+    };
     let Ok(index) = index.parse::<u32>() else {
         return bad_request(format!("Malformed part index \"{index}\""));
     };
+
+    // A stale attempt is turned away before its body is read. It's checked
+    // again below, since a new attempt can start while the body arrives.
+    if let Err(err) = shared.upload.lock().unwrap().parts_for(upload_id) {
+        return bad_request(format!("{err:#}"));
+    }
 
     let data = match read_limited(request.into_body(), PART_SIZE).await {
         Ok(data) => data,
@@ -201,7 +248,10 @@ async fn handle_part(shared: Arc<Shared>, request: Request<Body>) -> Response<Bo
     };
 
     let mut upload = shared.upload.lock().unwrap();
-    if let Err(err) = upload.parts_for(upload_id).insert(index, data) {
+    let inserted = upload
+        .parts_for(upload_id)
+        .and_then(|parts| parts.insert(index, data));
+    if let Err(err) = inserted {
         return bad_request(format!("{err:#}"));
     }
     msgpack_ok(())
@@ -214,7 +264,7 @@ async fn read_limited(mut body: Body, limit: usize) -> anyhow::Result<Vec<u8>> {
     while let Some(chunk) = body.data().await {
         let chunk = chunk?;
         if data.len() + chunk.len() > limit {
-            anyhow::bail!("Parts can be at most {limit} bytes.");
+            anyhow::bail!("The request body is larger than the limit of {limit} bytes.");
         }
         data.extend_from_slice(&chunk);
     }
@@ -222,7 +272,7 @@ async fn read_limited(mut body: Body, limit: usize) -> anyhow::Result<Vec<u8>> {
 }
 
 async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
-    let data = match body::to_bytes(request.into_body()).await {
+    let data = match read_limited(request.into_body(), FINISH_SIZE).await {
         Ok(data) => data,
         Err(err) => return bad_request(format!("Could not read the request. {err}")),
     };
@@ -238,8 +288,8 @@ async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<
         .upload
         .lock()
         .unwrap()
-        .parts_for(&request.upload_id)
-        .join(request.part_count);
+        .parts_for(request.upload_id)
+        .and_then(|parts| parts.join(request.part_count));
     let bytes = match joined {
         Ok(bytes) => bytes,
         Err(err) => return bad_request(format!("{err:#}")),
@@ -289,4 +339,56 @@ async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<
 
 fn bad_request(details: impl Into<String>) -> Response<Body> {
     msgpack(ErrorResponse::bad_request(details), StatusCode::BAD_REQUEST)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn parts_need_a_started_attempt() {
+        let mut upload = Upload::default();
+        for id in [0, 1, u64::MAX] {
+            assert!(upload.parts_for(id).is_err());
+        }
+    }
+
+    #[test]
+    fn a_new_attempt_starts_with_no_parts() {
+        let mut upload = Upload::default();
+        let a = upload.start();
+        upload.parts_for(a).unwrap().insert(5, vec![1]).unwrap();
+        let b = upload.start();
+        upload.parts_for(b).unwrap().insert(0, vec![2]).unwrap();
+
+        assert_eq!(upload.parts_for(b).unwrap().join(1).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn a_delayed_first_part_from_a_replaced_attempt_never_touches_the_retry() {
+        let mut upload = Upload::default();
+        // Attempt "a" starts, but none of its parts arrive before "b" starts.
+        let a = upload.start();
+        let b = upload.start();
+        upload.parts_for(b).unwrap().insert(0, vec![2]).unwrap();
+
+        // The first part and the finish from "a" finally arrive.
+        assert!(upload.parts_for(a).is_err());
+        assert_eq!(upload.parts_for(b).unwrap().join(1).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn only_the_newest_attempt_is_accepted() {
+        let mut upload = Upload::default();
+        let ids: Vec<_> = (0..5).map(|_| upload.start()).collect();
+        let (newest, older) = ids.split_last().unwrap();
+        for id in older {
+            assert!(
+                upload.parts_for(*id).is_err(),
+                "attempt {id} should be stale"
+            );
+        }
+        assert!(upload.parts_for(newest + 1).is_err());
+        assert!(upload.parts_for(*newest).is_ok());
+    }
 }

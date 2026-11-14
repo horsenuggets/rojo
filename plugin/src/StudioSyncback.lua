@@ -8,7 +8,6 @@
 	manifest that tells the server which service each child belongs to.
 ]]
 
-const HttpService = game:GetService("HttpService")
 const SerializationService = game:GetService("SerializationService")
 
 const Packages = script.Parent.Parent.Packages
@@ -26,7 +25,8 @@ const StudioSyncback = {}
 --[[
 	Collects the archivable children of each service, in order, along with the
 	manifest describing them. `findService` returns the place's instance for a
-	class name, or nil when the place doesn't have that service.
+	name and class name, or nil when the place doesn't have one. Mappings with no
+	instance are returned as missing.
 ]]
 function StudioSyncback.collect(services, findService)
 	const instances = {}
@@ -34,7 +34,7 @@ function StudioSyncback.collect(services, findService)
 	const missing = {}
 
 	for _, service in services do
-		const instance = findService(service.className)
+		const instance = findService(service.name, service.className)
 		if instance == nil then
 			table.insert(missing, service.name)
 			continue
@@ -109,26 +109,53 @@ function StudioSyncback.partRanges(size, partSize)
 end
 
 --[[
+	Builds the server URL, putting IPv6 addresses in brackets so the port isn't
+	read as part of the address.
+]]
+function StudioSyncback.baseUrl(host, port)
+	if string.find(host, ":", 1, true) and string.sub(host, 1, 1) ~= "[" then
+		host = `[{host}]`
+	end
+	return `http://{host}:{port}`
+end
+
+--[[
 	Turns a failed request into a readable message, using the details the server
 	sends back when there are any.
 ]]
 function StudioSyncback.describeError(err)
-	if type(err) == "table" and err.response ~= nil then
-		const ok, body = pcall(function()
-			return err.response:msgpack()
-		end)
-		if ok and type(body) == "table" and type(body.details) == "string" then
-			return body.details
-		end
+	if type(err) == "table" and type(err.details) == "string" then
+		return err.details
 	end
 	return tostring(err)
 end
 
-local function findService(className)
-	const ok, service = pcall(function()
-		return game:FindService(className)
-	end)
-	return if ok then service else nil
+--[[
+	Describes mappings the place doesn't have. Sending them as empty would make
+	syncback remove their files, so the upload is refused instead.
+]]
+function StudioSyncback.describeMissing(missing)
+	const names = {}
+	for _, name in missing do
+		table.insert(names, `"{name}"`)
+	end
+	const pronoun = if #missing == 1 then "it" else "them"
+	return `The project maps {table.concat(names, ", ")}, but this place doesn't have {pronoun}, so `
+		.. `nothing was sent. Syncing back would remove {if #missing == 1 then "its" else "their"} files.`
+end
+
+-- Projects map the DataModel's children by name, which covers services and any
+-- other top-level instance, like a Folder.
+local function findService(name, className)
+	for _, child in game:GetChildren() do
+		const ok, matches = pcall(function()
+			return child.Name == name and child.ClassName == className
+		end)
+		if ok and matches then
+			return child
+		end
+	end
+	return nil
 end
 
 local function uploadParts(baseUrl, syncbackId, uploadId, contents, ranges)
@@ -170,13 +197,13 @@ function StudioSyncback.run(baseUrl)
 			end
 
 			const instances, manifest, missing = StudioSyncback.collect(info.services, findService)
+			if #missing > 0 then
+				return Promise.reject(StudioSyncback.describeMissing(missing))
+			end
 			const cameraPath = StudioSyncback.cameraPath(instances, workspace.CurrentCamera)
-			-- A fresh ID per attempt keeps parts from an earlier failed attempt out
-			-- of this one.
-			const uploadId = HttpService:GenerateGUID(false)
 
 			const startTime = os.clock()
-			local contents, serializeTime, ranges
+			local contents, serializeTime, ranges, uploadId
 
 			-- SerializeInstancesAsync yields, which a Promise executor is allowed to do.
 			return Promise.new(function(resolve)
@@ -190,6 +217,15 @@ function StudioSyncback.run(baseUrl)
 				resolve()
 			end)
 				:andThen(function()
+					-- The server numbers each attempt, so requests still in flight
+					-- from an earlier failed attempt can't mix with this one.
+					return Http.post(
+						baseUrl .. "/api/syncback/start",
+						Http.msgpackEncode({ syncbackId = info.syncbackId })
+					)
+				end)
+				:andThen(function(startResponse)
+					uploadId = startResponse:msgpack().uploadId
 					return uploadParts(baseUrl, info.syncbackId, uploadId, contents, ranges)
 				end)
 				:andThen(function()
@@ -211,7 +247,6 @@ function StudioSyncback.run(baseUrl)
 						projectName = info.projectName,
 						instanceCount = result.instanceCount,
 						dropped = result.dropped,
-						missingServices = missing,
 						bytes = #contents,
 						parts = #ranges,
 						serializeSeconds = serializeTime,

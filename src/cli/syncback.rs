@@ -189,6 +189,7 @@ impl SyncbackCommand {
 
         let place = studio_syncback::receive_place(
             (ip, port).into(),
+            session.serve_allowed_hosts(),
             session.project_name().to_owned(),
             services,
             || {
