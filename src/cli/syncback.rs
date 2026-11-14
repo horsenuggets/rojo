@@ -1,6 +1,7 @@
 use std::{
     io::{self, BufReader, Write as _},
     mem::forget,
+    net::IpAddr,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -15,10 +16,14 @@ use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 use crate::{
     path_serializer::display_absolute,
     serve_session::ServeSession,
-    syncback::{syncback_loop, FsSnapshot},
+    syncback::{
+        from_studio::{inherit_service_properties, studio_services},
+        syncback_loop, FsSnapshot,
+    },
+    web::studio_syncback,
 };
 
-use super::{resolve_path, GlobalOptions};
+use super::{resolve_path, serve::resolve_bind_address, GlobalOptions};
 
 const UNKNOWN_INPUT_KIND_ERR: &str = "Could not detect what kind of file was inputted. \
                                        Expected input file to end in .rbxl, .rbxlx, .rbxm, or .rbxmx.";
@@ -38,8 +43,23 @@ pub struct SyncbackCommand {
     pub project: PathBuf,
 
     /// Path to the Roblox file to pull Instances from.
-    #[clap(long, short)]
-    pub input: PathBuf,
+    #[clap(long, short, required_unless_present = "from-studio")]
+    pub input: Option<PathBuf>,
+
+    /// If provided, Instances are pulled from the place open in Studio instead
+    /// of a file. Rojo waits for the Studio plugin to upload the place.
+    #[clap(long, conflicts_with = "input")]
+    pub from_studio: bool,
+
+    /// The IP address to wait for Studio on, with `--from-studio`. Defaults to
+    /// `127.0.0.1`.
+    #[clap(long, requires = "from-studio", conflicts_with = "input")]
+    pub address: Option<IpAddr>,
+
+    /// The port to wait for Studio on, with `--from-studio`. Defaults to the
+    /// project's preference, or the first free port from `34872`.
+    #[clap(long, requires = "from-studio", conflicts_with = "input")]
+    pub port: Option<u16>,
 
     /// If provided, a list all of the files and directories that will be
     /// added or removed is emitted into stdout.
@@ -59,15 +79,6 @@ pub struct SyncbackCommand {
 impl SyncbackCommand {
     pub fn run(&self, global: GlobalOptions) -> anyhow::Result<()> {
         let path_old = resolve_path(&self.project)?;
-        let path_new = resolve_path(&self.input)?;
-
-        let input_kind = FileKind::from_path(&path_new).context(UNKNOWN_INPUT_KIND_ERR)?;
-        let dom_start_timer = Instant::now();
-        let dom_new = read_dom(&path_new, input_kind)?;
-        log::debug!(
-            "Finished opening file in {:0.02}s",
-            dom_start_timer.elapsed().as_secs_f32()
-        );
 
         let vfs = Vfs::new_default()?;
         vfs.set_watch_enabled(false);
@@ -77,6 +88,20 @@ impl SyncbackCommand {
         log::debug!(
             "Finished opening project in {:0.02}s",
             project_start_timer.elapsed().as_secs_f32()
+        );
+
+        let dom_start_timer = Instant::now();
+        let dom_new = match &self.input {
+            Some(input) => {
+                let path_new = resolve_path(input)?;
+                let input_kind = FileKind::from_path(&path_new).context(UNKNOWN_INPUT_KIND_ERR)?;
+                read_dom(&path_new, input_kind)?
+            }
+            None => self.receive_from_studio(&session_old, global.color.into())?,
+        };
+        log::debug!(
+            "Finished reading the place in {:0.02}s",
+            dom_start_timer.elapsed().as_secs_f32()
         );
 
         let mut dom_old = session_old.tree();
@@ -152,6 +177,80 @@ impl SyncbackCommand {
 
         Ok(())
     }
+
+    /// Waits for the Studio plugin to upload the open place, then rebuilds it.
+    fn receive_from_studio(
+        &self,
+        session: &ServeSession,
+        color: ColorChoice,
+    ) -> anyhow::Result<WeakDom> {
+        let services = studio_services(session.tree().inner())?;
+        let (ip, port) = resolve_bind_address(session, self.address, self.port)?;
+
+        let place = studio_syncback::receive_place(
+            (ip, port).into(),
+            session.project_name().to_owned(),
+            services,
+            || {
+                let _ = show_waiting_message(ip, port, color);
+            },
+        )?;
+
+        let mut dom = place.dom;
+        let instance_count = dom.descendants().count() - 1;
+        eprintln!(
+            "Received {} from Studio.",
+            plural(instance_count, "instance", "instances")
+        );
+        if !place.dropped.is_empty() {
+            eprintln!(
+                "Studio couldn't serialize {}, so {} skipped.",
+                plural(place.dropped.len(), "instance", "instances"),
+                if place.dropped.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                }
+            );
+            for entry in &place.dropped {
+                eprintln!("  {}.{} ({})", entry.service, entry.name, entry.class_name);
+            }
+        }
+
+        inherit_service_properties(&mut dom, session.tree().inner());
+        Ok(dom)
+    }
+}
+
+fn plural(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+fn show_waiting_message(ip: IpAddr, port: u16, color: ColorChoice) -> io::Result<()> {
+    let mut green = ColorSpec::new();
+    green.set_fg(Some(Color::Green)).set_bold(true);
+
+    let writer = BufferWriter::stderr(color);
+    let mut buffer = writer.buffer();
+
+    let address = if ip.is_loopback() {
+        "localhost".to_owned()
+    } else {
+        ip.to_string()
+    };
+
+    write!(&mut buffer, "Waiting for Studio on ")?;
+    buffer.set_color(&green)?;
+    write!(&mut buffer, "{address}:{port}")?;
+    buffer.reset()?;
+    writeln!(&mut buffer, ".")?;
+    writeln!(
+        &mut buffer,
+        "Run \"shared.Rojo.syncbackFromStudio(\"{address}\", {port})\" in Studio to send the \
+         open place."
+    )?;
+
+    writer.print(&buffer)
 }
 
 fn read_dom(path: &Path, file_kind: FileKind) -> anyhow::Result<WeakDom> {

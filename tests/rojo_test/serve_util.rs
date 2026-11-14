@@ -288,7 +288,7 @@ impl TestServeSession {
     }
 }
 
-fn serialize_msgpack<T: Serialize>(value: T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+pub fn serialize_msgpack<T: Serialize>(value: T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
     let mut serialized = Vec::new();
     let mut serializer = rmp_serde::Serializer::new(&mut serialized)
         .with_human_readable()
@@ -313,7 +313,7 @@ pub fn deserialize_msgpack<'a, T: Deserialize<'a>>(
 /// If this method ends up having problems, we should add an option for Rojo to
 /// use a random port chosen by the operating system and figure out a good way
 /// to get that port back to the test CLI.
-fn get_port_number() -> usize {
+pub fn get_port_number() -> usize {
     static NEXT_PORT_NUMBER: AtomicUsize = AtomicUsize::new(35103);
 
     NEXT_PORT_NUMBER.fetch_add(1, Ordering::SeqCst)
