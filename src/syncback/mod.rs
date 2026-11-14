@@ -36,7 +36,7 @@ pub use file_names::{
 };
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
-pub(crate) use property_filter::can_write_property;
+pub(crate) use property_filter::{can_write_property, is_unset_binary_string};
 pub use property_filter::{filter_properties, filter_properties_preallocated, is_json_compatible};
 pub use snapshot::{SyncbackData, SyncbackSnapshot};
 pub use write_decision::{decide_property_write, PropertyWriteDecision};

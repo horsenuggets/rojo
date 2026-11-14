@@ -92,7 +92,7 @@ pub fn filter_properties_preallocated<'inst>(
 /// properties (like `Instance.SerializedOverrides`) on every instance before
 /// the reflection database records a default for them, so without this check
 /// syncback would write an empty value into the metadata of every instance.
-fn is_unset_binary_string(value: &Variant) -> bool {
+pub(crate) fn is_unset_binary_string(value: &Variant) -> bool {
     matches!(value, Variant::BinaryString(bytes) if AsRef::<[u8]>::as_ref(bytes).is_empty())
 }
 
