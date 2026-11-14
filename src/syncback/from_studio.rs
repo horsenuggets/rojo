@@ -66,6 +66,10 @@ pub fn studio_services(tree: &WeakDom) -> anyhow::Result<Vec<StudioService>> {
         .collect())
 }
 
+/// The most parts one upload can have. Parts are at most a few megabytes, so this
+/// bounds how much memory an upload can make the server hold.
+pub const MAX_PARTS: u32 = 256;
+
 /// Collects the parts of an upload, which can arrive in any order.
 #[derive(Debug, Default)]
 pub struct UploadParts {
@@ -73,25 +77,30 @@ pub struct UploadParts {
 }
 
 impl UploadParts {
-    pub fn insert(&mut self, index: u32, data: Vec<u8>) {
+    pub fn insert(&mut self, index: u32, data: Vec<u8>) -> anyhow::Result<()> {
+        if index >= MAX_PARTS {
+            bail!("Part {index} is past the limit of {MAX_PARTS} parts per upload.");
+        }
         self.parts.insert(index, data);
+        Ok(())
     }
 
     /// Joins the parts once all of `0..part_count` have arrived.
     pub fn join(&self, part_count: u32) -> anyhow::Result<Vec<u8>> {
-        let missing: Vec<_> = (0..part_count)
-            .filter(|index| !self.parts.contains_key(index))
-            .collect();
-        if !missing.is_empty() {
-            bail!(
-                "The upload is missing {} of {} parts (indices {:?}).",
-                missing.len(),
-                part_count,
-                missing
-            );
+        if part_count > MAX_PARTS {
+            bail!("The upload declared {part_count} parts, but the limit is {MAX_PARTS}.");
         }
         if let Some(extra) = self.parts.keys().find(|index| **index >= part_count) {
             bail!("The upload has part {extra}, but it only declared {part_count} parts.");
+        }
+        // Every stored index is below `part_count` at this point, so any shortfall
+        // in the count is a missing part.
+        let missing = part_count as usize - self.parts.len();
+        if missing > 0 {
+            bail!(
+                "The upload is missing {missing} of {part_count} {}.",
+                if part_count == 1 { "part" } else { "parts" }
+            );
         }
 
         Ok(self.parts.values().flatten().copied().collect())
@@ -104,17 +113,23 @@ impl UploadParts {
 /// objects), so the decoded children are matched against the manifest in order,
 /// and entries with no matching child are reported as dropped.
 ///
-/// `current_camera` is the manifest index of `Workspace.CurrentCamera`. Studio
+/// `current_camera` locates `Workspace.CurrentCamera`. Its first element is a
+/// manifest index, and the rest are child indices below that instance. Studio
 /// can't serialize the Workspace service, so this is how syncback still knows
 /// which camera to leave out.
+///
+/// An empty `bytes` is a place whose mapped services are all empty.
 pub fn assemble_place(
     bytes: &[u8],
     services: &[StudioService],
     manifest: &[ManifestEntry],
-    current_camera: Option<usize>,
+    current_camera: Option<&[usize]>,
 ) -> anyhow::Result<AssembledPlace> {
-    let mut dom =
-        rbx_binary::from_reader(bytes).context("Could not decode the place from Studio")?;
+    let mut dom = if bytes.is_empty() {
+        WeakDom::new(InstanceBuilder::new("DataModel"))
+    } else {
+        rbx_binary::from_reader(bytes).context("Could not decode the place from Studio")?
+    };
     let root_ref = dom.root_ref();
     dom.root_mut().class = ustr("DataModel");
     dom.root_mut().name = "DataModel".to_owned();
@@ -130,6 +145,11 @@ pub fn assemble_place(
         service_refs.insert(service.name.as_str(), referent);
     }
 
+    let (camera_entry, camera_path) = match current_camera {
+        Some([first, rest @ ..]) => (Some(*first), rest),
+        _ => (None, &[][..]),
+    };
+
     let mut dropped = Vec::new();
     let mut camera = None;
     let mut entries = manifest.iter().enumerate();
@@ -144,7 +164,7 @@ pub fn assemble_place(
                 );
             };
             if entry.name == child.name && entry.class_name == child.class.as_str() {
-                if current_camera == Some(index) {
+                if camera_entry == Some(index) {
                     camera = Some((entry.service.as_str(), child_ref));
                 }
                 break entry;
@@ -163,9 +183,18 @@ pub fn assemble_place(
     }
     dropped.extend(entries.map(|(_, entry)| entry.clone()));
 
-    if let Some((service, camera_ref)) = camera {
+    if let Some((service, top_ref)) = camera {
+        let camera_ref = camera_path.iter().try_fold(top_ref, |parent, index| {
+            dom.get_by_ref(parent)?.children().get(*index).copied()
+        });
+        // Syncback deletes whatever `CurrentCamera` points at, so a path that
+        // resolves to anything other than a camera is ignored.
+        let camera_ref = camera_ref.filter(|r| {
+            dom.get_by_ref(*r)
+                .is_some_and(|inst| inst.class == "Camera")
+        });
         let workspace = dom.get_by_ref_mut(service_refs[service]).unwrap();
-        if workspace.class == "Workspace" {
+        if let Some(camera_ref) = camera_ref.filter(|_| workspace.class == "Workspace") {
             workspace
                 .properties
                 .insert(ustr("CurrentCamera"), Variant::Ref(camera_ref));
@@ -279,9 +308,9 @@ mod test {
     #[test]
     fn parts_join_in_index_order_regardless_of_arrival() {
         let mut parts = UploadParts::default();
-        parts.insert(2, vec![5, 6]);
-        parts.insert(0, vec![1, 2]);
-        parts.insert(1, vec![3, 4]);
+        parts.insert(2, vec![5, 6]).unwrap();
+        parts.insert(0, vec![1, 2]).unwrap();
+        parts.insert(1, vec![3, 4]).unwrap();
 
         assert_eq!(parts.join(3).unwrap(), vec![1, 2, 3, 4, 5, 6]);
     }
@@ -289,12 +318,47 @@ mod test {
     #[test]
     fn missing_or_extra_parts_are_errors() {
         let mut parts = UploadParts::default();
-        parts.insert(0, vec![1]);
-        parts.insert(2, vec![3]);
+        parts.insert(0, vec![1]).unwrap();
+        parts.insert(2, vec![3]).unwrap();
 
         assert!(parts.join(3).is_err());
         assert!(parts.join(2).is_err());
         assert!(parts.join(1).is_err());
+    }
+
+    #[test]
+    fn an_empty_upload_joins_to_nothing() {
+        assert_eq!(UploadParts::default().join(0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn part_counts_and_indices_are_bounded() {
+        let mut parts = UploadParts::default();
+        assert!(parts.insert(MAX_PARTS, vec![1]).is_err());
+        assert!(parts.insert(MAX_PARTS - 1, vec![1]).is_ok());
+
+        // A huge declared count is rejected up front instead of being walked.
+        assert!(UploadParts::default().join(u32::MAX).is_err());
+        assert!(UploadParts::default().join(MAX_PARTS + 1).is_err());
+    }
+
+    #[test]
+    fn an_empty_place_has_only_its_services() {
+        let place = assemble_place(
+            &[],
+            &[service("ReplicatedStorage"), service("Workspace")],
+            &[],
+            None,
+        )
+        .unwrap();
+        let dom = &place.dom;
+        assert_eq!(
+            child_names(dom, dom.root_ref()),
+            vec!["ReplicatedStorage", "Workspace"]
+        );
+        for service in dom.root().children() {
+            assert!(dom.get_by_ref(*service).unwrap().children().is_empty());
+        }
     }
 
     #[test]
@@ -544,7 +608,7 @@ mod test {
     #[test]
     fn current_camera_points_at_the_uploaded_camera() {
         let (bytes, manifest) = camera_upload();
-        let place = assemble_place(&bytes, &[service("Workspace")], &manifest, Some(1)).unwrap();
+        let place = assemble_place(&bytes, &[service("Workspace")], &manifest, Some(&[1])).unwrap();
         assert_eq!(current_camera(&place.dom).as_deref(), Some("Camera"));
 
         let place = assemble_place(&bytes, &[service("Workspace")], &manifest, None).unwrap();
@@ -552,13 +616,33 @@ mod test {
     }
 
     #[test]
-    fn current_camera_is_ignored_when_studio_dropped_it_or_it_is_out_of_range() {
+    fn nested_current_cameras_are_found_by_path() {
+        let mut source = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let folder = source.insert(
+            source.root_ref(),
+            InstanceBuilder::new("Folder").with_name("Cameras"),
+        );
+        source.insert(folder, InstanceBuilder::new("Part").with_name("Marker"));
+        source.insert(folder, InstanceBuilder::new("Camera").with_name("Nested"));
+        let bytes = serialize(&source, &[folder]);
+        let manifest = [entry("Workspace", "Cameras", "Folder")];
+
+        let place =
+            assemble_place(&bytes, &[service("Workspace")], &manifest, Some(&[0, 1])).unwrap();
+        assert_eq!(current_camera(&place.dom).as_deref(), Some("Nested"));
+    }
+
+    #[test]
+    fn current_camera_paths_that_miss_a_camera_are_ignored() {
         let (bytes, mut manifest) = camera_upload();
         manifest.insert(1, entry("Workspace", "Dropped", "Camera"));
-        for index in [1, 9] {
+        // Each path either names an entry Studio dropped, runs past the manifest or
+        // a child list, or lands on something that isn't a camera.
+        let paths: [&[usize]; 5] = [&[1], &[9], &[2, 0], &[0], &[]];
+        for path in paths {
             let place =
-                assemble_place(&bytes, &[service("Workspace")], &manifest, Some(index)).unwrap();
-            assert_eq!(current_camera(&place.dom), None);
+                assemble_place(&bytes, &[service("Workspace")], &manifest, Some(path)).unwrap();
+            assert_eq!(current_camera(&place.dom), None, "path {path:?}");
         }
     }
 
@@ -574,7 +658,7 @@ mod test {
         );
         let (bytes, manifest) = camera_upload();
         let mut place =
-            assemble_place(&bytes, &[service("Workspace")], &manifest, Some(1)).unwrap();
+            assemble_place(&bytes, &[service("Workspace")], &manifest, Some(&[1])).unwrap();
 
         inherit_service_properties(&mut place.dom, &old);
 

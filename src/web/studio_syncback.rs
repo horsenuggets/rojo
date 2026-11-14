@@ -15,7 +15,7 @@ use std::{
 use anyhow::Context;
 use futures::channel::oneshot;
 use hyper::{
-    body,
+    body::{self, HttpBody as _},
     server::{conn::AddrStream, Server},
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, StatusCode,
@@ -43,10 +43,29 @@ struct Shared {
     syncback_id: SessionId,
     project_name: String,
     services: Vec<StudioService>,
-    parts: Mutex<UploadParts>,
+    upload: Mutex<Upload>,
 
     /// Taken by the first upload that finishes successfully.
     place_sender: Mutex<Option<oneshot::Sender<AssembledPlace>>>,
+}
+
+/// The parts of the newest upload attempt. Only one attempt is kept, so a retry
+/// after a failure starts clean, and memory is bounded by one upload.
+#[derive(Default)]
+struct Upload {
+    id: String,
+    parts: UploadParts,
+}
+
+impl Upload {
+    /// Returns the parts for `id`, discarding an older attempt's parts first.
+    fn parts_for(&mut self, id: &str) -> &mut UploadParts {
+        if self.id != id {
+            self.id = id.to_owned();
+            self.parts = UploadParts::default();
+        }
+        &mut self.parts
+    }
 }
 
 /// Serves the syncback routes on `address` until the plugin finishes an
@@ -66,7 +85,7 @@ pub fn receive_place(
         syncback_id: SessionId::new(),
         project_name,
         services,
-        parts: Mutex::new(UploadParts::default()),
+        upload: Mutex::new(Upload::default()),
         place_sender: Mutex::new(Some(place_sender)),
     });
     let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &[]);
@@ -161,12 +180,13 @@ async fn route(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
     }
 }
 
-/// Handles `POST /api/syncback/part/{syncbackId}/{index}`, whose body is the raw
-/// bytes of one part.
+/// Handles `POST /api/syncback/part/{syncbackId}/{uploadId}/{index}`, whose body
+/// is the raw bytes of one part.
 async fn handle_part(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
-    let argument = &request.uri().path()["/api/syncback/part/".len()..];
-    let Some((id, index)) = argument.split_once('/') else {
-        return bad_request("Expected /api/syncback/part/{syncbackId}/{index}");
+    let argument = request.uri().path()["/api/syncback/part/".len()..].to_owned();
+    let segments: Vec<_> = argument.split('/').collect();
+    let [id, upload_id, index] = segments[..] else {
+        return bad_request("Expected /api/syncback/part/{syncbackId}/{uploadId}/{index}");
     };
     if id != shared.syncback_id.to_string() {
         return bad_request("Wrong syncback ID");
@@ -175,19 +195,30 @@ async fn handle_part(shared: Arc<Shared>, request: Request<Body>) -> Response<Bo
         return bad_request(format!("Malformed part index \"{index}\""));
     };
 
-    let data = match body::to_bytes(request.into_body()).await {
+    let data = match read_limited(request.into_body(), PART_SIZE).await {
         Ok(data) => data,
         Err(err) => return bad_request(format!("Could not read part {index}. {err}")),
     };
-    if data.len() > PART_SIZE {
-        return bad_request(format!(
-            "Part {index} is {} bytes, but parts can be at most {PART_SIZE} bytes.",
-            data.len()
-        ));
-    }
 
-    shared.parts.lock().unwrap().insert(index, data.to_vec());
+    let mut upload = shared.upload.lock().unwrap();
+    if let Err(err) = upload.parts_for(upload_id).insert(index, data) {
+        return bad_request(format!("{err:#}"));
+    }
     msgpack_ok(())
+}
+
+/// Reads a request body, failing as soon as it passes `limit` bytes instead of
+/// buffering all of it first.
+async fn read_limited(mut body: Body, limit: usize) -> anyhow::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        if data.len() + chunk.len() > limit {
+            anyhow::bail!("Parts can be at most {limit} bytes.");
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
 }
 
 async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
@@ -203,7 +234,13 @@ async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<
         return bad_request("Wrong syncback ID");
     }
 
-    let bytes = match shared.parts.lock().unwrap().join(request.part_count) {
+    let joined = shared
+        .upload
+        .lock()
+        .unwrap()
+        .parts_for(&request.upload_id)
+        .join(request.part_count);
+    let bytes = match joined {
         Ok(bytes) => bytes,
         Err(err) => return bad_request(format!("{err:#}")),
     };
@@ -212,7 +249,12 @@ async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<
     // worker threads.
     let services = shared.services.clone();
     let assembled = tokio::task::spawn_blocking(move || {
-        assemble_place(&bytes, &services, &request.manifest, request.current_camera)
+        assemble_place(
+            &bytes,
+            &services,
+            &request.manifest,
+            request.current_camera.as_deref(),
+        )
     })
     .await;
     let place = match assembled {

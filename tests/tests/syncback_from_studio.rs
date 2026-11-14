@@ -123,26 +123,41 @@ fn syncback_from_studio_writes_the_uploaded_place() {
     let serve = client.get(format!("{base}/api/rojo")).send().unwrap();
     assert_eq!(serve.status(), StatusCode::NOT_FOUND);
 
+    let post_part = |upload_id: &str, index: usize, part: Vec<u8>| {
+        client
+            .post(format!(
+                "{base}/api/syncback/part/{}/{upload_id}/{index}",
+                info.syncback_id
+            ))
+            .body(part)
+            .send()
+            .unwrap()
+            .status()
+    };
+
     let wrong_id = client
-        .post(format!("{base}/api/syncback/part/not-the-id/0"))
+        .post(format!("{base}/api/syncback/part/not-the-id/attempt/0"))
         .body(vec![0])
         .send()
         .unwrap();
     assert_eq!(wrong_id.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        post_part("attempt", 0, vec![0; info.part_size + 1]),
+        StatusCode::BAD_REQUEST
+    );
+
+    // An earlier attempt failed partway, leaving a part with a higher index than
+    // the retry uses. The retry must not trip over it.
+    assert_eq!(
+        post_part("failed-attempt", 7, vec![1, 2, 3]),
+        StatusCode::OK
+    );
 
     // Parts arrive out of order when the plugin uploads them in parallel.
     let (bytes, manifest) = studio_upload();
     let parts: Vec<_> = bytes.chunks(bytes.len().div_ceil(3)).collect();
     for (index, part) in parts.iter().enumerate().rev() {
-        let response = client
-            .post(format!(
-                "{base}/api/syncback/part/{}/{index}",
-                info.syncback_id
-            ))
-            .body(part.to_vec())
-            .send()
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(post_part("retry", index, part.to_vec()), StatusCode::OK);
     }
 
     let finish = client
@@ -150,6 +165,7 @@ fn syncback_from_studio_writes_the_uploaded_place() {
         .body(
             serialize_msgpack(SyncbackFinishRequest {
                 syncback_id: info.syncback_id,
+                upload_id: "retry".to_owned(),
                 part_count: parts.len() as u32,
                 manifest,
                 current_camera: None,

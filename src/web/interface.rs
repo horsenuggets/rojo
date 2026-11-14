@@ -349,12 +349,18 @@ pub struct SyncbackInfoResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SyncbackFinishRequest {
     pub syncback_id: SessionId,
+
+    /// Chosen by the plugin for each attempt, so parts left over from a failed
+    /// attempt never mix with a retry.
+    pub upload_id: String,
     pub part_count: u32,
     pub manifest: Vec<ManifestEntry>,
 
-    /// The zero-based manifest index of `Workspace.CurrentCamera`, if it was sent.
+    /// Where `Workspace.CurrentCamera` is, if it was sent. The first element is a
+    /// zero-based manifest index, and the rest are zero-based child indices below
+    /// that instance.
     #[serde(default)]
-    pub current_camera: Option<usize>,
+    pub current_camera: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
