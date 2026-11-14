@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.0.16`
+
 * Sort properties and attributes by name when syncback writes metadata and `.model.json`
   files, so syncing the same place into an empty folder writes the same files every time
   instead of shuffling keys in hash map order.
