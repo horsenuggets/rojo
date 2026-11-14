@@ -388,12 +388,10 @@ fn inline_children(snapshot: &SyncbackSnapshot, new: Ref, old: Option<Ref>) -> V
         .zip(pairs)
         .map(|(child, old_child)| {
             let instance = snapshot.get_new_instance(*child).unwrap();
-            let mut values = filter_properties(snapshot.project(), instance)
-                .into_iter()
-                .collect::<Vec<_>>();
-            // Hash map order would reshuffle the file on every rewrite.
-            values.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
-            let (properties, attributes) = serialize_values(&instance.class, values);
+            let (properties, attributes) = serialize_values(
+                &instance.class,
+                filter_properties(snapshot.project(), instance),
+            );
             // An instance's own `Rojo_Id` attribute is saved with its other
             // attributes and is what Ref properties point at, so an ID inherited
             // from the paired old instance only survives when the instance has
