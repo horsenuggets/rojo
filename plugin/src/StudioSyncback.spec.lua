@@ -30,8 +30,9 @@ return function()
 				{ name = "ReplicatedStorage", className = "ReplicatedStorage" },
 				{ name = "Lighting", className = "Lighting" },
 				{ name = "Workspace", className = "Workspace" },
-			}, function(className)
-				return places[className]
+			}, function(name, className)
+				local found = places[name]
+				return if found and className == name then found else nil
 			end)
 
 			expect(#instances).to.equal(2)
@@ -160,38 +161,48 @@ return function()
 	end)
 
 	describe("describeError", function()
-		local function responseWith(body, decodes)
-			return {
-				msgpack = function()
-					if not decodes then
-						error("not msgpack")
-					end
-					return body
-				end,
-			}
-		end
-
-		it("should use the server's details when the body has them", function()
-			local err = { response = responseWith({ details = "The upload is missing parts." }, true) }
+		it("should use the server's details when the error has them", function()
+			local err = { details = "The upload is missing parts." }
 			expect(StudioSyncback.describeError(err)).to.equal("The upload is missing parts.")
 		end)
 
 		it("should fall back to the error itself otherwise", function()
 			expect(StudioSyncback.describeError("plain message")).to.equal("plain message")
 
-			local undecodable = setmetatable({ response = responseWith(nil, false) }, {
-				__tostring = function()
-					return "raw error"
-				end,
-			})
-			expect(StudioSyncback.describeError(undecodable)).to.equal("raw error")
-
-			local noDetails = setmetatable({ response = responseWith({ kind = "BadRequest" }, true) }, {
+			local noDetails = setmetatable({}, {
 				__tostring = function()
 					return "raw error"
 				end,
 			})
 			expect(StudioSyncback.describeError(noDetails)).to.equal("raw error")
+		end)
+	end)
+
+	describe("baseUrl", function()
+		it("should bracket IPv6 addresses only", function()
+			local cases = {
+				{ "localhost", "http://localhost:34872" },
+				{ "127.0.0.1", "http://127.0.0.1:34872" },
+				{ "fd00::1", "http://[fd00::1]:34872" },
+				{ "::1", "http://[::1]:34872" },
+				{ "[::1]", "http://[::1]:34872" },
+			}
+			for _, case in cases do
+				expect(StudioSyncback.baseUrl(case[1], "34872")).to.equal(case[2])
+			end
+		end)
+	end)
+
+	describe("describeMissing", function()
+		it("should name every missing mapping with the right grammar", function()
+			expect(StudioSyncback.describeMissing({ "Lighting" })).to.equal(
+				'The project maps "Lighting", but this place doesn\'t have it, so nothing was sent. '
+					.. "Syncing back would remove its files."
+			)
+			expect(StudioSyncback.describeMissing({ "Lighting", "Shared" })).to.equal(
+				'The project maps "Lighting", "Shared", but this place doesn\'t have them, so nothing '
+					.. "was sent. Syncing back would remove their files."
+			)
 		end)
 	end)
 end
