@@ -7,7 +7,6 @@
 //! session would push the project into Studio.
 
 use std::{
-    collections::HashSet,
     convert::Infallible,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -29,7 +28,7 @@ use crate::{
     web::{
         interface::{
             ErrorResponse, SyncbackFinishRequest, SyncbackFinishResponse, SyncbackInfoResponse,
-            PROTOCOL_VERSION, SERVER_VERSION,
+            SyncbackStartRequest, SyncbackStartResponse, PROTOCOL_VERSION, SERVER_VERSION,
         },
         origin,
         util::{deserialize_msgpack, msgpack, msgpack_ok},
@@ -54,30 +53,31 @@ struct Shared {
 /// children of each service, so it stays far below this.
 const FINISH_SIZE: usize = 16 * 1024 * 1024;
 
-/// The parts of the newest upload attempt. Only one attempt is kept, so a retry
-/// after a failure starts clean, and memory is bounded by one upload.
+/// The parts of the current upload attempt.
+///
+/// The server numbers attempts as they start, so their order is settled before
+/// any part is sent. Requests still in flight from an earlier attempt carry an
+/// older number and are rejected without touching the current one, and only one
+/// attempt's parts are ever held.
 #[derive(Default)]
 struct Upload {
-    id: Option<String>,
+    /// The current attempt, or 0 before the first one starts.
+    current: u64,
     parts: UploadParts,
-
-    /// Attempts that a newer one replaced. A failed attempt can still have
-    /// requests in flight, and those must not reset the retry that replaced it.
-    retired: HashSet<String>,
 }
 
 impl Upload {
-    /// Returns the parts for `id`. A new ID replaces the current attempt, and a
-    /// replaced ID is rejected.
-    fn parts_for(&mut self, id: &str) -> anyhow::Result<&mut UploadParts> {
-        if self.retired.contains(id) {
-            anyhow::bail!("Upload \"{id}\" was replaced by a newer attempt.");
-        }
-        if self.id.as_deref() != Some(id) {
-            if let Some(old) = self.id.replace(id.to_owned()) {
-                self.retired.insert(old);
-            }
-            self.parts = UploadParts::default();
+    /// Starts a new attempt, replacing the current one, and returns its number.
+    fn start(&mut self) -> u64 {
+        self.current += 1;
+        self.parts = UploadParts::default();
+        self.current
+    }
+
+    /// Returns the parts for attempt `id`, which must be the current one.
+    fn parts_for(&mut self, id: u64) -> anyhow::Result<&mut UploadParts> {
+        if self.current == 0 || id != self.current {
+            anyhow::bail!("Upload {id} isn't the current upload attempt.");
         }
         Ok(&mut self.parts)
     }
@@ -183,6 +183,7 @@ async fn route(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
             services: shared.services.clone(),
             part_size: PART_SIZE,
         }),
+        (&Method::POST, "/api/syncback/start") => handle_start(shared, request).await,
         (&Method::POST, "/api/syncback/finish") => handle_finish(shared, request).await,
         (&Method::POST, path) if path.starts_with("/api/syncback/part/") => {
             handle_part(shared, request).await
@@ -197,6 +198,26 @@ async fn route(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
     }
 }
 
+/// Handles `POST /api/syncback/start`, which begins a new upload attempt and
+/// discards any earlier one.
+async fn handle_start(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
+    let data = match read_limited(request.into_body(), FINISH_SIZE).await {
+        Ok(data) => data,
+        Err(err) => return bad_request(format!("Could not read the request. {err}")),
+    };
+    let request: SyncbackStartRequest = match deserialize_msgpack(&data) {
+        Ok(request) => request,
+        Err(err) => return bad_request(format!("Invalid body. {err}")),
+    };
+    if request.syncback_id != shared.syncback_id {
+        return bad_request("Wrong syncback ID");
+    }
+
+    msgpack_ok(SyncbackStartResponse {
+        upload_id: shared.upload.lock().unwrap().start(),
+    })
+}
+
 /// Handles `POST /api/syncback/part/{syncbackId}/{uploadId}/{index}`, whose body
 /// is the raw bytes of one part.
 async fn handle_part(shared: Arc<Shared>, request: Request<Body>) -> Response<Body> {
@@ -208,9 +229,18 @@ async fn handle_part(shared: Arc<Shared>, request: Request<Body>) -> Response<Bo
     if id != shared.syncback_id.to_string() {
         return bad_request("Wrong syncback ID");
     }
+    let Ok(upload_id) = upload_id.parse::<u64>() else {
+        return bad_request(format!("Malformed upload ID \"{upload_id}\""));
+    };
     let Ok(index) = index.parse::<u32>() else {
         return bad_request(format!("Malformed part index \"{index}\""));
     };
+
+    // A stale attempt is turned away before its body is read. It's checked
+    // again below, since a new attempt can start while the body arrives.
+    if let Err(err) = shared.upload.lock().unwrap().parts_for(upload_id) {
+        return bad_request(format!("{err:#}"));
+    }
 
     let data = match read_limited(request.into_body(), PART_SIZE).await {
         Ok(data) => data,
@@ -258,7 +288,7 @@ async fn handle_finish(shared: Arc<Shared>, request: Request<Body>) -> Response<
         .upload
         .lock()
         .unwrap()
-        .parts_for(&request.upload_id)
+        .parts_for(request.upload_id)
         .and_then(|parts| parts.join(request.part_count));
     let bytes = match joined {
         Ok(bytes) => bytes,
@@ -316,34 +346,49 @@ mod test {
     use super::*;
 
     #[test]
+    fn parts_need_a_started_attempt() {
+        let mut upload = Upload::default();
+        for id in [0, 1, u64::MAX] {
+            assert!(upload.parts_for(id).is_err());
+        }
+    }
+
+    #[test]
     fn a_new_attempt_starts_with_no_parts() {
         let mut upload = Upload::default();
-        upload.parts_for("a").unwrap().insert(5, vec![1]).unwrap();
-        upload.parts_for("b").unwrap().insert(0, vec![2]).unwrap();
+        let a = upload.start();
+        upload.parts_for(a).unwrap().insert(5, vec![1]).unwrap();
+        let b = upload.start();
+        upload.parts_for(b).unwrap().insert(0, vec![2]).unwrap();
 
-        assert_eq!(upload.parts_for("b").unwrap().join(1).unwrap(), vec![2]);
+        assert_eq!(upload.parts_for(b).unwrap().join(1).unwrap(), vec![2]);
     }
 
     #[test]
-    fn late_requests_from_a_replaced_attempt_never_touch_the_retry() {
+    fn a_delayed_first_part_from_a_replaced_attempt_never_touches_the_retry() {
         let mut upload = Upload::default();
-        upload.parts_for("a").unwrap().insert(0, vec![1]).unwrap();
-        upload.parts_for("b").unwrap().insert(0, vec![2]).unwrap();
+        // Attempt "a" starts, but none of its parts arrive before "b" starts.
+        let a = upload.start();
+        let b = upload.start();
+        upload.parts_for(b).unwrap().insert(0, vec![2]).unwrap();
 
-        // A part and a finish from attempt "a" arrive after "b" started.
-        assert!(upload.parts_for("a").is_err());
-        assert_eq!(upload.parts_for("b").unwrap().join(1).unwrap(), vec![2]);
+        // The first part and the finish from "a" finally arrive.
+        assert!(upload.parts_for(a).is_err());
+        assert_eq!(upload.parts_for(b).unwrap().join(1).unwrap(), vec![2]);
     }
 
     #[test]
-    fn every_replaced_attempt_stays_retired() {
+    fn only_the_newest_attempt_is_accepted() {
         let mut upload = Upload::default();
-        for id in ["a", "b", "c", "d"] {
-            upload.parts_for(id).unwrap();
+        let ids: Vec<_> = (0..5).map(|_| upload.start()).collect();
+        let (newest, older) = ids.split_last().unwrap();
+        for id in older {
+            assert!(
+                upload.parts_for(*id).is_err(),
+                "attempt {id} should be stale"
+            );
         }
-        for id in ["a", "b", "c"] {
-            assert!(upload.parts_for(id).is_err(), "{id} should be retired");
-        }
-        assert!(upload.parts_for("d").is_ok());
+        assert!(upload.parts_for(newest + 1).is_err());
+        assert!(upload.parts_for(*newest).is_ok());
     }
 }

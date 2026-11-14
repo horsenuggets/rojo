@@ -347,12 +347,23 @@ pub struct SyncbackInfoResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SyncbackStartRequest {
+    pub syncback_id: SessionId,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncbackStartResponse {
+    /// Issued by the server for each attempt, so requests left over from a
+    /// failed attempt never mix with a retry.
+    pub upload_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncbackFinishRequest {
     pub syncback_id: SessionId,
-
-    /// Chosen by the plugin for each attempt, so parts left over from a failed
-    /// attempt never mix with a retry.
-    pub upload_id: String,
+    pub upload_id: u64,
     pub part_count: u32,
     pub manifest: Vec<ManifestEntry>,
 

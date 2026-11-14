@@ -8,7 +8,6 @@
 	manifest that tells the server which service each child belongs to.
 ]]
 
-const HttpService = game:GetService("HttpService")
 const SerializationService = game:GetService("SerializationService")
 
 const Packages = script.Parent.Parent.Packages
@@ -202,12 +201,9 @@ function StudioSyncback.run(baseUrl)
 				return Promise.reject(StudioSyncback.describeMissing(missing))
 			end
 			const cameraPath = StudioSyncback.cameraPath(instances, workspace.CurrentCamera)
-			-- A fresh ID per attempt keeps parts from an earlier failed attempt out
-			-- of this one.
-			const uploadId = HttpService:GenerateGUID(false)
 
 			const startTime = os.clock()
-			local contents, serializeTime, ranges
+			local contents, serializeTime, ranges, uploadId
 
 			-- SerializeInstancesAsync yields, which a Promise executor is allowed to do.
 			return Promise.new(function(resolve)
@@ -221,6 +217,15 @@ function StudioSyncback.run(baseUrl)
 				resolve()
 			end)
 				:andThen(function()
+					-- The server numbers each attempt, so requests still in flight
+					-- from an earlier failed attempt can't mix with this one.
+					return Http.post(
+						baseUrl .. "/api/syncback/start",
+						Http.msgpackEncode({ syncbackId = info.syncbackId })
+					)
+				end)
+				:andThen(function(startResponse)
+					uploadId = startResponse:msgpack().uploadId
 					return uploadParts(baseUrl, info.syncbackId, uploadId, contents, ranges)
 				end)
 				:andThen(function()

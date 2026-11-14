@@ -6,6 +6,7 @@ use std::{
 
 use librojo::web_api::{
     ManifestEntry, SyncbackFinishRequest, SyncbackFinishResponse, SyncbackInfoResponse,
+    SyncbackStartRequest, SyncbackStartResponse,
 };
 use rbx_dom_weak::{types::Variant, ustr, InstanceBuilder, WeakDom};
 use reqwest::{blocking::Client, StatusCode};
@@ -123,7 +124,23 @@ fn syncback_from_studio_writes_the_uploaded_place() {
     let serve = client.get(format!("{base}/api/rojo")).send().unwrap();
     assert_eq!(serve.status(), StatusCode::NOT_FOUND);
 
-    let post_part = |upload_id: &str, index: usize, part: Vec<u8>| {
+    let start = || {
+        let response = client
+            .post(format!("{base}/api/syncback/start"))
+            .body(
+                serialize_msgpack(SyncbackStartRequest {
+                    syncback_id: info.syncback_id,
+                })
+                .unwrap(),
+            )
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        deserialize_msgpack::<SyncbackStartResponse>(&response.bytes().unwrap())
+            .unwrap()
+            .upload_id
+    };
+    let post_part = |upload_id: u64, index: usize, part: Vec<u8>| {
         client
             .post(format!(
                 "{base}/api/syncback/part/{}/{upload_id}/{index}",
@@ -136,36 +153,35 @@ fn syncback_from_studio_writes_the_uploaded_place() {
     };
 
     let wrong_id = client
-        .post(format!("{base}/api/syncback/part/not-the-id/attempt/0"))
+        .post(format!("{base}/api/syncback/part/not-the-id/1/0"))
         .body(vec![0])
         .send()
         .unwrap();
     assert_eq!(wrong_id.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        post_part("attempt", 0, vec![0; info.part_size + 1]),
-        StatusCode::BAD_REQUEST
-    );
+    // Parts are only accepted for an attempt the server started.
+    assert_eq!(post_part(1, 0, vec![1]), StatusCode::BAD_REQUEST);
 
     // An earlier attempt failed partway, leaving a part with a higher index than
     // the retry uses. The retry must not trip over it.
+    let failed = start();
+    assert_eq!(post_part(failed, 7, vec![1, 2, 3]), StatusCode::OK);
     assert_eq!(
-        post_part("failed-attempt", 7, vec![1, 2, 3]),
-        StatusCode::OK
+        post_part(failed, 0, vec![0; info.part_size + 1]),
+        StatusCode::BAD_REQUEST
     );
 
     // Parts arrive out of order when the plugin uploads them in parallel.
+    let retry = start();
+    assert!(retry > failed);
     let (bytes, manifest) = studio_upload();
     let parts: Vec<_> = bytes.chunks(bytes.len().div_ceil(3)).collect();
     for (index, part) in parts.iter().enumerate().rev() {
-        assert_eq!(post_part("retry", index, part.to_vec()), StatusCode::OK);
+        assert_eq!(post_part(retry, index, part.to_vec()), StatusCode::OK);
     }
 
     // A request from the failed attempt that was still in flight is rejected
     // instead of resetting the retry.
-    assert_eq!(
-        post_part("failed-attempt", 0, vec![1, 2, 3]),
-        StatusCode::BAD_REQUEST
-    );
+    assert_eq!(post_part(failed, 0, vec![1, 2, 3]), StatusCode::BAD_REQUEST);
 
     let oversized_finish = client
         .post(format!("{base}/api/syncback/finish"))
@@ -179,7 +195,7 @@ fn syncback_from_studio_writes_the_uploaded_place() {
         .body(
             serialize_msgpack(SyncbackFinishRequest {
                 syncback_id: info.syncback_id,
-                upload_id: "retry".to_owned(),
+                upload_id: retry,
                 part_count: parts.len() as u32,
                 manifest,
                 current_camera: None,
