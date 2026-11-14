@@ -248,7 +248,9 @@ fn write_sourcemap(
 
     if let Some(output_path) = output {
         let mut file = BufWriter::new(File::create(output_path)?);
-        file.write_all(&crate::json::to_vec_pretty(&root_node)?)?;
+        // Sourcemaps are machine-read and can describe hundreds of thousands of instances,
+        // so they stay minified rather than following the pretty metadata JSON style.
+        serde_json::to_writer(&mut file, &root_node)?;
         file.flush()?;
 
         println!("Created sourcemap at {}", output_path.display());
@@ -291,6 +293,32 @@ mod test {
         let sourcemap_contents =
             serde_json::from_str::<SourcemapNode>(&raw_sourcemap_contents).unwrap();
         insta::assert_json_snapshot!(sourcemap_contents);
+    }
+
+    #[test]
+    fn writes_minified_sourcemap_file() {
+        let sourcemap_dir = tempfile::tempdir().unwrap();
+        let sourcemap_output = sourcemap_dir.path().join("sourcemap.json");
+        let project_path = fs_err::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test-projects")
+                .join("relative_paths")
+                .join("project"),
+        )
+        .unwrap();
+        let sourcemap_command = SourcemapCommand {
+            project: project_path,
+            output: Some(sourcemap_output.clone()),
+            include_non_scripts: false,
+            watch: false,
+            absolute: false,
+        };
+        assert!(sourcemap_command.run().is_ok());
+
+        let raw_sourcemap_contents = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
+        assert!(serde_json::from_str::<SourcemapNode>(&raw_sourcemap_contents).is_ok());
+        assert!(!raw_sourcemap_contents.contains('\n'));
+        assert!(!raw_sourcemap_contents.contains(": "));
     }
 
     #[test]

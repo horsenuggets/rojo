@@ -33,6 +33,7 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## `7.7.1-horse.0.15`
 
+* Write `sourcemap.json` files minified again, as upstream Rojo does.
 * Serialize `className` first in directory metadata, including when other keys are present.
 * Disable update notifications, update checks, and sync reminders in the fork's Studio plugin.
 * Persist supported two-way-sync properties with filesystem authority on conflicts and
