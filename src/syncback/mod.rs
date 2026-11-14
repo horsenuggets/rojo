@@ -26,7 +26,7 @@ use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{InstanceWithMeta, RojoTree},
     snapshot_middleware::{dir_init_files, Middleware},
-    syncback::ref_properties::{collect_referents, link_referents},
+    syncback::ref_properties::{attribute_ids, collect_referents, link_referents},
     Project,
 };
 
@@ -81,6 +81,7 @@ pub fn syncback_instance(
     ) {
         anyhow::bail!("Model-file updates require subtree serialization");
     }
+    let attribute_ids = attribute_ids(&new_tree);
     let snapshot = SyncbackSnapshot {
         data: SyncbackData {
             vfs,
@@ -89,6 +90,7 @@ pub fn syncback_instance(
             project,
             scoped: true,
             script_containers: None,
+            attribute_ids: &attribute_ids,
         },
         old: Some(id),
         new: new_tree.root_ref(),
@@ -311,6 +313,7 @@ pub fn syncback_loop(
         HashSet::new()
     };
     let script_containers = inline::script_containers(&new_tree);
+    let attribute_ids = attribute_ids(&new_tree);
     let syncback_data = SyncbackData {
         vfs,
         old_tree,
@@ -318,6 +321,7 @@ pub fn syncback_loop(
         project,
         scoped: false,
         script_containers: Some(&script_containers),
+        attribute_ids: &attribute_ids,
     };
 
     let mut snapshots = vec![SyncbackSnapshot {
@@ -929,6 +933,98 @@ mod test {
         assert!(contents.starts_with("{\n    \"className\": \"Part\""));
         assert!(contents.contains("\"id\": \"wire-id\""));
         assert!(contents.contains("\"Transparency\": 0.75"));
+    }
+
+    /// A new sibling can shift which old instance each duplicate-named child
+    /// pairs with, so the first `Part` inherits the old `Part`'s inline ID
+    /// while the second one, which a Ref property points at, holds that same
+    /// ID through its `Rojo_Id` attribute.
+    #[test]
+    fn inline_ids_never_duplicate_an_attribute_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let holder = src.join("Holder");
+        std::fs::create_dir_all(&holder).unwrap();
+        let project_path = temp.path().join("default.project.json");
+        std::fs::write(
+            &project_path,
+            r#"{
+                "name": "Test",
+                "tree": { "$path": "src" },
+                "syncbackRules": { "instancesAsDirectories": true }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            holder.join("init.meta.json"),
+            r#"{
+                "className": "Folder",
+                "children": [
+                    { "className": "Part", "name": "Part", "id": "shared" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let session = crate::serve_session::ServeSession::new(vfs, &project_path).unwrap();
+
+        let mut new_tree = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("Folder"));
+        let root = new_tree.insert(
+            new_tree.root_ref(),
+            rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Holder"),
+        );
+        new_tree.insert(root, rbx_dom_weak::InstanceBuilder::new("Part"));
+        let mut attributes = Attributes::new();
+        attributes.insert(
+            crate::REF_ID_ATTRIBUTE_NAME.into(),
+            Variant::String("shared".into()),
+        );
+        let target = new_tree.insert(
+            root,
+            rbx_dom_weak::InstanceBuilder::new("Part").with_property("Attributes", attributes),
+        );
+        new_tree.insert(
+            root,
+            rbx_dom_weak::InstanceBuilder::new("ObjectValue")
+                .with_property("Value", Variant::Ref(target)),
+        );
+
+        let snapshot = {
+            let mut old_tree = session.tree();
+            syncback_loop(
+                session.vfs(),
+                &mut old_tree,
+                new_tree,
+                session.root_project(),
+            )
+            .unwrap()
+        };
+        snapshot.write_to_vfs(temp.path(), session.vfs()).unwrap();
+
+        let contents = std::fs::read_to_string(holder.join("init.meta.json")).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let children = metadata["children"].as_array().unwrap();
+        let ids: Vec<_> = children
+            .iter()
+            .map(|child| {
+                (
+                    child["id"].as_str(),
+                    child["attributes"][crate::REF_ID_ATTRIBUTE_NAME].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![(None, None), (None, Some("shared")), (None, None)],
+            "{contents}"
+        );
+        assert_eq!(
+            children[2]["attributes"]["Rojo_Target_Value"].as_str(),
+            Some("shared"),
+            "{contents}"
+        );
     }
 
     fn rules(ignore_paths: &[&str], create_ignore_dir_paths: Option<bool>) -> SyncbackRules {

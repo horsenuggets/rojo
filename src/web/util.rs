@@ -76,3 +76,44 @@ pub fn json<T: Serialize>(value: T, code: StatusCode) -> Response<Body> {
 
     response(code, "application/json", serialized)
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rbx_dom_weak::types::Variant;
+
+    /// The plugin's msgpack encoder writes NaN and infinity as 32-bit floats,
+    /// so a `Float64` attribute must still read them back from that form.
+    #[test]
+    fn non_finite_floats_from_the_plugin_decode_as_float64() {
+        for (bytes, expected) in [
+            ([0x7F, 0x80, 0x00, 0x00], f64::INFINITY),
+            ([0xFF, 0x80, 0x00, 0x00], f64::NEG_INFINITY),
+            ([0x7F, 0x80, 0x00, 0x01], f64::NAN),
+        ] {
+            // { "Float64": <float 32> }, as rbx_dom_lua encodes a number.
+            let mut message = vec![0x81, 0xA7];
+            message.extend_from_slice(b"Float64");
+            message.push(0xCA);
+            message.extend_from_slice(&bytes);
+            let Variant::Float64(value) = deserialize_msgpack::<Variant>(&message).unwrap() else {
+                panic!("expected a Float64");
+            };
+            assert!(
+                value == expected || value.is_nan() && expected.is_nan(),
+                "{value} should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_floats_round_trip_through_msgpack() {
+        for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let bytes = serialize_msgpack(Variant::Float64(value)).unwrap();
+            let Variant::Float64(read) = deserialize_msgpack::<Variant>(&bytes).unwrap() else {
+                panic!("expected a Float64");
+            };
+            assert_eq!(read.to_bits(), value.to_bits());
+        }
+    }
+}

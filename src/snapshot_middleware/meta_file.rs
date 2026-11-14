@@ -20,8 +20,8 @@ use crate::{
 
 /// Splits serializable values into metadata properties and attributes.
 ///
-/// Internal `RBX` attributes and values JSON cannot hold, like NaN, are left
-/// out so the file can always be read back.
+/// Internal `RBX` attributes and values JSON cannot hold, like a Vector3 with
+/// a NaN component, are left out so the file can always be read back.
 pub fn serialize_values<'a>(
     class: &str,
     values: impl IntoIterator<Item = (Ustr, &'a Variant)>,

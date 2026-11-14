@@ -37,9 +37,10 @@ pub fn filter_properties_preallocated<'inst>(
         .get(inst.class.as_str());
 
     let predicate = |prop_name: &Ustr, prop_value: &Variant| {
-        // JSON has no representation for NaN or infinity. Roblox uses NaN
-        // CFrames for unset values such as Model.ModelMeshCFrame, so leaving
-        // them in would make the metadata unreadable.
+        // JSON has no representation for NaN or infinity inside composite
+        // values. Roblox uses NaN CFrames for unset values such as
+        // Model.ModelMeshCFrame, so leaving them in would make the metadata
+        // unreadable.
         if !is_json_compatible(prop_value) {
             return true;
         }
@@ -72,13 +73,13 @@ pub fn filter_properties_preallocated<'inst>(
                 if !variant_eq(value, default) {
                     allocation.push((*name, value));
                 }
-            } else {
+            } else if !is_unset_binary_string(value) {
                 allocation.push((*name, value));
             }
         }
     } else {
         for (name, value) in &inst.properties {
-            if predicate(name, value) {
+            if predicate(name, value) || is_unset_binary_string(value) {
                 continue;
             }
             allocation.push((*name, value));
@@ -86,12 +87,21 @@ pub fn filter_properties_preallocated<'inst>(
     }
 }
 
+/// Returns whether `value` is an empty `BinaryString`, which Roblox writes for
+/// binary properties that hold nothing. Newer Studio versions serialize such
+/// properties (like `Instance.SerializedOverrides`) on every instance before
+/// the reflection database records a default for them, so without this check
+/// syncback would write an empty value into the metadata of every instance.
+fn is_unset_binary_string(value: &Variant) -> bool {
+    matches!(value, Variant::BinaryString(bytes) if AsRef::<[u8]>::as_ref(bytes).is_empty())
+}
+
 /// Returns whether a value can be represented in JSON without `null` from
 /// non-finite numbers. Roblox uses NaN and infinity for some unset values.
+/// Plain numbers always can, since non-finite ones are written in a tagged
+/// form like `{"Float64": "inf"}`.
 pub fn is_json_compatible(value: &Variant) -> bool {
     match value {
-        Variant::Float32(value) => value.is_finite(),
-        Variant::Float64(value) => value.is_finite(),
         Variant::Vector2(value) => vector2_is_finite(value),
         Variant::Vector3(value) => vector3_is_finite(value),
         Variant::Color3(value) => [value.r, value.g, value.b].into_iter().all(f32::is_finite),
@@ -209,4 +219,61 @@ fn should_property_serialize(class_name: &str, prop_name: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use memofs::Vfs;
+    use rbx_dom_weak::{types::BinaryString, ustr, InstanceBuilder, WeakDom};
+
+    fn load_project() -> (tempfile::TempDir, Project) {
+        let temp = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let path = temp.path().join("default.project.json");
+        vfs.write(&path, r#"{"name":"Test","tree":{"$className":"Folder"}}"#)
+            .unwrap();
+        let project = Project::load_exact(&vfs, &path, Some("Test")).unwrap();
+        (temp, project)
+    }
+
+    /// Walks every combination of a class with and without reflection data and
+    /// a binary property with and without content.
+    #[test]
+    fn binary_strings_without_defaults_are_kept_only_when_non_empty() {
+        let (_temp, project) = load_project();
+        let name = ustr("SerializedOverrides");
+        for class in ["Folder", "NotARealClass"] {
+            for bytes in [Vec::new(), vec![1, 2, 3]] {
+                let dom = WeakDom::new(
+                    InstanceBuilder::new(class)
+                        .with_property(name, BinaryString::from(bytes.clone())),
+                );
+                let filtered = filter_properties(&project, dom.root());
+                assert_eq!(
+                    filtered.contains_key(&name),
+                    !bytes.is_empty(),
+                    "{class} with {} bytes",
+                    bytes.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn properties_with_defaults_still_compare_against_them() {
+        let (_temp, project) = load_project();
+        let name = ustr("Transparency");
+        for (value, kept) in [(0.0, false), (0.5, true)] {
+            let dom = WeakDom::new(
+                InstanceBuilder::new("Part").with_property(name, Variant::Float32(value)),
+            );
+            assert_eq!(
+                filter_properties(&project, dom.root()).contains_key(&name),
+                kept,
+                "Transparency {value}"
+            );
+        }
+    }
 }

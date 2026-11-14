@@ -4,6 +4,10 @@ local RbxDom = require(Packages.RbxDom)
 
 local unmanagedAttributes = require(script.Parent.Parent.Reconciler.unmanagedAttributes)
 
+local function isNonFinite(value)
+	return type(value) == "number" and (value ~= value or value == math.huge or value == -math.huge)
+end
+
 return function(instance, propertyName, propertyDescriptor, instanceMap)
 	local readSuccess, readResult = propertyDescriptor:read(instance)
 
@@ -27,8 +31,8 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 		return true, { Ref = referentId }
 	end
 
-	-- Attributes the filesystem can't hold, like infinity, would otherwise be
-	-- encoded as sentinel values and saved. The server keeps its own copies.
+	-- Attributes the filesystem can't hold, like a Vector3 with a NaN component,
+	-- would otherwise be encoded and saved. The server keeps its own copies.
 	if dataType == "Attributes" and type(readResult) == "table" then
 		local managed = {}
 		for name, value in readResult do
@@ -49,6 +53,18 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 	if not encodeSuccess then
 		Log.warn("Could not sync back property {:?}.{}: {}", instance, propertyName, encodeResult)
 		return false, nil
+	end
+
+	-- rbx_dom_lua stands in a large finite number for infinity, but msgpack holds
+	-- it exactly and the filesystem writes it in a tagged form, so send it as is.
+	if (dataType == "Float32" or dataType == "Float64") and isNonFinite(readResult) then
+		encodeResult = { [dataType] = readResult }
+	elseif dataType == "Attributes" and type(readResult) == "table" then
+		for name, value in readResult do
+			if isNonFinite(value) then
+				encodeResult.Attributes[name] = { Float64 = value }
+			end
+		end
 	end
 
 	return true, encodeResult

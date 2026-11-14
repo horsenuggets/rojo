@@ -230,7 +230,7 @@ mod tests {
         valid.insert("Good".to_owned(), "kept".into());
 
         let mut mixed = valid.clone();
-        mixed.insert("Bad".to_owned(), f64::INFINITY.into());
+        mixed.insert("Bad".to_owned(), Vector3::new(f32::NAN, 0.0, 0.0).into());
 
         let mut valid_hasher = Hasher::new();
         hash_variant(&mut valid_hasher, &Variant::Attributes(valid));
@@ -238,5 +238,30 @@ mod tests {
         hash_variant(&mut mixed_hasher, &Variant::Attributes(mixed));
 
         assert_eq!(valid_hasher.finalize(), mixed_hasher.finalize());
+    }
+
+    /// Non-finite numbers are written to metadata, so changing one must
+    /// change the hash or syncback would never write the new value.
+    #[test]
+    fn non_finite_number_attributes_are_hashed() {
+        let hash = |value: f64| {
+            let mut attributes = Attributes::new();
+            attributes.insert("EmitDuration".to_owned(), value.into());
+            let mut hasher = Hasher::new();
+            hash_variant(&mut hasher, &Variant::Attributes(attributes));
+            hasher.finalize()
+        };
+        let hashes = [
+            hash(1.0),
+            hash(f64::INFINITY),
+            hash(f64::NEG_INFINITY),
+            hash(f64::NAN),
+        ];
+        for (index, a) in hashes.iter().enumerate() {
+            for b in &hashes[index + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(hash(f64::NAN), hash(f64::NAN));
     }
 }

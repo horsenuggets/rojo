@@ -33,6 +33,9 @@ pub struct SyncbackData<'sync> {
     /// Instances in the new tree that are scripts or have script descendants,
     /// when they were computed ahead of time for the whole tree.
     pub(super) script_containers: Option<&'sync HashSet<Ref>>,
+    /// IDs that instances in the new tree hold through their `Rojo_Id`
+    /// attribute, so no other instance may be written with one of them.
+    pub(super) attribute_ids: &'sync HashSet<String>,
 }
 
 pub struct SyncbackSnapshot<'sync> {
@@ -259,6 +262,13 @@ impl<'sync> SyncbackSnapshot<'sync> {
             Some(containers) => containers.contains(&new_ref),
             None => super::inline::contains_script(self.new_tree(), new_ref),
         }
+    }
+
+    /// Returns whether an instance in the new tree holds `id` through its
+    /// `Rojo_Id` attribute.
+    #[inline]
+    pub fn is_attribute_id(&self, id: &str) -> bool {
+        self.data.attribute_ids.contains(id)
     }
 
     /// Returns the underlying VFS being used for syncback.

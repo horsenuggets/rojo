@@ -394,11 +394,18 @@ fn inline_children(snapshot: &SyncbackSnapshot, new: Ref, old: Option<Ref>) -> V
             // Hash map order would reshuffle the file on every rewrite.
             values.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
             let (properties, attributes) = serialize_values(&instance.class, values);
+            // An instance's own `Rojo_Id` attribute is saved with its other
+            // attributes and is what Ref properties point at, so an ID inherited
+            // from the paired old instance only survives when the instance has
+            // no attribute and no other instance claims that ID. Reordered
+            // duplicate-named siblings can pair with each other's old instances,
+            // and writing both IDs would make two instances share one.
             let id = old_child
                 .and_then(|old| old.metadata().specified_id.as_ref())
                 .map(ToString::to_string)
-                // IDs given through the `Rojo_Id` attribute are already saved.
-                .filter(|id| rojo_id_attribute(instance) != Some(id.as_str()));
+                .filter(|id| {
+                    rojo_id_attribute(instance).is_none() && !snapshot.is_attribute_id(id)
+                });
 
             InlineInstance {
                 class_name: instance.class,
