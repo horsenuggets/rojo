@@ -5,7 +5,9 @@
 	> Internal attributes, prefixed with `RBX`, which syncback skips.
 	> Rojo's own reference links, `Rojo_Id` and `Rojo_Target_*`, which the server
 	  resolves into Ref properties instead of sending.
-	> Values JSON can't hold, such as NaN and infinity.
+	> Composite values JSON can't hold, such as a Vector3 with a NaN component.
+	  Plain numbers are always held, since NaN and infinity are written in a
+	  tagged form.
 
 	These are left exactly as they are in Studio when diffing and applying.
 ]]
@@ -28,9 +30,7 @@ end
 -- Mirrors the server's `is_json_compatible`, which decides what syncback skips.
 local function isJsonCompatible(value)
 	local valueType = typeof(value)
-	if valueType == "number" then
-		return isFinite(value)
-	elseif valueType == "Vector2" then
+	if valueType == "Vector2" then
 		return allFinite(value.X, value.Y)
 	elseif valueType == "Vector3" then
 		return allFinite(value.X, value.Y, value.Z)

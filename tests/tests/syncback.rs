@@ -69,7 +69,7 @@ syncback_tests! {
     json_middlewares => ["src/dir_with_meta/init.meta.json", "src/model_json.model.json", "src/project_json.project.json"],
     // Ensures projects that refer to other projects work as expected
     nested_projects => ["nested.project.json", "string_value.txt"],
-    // Non-finite attributes are skipped so every JSON writer stays readable.
+    // Non-finite number attributes are kept in their tagged form by every JSON writer.
     non_finite_attributes => ["default.project.json", "src/Directory/init.meta.json", "src/Model/init.meta.json", "src/Model/Value.model.json"],
     // Ensures files that are ignored by nested projects are picked up if
     // they're included in second project. Unusual but perfectly workable

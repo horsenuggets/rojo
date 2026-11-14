@@ -4,16 +4,37 @@ return function()
 	it("should never encode attributes the filesystem can't hold", function()
 		local part = Instance.new("Part")
 		part:SetAttribute("Health", 5)
-		part:SetAttribute("Far", math.huge)
-		part:SetAttribute("Broken", 0 / 0)
+		part:SetAttribute("Broken", Vector3.new(0 / 0, 0, 0))
 		part:SetAttribute("Rojo_Id", "linked")
 		local update = encodePatchUpdate(part, "PART", { Attributes = true })
 		local attributes = update.changedProperties.Attributes.Attributes
 		expect(attributes.Health ~= nil).to.equal(true)
-		expect(attributes.Far).to.equal(nil)
 		expect(attributes.Broken).to.equal(nil)
 		expect(attributes.Rojo_Id).to.equal(nil)
 		part:Destroy()
+	end)
+
+	it("should encode non-finite number attributes exactly", function()
+		local part = Instance.new("Part")
+		part:SetAttribute("Far", math.huge)
+		part:SetAttribute("Near", -math.huge)
+		part:SetAttribute("Broken", 0 / 0)
+		local update = encodePatchUpdate(part, "PART", { Attributes = true })
+		local attributes = update.changedProperties.Attributes.Attributes
+		expect(attributes.Far.Float64).to.equal(math.huge)
+		expect(attributes.Near.Float64).to.equal(-math.huge)
+		expect(attributes.Broken.Float64 ~= attributes.Broken.Float64).to.equal(true)
+		part:Destroy()
+	end)
+
+	it("should encode non-finite number properties exactly", function()
+		local value = Instance.new("NumberValue")
+		for _, number in { math.huge, -math.huge } do
+			value.Value = number
+			local update = encodePatchUpdate(value, "VALUE", { Value = true })
+			expect(update.changedProperties.Value.Float64).to.equal(number)
+		end
+		value:Destroy()
 	end)
 
 	it("should return an update when there are property changes", function()
