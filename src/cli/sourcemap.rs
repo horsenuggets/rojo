@@ -42,7 +42,7 @@ struct SourcemapNode<'a> {
     children: Vec<SourcemapNode<'a>>,
 }
 
-/// Generates a sourcemap file from the Rojo project.
+/// Generates a sourcemap file from the Rojo+ project.
 #[derive(Debug, Parser)]
 pub struct SourcemapCommand {
     /// Path to the project to use for the sourcemap. Defaults to the current

@@ -21,7 +21,7 @@ const GIT_IGNORE_PLACEHOLDER: &str = "gitignore.txt";
 
 static TEMPLATE_BINCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/templates.bincode"));
 
-/// Initializes a new Rojo project.
+/// Initializes a new Rojo+ project.
 ///
 /// By default, this will attempt to initialize a 'git' repository in the
 /// project directory if `git` is installed. To avoid this, pass `--skip-git`.
@@ -114,7 +114,7 @@ impl InitCommand {
     }
 }
 
-/// The templates we support for initializing a Rojo project.
+/// The templates we support for initializing a Rojo+ project.
 #[derive(Debug, Clone, Copy)]
 pub enum InitKind {
     /// A place that contains a baseplate.
@@ -136,22 +136,22 @@ impl InitKind {
         };
 
         let snapshot: VfsSnapshot = bincode::deserialize(TEMPLATE_BINCODE)
-            .context("Rojo's templates were not properly packed into Rojo's binary. This is a bug in Rojo; please file an issue.")?;
+            .context("Rojo+'s templates were not properly packed into Rojo+'s binary. This is a bug in Rojo+; please file an issue.")?;
 
         let VfsSnapshot::Dir { mut children } = snapshot else {
-            bail!("Rojo's templates were packed as a file instead of a directory. This is a bug in Rojo; please file an issue.");
+            bail!("Rojo+'s templates were packed as a file instead of a directory. This is a bug in Rojo+; please file an issue.");
         };
 
         let template = children.remove(template_path).ok_or_else(|| {
             format_err!(
-                "The template for project type {:?} is missing. This is a bug in Rojo; please file an issue.",
+                "The template for project type {:?} is missing. This is a bug in Rojo+; please file an issue.",
                 self
             )
         })?;
 
         let mut fs = InMemoryFs::new();
         fs.load_snapshot("", template)
-            .context("Failed to load Rojo's bundled template into memory")?;
+            .context("Failed to load Rojo+'s bundled template into memory")?;
 
         Ok(fs)
     }

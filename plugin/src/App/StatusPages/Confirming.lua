@@ -98,7 +98,7 @@ function ConfirmingPage:render()
 						onClick = self.props.onReject,
 					}, {
 						Tip = e(Tooltip.Trigger, {
-							text = "Push Studio changes to the Rojo server",
+							text = "Push Studio changes to the Rojo+ server",
 						}),
 					})
 					else nil,
@@ -111,7 +111,7 @@ function ConfirmingPage:render()
 					onClick = self.props.onAccept,
 				}, {
 					Tip = e(Tooltip.Trigger, {
-						text = "Pull Rojo server changes to Studio",
+						text = "Pull Rojo+ server changes to Studio",
 					}),
 				}),
 
@@ -137,7 +137,7 @@ function ConfirmingPage:render()
 			}),
 
 			StringDiff = e(StudioPluginGui, {
-				id = "Rojo_ConfirmingStringDiff",
+				id = "RojoPlus_ConfirmingStringDiff",
 				title = "String diff",
 				active = self.state.showingStringDiff,
 				isEphemeral = true,
@@ -175,7 +175,7 @@ function ConfirmingPage:render()
 			}),
 
 			TableDiff = e(StudioPluginGui, {
-				id = "Rojo_ConfirmingTableDiff",
+				id = "RojoPlus_ConfirmingTableDiff",
 				title = "Table diff",
 				active = self.state.showingTableDiff,
 				isEphemeral = true,
@@ -215,7 +215,7 @@ function ConfirmingPage:render()
 
 		if self.props.createPopup then
 			return e(StudioPluginGui, {
-				id = "Rojo_DiffSync",
+				id = "RojoPlus_DiffSync",
 				title = string.format(
 					"Confirm sync for project '%s':",
 					self.props.confirmData.serverInfo.projectName or "UNKNOWN"

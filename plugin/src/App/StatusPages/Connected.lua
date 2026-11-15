@@ -468,7 +468,7 @@ function ConnectedPage:render()
 					onClick = self.props.onDisconnect,
 				}, {
 					Tip = e(Tooltip.Trigger, {
-						text = "Disconnect from the Rojo sync server",
+						text = "Disconnect from the Rojo+ sync server",
 					}),
 				}),
 
@@ -481,7 +481,7 @@ function ConnectedPage:render()
 			}),
 
 			ChangesViewer = e(StudioPluginGui, {
-				id = "Rojo_ChangesViewer",
+				id = "RojoPlus_ChangesViewer",
 				title = "View changes",
 				active = self.state.renderChanges,
 				isEphemeral = true,
@@ -536,7 +536,7 @@ function ConnectedPage:render()
 			}),
 
 			StringDiff = e(StudioPluginGui, {
-				id = "Rojo_ConnectedStringDiff",
+				id = "RojoPlus_ConnectedStringDiff",
 				title = "String diff",
 				active = self.state.showingStringDiff,
 				isEphemeral = true,
@@ -574,7 +574,7 @@ function ConnectedPage:render()
 			}),
 
 			TableDiff = e(StudioPluginGui, {
-				id = "Rojo_ConnectedTableDiff",
+				id = "RojoPlus_ConnectedTableDiff",
 				title = "Table diff",
 				active = self.state.showingTableDiff,
 				isEphemeral = true,

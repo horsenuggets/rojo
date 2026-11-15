@@ -21,10 +21,10 @@ fn main() {
         };
 
         log::error!(
-            "Rojo crashed! You are running Rojo {}.",
+            "Rojo+ crashed! You are running Rojo+ {}.",
             env!("CARGO_PKG_VERSION")
         );
-        log::error!("This is probably a Rojo bug.");
+        log::error!("This is probably a Rojo+ bug.");
         log::error!("");
         log::error!(
             "Please consider filing an issue: {}/issues",

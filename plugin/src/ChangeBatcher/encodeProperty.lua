@@ -24,7 +24,7 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 
 		local referentId = instanceMap and instanceMap.fromInstances[readResult]
 		if referentId == nil then
-			Log.warn("Cannot sync reference {:?}.{} because its target is not managed by Rojo", instance, propertyName)
+			Log.warn("Cannot sync reference {:?}.{} because its target is not managed by Rojo+", instance, propertyName)
 			return false, nil
 		end
 

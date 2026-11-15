@@ -17,7 +17,7 @@ const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const DEFAULT_PORT: u16 = 34872;
 const MAX_PORT_ATTEMPTS: u16 = 100;
 
-/// Expose a Rojo project to the Rojo Studio plugin.
+/// Expose a Rojo+ project to the Rojo+ Studio plugin.
 #[derive(Debug, Parser)]
 pub struct ServeCommand {
     /// Path to the project to serve. Defaults to the current directory.
@@ -121,7 +121,7 @@ fn show_start_message(bind_address: IpAddr, port: u16, color: ColorChoice) -> io
         bind_address.to_string()
     };
 
-    writeln!(&mut buffer, "Rojo server listening:")?;
+    writeln!(&mut buffer, "Rojo+ server listening:")?;
 
     write!(&mut buffer, "  Address: ")?;
     buffer.set_color(&green)?;

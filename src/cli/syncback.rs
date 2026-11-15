@@ -31,9 +31,9 @@ const UNKNOWN_INPUT_KIND_ERR: &str = "Could not detect what kind of file was inp
 /// Performs 'syncback' for the provided project, using the `input` file
 /// given.
 ///
-/// Syncback exists to convert Roblox files into a Rojo project automatically.
+/// Syncback exists to convert Roblox files into a Rojo+ project automatically.
 /// It uses the project.json file provided to traverse the Roblox file passed as
-/// to serialize Instances to the file system in a format that Rojo understands.
+/// to serialize Instances to the file system in a format that Rojo+ understands.
 ///
 /// To ease programmatic use, this command pipes all normal output to stderr.
 #[derive(Debug, Parser)]
@@ -47,7 +47,7 @@ pub struct SyncbackCommand {
     pub input: Option<PathBuf>,
 
     /// If provided, Instances are pulled from the place open in Studio instead
-    /// of a file. Rojo waits for the Studio plugin to upload the place.
+    /// of a file. Rojo+ waits for the Studio plugin to upload the place.
     #[clap(long, conflicts_with = "input")]
     pub from_studio: bool,
 
@@ -247,7 +247,7 @@ fn show_waiting_message(ip: IpAddr, port: u16, color: ColorChoice) -> io::Result
     writeln!(&mut buffer, ".")?;
     writeln!(
         &mut buffer,
-        "Run \"shared.Rojo.syncbackFromStudio(\"{address}\", {port})\" in Studio to send the \
+        "Run \"shared.RojoPlus.syncbackFromStudio(\"{address}\", {port})\" in Studio to send the \
          open place."
     )?;
 
@@ -304,7 +304,7 @@ fn process_model_dom(dom: WeakDom) -> anyhow::Result<WeakDom> {
         Ok(new_tree)
     } else {
         anyhow::bail!(
-            "Rojo does not currently support models with more \
+            "Rojo+ does not currently support models with more \
         than one Instance at the Root!"
         );
     }
@@ -314,7 +314,7 @@ fn xml_decode_config() -> rbx_xml::DecodeOptions<'static> {
     rbx_xml::DecodeOptions::new().property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown)
 }
 
-/// The different kinds of input that Rojo can syncback.
+/// The different kinds of input that Rojo+ can syncback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileKind {
     /// An XML model file.

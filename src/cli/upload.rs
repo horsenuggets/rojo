@@ -19,11 +19,11 @@ pub struct UploadCommand {
     #[clap(default_value = "")]
     pub project: PathBuf,
 
-    /// Authenication cookie to use. If not specified, Rojo will attempt to find one from the system automatically.
+    /// Authenication cookie to use. If not specified, Rojo+ will attempt to find one from the system automatically.
     #[clap(long)]
     pub cookie: Option<String>,
 
-    /// API key obtained from create.roblox.com/credentials. Rojo will use the Open Cloud API when this is provided. Only supports uploading to a place.
+    /// API key obtained from create.roblox.com/credentials. Rojo+ will use the Open Cloud API when this is provided. Only supports uploading to a place.
     #[clap(long = "api_key")]
     pub api_key: Option<String>,
 
@@ -68,7 +68,7 @@ impl UploadCommand {
                 }
 
                 let cookie = cookie.or_else(get_auth_cookie).context(
-                    "Rojo could not find your Roblox auth cookie. Please pass one via --cookie.",
+                    "Rojo+ could not find your Roblox auth cookie. Please pass one via --cookie.",
                 )?;
                 do_upload(buffer, self.asset_id, &cookie)
             }

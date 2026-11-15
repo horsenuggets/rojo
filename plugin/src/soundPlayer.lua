@@ -2,12 +2,13 @@
 local plugin = plugin or script:FindFirstAncestorWhichIsA("Plugin")
 local widget = nil
 if plugin then
+	-- Distinct from upstream Rojo's "Rojo_soundPlayer", so both plugins can load together.
 	widget = plugin:CreateDockWidgetPluginGui(
-		"Rojo_soundPlayer",
+		"RojoPlus_soundPlayer",
 		DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, true, 10, 10, 10, 10)
 	)
-	widget.Name = "Rojo_soundPlayer"
-	widget.Title = "Rojo Sound Player"
+	widget.Name = "RojoPlus_soundPlayer"
+	widget.Title = "Rojo+ Sound Player"
 end
 
 local SoundPlayer = {}

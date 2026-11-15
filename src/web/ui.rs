@@ -55,7 +55,7 @@ impl UiService {
     fn handle_home(&self) -> Response<Body> {
         let page = self.normal_page(html! {
             <div class="button-list">
-                { Self::button("Rojo Documentation", "https://rojo.space/docs") }
+                { Self::button("Rojo+ Documentation", "https://rojo.space/docs") }
                 { Self::button("View instance tree state", "/show-instances") }
             </div>
         });
@@ -260,7 +260,7 @@ impl UiService {
             <html>
                 <head>
                     <meta charset="utf8" />
-                    <title>"Rojo Live Server"</title>
+                    <title>"Rojo+ Live Server"</title>
                     <link rel="icon" type="image/png" sizes="32x32" href="/icon.png" />
                     <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1" />
                     <style>

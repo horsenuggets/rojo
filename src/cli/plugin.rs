@@ -10,16 +10,18 @@ use roblox_install::RobloxStudio;
 use crate::serve_session::ServeSession;
 
 static PLUGIN_BINCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugin.bincode"));
-static PLUGIN_FILE_NAME: &str = "RojoManagedPlugin.rbxm";
+/// Differs from upstream Rojo's `RojoManagedPlugin.rbxm`, so both plugins can be
+/// installed side by side without overwriting each other.
+static PLUGIN_FILE_NAME: &str = "Rojo+.rbxm";
 
-/// Install Rojo's plugin.
+/// Install Rojo+'s plugin.
 #[derive(Debug, Parser)]
 pub struct PluginCommand {
     #[clap(subcommand)]
     subcommand: PluginSubcommand,
 }
 
-/// Manages Rojo's Roblox Studio plugin.
+/// Manages Rojo+'s Roblox Studio plugin.
 #[derive(Debug, Parser)]
 pub enum PluginSubcommand {
     /// Install the plugin in Roblox Studio's plugins folder. If the plugin is
@@ -48,7 +50,7 @@ impl PluginSubcommand {
 
 fn initialize_plugin() -> anyhow::Result<ServeSession> {
     let plugin_snapshot: VfsSnapshot = bincode::deserialize(PLUGIN_BINCODE)
-        .expect("Rojo's plugin was not properly packed into Rojo's binary");
+        .expect("Rojo+'s plugin was not properly packed into Rojo+'s binary");
 
     let mut in_memory_fs = InMemoryFs::new();
     in_memory_fs.load_snapshot("/plugin", plugin_snapshot)?;
@@ -96,7 +98,20 @@ fn uninstall_plugin() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn plugin_initialize() {
-    let _ = initialize_plugin().unwrap();
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn plugin_initialize() {
+        let _ = initialize_plugin().unwrap();
+    }
+
+    #[test]
+    fn the_plugin_never_overwrites_upstream_rojo() {
+        assert_eq!(PLUGIN_FILE_NAME, "Rojo+.rbxm");
+        for upstream in ["Rojo.rbxm", "RojoManagedPlugin.rbxm"] {
+            assert_ne!(PLUGIN_FILE_NAME, upstream);
+        }
+    }
 }
