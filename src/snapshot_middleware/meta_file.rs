@@ -374,7 +374,7 @@ impl AdjacentMetadata {
         if let Some(old_inst) = snapshot.old_inst() {
             if let Some(source) = &old_inst.metadata().instigating_source {
                 let source = source.path();
-                if source != path {
+                if source != path && !snapshot.is_script_suffix_migration(&path) {
                     log::debug!(
                         "Instigating source for Instance is mismatched so its metadata is being skipped.\nPath: {}",
                         path.display()

@@ -92,7 +92,7 @@ pub fn syncback_instance(
         source_file(&old_inst),
     ) {
         if let Some(name) = source.file_name().and_then(|name| name.to_str()) {
-            if file_names::canonical_script_file_name(script, name)
+            if file_names::canonical_script_source_name(script, &source, project)
                 .is_some_and(|canonical| canonical != name)
             {
                 anyhow::bail!(
@@ -351,7 +351,7 @@ pub fn syncback_loop(
         let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if file_names::canonical_script_file_name(middleware, name)
+        if file_names::canonical_script_source_name(middleware, &source, project)
             .is_some_and(|canonical| canonical != name)
         {
             let mut current = old.id();
@@ -405,6 +405,10 @@ pub fn syncback_loop(
             }
         }
 
+        if snapshot.is_script_suffix_migration(&snapshot.path) {
+            let old_source = snapshot.old_inst().as_ref().and_then(source_file).unwrap();
+            snapshot.validate_script_migration(&old_source, &snapshot.path)?;
+        }
         if !is_valid_path(&ignore_patterns, project_path, &snapshot.path) {
             log::debug!("Skipping {inst_path} because its path matches ignore pattern");
             continue;

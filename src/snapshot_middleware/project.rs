@@ -696,9 +696,21 @@ fn project_node_property_syncback_path(
     new_inst: &Instance,
     node: &mut ProjectNode,
 ) -> bool {
-    let filtered_properties = snapshot
+    let mut filtered_properties = snapshot
         .get_path_filtered_properties(new_inst.referent())
         .unwrap();
+    // Fixed project paths cannot change suffix, so even the engine-default
+    // context must override the source file's implied execution context.
+    if new_inst.class.as_str() == "Script" {
+        let database = rbx_reflection_database::get().unwrap();
+        if let Some(context) = new_inst.properties.get(&"RunContext".into()).or_else(|| {
+            database.classes["Script"]
+                .default_properties
+                .get("RunContext")
+        }) {
+            filtered_properties.insert("RunContext".into(), context);
+        }
+    }
     project_node_property_syncback(snapshot, filtered_properties, new_inst, node)
 }
 

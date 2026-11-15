@@ -19,6 +19,7 @@ pub fn name_for_inst<'old>(
     middleware: Middleware,
     new_inst: &Instance,
     old_inst: Option<InstanceWithMeta<'old>>,
+    project: &crate::Project,
 ) -> anyhow::Result<Cow<'old, str>> {
     if let Some(old_inst) = old_inst {
         if let Some(source) = old_inst.metadata().relevant_paths.first() {
@@ -26,7 +27,8 @@ pub fn name_for_inst<'old>(
                 .file_name()
                 .and_then(|s| s.to_str())
                 .context("sources on the file system should be valid unicode and not be stubs")?;
-            Ok(canonical_script_file_name(middleware, name).unwrap_or(Cow::Borrowed(name)))
+            Ok(canonical_script_source_name(middleware, source, project)
+                .unwrap_or(Cow::Borrowed(name)))
         } else {
             // This is technically not /always/ true, but we want to avoid
             // running syncback on anything that has no instigating source
@@ -76,6 +78,39 @@ pub(super) fn canonical_script_file_name(
         .into_iter()
         .find_map(|suffix| base.strip_suffix(suffix))
         .unwrap_or(base);
+    let canonical = format!("{stem}{kind}.{extension}");
+    Some(if canonical == name {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(canonical)
+    })
+}
+
+/// Uses the forward rule's actual stem, so custom suffixes do not change names
+/// or collapse distinct script sources onto the same destination.
+pub(super) fn canonical_script_source_name<'a>(
+    middleware: Middleware,
+    source: &'a Path,
+    project: &crate::Project,
+) -> Option<Cow<'a, str>> {
+    if middleware.is_dir() {
+        return None;
+    }
+    let name = source.file_name()?.to_str()?;
+    let kind = script_kind_suffix(middleware)?;
+    let extension = source.extension()?.to_str()?;
+    if !matches!(extension, "lua" | "luau") {
+        return None;
+    }
+    let Some(rule) = project
+        .sync_rules
+        .iter()
+        .chain(crate::snapshot_middleware::default_sync_rules())
+        .find(|rule| rule.matches(source))
+    else {
+        return canonical_script_file_name(middleware, name);
+    };
+    let stem = rule.file_name_for_path(source).ok()?;
     let canonical = format!("{stem}{kind}.{extension}");
     Some(if canonical == name {
         Cow::Borrowed(name)

@@ -834,6 +834,233 @@ fn replacing_reference_attribute_ids_is_stable_on_the_first_export() {
     pretty_assertions::assert_eq!(sync(), first);
 }
 
+#[test]
+fn script_suffix_migration_review_regressions() {
+    use rbx_dom_weak::{types::Enum, InstanceBuilder};
+
+    let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+    for directories in [false, true] {
+        for extension in ["lua", "luau"] {
+            for case in [
+                "initializer",
+                "ignore_old",
+                "ignore_new",
+                "ignore_leaf_old",
+                "ignore_leaf_new",
+                "custom",
+                "adjacent",
+                "fixed",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let project = temp.path().join("project");
+                fs_err::create_dir_all(project.join("src/Boot")).unwrap();
+                let mut config = serde_json::json!({
+                    "name": "Migration",
+                    "syncbackRules": { "instancesAsDirectories": directories },
+                    "tree": { "$className": "Folder", "src": { "$path": "src" } }
+                });
+                let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));
+                let root = dom.root_ref();
+                let parent = if case == "fixed" {
+                    root
+                } else {
+                    dom.insert(root, InstanceBuilder::new("Folder").with_name("src"))
+                };
+                let mut expected = vec![("Boot", "Script", "return 2", Some("Legacy"))];
+                match case {
+                    "initializer" | "ignore_old" | "ignore_new" => {
+                        fs_err::write(
+                            project.join(format!("src/Boot/init.server.{extension}")),
+                            "return 1",
+                        )
+                        .unwrap();
+                        dom.insert(
+                            parent,
+                            InstanceBuilder::new("Script")
+                                .with_name("Boot")
+                                .with_property("Source", "return 2"),
+                        );
+                        if case.starts_with("ignore") {
+                            let kind = if case == "ignore_old" {
+                                "server"
+                            } else {
+                                "legacy"
+                            };
+                            config["syncbackRules"]["ignorePaths"] =
+                                serde_json::json!([format!("src/Boot/init.{kind}.{extension}")]);
+                        }
+                    }
+                    "ignore_leaf_old" | "ignore_leaf_new" => {
+                        fs_err::remove_dir(project.join("src/Boot")).unwrap();
+                        fs_err::write(
+                            project.join(format!("src/Boot.server.{extension}")),
+                            "return 1",
+                        )
+                        .unwrap();
+                        dom.insert(
+                            parent,
+                            InstanceBuilder::new("Script")
+                                .with_name("Boot")
+                                .with_property("Source", "return 2"),
+                        );
+                        let kind = if case == "ignore_leaf_old" {
+                            "server"
+                        } else {
+                            "legacy"
+                        };
+                        config["syncbackRules"]["ignorePaths"] =
+                            serde_json::json!([format!("src/Boot.{kind}.{extension}")]);
+                    }
+                    "custom" => {
+                        config["syncRules"] = serde_json::json!([{
+                            "pattern": format!("*.server.{extension}"),
+                            "use": "moduleScript", "suffix": format!(".{extension}")
+                        }]);
+                        expected = vec![
+                            ("Foo.server", "ModuleScript", "return 3", None),
+                            ("Foo", "ModuleScript", "return 4", None),
+                        ];
+                        for (name, _, source, _) in &expected {
+                            fs_err::write(
+                                project.join(format!("src/{name}.{extension}")),
+                                "return 1",
+                            )
+                            .unwrap();
+                            dom.insert(
+                                parent,
+                                InstanceBuilder::new("ModuleScript")
+                                    .with_name(*name)
+                                    .with_property("Source", *source),
+                            );
+                        }
+                    }
+                    "adjacent" => {
+                        fs_err::write(
+                            project.join(format!("src/Boot.server.{extension}")),
+                            "return 1",
+                        )
+                        .unwrap();
+                        fs_err::write(project.join("src/Boot.meta.json"),
+                            r#"{"name":"Actual","properties":{"RunContext":{"Enum":0},"Disabled":false}}"#).unwrap();
+                        expected = vec![("Actual", "Script", "return 2", Some("Client"))];
+                        dom.insert(
+                            parent,
+                            InstanceBuilder::new("Script")
+                                .with_name("Actual")
+                                .with_property("Source", "return 2")
+                                .with_property("Disabled", true)
+                                .with_property("RunContext", Enum::from_u32(contexts["Client"])),
+                        );
+                    }
+                    "fixed" => {
+                        let path = format!("src/Boot.server.{extension}");
+                        fs_err::write(project.join(&path), "return 1").unwrap();
+                        config["tree"] = serde_json::json!({
+                            "$className": "Folder", "Boot": { "$path": path }
+                        });
+                        dom.insert(
+                            parent,
+                            InstanceBuilder::new("Script")
+                                .with_name("Boot")
+                                .with_property("Source", "return 2"),
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                // The unused directory must not mask an adjacent script of the same name.
+                if matches!(case, "custom" | "adjacent" | "fixed") {
+                    fs_err::remove_dir(project.join("src/Boot")).unwrap();
+                }
+                let project_path = project.join("default.project.json");
+                fs_err::write(&project_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+                let input = temp.path().join("input.rbxm");
+                rbx_binary::to_writer(fs_err::File::create(&input).unwrap(), &dom, &[root])
+                    .unwrap();
+                let before = read_files(&project);
+                let sync = || {
+                    Command::new(ROJO_PATH)
+                        .args(["--color", "never", "syncback"])
+                        .arg(&project_path)
+                        .arg("--input")
+                        .arg(&input)
+                        .arg("--non-interactive")
+                        .output()
+                        .unwrap()
+                };
+                let output = sync();
+                if case.starts_with("ignore") {
+                    assert!(!output.status.success(), "{case} {output:?}");
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr).contains("ignore pattern"),
+                        "{output:?}"
+                    );
+                    assert_eq!(read_files(&project), before);
+                    continue;
+                }
+                assert!(
+                    output.status.success(),
+                    "{case} {directories} {extension} {output:?}"
+                );
+                let first = read_files(&project);
+                match case {
+                    "initializer" => {
+                        assert!(first.contains_key(&format!("src/Boot/init.legacy.{extension}")));
+                        assert!(!first.contains_key(&format!("src/Boot/init.server.{extension}")));
+                    }
+                    "custom" => {
+                        assert_eq!(first[&format!("src/Foo.server.{extension}")], "return 3");
+                        assert_eq!(first[&format!("src/Foo.{extension}")], "return 4");
+                    }
+                    "adjacent" if !directories => {
+                        let metadata: serde_json::Value =
+                            serde_json::from_str(&first["src/Boot.meta.json"]).unwrap();
+                        assert_eq!(metadata["name"], "Actual");
+                        assert_eq!(metadata["properties"]["Disabled"], true);
+                    }
+                    _ => {}
+                }
+                let rebuilt_path = temp.path().join("rebuilt.rbxm");
+                let output = Command::new(ROJO_PATH)
+                    .arg("build")
+                    .arg(&project_path)
+                    .arg("--output")
+                    .arg(&rebuilt_path)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{case} {output:?}");
+                let rebuilt =
+                    rbx_binary::from_reader(fs_err::File::open(rebuilt_path).unwrap()).unwrap();
+                for (name, class, source, context) in expected {
+                    let actual = rebuilt
+                        .descendants()
+                        .find(|instance| instance.name == name)
+                        .unwrap();
+                    assert_eq!(actual.class.as_str(), class, "{case}");
+                    assert_eq!(
+                        actual.properties.get(&ustr("Source")),
+                        Some(&Variant::String(source.into())),
+                        "{case}"
+                    );
+                    if let Some(context) = context {
+                        let value = actual
+                            .properties
+                            .get(&ustr("RunContext"))
+                            .cloned()
+                            .unwrap_or_else(|| Enum::from_u32(contexts["Legacy"]).into());
+                        assert_eq!(
+                            value,
+                            Variant::Enum(Enum::from_u32(contexts[context])),
+                            "{case}"
+                        );
+                    }
+                }
+                assert!(sync().status.success());
+                assert_eq!(read_files(&project), first, "{case}");
+            }
+        }
+    }
+}
+
 /// Opt-in validation against private place data, always using an isolated copy.
 #[test]
 #[ignore = "Requires ROJO_REAL_PROJECT, ROJO_REAL_PLACE, and ROJO_REAL_SCRIPT"]

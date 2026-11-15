@@ -547,6 +547,14 @@ pub fn syncback_dir_no_meta<'sync>(
         // name they would be written to rather than by their Instance name.
         let stems = unique_child_stems(snapshot.new_tree(), new_inst);
         let mut old_child_map = HashMap::new();
+        let mut old_name_counts = HashMap::new();
+        let mut old_name_paths = HashMap::new();
+        let mut new_name_counts = HashMap::new();
+        for child in new_inst.children() {
+            *new_name_counts
+                .entry(snapshot.get_new_instance(*child).unwrap().name.as_str())
+                .or_insert(0) += 1;
+        }
         let mut project_children = HashMap::new();
         if let Some(old_inst) = snapshot.old_inst() {
             for child in old_inst.children() {
@@ -567,7 +575,10 @@ pub fn syncback_dir_no_meta<'sync>(
                     .and_then(|path| path.file_name())
                     .and_then(|name| name.to_str());
                 if let Some(file_name) = file_name {
-                    old_child_map.insert(file_name.to_lowercase(), inst);
+                    *old_name_counts.entry(inst.name()).or_insert(0) += 1;
+                    let key = file_name.to_lowercase();
+                    old_name_paths.insert(inst.name(), key.clone());
+                    old_child_map.insert(key, inst);
                 }
             }
         }
@@ -588,8 +599,19 @@ pub fn syncback_dir_no_meta<'sync>(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .map(str::to_lowercase);
-            let old_child: Option<InstanceWithMeta> =
-                file_name.and_then(|name| old_child_map.remove(&name));
+            let old_child: Option<InstanceWithMeta> = file_name
+                .and_then(|name| old_child_map.remove(&name))
+                .or_else(|| {
+                    // Unique logical names can keep their custom physical stem
+                    // when a suffix changes. Duplicate names still use allocation.
+                    if old_name_counts.get(new_child.name.as_str()) != Some(&1)
+                        || new_name_counts.get(new_child.name.as_str()) != Some(&1)
+                    {
+                        return None;
+                    }
+                    let key = old_name_paths.get(new_child.name.as_str())?;
+                    old_child_map.remove(key)
+                });
             children.push(match old_child {
                 Some(old_child) => {
                     snapshot.with_stem(&snapshot.path, *new_child_ref, Some(old_child.id()), stem)

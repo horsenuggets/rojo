@@ -39,7 +39,10 @@ Making a new release? Simply add the new header with the version and date undern
   kinds when rebuilding exported files, including scripts with children. Normalize
   unchanged script filenames during full syncback without overwriting unmanaged files.
   Reject scoped two-way edits that require a filename change and direct them to full
-  syncback instead of saving a mismatched script kind.
+  syncback instead of saving a mismatched script kind. Preserve custom-rule stems,
+  adjacent metadata, and initializer source extensions during suffix migrations. Reject
+  migrations excluded by ignore paths, and retain explicit execution-context overrides
+  for fixed project paths.
 
 * Drop an obsolete metadata `id` immediately when a new `Rojo_Id` attribute replaces it,
   so exporting a place does not need a second syncback to remove the stale ID.

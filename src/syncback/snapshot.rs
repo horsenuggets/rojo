@@ -60,7 +60,12 @@ impl<'sync> SyncbackSnapshot<'sync> {
             middleware: None,
         };
         let middleware = get_best_middleware(&snapshot);
-        let name = name_for_inst(middleware, snapshot.new_inst(), snapshot.old_inst())?;
+        let name = name_for_inst(
+            middleware,
+            snapshot.new_inst(),
+            snapshot.old_inst(),
+            snapshot.project(),
+        )?;
         snapshot.path = self.path.join(name.as_ref());
 
         Ok(snapshot)
@@ -86,17 +91,18 @@ impl<'sync> SyncbackSnapshot<'sync> {
             path: PathBuf::new(),
             middleware: None,
         };
-        let old_name = snapshot
+        let old_source = snapshot
             .old_inst()
             .and_then(|old| old.metadata().relevant_paths.first())
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str());
-        let name = match old_name {
-            Some(name) => {
-                super::file_names::canonical_script_file_name(get_best_middleware(&snapshot), name)
-                    .map(|name| name.into_owned())
-                    .unwrap_or_else(|| name.to_owned())
-            }
+            .and_then(|path| Some((path, path.file_name()?.to_str()?)));
+        let name = match old_source {
+            Some((source, name)) => super::file_names::canonical_script_source_name(
+                get_best_middleware(&snapshot),
+                source,
+                snapshot.project(),
+            )
+            .map(|name| name.into_owned())
+            .unwrap_or_else(|| name.to_owned()),
             None => file_name_for_stem(get_best_middleware(&snapshot), stem),
         };
         snapshot.path = base_path.join(name);
@@ -152,7 +158,12 @@ impl<'sync> SyncbackSnapshot<'sync> {
             middleware: None,
         };
         let middleware = get_best_middleware(&snapshot);
-        let name = name_for_inst(middleware, snapshot.new_inst(), snapshot.old_inst())?;
+        let name = name_for_inst(
+            middleware,
+            snapshot.new_inst(),
+            snapshot.old_inst(),
+            snapshot.project(),
+        )?;
         snapshot.path = base_path.join(name.as_ref());
 
         Ok(snapshot)
@@ -246,6 +257,45 @@ impl<'sync> SyncbackSnapshot<'sync> {
             .expect("SyncbackSnapshot should not contain invalid referents")
     }
 
+    /// Identifies a tracked file rename without treating fixed project paths as movable.
+    pub fn is_script_suffix_migration(&self, path: &Path) -> bool {
+        self.old_inst().is_some_and(|old| {
+            let Some(crate::snapshot::InstigatingSource::Path(source)) =
+                &old.metadata().instigating_source
+            else {
+                return false;
+            };
+            source != path
+                && source.parent() == path.parent()
+                && super::file_names::canonical_script_source_name(
+                    get_best_middleware(self),
+                    source,
+                    self.project(),
+                )
+                .is_some_and(|name| {
+                    path.file_name().and_then(|name| name.to_str()) == Some(name.as_ref())
+                })
+        })
+    }
+
+    /// A filtered rename must not remove its source without installing its replacement.
+    pub fn validate_script_migration(&self, old: &Path, new: &Path) -> anyhow::Result<()> {
+        let patterns = self
+            .project()
+            .syncback_rules
+            .as_ref()
+            .map(super::SyncbackRules::compile_globs)
+            .transpose()?;
+        for path in [old, new] {
+            anyhow::ensure!(
+                super::is_valid_path(&patterns, self.project().folder_location(), path),
+                "Cannot migrate a script source because an ignore pattern excludes {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Refuses to install a renamed source over a file the old tree does not own.
     pub fn validate_script_destination(&self, path: &Path) -> anyhow::Result<()> {
         if self
@@ -277,12 +327,15 @@ impl<'sync> SyncbackSnapshot<'sync> {
                 .and_then(super::source_file)
                 .is_some_and(|source| source == path)
         });
-        anyhow::ensure!(
-            owned,
-            "Cannot write script source because an unmanaged file already exists at {}",
+        anyhow::bail!(
+            "Cannot write script source because {} already exists at {}",
+            if owned {
+                "another managed source"
+            } else {
+                "an unmanaged file"
+            },
             path.display()
-        );
-        Ok(())
+        )
     }
 
     /// Returns the root Project that was used to make this snapshot.
