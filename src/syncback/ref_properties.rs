@@ -166,6 +166,11 @@ fn write_id_attributes(
     dom: &mut WeakDom,
     ids_on_disk: &HashMap<Ref, String>,
 ) -> anyhow::Result<()> {
+    // Every ID already given out. A made-up ID can match one of these, like when
+    // a referenced instance is renamed and a new one takes its old name and ID.
+    let mut reserved = attribute_ids(dom);
+    reserved.extend(ids_on_disk.values().cloned());
+
     for referent in &links.need_rewrite {
         let inst = match dom.get_by_ref_mut(*referent) {
             Some(inst) => inst,
@@ -176,11 +181,18 @@ fn write_id_attributes(
         // The ID already on disk is kept instead whenever there is one.
         let id = match ids_on_disk.get(referent) {
             Some(id) => id.clone(),
-            None => match inst.properties.get(&ustr("UniqueId")) {
-                Some(Variant::UniqueId(id)) => *id,
-                _ => UniqueId::now().unwrap(),
+            None => {
+                let mut id = match inst.properties.get(&ustr("UniqueId")) {
+                    Some(Variant::UniqueId(id)) => *id,
+                    _ => UniqueId::now().unwrap(),
+                }
+                .to_string();
+                while reserved.contains(&id) {
+                    id = UniqueId::now().unwrap().to_string();
+                }
+                reserved.insert(id.clone());
+                id
             }
-            .to_string(),
         };
 
         let attributes = match inst.properties.get_mut(&ustr("Attributes")) {
@@ -509,6 +521,52 @@ mod test {
             attributes.get("Rojo_Target_PrimaryPart"),
             Some(&Variant::String("head-id".into()))
         );
+    }
+
+    #[test]
+    fn made_up_ids_never_collide_with_ids_from_disk() {
+        // On disk, Target got the ID made from its UniqueId. It was then renamed
+        // to Moved, and a new Target took its place.
+        let unique_id = UniqueId::now().unwrap();
+        let mut old = WeakDom::new(InstanceBuilder::new("DataModel"));
+        old.insert(
+            old.root_ref(),
+            with_id(
+                InstanceBuilder::new("Part").with_name("Target"),
+                &unique_id.to_string(),
+            ),
+        );
+
+        let mut new = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = new.root_ref();
+        let moved = new.insert(
+            root,
+            InstanceBuilder::new("Part")
+                .with_name("Moved")
+                .with_property("UniqueId", Variant::UniqueId(unique_id)),
+        );
+        let target = new.insert(root, InstanceBuilder::new("Part").with_name("Target"));
+        new.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("ToMoved")
+                .with_property("Value", Variant::Ref(moved)),
+        );
+        new.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("ToTarget")
+                .with_property("Value", Variant::Ref(target)),
+        );
+
+        let links = collect_referents(&new);
+        let ids = ids_on_disk(&new, &old);
+        link_referents(links, &mut new, &ids).unwrap();
+
+        let target_id = get_existing_id(new.get_by_ref(target).unwrap()).unwrap();
+        let moved_id = get_existing_id(new.get_by_ref(moved).unwrap()).unwrap();
+        assert_eq!(target_id, unique_id.to_string());
+        assert_ne!(moved_id, target_id);
     }
 
     #[test]
