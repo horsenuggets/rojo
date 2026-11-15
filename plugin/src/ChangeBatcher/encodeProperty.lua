@@ -8,6 +8,21 @@ local function isNonFinite(value)
 	return type(value) == "number" and (value ~= value or value == math.huge or value == -math.huge)
 end
 
+-- rbx_dom_lua stands in a large finite number for infinity in numbers,
+-- Vector2s, and Vector3s, but msgpack holds it exactly and the filesystem writes
+-- it in a tagged form, so those values are sent as they are.
+local function restoreNonFinite(value, encoded)
+	local ty = next(encoded)
+	if (ty == "Float32" or ty == "Float64") and isNonFinite(value) then
+		return { [ty] = value }
+	elseif ty == "Vector2" and (isNonFinite(value.X) or isNonFinite(value.Y)) then
+		return { Vector2 = { value.X, value.Y } }
+	elseif ty == "Vector3" and (isNonFinite(value.X) or isNonFinite(value.Y) or isNonFinite(value.Z)) then
+		return { Vector3 = { value.X, value.Y, value.Z } }
+	end
+	return encoded
+end
+
 return function(instance, propertyName, propertyDescriptor, instanceMap)
 	local readSuccess, readResult = propertyDescriptor:read(instance)
 
@@ -31,12 +46,12 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 		return true, { Ref = referentId }
 	end
 
-	-- Attributes the filesystem can't hold, like a Vector3 with a NaN component,
-	-- would otherwise be encoded and saved. The server keeps its own copies.
+	-- Attributes the filesystem doesn't hold, like `RBX` ones, would otherwise
+	-- be encoded and saved. The server keeps its own copies.
 	if dataType == "Attributes" and type(readResult) == "table" then
 		local managed = {}
 		for name, value in readResult do
-			if not unmanagedAttributes.isUnmanaged(name, value) then
+			if not unmanagedAttributes.isUnmanaged(name) then
 				managed[name] = value
 			end
 		end
@@ -55,16 +70,16 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 		return false, nil
 	end
 
-	-- rbx_dom_lua stands in a large finite number for infinity, but msgpack holds
-	-- it exactly and the filesystem writes it in a tagged form, so send it as is.
-	if (dataType == "Float32" or dataType == "Float64") and isNonFinite(readResult) then
-		encodeResult = { [dataType] = readResult }
-	elseif dataType == "Attributes" and type(readResult) == "table" then
+	if dataType == "Attributes" and type(readResult) == "table" then
+		local encodedAttributes = encodeResult.Attributes
 		for name, value in readResult do
-			if isNonFinite(value) then
-				encodeResult.Attributes[name] = { Float64 = value }
+			-- Attributes rbx_dom_lua couldn't encode were already warned about.
+			if encodedAttributes[name] ~= nil then
+				encodedAttributes[name] = restoreNonFinite(value, encodedAttributes[name])
 			end
 		end
+	else
+		encodeResult = restoreNonFinite(readResult, encodeResult)
 	end
 
 	return true, encodeResult
