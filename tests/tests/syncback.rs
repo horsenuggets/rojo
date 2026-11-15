@@ -167,7 +167,8 @@ fn inline_script_free_round_trip() {
     });
 }
 
-/// Reads every file under `dir` into a map from relative path to contents.
+/// Reads every file under `dir` into a map from relative path to contents. Paths
+/// always use `/`, so tests can name them the same way on every platform.
 fn read_files(dir: &Path) -> std::collections::BTreeMap<String, String> {
     walkdir::WalkDir::new(dir)
         .into_iter()
@@ -175,10 +176,12 @@ fn read_files(dir: &Path) -> std::collections::BTreeMap<String, String> {
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| {
             let path = entry.path().strip_prefix(dir).unwrap();
-            (
-                path.display().to_string(),
-                fs_err::read_to_string(entry.path()).unwrap(),
-            )
+            let key = path
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            (key, fs_err::read_to_string(entry.path()).unwrap())
         })
         .collect()
 }
@@ -246,6 +249,35 @@ fn syncing_back_again_only_changes_what_changed() {
             .with_name("Pointer")
             .with_property("Value", Variant::Ref(module)),
     );
+
+    // Same-named scripts written differently, as `Twin.luau` and `Twin~2/`, used
+    // to load back in reverse and trade IDs on every run.
+    let twin_file = place.insert(
+        storage,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Twin")
+            .with_property("Source", "return 1"),
+    );
+    let twin_dir = place.insert(
+        storage,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Twin")
+            .with_property("Source", "return 2"),
+    );
+    place.insert(
+        twin_dir,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Child")
+            .with_property("Source", "return 3"),
+    );
+    for (name, target) in [("ToFirstTwin", twin_file), ("ToSecondTwin", twin_dir)] {
+        place.insert(
+            storage,
+            rbx_dom_weak::InstanceBuilder::new("ObjectValue")
+                .with_name(name)
+                .with_property("Value", Variant::Ref(target)),
+        );
+    }
     let input = dir.path().join("place.rbxl");
     let sync = |place: &WeakDom| {
         let file = std::io::BufWriter::new(fs_err::File::create(&input).unwrap());
