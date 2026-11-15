@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Report the actual listening port when `serve` or Studio syncback uses `--port 0`,
+  and use OS-assigned ports in live server tests to avoid socket collisions.
 * Write whole floating-point JSON values without `.0`, and round values within
   `0.000001` of an integer (including zero) when writing metadata, projects, and JSON
   models. Two-way sync acknowledges normalized values so repeated edits stay stable.

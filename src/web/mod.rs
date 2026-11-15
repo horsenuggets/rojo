@@ -45,9 +45,20 @@ impl LiveServer {
         self,
         address: SocketAddr,
         allowed_hosts: Vec<String>,
-        on_listening: impl FnOnce(),
+        on_listening: impl FnOnce(SocketAddr),
     ) -> anyhow::Result<()> {
         let serve_session = Arc::clone(&self.serve_session);
+        let rt = Runtime::new().context("Failed to start the async runtime for the web server")?;
+        let _guard = rt.enter();
+        let builder = Server::try_bind(&address).with_context(|| {
+            format!(
+                "Could not start the Rojo+ server on {address}.\n\
+                 The address may already be in use or reserved. Another Rojo+ server might already \
+                 be running, or another program may be using that port.\n\
+                 You can pick a different port with the --port option."
+            )
+        })?;
+        let address = builder.local_addr();
         let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &allowed_hosts);
 
         let make_service = make_service_fn(move |conn: &AddrStream| {
@@ -81,21 +92,10 @@ impl LiveServer {
             }
         });
 
-        let rt = Runtime::new().context("Failed to start the async runtime for the web server")?;
-        let _guard = rt.enter();
-        let server = Server::try_bind(&address)
-            .with_context(|| {
-                format!(
-                    "Could not start the Rojo+ server on {address}.\n\
-                     The address may already be in use or reserved. Another Rojo+ server might already \
-                     be running, or another program may be using that port.\n\
-                     You can pick a different port with the --port option."
-                )
-            })?
-            .serve(make_service);
+        let server = builder.serve(make_service);
 
-        // Binding succeeded, so it's now safe to tell the user we're listening.
-        on_listening();
+        // Report the actual address, including the OS-selected port for port zero.
+        on_listening(address);
 
         rt.block_on(server)
             .context("The Rojo+ web server encountered a fatal error")?;

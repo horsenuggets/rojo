@@ -1,8 +1,9 @@
 use std::{
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
+    process::{Command, Stdio},
+    sync::mpsc,
     thread,
     time::Duration,
 };
@@ -100,22 +101,25 @@ impl TestServeSession {
         #[cfg(target_os = "macos")]
         std::thread::sleep(Duration::from_millis(100));
 
-        let port = get_port_number();
-        let port_string = port.to_string();
-
-        let rojo_process = Command::new(ROJO_PATH)
-            .args([
-                "serve",
-                project_path.to_str().unwrap(),
-                "--port",
-                port_string.as_str(),
-            ])
-            .current_dir(working_dir)
-            .spawn()
-            .expect("Couldn't start Rojo");
+        let mut rojo_process = KillOnDrop(
+            Command::new(ROJO_PATH)
+                .args([
+                    "--color",
+                    "never",
+                    "serve",
+                    project_path.to_str().unwrap(),
+                    "--port",
+                    "0",
+                ])
+                .current_dir(working_dir)
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("Couldn't start Rojo"),
+        );
+        let port = read_server_port(rojo_process.0.stdout.take().unwrap(), "Port:");
 
         TestServeSession {
-            rojo_process: KillOnDrop(rojo_process),
+            rojo_process,
             _dir: dir,
             port,
             project_path,
@@ -320,16 +324,43 @@ pub fn deserialize_msgpack<'a, T: Deserialize<'a>>(
     T::deserialize(&mut deserializer)
 }
 
-/// Probably-okay way to generate random enough port numbers for running the
-/// Rojo live server.
-///
-/// If this method ends up having problems, we should add an option for Rojo to
-/// use a random port chosen by the operating system and figure out a good way
-/// to get that port back to the test CLI.
-pub fn get_port_number() -> usize {
-    static NEXT_PORT_NUMBER: AtomicUsize = AtomicUsize::new(35103);
+/// Reads the bound port from a child started with `--port 0`. The child retains
+/// its listener throughout startup, avoiding any probe-and-release port race.
+pub fn read_server_port(output: impl Read + Send + 'static, prefix: &'static str) -> usize {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            if let Some(port) = line.trim().strip_prefix(prefix) {
+                if let Ok(port) = port.trim().trim_end_matches('.').parse::<u16>() {
+                    let _ = sender.send(usize::from(port));
+                }
+            }
+            // Drain the remaining output so the child never blocks on a full pipe.
+            eprintln!("{line}");
+        }
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("Server did not report its bound port")
+}
 
-    NEXT_PORT_NUMBER.fetch_add(1, Ordering::SeqCst)
+#[test]
+fn startup_ports_are_read_from_actual_listening_messages() {
+    assert_eq!(
+        read_server_port(
+            std::io::Cursor::new("Starting\n  Port:    12345\nReady\n"),
+            "Port:"
+        ),
+        12345
+    );
+    assert_eq!(
+        read_server_port(
+            std::io::Cursor::new("Waiting for Studio on localhost:23456.\n"),
+            "Waiting for Studio on localhost:"
+        ),
+        23456
+    );
 }
 
 /// Takes a SerializeResponse and creates an XML model out of the response.
