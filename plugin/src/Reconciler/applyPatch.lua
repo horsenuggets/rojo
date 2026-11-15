@@ -28,32 +28,6 @@ local function applyPatch(instanceMap, patch)
 	-- to ensure that referents can be mapped to instances correctly.
 	local deferredRefs = {}
 
-	for _, removedIdOrInstance in ipairs(patch.removed) do
-		local removeInstanceSuccess = pcall(function()
-			local instance = if Types.RbxId(removedIdOrInstance)
-				then instanceMap.fromIds[removedIdOrInstance]
-				else removedIdOrInstance
-
-			-- Removals from the server pass through here without diffing, so
-			-- engine-owned instances and the current camera are protected here
-			-- too. Rojo just stops tracking them.
-			if instance ~= nil and services.isProtected(instance) then
-				Log.debug("Not removing protected instance {}", instance:GetFullName())
-				instanceMap:removeInstance(instance)
-				for _, descendant in instance:GetDescendants() do
-					instanceMap:removeInstance(descendant)
-				end
-			elseif Types.RbxId(removedIdOrInstance) then
-				instanceMap:destroyId(removedIdOrInstance)
-			else
-				instanceMap:destroyInstance(removedIdOrInstance)
-			end
-		end)
-		if not removeInstanceSuccess then
-			table.insert(unappliedPatch.removed, removedIdOrInstance)
-		end
-	end
-
 	for id, virtualInstance in pairs(patch.added) do
 		if instanceMap.fromIds[id] ~= nil then
 			-- This instance already exists. We might've already added it in a
@@ -100,7 +74,7 @@ local function applyPatch(instanceMap, patch)
 
 		if instance == nil then
 			-- We can't update an instance that doesn't exist.
-			table.insert(unappliedPatch.updated, update)
+			table.insert(unappliedPatch.updated, table.clone(update))
 			continue
 		end
 
@@ -121,7 +95,7 @@ local function applyPatch(instanceMap, patch)
 		-- Changing the class recreates the instance and unparents the original,
 		-- which must never happen to engine-owned instances or the camera.
 		if update.changedClassName ~= nil and services.isProtected(instance) then
-			table.insert(unappliedPatch.updated, update)
+			table.insert(unappliedPatch.updated, table.clone(update))
 			continue
 		end
 
@@ -167,7 +141,7 @@ local function applyPatch(instanceMap, patch)
 			-- critical. If the instance wasn't recreated or has the wrong Name,
 			-- we'll consider our attempt a failure.
 			if instance == newInstance or newInstance.Name ~= newName then
-				table.insert(unappliedPatch.updated, update)
+				table.insert(unappliedPatch.updated, table.clone(update))
 				continue
 			end
 
@@ -184,7 +158,13 @@ local function applyPatch(instanceMap, patch)
 			-- TODO: If this fails part way through, should we move everything
 			-- back? For now, we assume that moving things will not fail.
 			for _, child in ipairs(instance:GetChildren()) do
+				instanceMap:pauseInstance(child)
 				child.Parent = newInstance
+				-- A later rejected move must restore the replacement, not the detached parent.
+				if instanceMap.fromInstances[child] ~= nil then
+					instanceMap.knownParents[child] = newInstance
+					instanceMap.observedParents[child] = newInstance
+				end
 			end
 
 			-- See you later, original instance.
@@ -255,6 +235,86 @@ local function applyPatch(instanceMap, patch)
 
 		if partiallyApplied then
 			table.insert(unappliedPatch.updated, unappliedUpdate)
+		end
+	end
+
+	-- Apply moves after additions and class changes so every destination resolves to
+	-- its final identity. Retry temporary cycles after other moves break the ancestry.
+	local pendingMoves = {}
+	for _, update in patch.updated do
+		if update.changedParent ~= nil and instanceMap.fromIds[update.id] ~= nil then
+			table.insert(pendingMoves, update)
+		end
+	end
+	while #pendingMoves > 0 do
+		local remaining = {}
+		for _, update in pendingMoves do
+			local instance = instanceMap.fromIds[update.id]
+			local parent = instanceMap.fromIds[update.changedParent]
+			local success = false
+			if parent ~= nil and not services.isProtected(instance) then
+				instanceMap:pauseInstance(instance)
+				success = pcall(function()
+					instance.Parent = parent
+				end)
+				if success then
+					instanceMap.knownParents[instance] = parent
+					local unappliedUpdate = PatchSet.getUpdateForId(unappliedPatch, update.id)
+					if unappliedUpdate ~= nil then
+						unappliedUpdate.changedParent = nil
+					end
+				end
+			end
+			if not success then
+				table.insert(remaining, update)
+			end
+		end
+		if #remaining == #pendingMoves then
+			for _, update in remaining do
+				local unappliedUpdate = PatchSet.getUpdateForId(unappliedPatch, update.id)
+				if unappliedUpdate == nil then
+					unappliedUpdate = { id = update.id, changedProperties = {} }
+					table.insert(unappliedPatch.updated, unappliedUpdate)
+				end
+				unappliedUpdate.changedParent = update.changedParent
+			end
+			break
+		end
+		pendingMoves = remaining
+	end
+
+	-- A retained child must escape its old ancestor before that ancestor is removed.
+	for _, removedIdOrInstance in ipairs(patch.removed) do
+		local removeInstanceSuccess = pcall(function()
+			local instance = if Types.RbxId(removedIdOrInstance)
+				then instanceMap.fromIds[removedIdOrInstance]
+				else removedIdOrInstance
+
+			for _, update in unappliedPatch.updated do
+				local failedInstance = instanceMap.fromIds[update.id]
+				if update.changedParent ~= nil and instance ~= nil and failedInstance ~= nil then
+					if failedInstance == instance or failedInstance:IsDescendantOf(instance) then
+						table.insert(unappliedPatch.removed, removedIdOrInstance)
+						return
+					end
+				end
+			end
+
+			-- Engine-owned instances and the camera are only untracked, not removed.
+			if instance ~= nil and services.isProtected(instance) then
+				Log.debug("Not removing protected instance {}", instance:GetFullName())
+				instanceMap:removeInstance(instance)
+				for _, descendant in instance:GetDescendants() do
+					instanceMap:removeInstance(descendant)
+				end
+			elseif Types.RbxId(removedIdOrInstance) then
+				instanceMap:destroyId(removedIdOrInstance)
+			else
+				instanceMap:destroyInstance(removedIdOrInstance)
+			end
+		end)
+		if not removeInstanceSuccess then
+			table.insert(unappliedPatch.removed, removedIdOrInstance)
 		end
 	end
 

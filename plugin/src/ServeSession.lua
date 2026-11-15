@@ -678,8 +678,24 @@ function ServeSession:__initialSync(serverInfo)
 					continue
 				end
 
-				local update = encodePatchUpdate(instance, change.id, change.changedProperties)
-				table.insert(inversePatch.updated, update)
+				local properties = table.clone(change.changedProperties)
+				if change.changedName ~= nil then
+					properties.Name = true
+				end
+				if change.changedParent ~= nil then
+					if instance.Parent == nil then
+						table.insert(inversePatch.removed, change.id)
+						continue
+					end
+					if self.__instanceMap.fromInstances[instance.Parent] == nil then
+						return Promise.reject("Cannot reject a parent change to an unmanaged Studio parent")
+					end
+					properties.Parent = true
+				end
+				local update = encodePatchUpdate(instance, change.id, properties, self.__instanceMap)
+				if update ~= nil then
+					table.insert(inversePatch.updated, update)
+				end
 			end
 			-- Add the removed instances back to Rojo
 			-- selene:allow(empty_if, unused_variable, empty_loop)

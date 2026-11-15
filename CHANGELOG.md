@@ -31,6 +31,17 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Persist two-way sync renames and parent changes for filesystem-backed instances as
+  recoverable, no-clobber relocations. Directory moves preserve unmanaged contents, file
+  moves include existing metadata sidecars, and moved instances keep their IDs and path
+  indexes. Validate batch parent graphs before applying moves, respect the selected
+  conflict authority, and recover interrupted relocations before loading a serve session.
+  Moving a child into a managed file-backed script promotes the parent to a directory
+  with its original initializer kind and `.lua` or `.luau` extension. Parent and child
+  metadata sidecars and unmanaged child files survive promotion, and empty promoted
+  parents stay directories. Promotions stage their output and originals in recoverable
+  journals before installation. Project-defined, aliased, custom-mapped, model, and
+  inline cross-owner moves are rejected without overwriting destination files.
 * Add a UI Labs storybook for the plugin. Serve `storybook.project.json`, connect, and
   open UI Labs to preview the plugin's buttons, inputs, checkboxes, dropdowns, tags,
   header, spinner, and its connecting, error, not connected, and settings pages one at a

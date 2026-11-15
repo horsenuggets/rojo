@@ -232,6 +232,7 @@ fn compute_property_patches(
         id: instance.id(),
         changed_name,
         changed_class_name,
+        changed_parent: None,
         changed_properties,
         changed_metadata,
     });
@@ -455,6 +456,7 @@ mod test {
                 id: root_id,
                 changed_name: None,
                 changed_class_name: None,
+                changed_parent: None,
                 changed_properties: UstrMap::from_iter([(
                     ustr("Self"),
                     Some(Variant::Ref(root_id)),

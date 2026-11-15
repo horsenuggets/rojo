@@ -14,6 +14,8 @@ return function(instance, instanceId, properties, instanceMap)
 	for propertyName in properties do
 		if propertyName == "Name" then
 			update.changedName = instance.Name
+		elseif propertyName == "Parent" then
+			update.changedParent = instanceMap.fromInstances[instance.Parent]
 		else
 			local descriptor = RbxDom.findCanonicalPropertyDescriptor(instance.ClassName, propertyName)
 
@@ -46,7 +48,7 @@ return function(instance, instanceId, properties, instanceMap)
 		end
 	end
 
-	if next(update.changedProperties) == nil and update.changedName == nil then
+	if next(update.changedProperties) == nil and update.changedName == nil and update.changedParent == nil then
 		return nil
 	end
 

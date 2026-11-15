@@ -7,10 +7,305 @@ use tempfile::tempdir;
 
 use crate::rojo_test::{
     internable::InternAndRedact,
-    serve_util::{deserialize_msgpack, run_serve_test, serialize_to_xml_model},
+    serve_util::{deserialize_msgpack, run_serve_test, serialize_msgpack, serialize_to_xml_model},
 };
 
 use librojo::web_api::{SerializeResponse, SocketPacketType};
+
+#[test]
+fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {
+    use librojo::web_api::{
+        InstanceUpdate, SocketPacketBody, WriteAuthority, WriteRequest, WriteResponse,
+    };
+    use rbx_dom_weak::{types::Variant, UstrMap};
+    use std::{
+        collections::HashMap,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    run_serve_test("scripts", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let root = info.root_instance_id;
+        let initial = session.get_api_read(root).unwrap();
+        let source = initial
+            .instances
+            .values()
+            .find(|instance| instance.name == "foo")
+            .expect("The fixture must contain foo")
+            .id;
+        fs::create_dir(session.path().join("src/Destination")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (destination, cursor) = loop {
+            let response = session.get_api_read(root).unwrap();
+            if let Some(instance) = response
+                .instances
+                .values()
+                .find(|instance| instance.name == "Destination")
+            {
+                break (instance.id, response.message_cursor);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "The watcher did not observe Destination"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let request = WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(cursor),
+            authority: WriteAuthority::Studio,
+            removed: Vec::new(),
+            added: HashMap::new(),
+            updated: vec![InstanceUpdate {
+                id: source,
+                changed_parent: Some(destination),
+                changed_name: Some("Moved".into()),
+                changed_class_name: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::default(),
+            }],
+        };
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://localhost:{}/api/write", session.port()))
+            .header("content-type", "application/msgpack")
+            .body(serialize_msgpack(&request).unwrap())
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let response: WriteResponse = deserialize_msgpack(&response).unwrap();
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(
+            response.conflicts.updated_instances.is_empty(),
+            "{:?}",
+            response.conflicts
+        );
+        assert!(!session.path().join("src/foo.lua").exists());
+        let new_path = session.path().join("src/Destination/Moved.lua");
+        assert!(new_path.is_file());
+
+        // Reading the socket confirms structural changes are updates, not replacements.
+        let packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, cursor)
+            .unwrap();
+        let SocketPacketBody::Messages(body) = packet.body;
+        assert!(body.messages.iter().all(|message| {
+            !message.removed.contains(&source) && !message.added.contains_key(&source)
+        }));
+        let moved = session.get_api_read(root).unwrap();
+        assert_eq!(moved.instances[&source].parent, destination);
+        assert_eq!(moved.instances[&source].name, "Moved");
+
+        // A subsequent real disk edit must reach the same managed instance, including
+        // when the OS reports the earlier relocation notifications late.
+        fs::write(&new_path, "return 739\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = session.get_api_read(root).unwrap();
+            let instance = response
+                .instances
+                .get(&source)
+                .expect("A filesystem echo must not replace the moved instance");
+            assert_eq!(instance.parent, destination);
+            if instance.properties.get(&"Source".into())
+                .is_some_and(|value| matches!(value.as_ref(), Variant::String(source) if source == "return 739\n")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "The moved source did not receive its disk edit"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
+
+#[test]
+fn studio_move_promotes_script_parent_through_real_watcher_events() {
+    use librojo::web_api::{InstanceUpdate, WriteAuthority, WriteRequest, WriteResponse};
+    use rbx_dom_weak::{types::Variant, UstrMap};
+    use std::{
+        collections::HashMap,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    run_serve_test("scripts", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let root = info.root_instance_id;
+        let initial = session.get_api_read(root).unwrap();
+        let child = initial
+            .instances
+            .values()
+            .find(|instance| instance.name == "foo")
+            .unwrap()
+            .id;
+        let parent = initial
+            .instances
+            .values()
+            .find(|instance| instance.name == "bar")
+            .unwrap()
+            .id;
+        let parent_bytes = fs::read(session.path().join("src/bar.server.lua")).unwrap();
+        let request = WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(initial.message_cursor),
+            authority: WriteAuthority::Studio,
+            removed: Vec::new(),
+            added: HashMap::new(),
+            updated: vec![InstanceUpdate {
+                id: child,
+                changed_parent: Some(parent),
+                changed_name: Some("Nested".into()),
+                changed_class_name: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::default(),
+            }],
+        };
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://localhost:{}/api/write", session.port()))
+            .header("content-type", "application/msgpack")
+            .body(serialize_msgpack(&request).unwrap())
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let response: WriteResponse = deserialize_msgpack(&response).unwrap();
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(
+            response.conflicts.updated_instances.is_empty(),
+            "{:?}",
+            response.conflicts
+        );
+        assert!(!session.path().join("src/bar.server.lua").exists());
+        assert!(!session.path().join("src/foo.lua").exists());
+        let initializer = session.path().join("src/bar/init.server.lua");
+        let nested = session.path().join("src/bar/Nested.lua");
+        assert_eq!(fs::read(&initializer).unwrap(), parent_bytes);
+        assert!(nested.is_file());
+        fs::write(&initializer, "print('promoted parent')\n").unwrap();
+        fs::write(&nested, "return 'promoted child'\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = session.get_api_read(root).unwrap();
+            let parent_instance = response
+                .instances
+                .get(&parent)
+                .expect("Promotion must retain the parent ID");
+            let child_instance = response
+                .instances
+                .get(&child)
+                .expect("Promotion must retain the child ID");
+            assert_eq!(child_instance.parent, parent);
+            assert_eq!(child_instance.name, "Nested");
+            let parent_updated = parent_instance.properties.get(&"Source".into()).is_some_and(|value| matches!(value.as_ref(), Variant::String(source) if source == "print('promoted parent')\n"));
+            let child_updated = child_instance.properties.get(&"Source".into()).is_some_and(|value| matches!(value.as_ref(), Variant::String(source) if source == "return 'promoted child'\n"));
+            if parent_updated && child_updated {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Promoted instances did not receive later disk edits"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
+
+#[test]
+fn studio_move_cannot_overwrite_an_occupied_destination() {
+    use librojo::web_api::{InstanceUpdate, WriteAuthority, WriteRequest, WriteResponse};
+    use rbx_dom_weak::UstrMap;
+    use std::{
+        collections::HashMap,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    run_serve_test("scripts", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let root = info.root_instance_id;
+        let initial = session.get_api_read(root).unwrap();
+        let source = initial
+            .instances
+            .values()
+            .find(|instance| instance.name == "foo")
+            .unwrap()
+            .id;
+        let original = fs::read(session.path().join("src/foo.lua")).unwrap();
+        fs::create_dir(session.path().join("src/Destination")).unwrap();
+        fs::write(
+            session.path().join("src/Destination/foo.lua"),
+            "return 'occupied'\n",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (destination, cursor) =
+            loop {
+                let response = session.get_api_read(root).unwrap();
+                if let Some(instance) = response.instances.values().find(|instance| {
+                    instance.name == "Destination" && !instance.children.is_empty()
+                }) {
+                    break (instance.id, response.message_cursor);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "The watcher did not observe the occupied destination"
+                );
+                thread::sleep(Duration::from_millis(20));
+            };
+        let request = WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(cursor),
+            authority: WriteAuthority::Studio,
+            removed: Vec::new(),
+            added: HashMap::new(),
+            updated: vec![InstanceUpdate {
+                id: source,
+                changed_parent: Some(destination),
+                changed_name: None,
+                changed_class_name: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::default(),
+            }],
+        };
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://localhost:{}/api/write", session.port()))
+            .header("content-type", "application/msgpack")
+            .body(serialize_msgpack(&request).unwrap())
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let response: WriteResponse = deserialize_msgpack(&response).unwrap();
+        assert!(!response.errors.is_empty());
+        assert!(response.accepted.updated_instances.is_empty());
+        assert!(response
+            .conflicts
+            .updated_instances
+            .iter()
+            .any(|update| update.id == source && update.changed_parent == Some(root)));
+        assert_eq!(
+            fs::read(session.path().join("src/foo.lua")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read_to_string(session.path().join("src/Destination/foo.lua")).unwrap(),
+            "return 'occupied'\n"
+        );
+        assert_eq!(
+            session.get_api_read(root).unwrap().instances[&source].parent,
+            root
+        );
+    });
+}
 
 #[test]
 fn rejects_dns_rebinding_requests() {

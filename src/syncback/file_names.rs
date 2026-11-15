@@ -134,6 +134,9 @@ const FORBIDDEN_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '|', '?', '*', '\\'
 pub fn validate_file_name<S: AsRef<str>>(name: S) -> anyhow::Result<()> {
     let str = name.as_ref();
 
+    if str.is_empty() {
+        anyhow::bail!("file names cannot be empty")
+    }
     if str.ends_with(' ') {
         anyhow::bail!("file names cannot end with a space")
     }
@@ -149,8 +152,9 @@ pub fn validate_file_name<S: AsRef<str>>(name: S) -> anyhow::Result<()> {
         }
     }
 
+    let stem = str.split('.').next().unwrap();
     for forbidden in INVALID_WINDOWS_NAMES {
-        if str == forbidden {
+        if stem.eq_ignore_ascii_case(forbidden) {
             anyhow::bail!("files cannot be named {str}")
         }
     }
@@ -424,6 +428,23 @@ mod test {
             stems_for(&[("A~2", "Part"), ("A", "Part"), ("A", "Part")]),
             ["A~2", "A", "A~3"]
         );
+    }
+
+    #[test]
+    fn validation_rejects_empty_and_case_insensitive_reserved_device_names() {
+        assert!(validate_file_name("").is_err());
+        for reserved in INVALID_WINDOWS_NAMES {
+            for name in [
+                reserved.to_owned(),
+                reserved.to_lowercase(),
+                format!("{reserved}.txt"),
+            ] {
+                assert!(validate_file_name(&name).is_err(), "{name:?}");
+            }
+        }
+        for name in ["Console", "auxiliary", "com10", "hello.world"] {
+            assert!(validate_file_name(name).is_ok(), "{name:?}");
+        }
     }
 
     #[test]

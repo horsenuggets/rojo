@@ -6,6 +6,180 @@ return function()
 
 	local container = Instance.new("Folder")
 
+	it("should restore children to a replaced authoritative parent after an unmanaged move", function()
+		local createPatchSet = require(script.Parent.Parent.ChangeBatcher.createPatchSet)
+		local instanceMap = InstanceMap.new()
+		local root = Instance.new("Folder")
+		local original = Instance.new("Folder")
+		original.Name = "Parent"
+		original.Parent = root
+		local child = Instance.new("Folder")
+		child.Parent = original
+		local unmanaged = Instance.new("Folder")
+		instanceMap:insert("ROOT", root)
+		instanceMap:insert("PARENT", original)
+		instanceMap:insert("CHILD", child)
+		local patch = PatchSet.newEmpty()
+		patch.updated = {
+			{ id = "PARENT", changedClassName = "ModuleScript", changedProperties = {} },
+		}
+		assert(PatchSet.isEmpty(applyPatch(instanceMap, patch)))
+		local replacement = instanceMap.fromIds.PARENT
+		expect(replacement == original).to.equal(false)
+		expect(child.Parent).to.equal(replacement)
+		expect(instanceMap.knownParents[child]).to.equal(replacement)
+		instanceMap:unpauseAllInstances()
+		child.Parent = unmanaged
+		local rejected = createPatchSet(instanceMap, { [child] = { Parent = true } })
+		expect(PatchSet.isEmpty(rejected)).to.equal(true)
+		expect(child.Parent).to.equal(replacement)
+		expect(instanceMap.fromIds.CHILD).to.equal(child)
+		instanceMap:stop()
+		root:Destroy()
+		original:Destroy()
+		unmanaged:Destroy()
+	end)
+
+	it("should move the same instance with its children and references intact", function()
+		local instanceMap = InstanceMap.new()
+		local source = Instance.new("Folder")
+		local destination = Instance.new("Folder")
+		local part = Instance.new("Part")
+		part.Parent = source
+		local child = Instance.new("Folder")
+		child.Parent = part
+		local reference = Instance.new("ObjectValue")
+		reference.Value = part
+		instanceMap:insert("PART", part)
+		instanceMap:insert("DESTINATION", destination)
+		local patch = PatchSet.newEmpty()
+		patch.updated = {
+			{
+				id = "PART",
+				changedParent = "DESTINATION",
+				changedName = "Moved",
+				changedProperties = {
+					Transparency = { Float32 = 0.5 },
+				},
+			},
+		}
+		local unapplied = applyPatch(instanceMap, patch)
+		expect(PatchSet.isEmpty(unapplied)).to.equal(true)
+		expect(instanceMap.fromIds.PART).to.equal(part)
+		expect(part.Parent).to.equal(destination)
+		expect(part.Name).to.equal("Moved")
+		expect(part.Transparency).to.equal(0.5)
+		expect(child.Parent).to.equal(part)
+		expect(reference.Value).to.equal(part)
+		expect(instanceMap.knownParents[part]).to.equal(destination)
+		instanceMap:stop()
+		source:Destroy()
+		destination:Destroy()
+		reference:Destroy()
+	end)
+
+	it("should preserve only unapplied structural changes for missing and cyclic destinations", function()
+		for _, destinationId in { "MISSING", "CHILD", "PART" } do
+			local instanceMap = InstanceMap.new()
+			local source = Instance.new("Folder")
+			local part = Instance.new("Part")
+			part.Parent = source
+			local child = Instance.new("Folder")
+			child.Parent = part
+			instanceMap:insert("PART", part)
+			instanceMap:insert("CHILD", child)
+			local patch = PatchSet.newEmpty()
+			patch.updated = {
+				{ id = "PART", changedParent = destinationId, changedName = "Kept", changedProperties = {} },
+			}
+			local unapplied = applyPatch(instanceMap, patch)
+			expect(#unapplied.updated).to.equal(1)
+			expect(unapplied.updated[1].changedParent).to.equal(destinationId)
+			expect(unapplied.updated[1].changedName).to.equal(nil)
+			expect(instanceMap.fromIds.PART).to.equal(part)
+			expect(part.Parent).to.equal(source)
+			expect(part.Name).to.equal("Kept")
+			instanceMap:stop()
+			source:Destroy()
+		end
+	end)
+
+	it("should move known children into newly added parents without recreating them", function()
+		local instanceMap = InstanceMap.new()
+		local root = Instance.new("Folder")
+		local child = Instance.new("Folder")
+		child.Parent = root
+		instanceMap:insert("ROOT", root)
+		instanceMap:insert("CHILD", child)
+		local patch = PatchSet.newEmpty()
+		patch.added.NEW = {
+			Id = "NEW",
+			Parent = "ROOT",
+			Name = "New",
+			ClassName = "Folder",
+			Properties = {},
+			Children = { "CHILD" },
+		}
+		patch.updated = { { id = "CHILD", changedParent = "NEW", changedProperties = {} } }
+		expect(PatchSet.isEmpty(applyPatch(instanceMap, patch))).to.equal(true)
+		expect(instanceMap.fromIds.CHILD).to.equal(child)
+		expect(child.Parent).to.equal(instanceMap.fromIds.NEW)
+		instanceMap:stop()
+		root:Destroy()
+	end)
+
+	it("should move retained descendants before removing their old ancestor", function()
+		for _, destinationId in { "DESTINATION", "MISSING" } do
+			local instanceMap = InstanceMap.new()
+			local oldParent = Instance.new("Folder")
+			local destination = Instance.new("Folder")
+			local child = Instance.new("Folder")
+			child.Parent = oldParent
+			instanceMap:insert("OLD", oldParent)
+			instanceMap:insert("DESTINATION", destination)
+			instanceMap:insert("CHILD", child)
+			local patch = PatchSet.newEmpty()
+			patch.removed = { "OLD" }
+			patch.updated = { { id = "CHILD", changedParent = destinationId, changedProperties = {} } }
+			local unapplied = applyPatch(instanceMap, patch)
+			expect(instanceMap.fromIds.CHILD).to.equal(child)
+			if destinationId == "DESTINATION" then
+				expect(child.Parent).to.equal(destination)
+				expect(instanceMap.fromIds.OLD).to.equal(nil)
+				expect(PatchSet.isEmpty(unapplied)).to.equal(true)
+			else
+				expect(child.Parent).to.equal(oldParent)
+				expect(instanceMap.fromIds.OLD).to.equal(oldParent)
+				expect(unapplied.removed[1]).to.equal("OLD")
+			end
+			instanceMap:stop()
+			oldParent:Destroy()
+			destination:Destroy()
+		end
+	end)
+
+	it("should retry ancestry inversions after their destination moves out", function()
+		local instanceMap = InstanceMap.new()
+		local root = Instance.new("Folder")
+		local parent = Instance.new("Folder")
+		parent.Parent = root
+		local child = Instance.new("Folder")
+		child.Parent = parent
+		instanceMap:insert("ROOT", root)
+		instanceMap:insert("PARENT", parent)
+		instanceMap:insert("CHILD", child)
+		local patch = PatchSet.newEmpty()
+		patch.updated = {
+			{ id = "PARENT", changedParent = "CHILD", changedProperties = {} },
+			{ id = "CHILD", changedParent = "ROOT", changedProperties = {} },
+		}
+		expect(PatchSet.isEmpty(applyPatch(instanceMap, patch))).to.equal(true)
+		expect(parent.Parent).to.equal(child)
+		expect(child.Parent).to.equal(root)
+		instanceMap:stop()
+		root:Destroy()
+	end)
+
 	it("should clear a reference when the server sends a null ref", function()
 		local target = Instance.new("Folder")
 		local pointer = Instance.new("ObjectValue")

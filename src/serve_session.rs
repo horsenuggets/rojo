@@ -116,6 +116,7 @@ impl ServeSession {
         log::trace!("Starting new ServeSession at path {}", start_path.display());
 
         let root_project = Arc::new(Project::load_initial_project(&vfs, start_path)?);
+        crate::syncback::relocation::recover_relocations(&vfs, &root_project)?;
 
         let mut tree = RojoTree::new(InstanceSnapshot::new());
 
@@ -123,6 +124,12 @@ impl ServeSession {
 
         let mut instance_context =
             InstanceContext::with_emit_legacy_scripts(root_project.emit_legacy_scripts);
+
+        // Journals are private server state, never source instances.
+        instance_context.add_path_ignore_rules([crate::snapshot::PathIgnoreRule {
+            base_path: root_project.folder_location().to_path_buf(),
+            glob: crate::glob::IgnorableGlob::new(".rojo").unwrap(),
+        }]);
 
         // Enable .luaurc alias resolution. Alias requires are
         // transformed into relative require-by-string paths during
@@ -376,6 +383,62 @@ mod test {
             drop(session);
             assert_eq!(Arc::strong_count(&pool), 1);
         }
+    }
+
+    #[test]
+    fn relocation_recovery_precedes_the_initial_snapshot_and_invalidates_cached_paths() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot(
+                "/project",
+                VfsSnapshot::dir([
+                    (
+                        "default.project.json",
+                        VfsSnapshot::file(r#"{"name":"Test","tree":{"$path":"Source"}}"#),
+                    ),
+                    (
+                        "Source",
+                        VfsSnapshot::dir([("Code.luau", VfsSnapshot::file("return 42"))]),
+                    ),
+                ]),
+            )
+            .unwrap();
+        let vfs = Vfs::new(backend);
+        vfs.set_watch_enabled(false);
+        let source = PathBuf::from("/project/Source/Code.luau");
+        let destination = PathBuf::from("/project/Source/Renamed.luau");
+        let expected = vfs.snapshot_tree(&source).unwrap();
+        vfs.read(&source).unwrap();
+        vfs.read_dir("/project/Source").unwrap();
+        let journal = PathBuf::from("/project/.rojo/relocations/interrupted");
+        vfs.create_dir_all(&journal).unwrap();
+        let relocation = crate::syncback::relocation_transaction::Relocation {
+            source: source.clone(),
+            destination: destination.clone(),
+            expected: expected.clone(),
+        };
+        vfs.write(
+            journal.join("intent.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "moves": [relocation]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        vfs.move_no_replace(&source, &journal.join("stage-0"), &expected)
+            .unwrap();
+        let session = ServeSession::new(vfs, "/project").unwrap();
+        let tree = session.tree();
+        let child = tree.get_instance(tree.root().children()[0]).unwrap();
+        assert_eq!(child.name(), "Code");
+        assert_eq!(
+            child.properties().get(&rbx_dom_weak::ustr("Source")),
+            Some(&rbx_dom_weak::types::Variant::String("return 42".into()))
+        );
+        assert!(!tree.get_ids_at_path(&source).is_empty());
+        assert!(tree.get_ids_at_path(&destination).is_empty());
+        assert!(session.vfs().metadata(&journal).is_err());
     }
 
     #[test]

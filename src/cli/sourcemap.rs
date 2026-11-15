@@ -141,8 +141,14 @@ fn patch_set_affects_sourcemap(
     patch_set: &[AppliedPatchSet],
     filter: fn(&InstanceWithMeta) -> bool,
 ) -> bool {
-    let tree = session.tree();
+    tree_patch_affects_sourcemap(&session.tree(), patch_set, filter)
+}
 
+fn tree_patch_affects_sourcemap(
+    tree: &RojoTree,
+    patch_set: &[AppliedPatchSet],
+    filter: fn(&InstanceWithMeta) -> bool,
+) -> bool {
     // A sourcemap has probably changed when:
     patch_set.par_iter().any(|set| {
         // 1. An instance was removed, in which case it will no
@@ -155,17 +161,15 @@ fn patch_set_affects_sourcemap(
                     .expect("instance did not exist when updating sourcemap");
                 filter(&instance)
             })
-            // 3. An existing instance has its class name, name,
-            // or file paths changed, and passes the filter
+            // 3. An existing instance changes the structure or paths of a mapped
+            // subtree. A folder can affect script paths without passing the filter.
             || set.updated.iter().any(|updated| {
-                let changed = updated.changed_class_name.is_some()
+                let changed = updated.changed_parent.is_some()
+                    || updated.changed_class_name.is_some()
                     || updated.changed_name.is_some()
                     || updated.changed_metadata.is_some();
                 if changed {
-                    let instance = tree
-                        .get_instance(updated.id)
-                        .expect("instance did not exist when updating sourcemap");
-                    filter(&instance)
+                    tree.descendants(updated.id).any(|instance| filter(&instance))
                 } else {
                     false
                 }
@@ -268,6 +272,33 @@ mod test {
     use crate::cli::SourcemapCommand;
     use insta::internals::Content;
     use std::path::Path;
+
+    #[test]
+    fn structural_updates_to_script_ancestors_affect_sourcemaps() {
+        use super::{filter_non_scripts, tree_patch_affects_sourcemap};
+        use crate::snapshot::{AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, RojoTree};
+        let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Folder"));
+        let root = tree.get_root_id();
+        let folder = tree.insert_instance(root, InstanceSnapshot::new().class_name("Folder"));
+        tree.insert_instance(folder, InstanceSnapshot::new().class_name("ModuleScript"));
+        let mut update = AppliedPatchUpdate::new(folder);
+        let affects = |update| {
+            tree_patch_affects_sourcemap(
+                &tree,
+                &[AppliedPatchSet {
+                    updated: vec![update],
+                    ..Default::default()
+                }],
+                filter_non_scripts,
+            )
+        };
+        assert!(!affects(update.clone()));
+        update.changed_parent = Some(root);
+        assert!(affects(update.clone()));
+        update.changed_parent = None;
+        update.changed_name = Some("Renamed".into());
+        assert!(affects(update));
+    }
 
     #[test]
     fn maps_relative_paths() {

@@ -31,8 +31,9 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Current protocol version, which is required to match. Version 6 added write
 /// cursors to write requests and accepted, conflicted, and failed results to write
 /// responses, which older peers neither send nor understand. Version 7 made write
-/// requests carry the plugin's chosen `WriteAuthority`.
-pub const PROTOCOL_VERSION: u64 = 7;
+/// requests carry the plugin's chosen `WriteAuthority`. Version 8 adds identity-preserving
+/// instance reparenting through `changedParent` updates.
+pub const PROTOCOL_VERSION: u64 = 8;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +99,7 @@ impl<'a> SubscribeMessage<'a> {
                     id: update.id,
                     changed_name: update.changed_name,
                     changed_class_name: update.changed_class_name,
+                    changed_parent: update.changed_parent,
                     changed_properties,
                     changed_metadata,
                 }
@@ -118,6 +120,8 @@ pub struct InstanceUpdate {
     pub id: Ref,
     pub changed_name: Option<String>,
     pub changed_class_name: Option<Ustr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_parent: Option<Ref>,
 
     // TODO: Transform from UstrMap<String, Option<_>> to something else, since
     // null will get lost when decoding from JSON in some languages.
@@ -448,6 +452,91 @@ mod tests {
     use rbx_dom_weak::ustr;
 
     #[test]
+    fn structural_protocol_round_trips_json_and_messagepack() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        let id = Ref::new();
+        let parent = Ref::new();
+        let update = InstanceUpdate {
+            id,
+            changed_parent: Some(parent),
+            changed_name: None,
+            changed_class_name: None,
+            changed_properties: Default::default(),
+            changed_metadata: None,
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["changedParent"], serde_json::to_value(parent).unwrap());
+        assert!(json.get("changed_parent").is_none());
+        let decoded: InstanceUpdate = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.changed_parent, Some(parent));
+        let bytes = rmp_serde::to_vec_named(&update).unwrap();
+        let decoded: InstanceUpdate = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.changed_parent, Some(parent));
+
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let child = tree.insert_instance(root, InstanceSnapshot::new());
+        let destination = tree.insert_instance(root, InstanceSnapshot::new());
+        let patch = PatchSet {
+            updated_instances: vec![PatchUpdate {
+                id: child,
+                changed_parent: Some(destination),
+                changed_name: None,
+                changed_class_name: None,
+                changed_properties: Default::default(),
+                changed_metadata: None,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            json["updated_instances"][0]["changedParent"],
+            serde_json::to_value(destination).unwrap()
+        );
+        let patch: PatchSet =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&patch).unwrap()).unwrap();
+        let applied = apply_patch_set(&mut tree, patch);
+        let applied_json = serde_json::to_value(&applied).unwrap();
+        assert_eq!(
+            applied_json["updated"][0]["changedParent"],
+            serde_json::to_value(destination).unwrap()
+        );
+        let message = SubscribeMessage::from_patch_update(&tree, applied);
+        let message: SubscribeMessage =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&message).unwrap()).unwrap();
+        assert_eq!(message.updated[0].changed_parent, Some(destination));
+        assert!(message.added.is_empty());
+        assert!(message.removed.is_empty());
+    }
+
+    #[test]
+    fn absent_parent_is_a_compatible_non_structural_update() {
+        let value = serde_json::json!({ "id": Ref::new() });
+        let update: InstanceUpdate = serde_json::from_value(value).unwrap();
+        assert_eq!(update.changed_parent, None);
+        assert!(serde_json::to_value(update)
+            .unwrap()
+            .get("changedParent")
+            .is_none());
+        let patch = PatchUpdate {
+            id: Ref::new(),
+            changed_parent: None,
+            changed_name: None,
+            changed_class_name: None,
+            changed_properties: Default::default(),
+            changed_metadata: None,
+        };
+        let json = serde_json::to_value(patch).unwrap();
+        assert!(json.get("changedParent").is_none());
+        assert_eq!(
+            serde_json::from_value::<PatchUpdate>(json)
+                .unwrap()
+                .changed_parent,
+            None
+        );
+    }
+
+    #[test]
     fn removed_references_are_sent_as_explicit_null_refs() {
         let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("ObjectValue"));
         let id = tree.get_root_id();
@@ -458,6 +547,7 @@ mod tests {
                     id,
                     changed_name: None,
                     changed_class_name: None,
+                    changed_parent: None,
                     changed_properties: UstrMap::from_iter([(ustr("Value"), None)]),
                     changed_metadata: None,
                 }],
@@ -487,6 +577,7 @@ mod tests {
                     id,
                     changed_name: None,
                     changed_class_name: None,
+                    changed_parent: None,
                     changed_properties: UstrMap::from_iter([(ustr("Transparency"), None)]),
                     changed_metadata: None,
                 }],

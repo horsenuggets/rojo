@@ -13,6 +13,103 @@ return function()
 		}
 	end
 
+	it("should keep structural failures out of replacement fallback", function()
+		local InstanceMap = require(script.Parent.InstanceMap)
+		local PatchSet = require(script.Parent.PatchSet)
+		local Settings = require(script.Parent.Settings)
+		local applyPatch = require(script.Parent.Reconciler.applyPatch)
+		local original = Settings:get("enableSyncFallback")
+		local instanceMap = InstanceMap.new()
+		local instance = Instance.new("Folder")
+		instanceMap:insert("INSTANCE", instance)
+		local success, err = pcall(function()
+			Settings:set("enableSyncFallback", true)
+			local session = setmetatable({
+				__instanceMap = instanceMap,
+				__precommitCallbacks = {},
+				__postcommitCallbacks = {},
+				__reconciler = {
+					applyPatch = function(_self, patch)
+						return applyPatch(instanceMap, patch)
+					end,
+				},
+				__replaceInstances = function(_self, ids)
+					expect(#ids).to.equal(0)
+					return true, PatchSet.newEmpty()
+				end,
+			}, ServeSession)
+			local patch = PatchSet.newEmpty()
+			patch.updated = { { id = "INSTANCE", changedParent = "MISSING", changedProperties = {} } }
+			session:__applyPatch(patch)
+			expect(instanceMap.fromIds.INSTANCE).to.equal(instance)
+		end)
+		Settings:set("enableSyncFallback", original)
+		instanceMap:stop()
+		instance:Destroy()
+		assert(success, err)
+	end)
+
+	it("should reject initial changes with the current name parent and managed refs", function()
+		local InstanceMap = require(script.Parent.InstanceMap)
+		local PatchSet = require(script.Parent.PatchSet)
+		local instanceMap = InstanceMap.new()
+		local parent = Instance.new("Folder")
+		local target = Instance.new("Folder")
+		local instance = Instance.new("ObjectValue")
+		instance.Name = "StudioName"
+		instance.Parent = parent
+		instance.Value = target
+		instanceMap:insert("INSTANCE", instance)
+		instanceMap:insert("PARENT", parent)
+		instanceMap:insert("TARGET", target)
+		local catchUp = PatchSet.newEmpty()
+		catchUp.updated = {
+			{
+				id = "INSTANCE",
+				changedName = "DiskName",
+				changedParent = "OTHER",
+				changedProperties = { Value = { Ref = "OTHER" } },
+			},
+		}
+		local sent
+		local session = setmetatable({
+			__instanceMap = instanceMap,
+			__twoWaySync = true,
+			__updateLoadingText = function() end,
+			__userConfirmCallback = function()
+				return "Reject"
+			end,
+			__reconciler = {
+				hydrate = function() end,
+				diff = function()
+					return true, catchUp
+				end,
+			},
+			__apiContext = {
+				read = function()
+					return Promise.resolve({ messageCursor = 1, instances = {} })
+				end,
+				setMessageCursor = function() end,
+				write = function(_self, patch, _cursor, authority)
+					sent = patch
+					expect(authority).to.equal("Studio")
+					return Promise.resolve({})
+				end,
+			},
+		}, ServeSession)
+		expect(session:__initialSync({ rootInstanceId = "ROOT" }):await()).to.equal(true)
+		expect(sent.updated[1].changedName).to.equal("StudioName")
+		expect(sent.updated[1].changedParent).to.equal("PARENT")
+		expect(sent.updated[1].changedProperties.Value.Ref).to.equal("TARGET")
+		-- A class-only rejection has nothing representable to encode.
+		catchUp.updated = { { id = "INSTANCE", changedClassName = "Folder", changedProperties = {} } }
+		expect(session:__initialSync({ rootInstanceId = "ROOT" }):await()).to.equal(true)
+		expect(#sent.updated).to.equal(0)
+		instanceMap:stop()
+		parent:Destroy()
+		target:Destroy()
+	end)
+
 	it("should report transport failures to the notification callback", function()
 		local session = setmetatable({
 			__apiContext = {
