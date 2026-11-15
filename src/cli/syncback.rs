@@ -192,8 +192,8 @@ impl SyncbackCommand {
             session.serve_allowed_hosts(),
             session.project_name().to_owned(),
             services,
-            || {
-                let _ = show_waiting_message(ip, port, color);
+            |address| {
+                let _ = show_waiting_message(address.ip(), address.port(), color);
             },
         )?;
 

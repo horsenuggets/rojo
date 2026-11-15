@@ -14,7 +14,7 @@ use tempfile::tempdir;
 
 use crate::rojo_test::{
     io_util::{KillOnDrop, ROJO_PATH},
-    serve_util::{deserialize_msgpack, get_port_number, serialize_msgpack},
+    serve_util::{deserialize_msgpack, read_server_port, serialize_msgpack},
 };
 
 const PROJECT: &str = r#"{
@@ -98,15 +98,19 @@ fn syncback_from_studio_writes_the_uploaded_place() {
     fs_err::create_dir_all(project.join("src/Workspace")).unwrap();
     fs_err::write(project.join("default.project.json"), PROJECT).unwrap();
 
-    let port = get_port_number().to_string();
     let mut process = KillOnDrop(
         Command::new(ROJO_PATH)
             .args(["--color", "never", "syncback"])
             .arg(&project)
-            .args(["--from-studio", "--non-interactive", "--port", &port])
+            .args(["--from-studio", "--non-interactive", "--port", "0"])
             .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
+    );
+    let port = read_server_port(
+        process.0.stderr.take().unwrap(),
+        "Waiting for Studio on localhost:",
     );
 
     let client = Client::new();
