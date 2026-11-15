@@ -6,6 +6,7 @@ use rbx_dom_weak::{
     ustr, HashMapExt as _, InstanceBuilder, UstrMap, WeakDom,
 };
 use std::collections::HashSet;
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -257,7 +258,11 @@ impl JobThreadContext {
     ) -> WriteResult {
         // A request is based on the last revision applied before its local batch began.
         // The current server DOM is not a baseline when a watcher has advanced it.
-        let stale = message_cursor != Some(self.message_queue.cursor());
+        let context = WriteContext {
+            stale: message_cursor != Some(self.message_queue.cursor()),
+            authority,
+            batch: &patch_set.updated_instances,
+        };
         log::trace!("Persisting PatchSet from client: {:#?}", patch_set);
         let mut accepted = PatchSet::new();
         let mut conflicts = PatchSet::new();
@@ -268,14 +273,8 @@ impl JobThreadContext {
             let mut tree = self.tree.lock().unwrap();
             for &id in &patch_set.removed_instances {
                 if let Some(owner) = inline_owner(&tree, id) {
-                    let removal = self.remove_inline_instance(
-                        &mut tree,
-                        id,
-                        owner,
-                        stale,
-                        authority,
-                        &mut messages,
-                    );
+                    let removal =
+                        self.remove_inline_instance(&mut tree, id, owner, &context, &mut messages);
                     let latest = match removal {
                         Ok(InlineRemoval::Removed) => {
                             accepted.removed_instances.push(id);
@@ -324,7 +323,7 @@ impl JobThreadContext {
                     }
                     continue;
                 }
-                match self.remove_instance(&tree, id, stale, authority) {
+                match self.remove_instance(&tree, id, &context) {
                     Ok(Some(snapshot)) => {
                         if let Some(instance) = tree.get_instance(id) {
                             deletion_conflicts.push(PatchAdd {
@@ -383,15 +382,21 @@ impl JobThreadContext {
                         errors: &mut errors,
                         messages: &mut messages,
                     },
-                    stale,
-                    authority,
+                    &context,
                     1,
                 );
             }
         }
-        if accepted != PatchSet::new() {
+        // Saved updates were applied as they were written, so a later update in
+        // the batch sees them. Removals wait until here, since a removed parent
+        // must still be known while its removed children are handled.
+        if !accepted.removed_instances.is_empty() {
             let mut tree = self.tree.lock().unwrap();
-            messages.push(apply_patch_set(&mut tree, accepted.clone()));
+            let removals = PatchSet {
+                removed_instances: accepted.removed_instances.clone(),
+                ..PatchSet::new()
+            };
+            messages.push(apply_patch_set(&mut tree, removals));
         }
         if conflicts != PatchSet::new() {
             let mut tree = self.tree.lock().unwrap();
@@ -406,8 +411,7 @@ impl JobThreadContext {
         &self,
         tree: &RojoTree,
         id: Ref,
-        stale: bool,
-        authority: WriteAuthority,
+        context: &WriteContext,
     ) -> anyhow::Result<Option<crate::snapshot::InstanceSnapshot>> {
         let instance = tree
             .get_instance(id)
@@ -418,7 +422,9 @@ impl JobThreadContext {
         };
         let snapshot = snapshot_from_vfs(&instance.metadata().context, &self.vfs, path)?;
         let disk_patch = compute_patch_set(snapshot.clone(), tree, id);
-        if authority == WriteAuthority::Filesystem && (stale || disk_patch != PatchSet::new()) {
+        if context.authority == WriteAuthority::Filesystem
+            && (context.stale || disk_patch != PatchSet::new())
+        {
             return Ok(snapshot);
         }
         // A snapshot excludes ignored and unrecognized files. Never delete those as
@@ -480,10 +486,10 @@ impl JobThreadContext {
         tree: &mut RojoTree,
         id: Ref,
         owner: Ref,
-        stale: bool,
-        authority: WriteAuthority,
+        context: &WriteContext,
         messages: &mut Vec<AppliedPatchSet>,
     ) -> anyhow::Result<InlineRemoval> {
+        let authority = context.authority;
         for _ in 0..STUDIO_WRITE_ATTEMPTS {
             let owner_instance = tree
                 .get_instance(owner)
@@ -494,13 +500,13 @@ impl JobThreadContext {
             )?;
             let snapshot = self.snapshot_owner(tree, owner)?;
             let disk_patch = compute_shallow_patch_set(snapshot.clone(), tree, owner);
-            if stale || disk_patch != PatchSet::new() {
+            if context.stale || disk_patch != PatchSet::new() {
                 if authority == WriteAuthority::Filesystem {
                     return Ok(InlineRemoval::Restore(Box::new(snapshot)));
                 }
                 // The owner's file is rewritten from the server's copy, so it
                 // takes in the disk's changes first to keep them.
-                catch_up(tree, disk_patch, None, messages);
+                catch_up(tree, disk_patch, context.batch, messages);
                 if tree.get_instance(id).is_none() {
                     return Ok(InlineRemoval::Removed);
                 }
@@ -515,12 +521,21 @@ impl JobThreadContext {
                 }
                 continue;
             }
-            staged.write_single_file_to_vfs(
+            match staged.write_single_file_to_vfs(
                 self.project.folder_location(),
                 &self.vfs,
                 &expected,
-            )?;
-            return Ok(InlineRemoval::Removed);
+            ) {
+                Ok(()) => return Ok(InlineRemoval::Removed),
+                // The file changed after the last read, which is the same race.
+                Err(err)
+                    if authority == WriteAuthority::Studio
+                        && err.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    continue
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
         anyhow::bail!("The file kept changing on disk while the deletion was being saved")
     }
@@ -530,8 +545,7 @@ impl JobThreadContext {
         tree: &mut RojoTree,
         update: &PatchUpdate,
         outcome: &mut WriteOutcome,
-        stale: bool,
-        authority: WriteAuthority,
+        context: &WriteContext,
         attempt: u32,
     ) {
         let WriteOutcome {
@@ -540,6 +554,7 @@ impl JobThreadContext {
             errors,
             messages,
         } = outcome;
+        let authority = context.authority;
         // A retry starts over, so it drops what the attempt before it reported.
         let errors_before = errors.len();
         let id = update.id;
@@ -612,11 +627,14 @@ impl JobThreadContext {
         };
         if snapshot.is_none() {
             conflicts.removed_instances.push(owner_id);
+            if authority == WriteAuthority::Studio {
+                errors.push(removed_on_disk(id));
+            }
             return;
         }
         let path = path.clone();
         let disk_changes = compute_shallow_patch_set(snapshot.clone(), tree, owner_id);
-        if stale || disk_changes != PatchSet::new() {
+        if context.stale || disk_changes != PatchSet::new() {
             if authority == WriteAuthority::Filesystem {
                 let disk_patch = disk_restoration(tree, owner_id, update, snapshot);
                 conflicts
@@ -630,15 +648,9 @@ impl JobThreadContext {
             }
             // The server takes in the disk's changes, so the write below starts
             // from the current file and only Studio's edits replace anything.
-            catch_up(tree, disk_changes, Some(update), messages);
+            catch_up(tree, disk_changes, context.batch, messages);
             if tree.get_instance(id).is_none() {
-                errors.push(WriteError {
-                    id,
-                    property: None,
-                    message:
-                        "This instance was removed on disk, and two-way sync can't recreate it"
-                            .into(),
-                });
+                errors.push(removed_on_disk(id));
                 return;
             }
         }
@@ -868,9 +880,49 @@ impl JobThreadContext {
                 return;
             }
         };
-        if snapshots_differ(snapshot.clone(), latest.as_ref()) {
-            match changed_during_write(authority, attempt) {
-                // The restoration below handles it.
+        let owner_context = owner.metadata().context.clone();
+        // The file changing after it was read shows up either in the second
+        // read or in the write's own byte check. Studio authority treats both as
+        // the same race, while the filesystem keeps a failed write a failure.
+        let written = (!snapshots_differ(snapshot, latest.as_ref())).then(|| {
+            staged.write_single_file_to_vfs(self.project.folder_location(), &self.vfs, &expected)
+        });
+        match written {
+            Some(Ok(())) => {
+                let saved = PatchUpdate {
+                    id,
+                    changed_name: accepted_name,
+                    changed_class_name: None,
+                    changed_properties: accepted_properties,
+                    changed_metadata: None,
+                };
+                // Applied now rather than with the rest of the batch, so a later
+                // update to the same file doesn't mistake this edit for a change
+                // made on disk.
+                let applied = apply_patch_set(
+                    tree,
+                    PatchSet {
+                        updated_instances: vec![saved.clone()],
+                        ..PatchSet::new()
+                    },
+                );
+                if !applied.is_empty() {
+                    messages.push(applied);
+                }
+                accepted.updated_instances.push(saved);
+                return;
+            }
+            Some(Err(err))
+                if authority == WriteAuthority::Filesystem
+                    || err.kind() != io::ErrorKind::WouldBlock =>
+            {
+                errors.push(WriteError {
+                    id,
+                    property: None,
+                    message: format!("Failed to persist changes: {err:#}"),
+                });
+            }
+            _ => match changed_during_write(authority, attempt) {
                 ChangedDuringWrite::Restore => {}
                 ChangedDuringWrite::Retry => {
                     conflicts.updated_instances.retain(|patch| patch.id != id);
@@ -881,14 +933,7 @@ impl JobThreadContext {
                         errors,
                         messages,
                     };
-                    return self.persist_update(
-                        tree,
-                        update,
-                        outcome,
-                        stale,
-                        authority,
-                        attempt + 1,
-                    );
+                    return self.persist_update(tree, update, outcome, context, attempt + 1);
                 }
                 ChangedDuringWrite::GiveUp => errors.push(WriteError {
                     id,
@@ -896,55 +941,28 @@ impl JobThreadContext {
                     message: "The file kept changing on disk while this edit was being saved"
                         .into(),
                 }),
+            },
+        }
+        // Read again, since the disk may have moved on since the last read.
+        match snapshot_shallow_from_vfs(&owner_context, &self.vfs, &path) {
+            Ok(latest) => {
+                let restoration = disk_restoration(tree, owner_id, update, latest);
+                conflicts.updated_instances.retain(|patch| patch.id != id);
+                conflicts
+                    .removed_instances
+                    .extend(restoration.removed_instances);
+                conflicts
+                    .added_instances
+                    .extend(restoration.added_instances);
+                conflicts
+                    .updated_instances
+                    .extend(restoration.updated_instances);
             }
-        }
-        if let Some(disk_patch) = revalidation_conflicts(tree, owner_id, update, snapshot, latest) {
-            conflicts.updated_instances.retain(|patch| patch.id != id);
-            conflicts
-                .removed_instances
-                .extend(disk_patch.removed_instances);
-            conflicts.added_instances.extend(disk_patch.added_instances);
-            conflicts
-                .updated_instances
-                .extend(disk_patch.updated_instances);
-            return;
-        }
-        match staged.write_single_file_to_vfs(self.project.folder_location(), &self.vfs, &expected)
-        {
-            Ok(()) => accepted.updated_instances.push(PatchUpdate {
+            Err(error) => errors.push(WriteError {
                 id,
-                changed_name: accepted_name,
-                changed_class_name: None,
-                changed_properties: accepted_properties,
-                changed_metadata: None,
+                property: None,
+                message: format!("Could not restore filesystem state: {error:#}"),
             }),
-            Err(err) => {
-                errors.push(WriteError {
-                    id,
-                    property: None,
-                    message: format!("Failed to persist changes: {err:#}"),
-                });
-                match snapshot_shallow_from_vfs(&owner.metadata().context, &self.vfs, &path) {
-                    Ok(latest) => {
-                        let restoration = disk_restoration(tree, owner_id, update, latest);
-                        conflicts.updated_instances.retain(|patch| patch.id != id);
-                        conflicts
-                            .removed_instances
-                            .extend(restoration.removed_instances);
-                        conflicts
-                            .added_instances
-                            .extend(restoration.added_instances);
-                        conflicts
-                            .updated_instances
-                            .extend(restoration.updated_instances);
-                    }
-                    Err(error) => errors.push(WriteError {
-                        id,
-                        property: None,
-                        message: format!("Could not restore filesystem state: {error:#}"),
-                    }),
-                }
-            }
         }
     }
 }
@@ -976,29 +994,56 @@ struct WriteOutcome<'a> {
     messages: &'a mut Vec<AppliedPatchSet>,
 }
 
-/// Splits disk changes into the ones to send to Studio and the ones Studio is
-/// about to overwrite with its own edit, so Studio isn't sent a value it will
-/// immediately replace.
-fn split_studio_edits(mut disk_changes: PatchSet, update: &PatchUpdate) -> (PatchSet, PatchSet) {
-    let mut overwritten = PatchUpdate {
-        id: update.id,
-        changed_name: None,
-        changed_class_name: None,
-        changed_properties: UstrMap::new(),
-        changed_metadata: None,
-    };
-    if let Some(entry) = disk_changes
-        .updated_instances
-        .iter_mut()
-        .find(|entry| entry.id == update.id)
-    {
-        if update.changed_name.is_some() {
-            overwritten.changed_name = entry.changed_name.take();
+/// What every write in a batch is checked against.
+struct WriteContext<'a> {
+    /// Whether the batch began before the server's latest revision.
+    stale: bool,
+    authority: WriteAuthority,
+    /// Every update in the batch, so catching up for one never sends Studio a
+    /// disk value that a later update in the same batch replaces.
+    batch: &'a [PatchUpdate],
+}
+
+fn removed_on_disk(id: Ref) -> WriteError {
+    WriteError {
+        id,
+        property: None,
+        message: "This instance was removed on disk, and two-way sync can't recreate it".into(),
+    }
+}
+
+/// Splits disk changes into the ones to send to Studio and the ones a pending
+/// Studio edit is about to replace, so Studio isn't sent a value it will
+/// immediately overwrite. A disk value equal to Studio's is sent normally,
+/// since nothing will be written for it and other clients still need it.
+fn split_studio_edits(mut disk_changes: PatchSet, batch: &[PatchUpdate]) -> (PatchSet, PatchSet) {
+    let mut overwritten = PatchSet::new();
+    for entry in &mut disk_changes.updated_instances {
+        let Some(update) = batch.iter().find(|update| update.id == entry.id) else {
+            continue;
+        };
+        let mut held = PatchUpdate {
+            id: entry.id,
+            changed_name: None,
+            changed_class_name: None,
+            changed_properties: UstrMap::new(),
+            changed_metadata: None,
+        };
+        if update.changed_name.is_some() && entry.changed_name != update.changed_name {
+            held.changed_name = entry.changed_name.take();
         }
-        for key in update.changed_properties.keys() {
-            if let Some(value) = entry.changed_properties.remove(key) {
-                overwritten.changed_properties.insert(*key, value);
+        for (key, studio_value) in &update.changed_properties {
+            let differs = entry
+                .changed_properties
+                .get(key)
+                .is_some_and(|disk_value| !same_value(disk_value.as_ref(), studio_value.as_ref()));
+            if differs {
+                let disk_value = entry.changed_properties.remove(key).unwrap();
+                held.changed_properties.insert(*key, disk_value);
             }
+        }
+        if held.changed_name.is_some() || !held.changed_properties.is_empty() {
+            overwritten.updated_instances.push(held);
         }
     }
     disk_changes.updated_instances.retain(|entry| {
@@ -1007,11 +1052,7 @@ fn split_studio_edits(mut disk_changes: PatchSet, update: &PatchUpdate) -> (Patc
             || !entry.changed_properties.is_empty()
             || entry.changed_metadata.is_some()
     });
-    let mut overwritten_patch = PatchSet::new();
-    if overwritten.changed_name.is_some() || !overwritten.changed_properties.is_empty() {
-        overwritten_patch.updated_instances.push(overwritten);
-    }
-    (disk_changes, overwritten_patch)
+    (disk_changes, overwritten)
 }
 
 /// Brings the server's copy up to date with disk changes it hasn't applied
@@ -1019,32 +1060,15 @@ fn split_studio_edits(mut disk_changes: PatchSet, update: &PatchUpdate) -> (Patc
 fn catch_up(
     tree: &mut RojoTree,
     disk_changes: PatchSet,
-    update: Option<&PatchUpdate>,
+    batch: &[PatchUpdate],
     messages: &mut Vec<AppliedPatchSet>,
 ) {
-    let (to_studio, overwritten) = match update {
-        Some(update) => split_studio_edits(disk_changes, update),
-        None => (disk_changes, PatchSet::new()),
-    };
+    let (to_studio, overwritten) = split_studio_edits(disk_changes, batch);
     let applied = apply_patch_set(tree, to_studio);
     if !applied.is_empty() {
         messages.push(applied);
     }
     apply_patch_set(tree, overwritten);
-}
-
-fn revalidation_conflicts(
-    tree: &RojoTree,
-    owner: Ref,
-    update: &PatchUpdate,
-    baseline: Option<InstanceSnapshot>,
-    latest: Option<InstanceSnapshot>,
-) -> Option<PatchSet> {
-    if !snapshots_differ(baseline, latest.as_ref()) {
-        return None;
-    }
-
-    Some(disk_restoration(tree, owner, update, latest))
 }
 
 /// Returns whether the disk changed between two reads of the same source.
@@ -1392,7 +1416,7 @@ fn compute_and_apply_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::InstanceMetadata;
+    use crate::{snapshot::InstanceMetadata, variant_eq::variant_eq};
     use memofs::{InMemoryFs, VfsSnapshot};
     use rbx_dom_weak::{
         types::{Attributes, CFrame, Matrix3, NumberRange, Vector3},
@@ -1846,7 +1870,8 @@ mod tests {
             .changed_properties
             .insert(ustr("CanCollide"), Some(Variant::Bool(true)));
         let mut tree = job.tree.lock().unwrap();
-        let patch = revalidation_conflicts(&tree, id, &update, baseline.clone(), latest).unwrap();
+        assert!(snapshots_differ(baseline.clone(), latest.as_ref()));
+        let patch = disk_restoration(&tree, id, &update, latest);
         assert!(patch.updated_instances.iter().all(|update| update.id == id));
         assert_eq!(patch.added_instances.len(), 1);
         assert_eq!(patch.added_instances[0].parent_id, id);
@@ -1859,7 +1884,8 @@ mod tests {
             tree.get_instance(id).unwrap().properties()[&ustr("Transparency")],
             Variant::Float32(0.5)
         );
-        let patch = revalidation_conflicts(&tree, id, &update, baseline, None).unwrap();
+        assert!(snapshots_differ(baseline, None));
+        let patch = disk_restoration(&tree, id, &update, None);
         assert_eq!(patch.removed_instances, vec![id]);
     }
 
@@ -2354,16 +2380,17 @@ mod tests {
         )
     }
 
-    /// Walks every combination of Studio editing the name and a property and
-    /// the disk changing the name, that property, and another one. Studio's
-    /// edits are always held back from Studio, and everything else is sent.
+    /// Walks every combination of Studio editing the name and a property, the
+    /// disk changing the name, that property, and another one, and the disk
+    /// agreeing with Studio's values. Only values Studio will actually change
+    /// are held back from Studio, and everything else is sent.
     #[test]
     fn studio_edits_are_split_from_the_disk_changes_studio_still_needs() {
         let id = Ref::new();
         let [edited, other] = [ustr("Transparency"), ustr("CanCollide")];
-        for bits in 0..32u32 {
-            let [studio_name, studio_property, disk_name, disk_property, disk_other] =
-                [0, 1, 2, 3, 4].map(|bit| bits & (1 << bit) != 0);
+        for bits in 0..64u32 {
+            let [studio_name, studio_property, disk_name, disk_property, disk_other, agree] =
+                [0, 1, 2, 3, 4, 5].map(|bit| bits & (1 << bit) != 0);
             let update = PatchUpdate {
                 id,
                 changed_name: studio_name.then(|| "StudioName".to_owned()),
@@ -2373,9 +2400,14 @@ mod tests {
                 ),
                 changed_metadata: None,
             };
+            let (disk_name_value, disk_value) = if agree {
+                ("StudioName", 0.75)
+            } else {
+                ("DiskName", 0.5)
+            };
             let mut disk_properties = UstrMap::new();
             if disk_property {
-                disk_properties.insert(edited, Some(Variant::Float32(0.5)));
+                disk_properties.insert(edited, Some(Variant::Float32(disk_value)));
             }
             if disk_other {
                 disk_properties.insert(other, Some(Variant::Bool(true)));
@@ -2383,20 +2415,20 @@ mod tests {
             let disk = PatchSet {
                 updated_instances: vec![PatchUpdate {
                     id,
-                    changed_name: disk_name.then(|| "DiskName".to_owned()),
+                    changed_name: disk_name.then(|| disk_name_value.to_owned()),
                     changed_class_name: None,
                     changed_properties: disk_properties,
                     changed_metadata: None,
                 }],
                 ..PatchSet::new()
             };
-            let (to_studio, overwritten) = split_studio_edits(disk, &update);
+            let (to_studio, overwritten) = split_studio_edits(disk, &[update]);
             let sent = to_studio.updated_instances.first();
             let held = overwritten.updated_instances.first();
-            let case = format!("case {bits:05b}");
+            let case = format!("case {bits:06b}");
 
-            let sends_name = disk_name && !studio_name;
-            let sends_edited = disk_property && !studio_property;
+            let sends_name = disk_name && (!studio_name || agree);
+            let sends_edited = disk_property && (!studio_property || agree);
             assert_eq!(
                 sent.is_some(),
                 sends_name || sends_edited || disk_other,
@@ -2416,8 +2448,8 @@ mod tests {
                 );
             }
 
-            let holds_name = disk_name && studio_name;
-            let holds_edited = disk_property && studio_property;
+            let holds_name = disk_name && studio_name && !agree;
+            let holds_edited = disk_property && studio_property && !agree;
             assert_eq!(held.is_some(), holds_name || holds_edited, "{case}");
             if let Some(held) = held {
                 assert_eq!(held.changed_name.is_some(), holds_name, "{case}");
@@ -2428,6 +2460,107 @@ mod tests {
                 );
                 assert!(!held.changed_properties.contains_key(&other), "{case}");
             }
+        }
+    }
+
+    /// Two inline siblings share one file, and Studio edits both in a batch
+    /// while the disk changed both. Studio is never sent either disk value,
+    /// even while the first sibling's write catches up for the second.
+    #[test]
+    fn studio_authority_holds_back_every_edit_in_the_batch() {
+        let (job, owner) = inline_job();
+        let base = find(&job, &["Base"]);
+        let deep = find(&job, &["Nested", "Deep"]);
+        let mut meta = read_props_meta(&job);
+        meta["children"][0]["properties"]["Transparency"] = serde_json::json!(0.1);
+        meta["children"][1]["children"][0]["properties"]["Transparency"] = serde_json::json!(0.2);
+        job.vfs
+            .write(
+                "/project/Props/init.meta.json",
+                serde_json::to_string_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+        let mut patch = transparency_update(base, 0.75);
+        patch
+            .updated_instances
+            .extend(transparency_update(deep, 0.8).updated_instances);
+        let cursor = job.message_queue.cursor();
+
+        let (accepted, conflicts, errors) = studio_write(&job, patch);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(conflicts, PatchSet::new());
+        assert_eq!(accepted.updated_instances.len(), 2);
+        let meta = read_props_meta(&job);
+        assert_eq!(
+            meta_entry(&meta, &["Base"]).unwrap()["properties"]["Transparency"],
+            0.75
+        );
+        assert_eq!(
+            meta_entry(&meta, &["Nested", "Deep"]).unwrap()["properties"]["Transparency"],
+            0.8
+        );
+        let disk_values = [Variant::Float32(0.1), Variant::Float32(0.2)];
+        for message in messages_since(&job, cursor) {
+            for update in message.updated {
+                if let Some(Some(value)) = update.changed_properties.get(&ustr("Transparency")) {
+                    assert!(
+                        !disk_values.iter().any(|disk| variant_eq(disk, value)),
+                        "Studio was sent a disk value it overwrites: {value:?}"
+                    );
+                }
+            }
+        }
+        assert_disk_matches_server(&job, owner);
+    }
+
+    /// Renaming an inline parent and editing its child in one batch saves both,
+    /// since the rename is applied before the child is compared with the disk.
+    #[test]
+    fn inline_renames_are_seen_by_later_edits_in_the_batch() {
+        for authority in [WriteAuthority::Filesystem, WriteAuthority::Studio] {
+            let (job, owner) = inline_job();
+            let nested = find(&job, &["Nested"]);
+            let deep = find(&job, &["Nested", "Deep"]);
+            let mut patch = rename_update(nested, "Renamed");
+            patch
+                .updated_instances
+                .extend(transparency_update(deep, 0.8).updated_instances);
+            let (accepted, conflicts, errors) =
+                job.handle_tree_event_at_cursor(patch, Some(job.message_queue.cursor()), authority);
+            assert!(errors.is_empty(), "{authority:?}: {errors:?}");
+            assert_eq!(conflicts, PatchSet::new(), "{authority:?}");
+            assert_eq!(accepted.updated_instances.len(), 2, "{authority:?}");
+            let meta = read_props_meta(&job);
+            assert_eq!(
+                meta_entry(&meta, &["Renamed", "Deep"]).unwrap()["properties"]["Transparency"],
+                0.8,
+                "{authority:?}"
+            );
+            assert_eq!(find(&job, &["Renamed", "Deep"]), deep, "{authority:?}");
+            assert_disk_matches_server(&job, owner);
+        }
+    }
+
+    /// An edit to an instance whose own file was deleted on disk fails under
+    /// Studio authority, since two-way sync can't recreate it, and is only a
+    /// conflict under filesystem authority.
+    #[test]
+    fn edits_to_deleted_sources_fail_only_under_studio_authority() {
+        for authority in [WriteAuthority::Filesystem, WriteAuthority::Studio] {
+            let (job, id) = part_job();
+            job.vfs.remove_dir_all("/project/Part").unwrap();
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                transparency_update(id, 0.75),
+                Some(job.message_queue.cursor()),
+                authority,
+            );
+            assert!(accepted.updated_instances.is_empty(), "{authority:?}");
+            assert_eq!(conflicts.removed_instances, vec![id], "{authority:?}");
+            assert_eq!(
+                errors.len(),
+                (authority == WriteAuthority::Studio) as usize,
+                "{authority:?}"
+            );
         }
     }
 
