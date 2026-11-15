@@ -43,12 +43,17 @@ Making a new release? Simply add the new header with the version and date undern
   metadata sidecars and unmanaged child files survive promotion, and empty promoted
   parents stay directories. Promotions stage their output and originals in recoverable
   journals before installation. Project-defined, aliased, custom-mapped, model, and
-  inline cross-owner moves are rejected without overwriting destination files.
+  inline cross-owner moves are rejected without overwriting destination files. The
+  project's reserved `.rojo/` cache cannot be re-included by negated ignore patterns.
 * Report the actual listening port when `serve` or Studio syncback uses `--port 0`,
   and use OS-assigned ports in live server tests to avoid socket collisions.
 * Write whole floating-point JSON values without `.0`, and round values within
   `0.000001` of an integer (including zero) when writing metadata, projects, and JSON
   models. Two-way sync acknowledges normalized values so repeated edits stay stable.
+  Hash rounded zero consistently regardless of sign so negative-zero attributes do not
+  trigger repeated syncback rewrites. Compare JSON-backed values after default-value
+  normalization and keep unchanged directory metadata files untouched, while preserving
+  tiny property changes in binary models.
 * Add a UI Labs storybook for the plugin. Serve `storybook.project.json`, connect, and
   open UI Labs to preview the plugin's buttons, inputs, checkboxes, dropdowns, tags,
   header, spinner, and its connecting, error, not connected, and settings pages one at a
@@ -66,8 +71,8 @@ Making a new release? Simply add the new header with the version and date undern
   again before the write lands.
 * Apply each saved two-way sync edit before the next one in the same batch, so editing a
   child right after renaming its inline parent no longer conflicts with the rename.
-* Bump the server and plugin protocol version to 7, since write requests now carry the
-  chosen authority.
+* Bump the server and plugin protocol version to 8, since write requests now carry the
+  chosen authority and managed parent changes.
 * Show the usual protocol version mismatch message when the plugin connects to an older
   server that answers in JSON, like upstream Rojo. It used to fail with "attempt to index
   number with 'protocolVersion'" instead.

@@ -12,7 +12,13 @@ use std::collections::HashMap;
 
 use crate::{variant_eq::variant_eq, Project};
 
-use super::{descendants, filter_properties_preallocated};
+use super::{descendants, filter_json_properties_preallocated, filter_properties_preallocated};
+
+#[derive(Clone, Copy)]
+enum PropertyHashMode {
+    Raw,
+    Json,
+}
 
 /// Returns a map of every `Ref` in the `WeakDom` to a hashed version of the
 /// `Instance` it points to, including the properties and descendants of the
@@ -21,6 +27,19 @@ use super::{descendants, filter_properties_preallocated};
 /// The hashes **do** include the descendants of the Instances in them,
 /// so they should only be used for comparing subtrees directly.
 pub fn hash_tree(project: &Project, dom: &WeakDom, root_ref: Ref) -> HashMap<Ref, Hash> {
+    hash_tree_with_mode(project, dom, root_ref, PropertyHashMode::Raw)
+}
+
+pub fn hash_json_tree(project: &Project, dom: &WeakDom, root_ref: Ref) -> HashMap<Ref, Hash> {
+    hash_tree_with_mode(project, dom, root_ref, PropertyHashMode::Json)
+}
+
+fn hash_tree_with_mode(
+    project: &Project,
+    dom: &WeakDom,
+    root_ref: Ref,
+    mode: PropertyHashMode,
+) -> HashMap<Ref, Hash> {
     let mut order = descendants(dom, root_ref);
     let mut map: HashMap<Ref, Hash> = HashMap::with_capacity(order.len());
 
@@ -29,7 +48,7 @@ pub fn hash_tree(project: &Project, dom: &WeakDom, root_ref: Ref) -> HashMap<Ref
 
     while let Some(referent) = order.pop() {
         let inst = dom.get_by_ref(referent).unwrap();
-        let mut hasher = hash_inst_filtered(project, inst, &mut prop_list);
+        let mut hasher = hash_inst_filtered(project, inst, &mut prop_list, mode);
         add_children(inst, &map, &mut child_hashes, &mut hasher);
 
         map.insert(referent, hasher.finalize());
@@ -43,11 +62,11 @@ pub fn hash_tree(project: &Project, dom: &WeakDom, root_ref: Ref) -> HashMap<Ref
 /// This function filters properties using user-provided syncing rules from
 /// the passed project.
 #[inline]
-pub fn hash_instance(project: &Project, dom: &WeakDom, referent: Ref) -> Option<Hash> {
+pub fn hash_json_instance(project: &Project, dom: &WeakDom, referent: Ref) -> Option<Hash> {
     let mut prop_list = Vec::with_capacity(2);
     let inst = dom.get_by_ref(referent)?;
 
-    Some(hash_inst_filtered(project, inst, &mut prop_list).finalize())
+    Some(hash_inst_filtered(project, inst, &mut prop_list, PropertyHashMode::Json).finalize())
 }
 
 /// Adds the hashes of children for an Instance to the provided Hasher.
@@ -77,10 +96,14 @@ fn hash_inst_filtered<'inst>(
     project: &Project,
     inst: &'inst Instance,
     prop_list: &mut Vec<(Ustr, &'inst Variant)>,
+    mode: PropertyHashMode,
 ) -> Hasher {
-    filter_properties_preallocated(project, inst, prop_list);
+    match mode {
+        PropertyHashMode::Raw => filter_properties_preallocated(project, inst, prop_list),
+        PropertyHashMode::Json => filter_json_properties_preallocated(project, inst, prop_list),
+    }
 
-    hash_inst_prefilled(inst, prop_list)
+    hash_inst_prefilled(inst, prop_list, mode)
 }
 
 /// Performs hashing on an Instance using a pre-filled list of properties.
@@ -88,7 +111,12 @@ fn hash_inst_filtered<'inst>(
 fn hash_inst_prefilled<'inst>(
     inst: &'inst Instance,
     prop_list: &mut Vec<(Ustr, &'inst Variant)>,
+    mode: PropertyHashMode,
 ) -> Hasher {
+    let hash_value = match mode {
+        PropertyHashMode::Raw => hash_variant,
+        PropertyHashMode::Json => hash_json_variant,
+    };
     let mut hasher = Hasher::new();
     hasher.update(inst.name.as_bytes());
     hasher.update(inst.class.as_bytes());
@@ -105,16 +133,16 @@ fn hash_inst_prefilled<'inst>(
             hasher.update(name.as_bytes());
             if let Some(default) = descriptor.default_properties.get(name.as_str()) {
                 if !variant_eq(default, value) {
-                    hash_variant(&mut hasher, value)
+                    hash_value(&mut hasher, value)
                 }
             } else {
-                hash_variant(&mut hasher, value)
+                hash_value(&mut hasher, value)
             }
         }
     } else {
         for (name, value) in prop_list.drain(..) {
             hasher.update(name.as_bytes());
-            hash_variant(&mut hasher, value)
+            hash_value(&mut hasher, value)
         }
     }
 

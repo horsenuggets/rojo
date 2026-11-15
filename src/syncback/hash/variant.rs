@@ -33,6 +33,14 @@ macro_rules! hash {
     }};
 }
 
+pub fn hash_json_variant(hasher: &mut Hasher, value: &Variant) {
+    // JSON rounds near-integers and loses negative zero, unlike binary exports.
+    hash_variant(
+        hasher,
+        &crate::resolution::normalize_json_variant(value.clone()),
+    );
+}
+
 /// Places `value` into the provided hasher.
 pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
     // We need to round floats, though I'm not sure to what degree we can
@@ -280,6 +288,28 @@ mod tests {
             hash(Vector3::new(f32::NAN, 0.0, 0.0).into())
         );
         assert_eq!(hash(sequence(negative_nan)), hash(sequence(f32::NAN)));
+    }
+
+    #[test]
+    fn rounded_zero_has_one_json_hash_regardless_of_sign() {
+        let hash = |value: Variant| {
+            let mut attributes = Attributes::new();
+            attributes.insert("Value".to_owned(), value);
+            let mut hasher = Hasher::new();
+            hash_json_variant(&mut hasher, &Variant::Attributes(attributes));
+            hasher.finalize()
+        };
+        for value in [-0.0, -0.0000005, 0.0, 0.0000005] {
+            assert_eq!(hash(Variant::Float64(value)), hash(Variant::Float64(0.0)));
+            assert_eq!(
+                hash(Variant::Float32(value as f32)),
+                hash(Variant::Float32(0.0))
+            );
+            assert_eq!(
+                hash(Vector3::new(value as f32, 0.0, 0.0).into()),
+                hash(Vector3::new(0.0, 0.0, 0.0).into())
+            );
+        }
     }
 
     /// Non-finite numbers are written to metadata, so changing one must
