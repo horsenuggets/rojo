@@ -53,6 +53,10 @@ Making a new release? Simply add the new header with the version and date undern
 * Show the usual protocol version mismatch message when the plugin connects to an older
   server that answers in JSON, like upstream Rojo. It used to fail with "attempt to index
   number with 'protocolVersion'" instead.
+* Stop two-way sync from warning "Cannot sync non-nil Parent property changes yet" for
+  every instance inside a folder that moved. It fired for each nested instance on the
+  initial sync, and for everything inside a folder that was moved or deleted in Studio,
+  because a change to an ancestor was treated as a change to each descendant's own parent.
 
 ## `7.7.1-horse.1.1`
 
