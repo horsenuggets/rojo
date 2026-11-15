@@ -42,6 +42,8 @@ Making a new release? Simply add the new header with the version and date undern
 * Expose the plugin API as `shared.RojoPlus`. It's also published as `shared.Rojo` for
   existing scripts unless another Rojo build already holds that name, and unloading the
   plugin only clears names that still point at Rojo+.
+* Change the plugin's brand red from `#E13835` to `#FF5D5D` so buttons, the spinner, the
+  header logo, and other accents match the red in the Rojo+ icons and logo.
 
 ## `7.7.1-horse.1.0`
 
