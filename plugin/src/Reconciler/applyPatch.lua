@@ -28,6 +28,38 @@ local function applyPatch(instanceMap, patch)
 	-- to ensure that referents can be mapped to instances correctly.
 	local deferredRefs = {}
 
+	local function removeInstance(removedIdOrInstance)
+		local instance = if Types.RbxId(removedIdOrInstance)
+			then instanceMap.fromIds[removedIdOrInstance]
+			else removedIdOrInstance
+
+		-- Engine-owned instances and the camera are only untracked, not removed.
+		if instance ~= nil and services.isProtected(instance) then
+			Log.debug("Not removing protected instance {}", instance:GetFullName())
+			instanceMap:removeInstance(instance)
+			for _, descendant in instance:GetDescendants() do
+				instanceMap:removeInstance(descendant)
+			end
+		elseif Types.RbxId(removedIdOrInstance) then
+			instanceMap:destroyId(removedIdOrInstance)
+		else
+			instanceMap:destroyInstance(removedIdOrInstance)
+		end
+	end
+
+	-- Deletion rejections restore authoritative subtrees using remove-and-add packets.
+	-- Their old mappings must disappear before reification, and the restored IDs must
+	-- not be removed again by the deferred ancestor-removal pass.
+	local replacedIds = {}
+	for _, removedId in patch.removed do
+		if Types.RbxId(removedId) and patch.added[removedId] ~= nil then
+			replacedIds[removedId] = true
+			if not pcall(removeInstance, removedId) then
+				table.insert(unappliedPatch.removed, removedId)
+			end
+		end
+	end
+
 	for id, virtualInstance in pairs(patch.added) do
 		if instanceMap.fromIds[id] ~= nil then
 			-- This instance already exists. We might've already added it in a
@@ -285,6 +317,9 @@ local function applyPatch(instanceMap, patch)
 
 	-- A retained child must escape its old ancestor before that ancestor is removed.
 	for _, removedIdOrInstance in ipairs(patch.removed) do
+		if replacedIds[removedIdOrInstance] then
+			continue
+		end
 		local removeInstanceSuccess = pcall(function()
 			local instance = if Types.RbxId(removedIdOrInstance)
 				then instanceMap.fromIds[removedIdOrInstance]
@@ -300,18 +335,7 @@ local function applyPatch(instanceMap, patch)
 				end
 			end
 
-			-- Engine-owned instances and the camera are only untracked, not removed.
-			if instance ~= nil and services.isProtected(instance) then
-				Log.debug("Not removing protected instance {}", instance:GetFullName())
-				instanceMap:removeInstance(instance)
-				for _, descendant in instance:GetDescendants() do
-					instanceMap:removeInstance(descendant)
-				end
-			elseif Types.RbxId(removedIdOrInstance) then
-				instanceMap:destroyId(removedIdOrInstance)
-			else
-				instanceMap:destroyInstance(removedIdOrInstance)
-			end
+			removeInstance(removedIdOrInstance)
 		end)
 		if not removeInstanceSuccess then
 			table.insert(unappliedPatch.removed, removedIdOrInstance)

@@ -6,6 +6,57 @@ return function()
 
 	local container = Instance.new("Folder")
 
+	it("should restore remove-and-add subtrees whether their old IDs are still mapped or absent", function()
+		for _, mapped in { false, true } do
+			local instanceMap = InstanceMap.new()
+			local root = Instance.new("Folder")
+			local original = Instance.new("Folder")
+			original.Name = "Speculative"
+			original.Parent = root
+			local oldChild = Instance.new("Folder")
+			oldChild.Parent = original
+			instanceMap:insert("ROOT", root)
+			if mapped then
+				instanceMap:insert("RESTORED", original)
+				instanceMap:insert("CHILD", oldChild)
+			else
+				original.Parent = nil
+			end
+			local patch = PatchSet.newEmpty()
+			patch.removed = { "RESTORED" }
+			patch.added = {
+				RESTORED = {
+					Id = "RESTORED",
+					Parent = "ROOT",
+					Name = "Authoritative",
+					ClassName = "Folder",
+					Properties = {},
+					Children = { "CHILD" },
+				},
+				CHILD = {
+					Id = "CHILD",
+					Parent = "RESTORED",
+					Name = "RestoredChild",
+					ClassName = "Folder",
+					Properties = {},
+					Children = {},
+				},
+			}
+			expect(PatchSet.isEmpty(applyPatch(instanceMap, patch))).to.equal(true)
+			local restored = instanceMap.fromIds.RESTORED
+			expect(restored ~= original).to.equal(true)
+			expect(restored.Name).to.equal("Authoritative")
+			expect(restored.Parent).to.equal(root)
+			expect(instanceMap.fromIds.CHILD.Parent).to.equal(restored)
+			expect(instanceMap.fromIds.CHILD.Name).to.equal("RestoredChild")
+			expect(instanceMap.fromIds.CHILD ~= oldChild).to.equal(true)
+			expect(#root:GetChildren()).to.equal(1)
+			instanceMap:stop()
+			root:Destroy()
+			original:Destroy()
+		end
+	end)
+
 	it("should restore children to a replaced authoritative parent after an unmanaged move", function()
 		local createPatchSet = require(script.Parent.Parent.ChangeBatcher.createPatchSet)
 		local instanceMap = InstanceMap.new()

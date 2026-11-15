@@ -49,6 +49,74 @@ return function()
 		assert(success, err)
 	end)
 
+	it("should restore fallback replacements and retained children to their final authoritative parents", function()
+		local InstanceMap = require(script.Parent.InstanceMap)
+		local PatchSet = require(script.Parent.PatchSet)
+		local createPatchSet = require(script.Parent.ChangeBatcher.createPatchSet)
+		local root = Instance.new("Folder")
+		local original = Instance.new("Folder")
+		original.Name = "Parent"
+		original.Parent = root
+		local child = Instance.new("Folder")
+		child.Parent = original
+		local unmanaged = Instance.new("Folder")
+		local instanceMap = InstanceMap.new()
+		instanceMap:insert("ROOT", root)
+		instanceMap:insert("PARENT", original)
+		instanceMap:insert("CHILD", child)
+
+		local model = Instance.new("Folder")
+		local pointer = Instance.new("ObjectValue")
+		pointer.Name = "PARENT"
+		pointer.Parent = model
+		local serializedParent = Instance.new("Folder")
+		serializedParent.Name = "Parent"
+		serializedParent.Parent = pointer
+		pointer.Value = serializedParent
+		local contents = game:GetService("SerializationService"):SerializeInstancesAsync({ model })
+		local session = setmetatable({
+			__instanceMap = instanceMap,
+			__apiContext = {
+				serialize = function()
+					return Promise.resolve({ modelContents = contents })
+				end,
+				refPatch = function()
+					return Promise.resolve({ patch = PatchSet.newEmpty() })
+				end,
+			},
+			__reconciler = {
+				applyPatch = function(_self, patch)
+					return require(script.Parent.Reconciler.applyPatch)(instanceMap, patch)
+				end,
+			},
+		}, ServeSession)
+		local success, unapplied = session:__replaceInstances({ "PARENT" })
+		expect(success).to.equal(true)
+		expect(PatchSet.isEmpty(unapplied)).to.equal(true)
+		local replacement = instanceMap.fromIds.PARENT
+		expect(replacement ~= original).to.equal(true)
+		expect(replacement.Parent).to.equal(root)
+		expect(child.Parent).to.equal(replacement)
+		expect(instanceMap.knownParents[replacement]).to.equal(root)
+		expect(instanceMap.observedParents[replacement]).to.equal(root)
+		expect(instanceMap.knownParents[child]).to.equal(replacement)
+		expect(instanceMap.observedParents[child]).to.equal(replacement)
+		expect(instanceMap.pausedUpdateInstances[child]).to.equal(true)
+		instanceMap:unpauseAllInstances()
+		replacement.Parent = unmanaged
+		expect(PatchSet.isEmpty(createPatchSet(instanceMap, { [replacement] = { Parent = true } }))).to.equal(true)
+		expect(replacement.Parent).to.equal(root)
+		child.Parent = unmanaged
+		expect(PatchSet.isEmpty(createPatchSet(instanceMap, { [child] = { Parent = true } }))).to.equal(true)
+		expect(child.Parent).to.equal(replacement)
+		expect(instanceMap.fromIds.CHILD).to.equal(child)
+		instanceMap:stop()
+		root:Destroy()
+		original:Destroy()
+		unmanaged:Destroy()
+		model:Destroy()
+	end)
+
 	it("should reject initial changes with the current name parent and managed refs", function()
 		local InstanceMap = require(script.Parent.InstanceMap)
 		local PatchSet = require(script.Parent.PatchSet)
