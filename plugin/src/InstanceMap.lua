@@ -193,10 +193,6 @@ function InstanceMap:__connectSignals(instance)
 			instance.AttributeChanged:Connect(function()
 				self:__maybeFireInstanceChanged(instance, "Attributes")
 			end),
-
-			instance.AncestryChanged:Connect(function()
-				self:__maybeFireInstanceChanged(instance, "Parent")
-			end),
 		}
 
 		self.instancesToSignal[instance] = signals
@@ -208,12 +204,14 @@ function InstanceMap:__connectSignals(instance)
 			instance.AttributeChanged:Connect(function()
 				self:__maybeFireInstanceChanged(instance, "Attributes")
 			end),
-
-			instance.AncestryChanged:Connect(function()
-				self:__maybeFireInstanceChanged(instance, "Parent")
-			end),
 		}
 	end
+
+	-- AncestryChanged is deliberately not watched. Changes to an instance's own Parent
+	-- already arrive through the signals above, while AncestryChanged also fires on every
+	-- descendant when an ancestor moves. Those descendants still have their parent, so
+	-- reporting them made two-way sync warn about every instance inside a moved or
+	-- deleted folder, and about every nested instance created by the initial sync.
 end
 
 function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
