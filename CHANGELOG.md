@@ -36,6 +36,9 @@ Making a new release? Simply add the new header with the version and date undern
   header, spinner, and its connecting, error, not connected, and settings pages one at a
   time. Every story has controls for the brand color and transparency, and stories live in
   `plugin/stories/` so they aren't included in the built plugin.
+* Show the usual protocol version mismatch message when the plugin connects to an older
+  server that answers in JSON, like upstream Rojo. It used to fail with "attempt to index
+  number with 'protocolVersion'" instead.
 
 ## `7.7.1-horse.1.1`
 
