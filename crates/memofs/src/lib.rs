@@ -115,6 +115,14 @@ pub trait VfsBackend: sealed::Sealed + Send + Sync + 'static {
         ))
     }
 
+    /// Copy permissions between existing entries without changing their contents.
+    fn copy_permissions(&mut self, _source: &Path, _destination: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Backend cannot copy permissions",
+        ))
+    }
+
     /// Flush an existing file or directory entry to stable storage. Directory flushes
     /// are platform dependent; see StdBackend's implementation.
     fn sync_path(&mut self, _path: &Path) -> io::Result<()> {
@@ -142,6 +150,11 @@ pub trait VfsBackend: sealed::Sealed + Send + Sync + 'static {
     fn remove_file(&mut self, path: &Path) -> io::Result<()>;
     fn remove_dir_all(&mut self, path: &Path) -> io::Result<()>;
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
+
+    /// Whether a path is absolute in this backend's namespace, not the host's.
+    fn is_absolute_path(&self, path: &Path) -> bool {
+        path.is_absolute()
+    }
 
     fn event_receiver(&self) -> crossbeam_channel::Receiver<VfsEvent>;
     fn watch(&mut self, path: &Path) -> io::Result<()>;
@@ -447,6 +460,15 @@ impl Vfs {
             .move_no_replace(source, destination, expected)
     }
 
+    /// Copy permissions through the backend without registering watches.
+    pub fn copy_permissions(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        self.inner
+            .write()
+            .unwrap()
+            .backend
+            .copy_permissions(source, destination)
+    }
+
     /// Flush a file or directory through the backend.
     pub fn sync_path(&self, path: &Path) -> io::Result<()> {
         self.inner.write().unwrap().backend.sync_path(path)
@@ -636,6 +658,11 @@ impl VfsLock<'_> {
             .move_no_replace(source, destination, expected)
     }
 
+    /// Copy permissions through the backend without registering watches.
+    pub fn copy_permissions(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
+        self.inner.backend.copy_permissions(source, destination)
+    }
+
     /// Flush a file or directory through the backend.
     pub fn sync_path(&mut self, path: &Path) -> io::Result<()> {
         self.inner.backend.sync_path(path)
@@ -712,6 +739,12 @@ impl VfsLock<'_> {
     pub fn metadata<P: AsRef<Path>>(&mut self, path: P) -> io::Result<Metadata> {
         let path = path.as_ref();
         self.inner.metadata(path)
+    }
+
+    /// Check absoluteness in the underlying backend's namespace.
+    #[inline]
+    pub fn is_absolute_path(&self, path: &Path) -> bool {
+        self.inner.backend.is_absolute_path(path)
     }
 
     /// Normalize a path via the underlying backend.
@@ -1046,6 +1079,36 @@ mod test {
             vfs.canonicalize("file").unwrap_err().kind(),
             io::ErrorKind::Other
         );
+    }
+
+    #[test]
+    fn absolute_paths_follow_the_backend_namespace() {
+        let virtual_fs = Vfs::new(InMemoryFs::new());
+        assert!(virtual_fs
+            .lock()
+            .is_absolute_path(Path::new("/project/file.lua")));
+        assert!(!virtual_fs
+            .lock()
+            .is_absolute_path(Path::new("project/file.lua")));
+        let native = Vfs::new(StdBackend::new().unwrap());
+        for path in [
+            Path::new("/project/file.lua"),
+            Path::new("relative/file.lua"),
+        ] {
+            assert_eq!(native.lock().is_absolute_path(path), path.is_absolute());
+        }
+        #[cfg(windows)]
+        {
+            assert!(!native
+                .lock()
+                .is_absolute_path(Path::new(r"\project\file.lua")));
+            assert!(!native
+                .lock()
+                .is_absolute_path(Path::new(r"C:project\file.lua")));
+            assert!(native
+                .lock()
+                .is_absolute_path(Path::new(r"C:\project\file.lua")));
+        }
     }
 
     /// https://github.com/rojo-rbx/rojo/issues/899

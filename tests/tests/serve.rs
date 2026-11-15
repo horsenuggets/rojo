@@ -36,14 +36,14 @@ fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {
             .id;
         fs::create_dir(session.path().join("src/Destination")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let (destination, cursor) = loop {
+        let destination = loop {
             let response = session.get_api_read(root).unwrap();
             if let Some(instance) = response
                 .instances
                 .values()
                 .find(|instance| instance.name == "Destination")
             {
-                break (instance.id, response.message_cursor);
+                break instance.id;
             }
             assert!(
                 Instant::now() < deadline,
@@ -51,6 +51,17 @@ fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {
             );
             thread::sleep(Duration::from_millis(20));
         };
+        // The read can see the new tree before its notification is published. Drain
+        // fixture creation before asserting that the move itself is update-only.
+        let setup = session
+            .get_api_socket_packet(SocketPacketType::Messages, initial.message_cursor)
+            .unwrap();
+        let SocketPacketBody::Messages(setup) = setup.body;
+        assert!(setup
+            .messages
+            .iter()
+            .any(|message| message.added.contains_key(&destination)));
+        let cursor = setup.message_cursor;
         let request = WriteRequest {
             session_id: info.session_id,
             message_cursor: Some(cursor),

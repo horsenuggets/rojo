@@ -231,6 +231,23 @@ pub(crate) fn recover_relocations(
     // mutate a journal reached through a different coordinator's lock domain.
     vfs.sync_path(&cache)?;
     for entry in entries {
+        let preparing = entry
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(".preparing-"))
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+        if preparing {
+            if super::relocation_transaction::preparation_is_discardable(vfs, entry.path())? {
+                retire_journal(vfs, entry.path())?;
+            } else {
+                log::warn!(
+                    "Preserved incomplete relocation preparation at \"{}\".",
+                    entry.path().display()
+                );
+            }
+            continue;
+        }
         let retired = entry
             .path()
             .file_name()
@@ -255,6 +272,9 @@ pub(crate) fn relocation_order(
     updates: &[PatchUpdate],
     removed: &[Ref],
 ) -> anyhow::Result<Vec<usize>> {
+    if updates.iter().all(|update| update.changed_parent.is_none()) {
+        return Ok((0..updates.len()).collect());
+    }
     let removed: HashSet<_> = removed.iter().copied().collect();
     let mut parents: HashMap<_, _> = tree
         .descendants(tree.get_root_id())
@@ -353,6 +373,25 @@ fn script_suffix(filename: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_parent_updates_keep_their_original_order_without_graph_validation() {
+        let tree = RojoTree::new(crate::snapshot::InstanceSnapshot::new());
+        let updates: Vec<_> = (0..3)
+            .map(|_| PatchUpdate {
+                id: Ref::new(),
+                changed_name: Some("Renamed".into()),
+                changed_class_name: None,
+                changed_parent: None,
+                changed_properties: Default::default(),
+                changed_metadata: None,
+            })
+            .collect();
+        assert_eq!(
+            relocation_order(&tree, &updates, &[]).unwrap(),
+            vec![0, 1, 2]
+        );
+    }
 
     #[test]
     fn moves_legacy_scripts_with_both_possible_sidecars() {
@@ -484,7 +523,7 @@ mod tests {
 
         for obstructed in [false, true] {
             let temp = tempfile::tempdir().unwrap();
-            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let root = dunce::canonicalize(temp.path()).unwrap();
             let source = root.join("source");
             let destination = root.join("destination");
             let cache = root.join(".rojo/relocations");
@@ -526,7 +565,7 @@ mod tests {
         use super::super::relocation_transaction::{Promotion, Relocation};
         for obstructed in [false, true] {
             let temp = tempfile::tempdir().unwrap();
-            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let root = dunce::canonicalize(temp.path()).unwrap();
             let source = root.join("script.lua");
             let destination = root.join("script");
             let cache = root.join(".rojo/relocations");

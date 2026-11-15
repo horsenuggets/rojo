@@ -99,17 +99,13 @@ pub fn execute(
             ));
         }
     }
-    // create_dir is exclusive, unlike create_dir_all. An existing journal must be
-    // recovered explicitly, never silently reused by another transaction.
-    fs.create_dir(journal_dir)?;
-    fs.sync_path(journal_dir.parent().unwrap())?;
     let journal = Journal {
         version: JOURNAL_VERSION,
         moves,
         absent_paths,
     };
     let bytes = serde_json::to_vec(&journal).map_err(io::Error::other)?;
-    persist(&mut fs, journal_dir, "intent.json", &bytes)?;
+    publish_intent(&mut fs, journal_dir, &bytes)?;
     execute_prepared(&mut fs, journal_dir, &journal)
 }
 
@@ -283,18 +279,15 @@ pub fn execute_promotion(
             "Promotion destination is occupied",
         ));
     }
-    fs.create_dir(journal_dir)?;
-    fs.sync_path(journal_dir.parent().unwrap())?;
     let journal = PromotionJournal {
         version: JOURNAL_VERSION,
         kind: "promotion".to_owned(),
         promotion,
         absent_paths,
     };
-    persist(
+    publish_intent(
         &mut fs,
         journal_dir,
-        "intent.json",
         &serde_json::to_vec(&journal).map_err(io::Error::other)?,
     )?;
     execute_promotion_prepared(
@@ -327,6 +320,16 @@ fn execute_promotion_prepared(
                 &entry.expected,
             )?;
         }
+        for (index, entry) in promotion.originals.iter().enumerate() {
+            let name = entry.destination.file_name().unwrap();
+            copy_tree_permissions(
+                fs,
+                &stage(journal_dir, index),
+                &journal_dir.join("output").join(name),
+                &entry.expected,
+            )?;
+        }
+        flush_tree(fs, &journal_dir.join("output"))?;
         transfer(
             fs,
             &journal_dir.join("output"),
@@ -397,6 +400,21 @@ fn validate_promotion(
         ));
     }
     Ok(VfsSnapshot::Dir { children })
+}
+
+fn copy_tree_permissions(
+    fs: &mut VfsLock<'_>,
+    source: &Path,
+    destination: &Path,
+    snapshot: &VfsSnapshot,
+) -> io::Result<()> {
+    if let VfsSnapshot::Dir { children } = snapshot {
+        for (name, child) in children {
+            copy_tree_permissions(fs, &source.join(name), &destination.join(name), child)?;
+        }
+    }
+    // Apply directories last so restrictive modes do not prevent copying children.
+    fs.copy_permissions(source, destination)
 }
 
 fn materialize(fs: &mut VfsLock<'_>, path: &Path, snapshot: &VfsSnapshot) -> io::Result<()> {
@@ -621,6 +639,63 @@ fn read_file(fs: &VfsLock<'_>, path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
+fn publish_intent(fs: &mut VfsLock<'_>, journal_dir: &Path, bytes: &[u8]) -> io::Result<()> {
+    let cache = journal_dir.parent().unwrap();
+    let preparation = cache.join(format!(".preparing-{}", uuid::Uuid::new_v4()));
+    fs.create_dir(&preparation)?;
+    fs.sync_path(cache)?;
+    // This file is deliberately not an active intent yet. Interrupted writes can
+    // only leave preparation data; no original is staged until publication succeeds.
+    fs.write(preparation.join("intent.json"), bytes)?;
+    fs.sync_path(&preparation.join("intent.json"))?;
+    fs.sync_path(&preparation)?;
+    let expected = fs.snapshot_tree(&preparation)?;
+    fs.move_no_replace(&preparation, journal_dir, &expected)?;
+    fs.sync_path(cache)
+}
+
+/// An unpublished directory cannot contain staged originals. Retire only recognized
+/// complete intents or empty preparations; preserve incomplete or unexpected contents
+/// without letting an interrupted preparation block startup recovery.
+pub(crate) fn preparation_is_discardable(vfs: &Vfs, directory: &Path) -> io::Result<bool> {
+    let VfsSnapshot::Dir { children } = vfs.snapshot_tree(directory)? else {
+        return Ok(false);
+    };
+    if children.is_empty() {
+        return Ok(true);
+    }
+    if children.len() != 1 {
+        return Ok(false);
+    }
+    let Some(VfsSnapshot::File { contents }) = children.get("intent.json") else {
+        return Ok(false);
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(contents) else {
+        return Ok(false);
+    };
+    let mut fs = vfs.lock();
+    if value.get("kind").is_some() {
+        let Ok(journal) = serde_json::from_value::<PromotionJournal>(value) else {
+            return Ok(false);
+        };
+        Ok(
+            serde_json::to_vec(&journal).map_err(io::Error::other)? == *contents
+                && journal.version == JOURNAL_VERSION
+                && journal.kind == "promotion"
+                && validate_promotion(&mut fs, directory, &journal.promotion, false).is_ok(),
+        )
+    } else {
+        let Ok(journal) = serde_json::from_value::<Journal>(value) else {
+            return Ok(false);
+        };
+        Ok(
+            serde_json::to_vec(&journal).map_err(io::Error::other)? == *contents
+                && journal.version == JOURNAL_VERSION
+                && validate(&mut fs, directory, &journal.moves, false).is_ok(),
+        )
+    }
+}
+
 fn persist(fs: &mut VfsLock<'_>, directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let path = directory.join(name);
     fs.write_atomic(&path, bytes, None)?;
@@ -657,7 +732,7 @@ fn validate(
 
 fn validate_paths(fs: &mut VfsLock<'_>, paths: &[&Path], check_parents: bool) -> io::Result<()> {
     for (index, path) in paths.iter().enumerate() {
-        if !path.is_absolute()
+        if !fs.is_absolute_path(path)
             || path
                 .components()
                 .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
@@ -794,6 +869,191 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn interrupted_preparations_do_not_block_startup_or_discard_unexpected_data() {
+        for real in [false, true] {
+            for state in [
+                "empty",
+                "partial",
+                "move",
+                "promotion",
+                "unexpected",
+                "edited",
+            ] {
+                let (fs, _temp, root) = fixture(real);
+                let project_path = root.join("default.project.json");
+                fs.write(
+                    &project_path,
+                    r#"{"name":"Test","tree":{"$className":"Folder"}}"#,
+                )
+                .unwrap();
+                let project = crate::Project::load_exact(&fs, &project_path, Some("Test")).unwrap();
+                let cache = super::super::relocation::cache_directory(&project);
+                let preparation = cache.join(format!(".preparing-{}", uuid::Uuid::new_v4()));
+                fs.create_dir_all(&preparation).unwrap();
+                let originals = if state == "promotion" {
+                    let plan = promotion_fixture(&fs, &root);
+                    fs.write(
+                        preparation.join("intent.json"),
+                        serde_json::to_vec(&PromotionJournal {
+                            version: JOURNAL_VERSION,
+                            kind: "promotion".into(),
+                            promotion: plan.clone(),
+                            absent_paths: Vec::new(),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    plan.originals
+                } else {
+                    let plan = moves(&fs, &root);
+                    match state {
+                        "move" => fs
+                            .write(
+                                preparation.join("intent.json"),
+                                serde_json::to_vec(&Journal {
+                                    version: JOURNAL_VERSION,
+                                    moves: plan.clone(),
+                                    absent_paths: Vec::new(),
+                                })
+                                .unwrap(),
+                            )
+                            .unwrap(),
+                        "partial" => fs
+                            .write(preparation.join("intent.json"), b"{\"version\":")
+                            .unwrap(),
+                        "unexpected" => fs
+                            .write(preparation.join("stage-0"), "external data")
+                            .unwrap(),
+                        "edited" => {
+                            let mut value = serde_json::to_value(&Journal {
+                                version: JOURNAL_VERSION,
+                                moves: plan.clone(),
+                                absent_paths: Vec::new(),
+                            })
+                            .unwrap();
+                            value["external"] = "preserve this edit".into();
+                            fs.write(
+                                preparation.join("intent.json"),
+                                serde_json::to_vec(&value).unwrap(),
+                            )
+                            .unwrap();
+                        }
+                        _ => {}
+                    }
+                    plan
+                };
+                let before = fs.snapshot_tree(&preparation).unwrap();
+                super::super::relocation::recover_relocations(&fs, &project).unwrap();
+                if matches!(state, "partial" | "unexpected" | "edited") {
+                    assert_eq!(fs.snapshot_tree(&preparation).unwrap(), before);
+                } else {
+                    assert!(!fs.exists(&preparation).unwrap());
+                }
+                for entry in originals {
+                    assert_eq!(fs.snapshot_tree(&entry.source).unwrap(), entry.expected);
+                    assert!(!fs.exists(&entry.destination).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn intent_publication_never_replaces_an_existing_journal() {
+        for real in [false, true] {
+            let (fs, _temp, root) = fixture(real);
+            let plan = moves(&fs, &root);
+            let journal = root.join("cache/tx");
+            fs.create_dir(&journal).unwrap();
+            fs.write(journal.join("external"), "occupied").unwrap();
+            let before = fs.snapshot_tree(&journal).unwrap();
+            let bytes = serde_json::to_vec(&Journal {
+                version: JOURNAL_VERSION,
+                moves: plan.clone(),
+                absent_paths: Vec::new(),
+            })
+            .unwrap();
+            assert!(publish_intent(&mut fs.lock(), &journal, &bytes).is_err());
+            assert_eq!(fs.snapshot_tree(&journal).unwrap(), before);
+            let preparations: Vec<_> = fs
+                .read_dir(root.join("cache"))
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| entry.path() != journal)
+                .collect();
+            assert_eq!(preparations.len(), 1);
+            assert!(preparation_is_discardable(&fs, preparations[0].path()).unwrap());
+            for entry in plan {
+                assert_eq!(fs.snapshot_tree(&entry.source).unwrap(), entry.expected);
+                assert!(!fs.exists(&entry.destination).unwrap());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_preserves_unmanaged_executable_and_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (fs, _temp, root) = fixture(true);
+        let plan = promotion_fixture(&fs, &root);
+        std::fs::set_permissions(
+            root.join("dst/Parent.server.lua"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            root.join("dst/Parent.meta.jsonc"),
+            std::fs::Permissions::from_mode(0o440),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            root.join("src/Child"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            root.join("src/Child/unmanaged.bin"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        execute_promotion(&fs, &root.join("cache/tx"), plan.clone(), Vec::new()).unwrap();
+        for (name, expected) in [
+            ("init.server.lua", 0o640),
+            ("init.meta.jsonc", 0o440),
+            ("Child", 0o751),
+            ("Child/unmanaged.bin", 0o751),
+        ] {
+            assert_eq!(
+                std::fs::metadata(plan.destination.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                expected
+            );
+        }
+        assert_eq!(
+            recover(&fs, &root.join("cache/tx")).unwrap(),
+            Recovery::Committed
+        );
+    }
+
+    #[test]
+    fn permission_copies_in_memory_do_not_require_host_entries() {
+        let (fs, _temp, root) = fixture(false);
+        let source = root.join("src/script.lua");
+        let destination = root.join("dst/script.lua");
+        fs.write(&source, "original").unwrap();
+        fs.write(&destination, "copy").unwrap();
+        fs.copy_permissions(&source, &destination).unwrap();
+        fs.lock().copy_permissions(&source, &destination).unwrap();
+        assert_eq!(fs.read(&source).unwrap().as_slice(), b"original");
+        assert_eq!(fs.read(&destination).unwrap().as_slice(), b"copy");
+        assert!(fs
+            .copy_permissions(&root.join("missing"), &destination)
+            .is_err());
     }
 
     #[test]

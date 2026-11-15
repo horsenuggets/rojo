@@ -167,6 +167,10 @@ enum Entry {
 }
 
 impl VfsBackend for InMemoryFs {
+    fn is_absolute_path(&self, path: &Path) -> bool {
+        path.has_root()
+    }
+
     fn lock_exclusive(&self, _path: &Path) -> io::Result<crate::VfsLockGuard> {
         Ok(crate::VfsLockGuard { _file: None })
     }
@@ -230,6 +234,17 @@ impl VfsBackend for InMemoryFs {
         // The shared mutex covers validation, exclusion and the entire subtree move.
         inner.remove(source.to_owned());
         inner.load_snapshot(destination.to_owned(), snapshot)
+    }
+
+    fn copy_permissions(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
+        let inner = self.inner.lock().unwrap();
+        for path in [source, destination] {
+            if !inner.entries.contains_key(path) {
+                return not_found(path);
+            }
+        }
+        // The virtual filesystem has no host permission state.
+        Ok(())
     }
 
     fn sync_path(&mut self, path: &Path) -> io::Result<()> {

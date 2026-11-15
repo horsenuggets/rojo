@@ -209,6 +209,20 @@ impl VfsBackend for StdBackend {
         crate::relocation::rename_no_replace(source, destination)
     }
 
+    fn copy_permissions(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
+        let source_metadata = fs_err::symlink_metadata(source)?;
+        let destination_metadata = fs_err::symlink_metadata(destination)?;
+        if !(source_metadata.is_file() && destination_metadata.is_file()
+            || source_metadata.is_dir() && destination_metadata.is_dir())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Permission copies require matching regular entries",
+            ));
+        }
+        fs_err::set_permissions(destination, source_metadata.permissions())
+    }
+
     fn sync_path(&mut self, path: &Path) -> io::Result<()> {
         let metadata = fs_err::symlink_metadata(path)?;
         if metadata.is_file() {

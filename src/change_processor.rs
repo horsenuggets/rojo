@@ -276,7 +276,73 @@ impl JobThreadContext {
                 &patch_set.updated_instances,
                 &patch_set.removed_instances,
             );
+            let mut updates = patch_set.updated_instances.clone();
+            let order = match order {
+                Ok(order) => order,
+                Err(error) => {
+                    // Invalid structural edits must not discard independent property edits.
+                    for update in &mut updates {
+                        if update.changed_parent.take().is_some() {
+                            errors.push(WriteError {
+                                id: update.id,
+                                property: Some("Parent".into()),
+                                message: format!("{error:#}"),
+                            });
+                            if let Some(instance) = tree.get_instance(update.id) {
+                                conflicts.updated_instances.push(PatchUpdate {
+                                    id: update.id,
+                                    changed_parent: Some(instance.parent()),
+                                    ..empty_update(update.id)
+                                });
+                            }
+                        }
+                    }
+                    (0..updates.len()).collect()
+                }
+            };
+            // Retained descendants must reach their destinations before an old
+            // ancestor's filesystem tree can be removed.
+            for index in order {
+                self.persist_update(
+                    &mut tree,
+                    &updates[index],
+                    &mut WriteOutcome {
+                        accepted: &mut accepted,
+                        conflicts: &mut conflicts,
+                        errors: &mut errors,
+                        messages: &mut messages,
+                    },
+                    &context,
+                    1,
+                );
+            }
             for &id in &patch_set.removed_instances {
+                let retained_move_failed = tree.get_instance(id).is_some()
+                    && patch_set.updated_instances.iter().any(|update| {
+                        update.changed_parent.is_some()
+                            && tree
+                                .descendants(id)
+                                .any(|instance| instance.id() == update.id)
+                    });
+                if retained_move_failed {
+                    if let Some(instance) = tree.get_instance(id) {
+                        deletion_conflicts.push(PatchAdd {
+                            parent_id: instance.parent(),
+                            instance: snapshot_from_tree(&tree, id),
+                        });
+                        messages.push(AppliedPatchSet {
+                            removed: vec![id],
+                            added: vec![id],
+                            updated: Vec::new(),
+                        });
+                    }
+                    errors.push(WriteError {
+                        id,
+                        property: None,
+                        message: "Cannot remove an ancestor while a retained descendant's move is unapplied".into(),
+                    });
+                    continue;
+                }
                 if let Some(owner) = inline_owner(&tree, id) {
                     let removal =
                         self.remove_inline_instance(&mut tree, id, owner, &context, &mut messages);
@@ -376,45 +442,6 @@ impl JobThreadContext {
                         }
                     }
                 }
-            }
-            let mut updates = patch_set.updated_instances.clone();
-            let order = match order {
-                Ok(order) => order,
-                Err(error) => {
-                    // Invalid structural edits must not discard independent property edits.
-                    for update in &mut updates {
-                        if update.changed_parent.take().is_some() {
-                            errors.push(WriteError {
-                                id: update.id,
-                                property: Some("Parent".into()),
-                                message: format!("{error:#}"),
-                            });
-                            if let Some(instance) = tree.get_instance(update.id) {
-                                conflicts.updated_instances.push(PatchUpdate {
-                                    id: update.id,
-                                    changed_parent: Some(instance.parent()),
-                                    ..empty_update(update.id)
-                                });
-                            }
-                        }
-                    }
-                    (0..updates.len()).collect()
-                }
-            };
-            for index in order {
-                let update = &updates[index];
-                self.persist_update(
-                    &mut tree,
-                    update,
-                    &mut WriteOutcome {
-                        accepted: &mut accepted,
-                        conflicts: &mut conflicts,
-                        errors: &mut errors,
-                        messages: &mut messages,
-                    },
-                    &context,
-                    1,
-                );
             }
         }
         // Saved updates were applied as they were written, so a later update in
@@ -2279,6 +2306,57 @@ mod tests {
                 ..empty_update(id)
             }],
             ..PatchSet::new()
+        }
+    }
+
+    #[test]
+    fn retained_children_escape_before_ancestor_deletion_and_block_it_on_failure() {
+        for collision in [false, true] {
+            let (job, root) = script_job(
+                vec![(
+                    "src",
+                    VfsSnapshot::dir([
+                        (
+                            "Old",
+                            VfsSnapshot::dir([("Child.lua", VfsSnapshot::file("return 1"))]),
+                        ),
+                        ("Other.lua", VfsSnapshot::file("return 2")),
+                    ]),
+                )],
+                "/project/src",
+            );
+            let old = find(&job, &["Old"]);
+            let child = find(&job, &["Old", "Child"]);
+            if collision {
+                job.vfs.write("/project/src/Child.lua", "occupied").unwrap();
+            }
+            let mut patch = parent_update(child, root);
+            patch.removed_instances.push(old);
+            let (accepted, conflicts, errors) = job.handle_tree_event(patch);
+            if collision {
+                assert!(!errors.is_empty());
+                assert!(accepted.removed_instances.is_empty());
+                assert!(!conflicts.added_instances.is_empty());
+                assert_eq!(find(&job, &["Old", "Child"]), child);
+                assert_eq!(
+                    read_text(&job.vfs, "/project/src/Old/Child.lua").as_deref(),
+                    Some("return 1")
+                );
+                assert_eq!(
+                    read_text(&job.vfs, "/project/src/Child.lua").as_deref(),
+                    Some("occupied")
+                );
+            } else {
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(accepted.removed_instances, vec![old]);
+                assert_eq!(conflicts, PatchSet::new());
+                assert_eq!(find(&job, &["Child"]), child);
+                assert!(!job.vfs.exists("/project/src/Old").unwrap());
+                assert_eq!(
+                    read_text(&job.vfs, "/project/src/Child.lua").as_deref(),
+                    Some("return 1")
+                );
+            }
         }
     }
 
