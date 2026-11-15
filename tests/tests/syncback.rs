@@ -848,8 +848,11 @@ fn script_suffix_migration_review_regressions() {
                 "ignore_leaf_old",
                 "ignore_leaf_new",
                 "custom",
+                "nested",
+                "staged_collision",
                 "adjacent",
                 "fixed",
+                "ignored_context",
             ] {
                 let temp = tempfile::tempdir().unwrap();
                 let project = temp.path().join("project");
@@ -861,7 +864,7 @@ fn script_suffix_migration_review_regressions() {
                 });
                 let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));
                 let root = dom.root_ref();
-                let parent = if case == "fixed" {
+                let parent = if matches!(case, "fixed" | "ignored_context") {
                     root
                 } else {
                     dom.insert(root, InstanceBuilder::new("Folder").with_name("src"))
@@ -911,18 +914,36 @@ fn script_suffix_migration_review_regressions() {
                         config["syncbackRules"]["ignorePaths"] =
                             serde_json::json!([format!("src/Boot.{kind}.{extension}")]);
                     }
-                    "custom" => {
-                        config["syncRules"] = serde_json::json!([{
+                    "custom" | "nested" => {
+                        let rules = serde_json::json!([{
                             "pattern": format!("*.server.{extension}"),
                             "use": "moduleScript", "suffix": format!(".{extension}")
                         }]);
+                        let (source_dir, parent) = if case == "nested" {
+                            fs_err::create_dir_all(project.join("src/Nested/Content")).unwrap();
+                            fs_err::write(project.join("src/Nested/default.project.json"),
+                                serde_json::to_vec_pretty(&serde_json::json!({
+                                    "name":"Nested", "tree":{"$className":"Folder","$path":"Content"},
+                                    "syncRules": rules
+                                })).unwrap()).unwrap();
+                            (
+                                "src/Nested/Content",
+                                dom.insert(
+                                    parent,
+                                    InstanceBuilder::new("Folder").with_name("Nested"),
+                                ),
+                            )
+                        } else {
+                            config["syncRules"] = rules;
+                            ("src", parent)
+                        };
                         expected = vec![
                             ("Foo.server", "ModuleScript", "return 3", None),
                             ("Foo", "ModuleScript", "return 4", None),
                         ];
                         for (name, _, source, _) in &expected {
                             fs_err::write(
-                                project.join(format!("src/{name}.{extension}")),
+                                project.join(format!("{source_dir}/{name}.{extension}")),
                                 "return 1",
                             )
                             .unwrap();
@@ -931,6 +952,27 @@ fn script_suffix_migration_review_regressions() {
                                 InstanceBuilder::new("ModuleScript")
                                     .with_name(*name)
                                     .with_property("Source", *source),
+                            );
+                        }
+                    }
+                    "staged_collision" => {
+                        fs_err::write(
+                            project.join(format!("src/Effect.client.{extension}")),
+                            "return 1",
+                        )
+                        .unwrap();
+                        fs_err::write(project.join("src/Effect.meta.json"), r#"{"name":"Actual"}"#)
+                            .unwrap();
+                        config["syncRules"] = serde_json::json!([{
+                            "pattern":format!("*.client.{extension}"),
+                            "use":"legacyClientScript", "suffix":format!(".client.{extension}")
+                        }]);
+                        for (name, source) in [("Actual", "return 2"), ("Effect", "return 3")] {
+                            dom.insert(
+                                parent,
+                                InstanceBuilder::new("LocalScript")
+                                    .with_name(name)
+                                    .with_property("Source", source),
                             );
                         }
                     }
@@ -952,12 +994,19 @@ fn script_suffix_migration_review_regressions() {
                                 .with_property("RunContext", Enum::from_u32(contexts["Client"])),
                         );
                     }
-                    "fixed" => {
+                    "fixed" | "ignored_context" => {
                         let path = format!("src/Boot.server.{extension}");
                         fs_err::write(project.join(&path), "return 1").unwrap();
                         config["tree"] = serde_json::json!({
                             "$className": "Folder", "Boot": { "$path": path }
                         });
+                        if case == "ignored_context" {
+                            config["tree"]["Boot"]["$properties"] =
+                                serde_json::json!({"RunContext":{"Enum":contexts["Client"]}});
+                            config["syncbackRules"]["ignoreProperties"] =
+                                serde_json::json!({"LuaSourceContainer":["RunContext"]});
+                            expected = vec![("Boot", "Script", "return 2", Some("Client"))];
+                        }
                         dom.insert(
                             parent,
                             InstanceBuilder::new("Script")
@@ -968,7 +1017,15 @@ fn script_suffix_migration_review_regressions() {
                     _ => unreachable!(),
                 }
                 // The unused directory must not mask an adjacent script of the same name.
-                if matches!(case, "custom" | "adjacent" | "fixed") {
+                if matches!(
+                    case,
+                    "custom"
+                        | "nested"
+                        | "staged_collision"
+                        | "adjacent"
+                        | "fixed"
+                        | "ignored_context"
+                ) {
                     fs_err::remove_dir(project.join("src/Boot")).unwrap();
                 }
                 let project_path = project.join("default.project.json");
@@ -988,10 +1045,15 @@ fn script_suffix_migration_review_regressions() {
                         .unwrap()
                 };
                 let output = sync();
-                if case.starts_with("ignore") {
+                if case.starts_with("ignore_") || case == "staged_collision" {
                     assert!(!output.status.success(), "{case} {output:?}");
+                    let message = if case == "staged_collision" {
+                        "same destination"
+                    } else {
+                        "ignore pattern"
+                    };
                     assert!(
-                        String::from_utf8_lossy(&output.stderr).contains("ignore pattern"),
+                        String::from_utf8_lossy(&output.stderr).contains(message),
                         "{output:?}"
                     );
                     assert_eq!(read_files(&project), before);
@@ -1007,9 +1069,17 @@ fn script_suffix_migration_review_regressions() {
                         assert!(first.contains_key(&format!("src/Boot/init.legacy.{extension}")));
                         assert!(!first.contains_key(&format!("src/Boot/init.server.{extension}")));
                     }
-                    "custom" => {
-                        assert_eq!(first[&format!("src/Foo.server.{extension}")], "return 3");
-                        assert_eq!(first[&format!("src/Foo.{extension}")], "return 4");
+                    "custom" | "nested" => {
+                        let prefix = if case == "nested" {
+                            "src/Nested/Content"
+                        } else {
+                            "src"
+                        };
+                        assert_eq!(
+                            first[&format!("{prefix}/Foo.server.{extension}")],
+                            "return 3"
+                        );
+                        assert_eq!(first[&format!("{prefix}/Foo.{extension}")], "return 4");
                     }
                     "adjacent" if !directories => {
                         let metadata: serde_json::Value =

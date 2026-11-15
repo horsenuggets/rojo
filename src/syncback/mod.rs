@@ -92,8 +92,12 @@ pub fn syncback_instance(
         source_file(&old_inst),
     ) {
         if let Some(name) = source.file_name().and_then(|name| name.to_str()) {
-            if file_names::canonical_script_source_name(script, &source, project)
-                .is_some_and(|canonical| canonical != name)
+            if file_names::canonical_script_source_name(
+                script,
+                &source,
+                &old_inst.metadata().context.sync_rules,
+            )
+            .is_some_and(|canonical| canonical != name)
             {
                 anyhow::bail!(
                     "This script's class or RunContext requires a different source filename. \
@@ -351,8 +355,12 @@ pub fn syncback_loop(
         let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if file_names::canonical_script_source_name(middleware, &source, project)
-            .is_some_and(|canonical| canonical != name)
+        if file_names::canonical_script_source_name(
+            middleware,
+            &source,
+            &old.metadata().context.sync_rules,
+        )
+        .is_some_and(|canonical| canonical != name)
         {
             let mut current = old.id();
             while relayout.insert(current) {
@@ -384,6 +392,7 @@ pub fn syncback_loop(
     }];
 
     let mut fs_snapshot = FsSnapshot::new();
+    let mut file_owners = HashMap::new();
 
     'syncback: while let Some(snapshot) = snapshots.pop() {
         let inst_path = snapshot.get_new_inst_path(snapshot.new);
@@ -528,9 +537,12 @@ pub fn syncback_loop(
 
         // TODO provide replacement snapshots for e.g. two way sync
 
-        fs_snapshot.merge_with_filter(syncback.fs_snapshot, |path| {
-            is_valid_path(&ignore_patterns, project_path, path)
-        });
+        fs_snapshot.merge_with_filter(
+            syncback.fs_snapshot,
+            |path| is_valid_path(&ignore_patterns, project_path, path),
+            snapshot.new,
+            &mut file_owners,
+        )?;
 
         snapshots.extend(syncback.children);
     }
@@ -593,6 +605,8 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
             return file_names::directory_variant(script);
         }
         return script;
+    } else if old_middleware == Some(Middleware::Project) {
+        return Middleware::Project;
     } else if instances_as_directories(snapshot.project()) {
         return directory_middleware_for_instance(inst);
     } else if let Some(old_middleware) = old_middleware {

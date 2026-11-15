@@ -19,7 +19,6 @@ pub fn name_for_inst<'old>(
     middleware: Middleware,
     new_inst: &Instance,
     old_inst: Option<InstanceWithMeta<'old>>,
-    project: &crate::Project,
 ) -> anyhow::Result<Cow<'old, str>> {
     if let Some(old_inst) = old_inst {
         if let Some(source) = old_inst.metadata().relevant_paths.first() {
@@ -27,8 +26,12 @@ pub fn name_for_inst<'old>(
                 .file_name()
                 .and_then(|s| s.to_str())
                 .context("sources on the file system should be valid unicode and not be stubs")?;
-            Ok(canonical_script_source_name(middleware, source, project)
-                .unwrap_or(Cow::Borrowed(name)))
+            Ok(canonical_script_source_name(
+                middleware,
+                source,
+                &old_inst.metadata().context.sync_rules,
+            )
+            .unwrap_or(Cow::Borrowed(name)))
         } else {
             // This is technically not /always/ true, but we want to avoid
             // running syncback on anything that has no instigating source
@@ -91,7 +94,7 @@ pub(super) fn canonical_script_file_name(
 pub(super) fn canonical_script_source_name<'a>(
     middleware: Middleware,
     source: &'a Path,
-    project: &crate::Project,
+    rules: &[crate::snapshot::SyncRule],
 ) -> Option<Cow<'a, str>> {
     if middleware.is_dir() {
         return None;
@@ -102,8 +105,7 @@ pub(super) fn canonical_script_source_name<'a>(
     if !matches!(extension, "lua" | "luau") {
         return None;
     }
-    let Some(rule) = project
-        .sync_rules
+    let Some(rule) = rules
         .iter()
         .chain(crate::snapshot_middleware::default_sync_rules())
         .find(|rule| rule.matches(source))

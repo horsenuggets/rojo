@@ -701,7 +701,10 @@ fn project_node_property_syncback_path(
         .unwrap();
     // Fixed project paths cannot change suffix, so even the engine-default
     // context must override the source file's implied execution context.
-    if new_inst.class.as_str() == "Script" {
+    if new_inst.class.as_str() == "Script"
+        && !get_property_filter(snapshot.project(), new_inst)
+            .is_some_and(|ignored| ignored.contains(&"RunContext".into()))
+    {
         let database = rbx_reflection_database::get().unwrap();
         if let Some(context) = new_inst.properties.get(&"RunContext".into()).or_else(|| {
             database.classes["Script"]

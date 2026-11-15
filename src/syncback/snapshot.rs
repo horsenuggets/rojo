@@ -60,12 +60,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
             middleware: None,
         };
         let middleware = get_best_middleware(&snapshot);
-        let name = name_for_inst(
-            middleware,
-            snapshot.new_inst(),
-            snapshot.old_inst(),
-            snapshot.project(),
-        )?;
+        let name = name_for_inst(middleware, snapshot.new_inst(), snapshot.old_inst())?;
         snapshot.path = self.path.join(name.as_ref());
 
         Ok(snapshot)
@@ -99,7 +94,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
             Some((source, name)) => super::file_names::canonical_script_source_name(
                 get_best_middleware(&snapshot),
                 source,
-                snapshot.project(),
+                &snapshot.old_inst().unwrap().metadata().context.sync_rules,
             )
             .map(|name| name.into_owned())
             .unwrap_or_else(|| name.to_owned()),
@@ -158,12 +153,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
             middleware: None,
         };
         let middleware = get_best_middleware(&snapshot);
-        let name = name_for_inst(
-            middleware,
-            snapshot.new_inst(),
-            snapshot.old_inst(),
-            snapshot.project(),
-        )?;
+        let name = name_for_inst(middleware, snapshot.new_inst(), snapshot.old_inst())?;
         snapshot.path = base_path.join(name.as_ref());
 
         Ok(snapshot)
@@ -270,7 +260,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
                 && super::file_names::canonical_script_source_name(
                     get_best_middleware(self),
                     source,
-                    self.project(),
+                    &old.metadata().context.sync_rules,
                 )
                 .is_some_and(|name| {
                     path.file_name().and_then(|name| name.to_str()) == Some(name.as_ref())

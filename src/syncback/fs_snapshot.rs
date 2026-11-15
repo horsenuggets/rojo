@@ -55,20 +55,36 @@ impl FsSnapshot {
         self.removed_dirs.extend(other.removed_dirs);
     }
 
-    /// Merges two `FsSnapshot`s together, with a filter applied to the paths.
+    /// Merges filtered paths, rejecting files claimed by different instances.
+    /// Project traversal may serialize the same instance more than once.
     #[inline]
-    pub fn merge_with_filter<F>(&mut self, other: Self, mut predicate: F)
+    pub fn merge_with_filter<F>(
+        &mut self,
+        mut other: Self,
+        mut predicate: F,
+        owner: rbx_dom_weak::types::Ref,
+        owners: &mut HashMap<PathBuf, rbx_dom_weak::types::Ref>,
+    ) -> anyhow::Result<()>
     where
         F: FnMut(&Path) -> bool,
     {
-        self.added_files
-            .extend(other.added_files.into_iter().filter(|(k, _)| predicate(k)));
+        other.added_files.retain(|path, _| predicate(path));
+        for path in other.added_files.keys() {
+            anyhow::ensure!(
+                owners.get(path).is_none_or(|previous| *previous == owner),
+                "Cannot stage multiple files at the same destination {}",
+                path.display()
+            );
+        }
+        owners.extend(other.added_files.keys().cloned().map(|path| (path, owner)));
+        self.added_files.extend(other.added_files);
         self.added_dirs
             .extend(other.added_dirs.into_iter().filter(|p| predicate(p)));
         self.removed_files
             .extend(other.removed_files.into_iter().filter(|p| predicate(p)));
         self.removed_dirs
             .extend(other.removed_dirs.into_iter().filter(|p| predicate(p)));
+        Ok(())
     }
 
     /// Adds the provided path as a file with the given contents.
@@ -312,6 +328,51 @@ impl FsSnapshot {
 mod tests {
     use super::*;
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn filtered_merge_rejects_duplicate_destinations_before_mutating() {
+        for same_contents in [false, true] {
+            for ignored in [false, true] {
+                let mut staged = FsSnapshot::new().with_added_file("Code.luau", b"first".to_vec());
+                let incoming = FsSnapshot::new()
+                    .with_added_file("Other.luau", b"other".to_vec())
+                    .with_added_file(
+                        "Code.luau",
+                        if same_contents { b"first" } else { b"other" }.to_vec(),
+                    );
+                let original_owner = rbx_dom_weak::types::Ref::new();
+                let mut owners = HashMap::from([(PathBuf::from("Code.luau"), original_owner)]);
+                let result = staged.merge_with_filter(
+                    incoming,
+                    |path| !ignored || path != Path::new("Code.luau"),
+                    rbx_dom_weak::types::Ref::new(),
+                    &mut owners,
+                );
+                assert_eq!(result.is_ok(), ignored);
+                assert_eq!(staged.added_files[Path::new("Code.luau")], b"first");
+                assert_eq!(
+                    staged.added_files.contains_key(Path::new("Other.luau")),
+                    ignored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_merge_allows_the_same_instance_to_reserialize_its_file() {
+        let owner = rbx_dom_weak::types::Ref::new();
+        let mut owners = HashMap::from([(PathBuf::from("Code.luau"), owner)]);
+        let mut staged = FsSnapshot::new().with_added_file("Code.luau", b"first".to_vec());
+        staged
+            .merge_with_filter(
+                FsSnapshot::new().with_added_file("Code.luau", b"updated".to_vec()),
+                |_| true,
+                owner,
+                &mut owners,
+            )
+            .unwrap();
+        assert_eq!(staged.added_files[Path::new("Code.luau")], b"updated");
+    }
 
     #[test]
     fn multi_file_scoped_updates_fail_before_changing_any_file() {
