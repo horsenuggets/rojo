@@ -114,6 +114,7 @@ pub fn syncback_instance(
             new_tree: &new_tree,
             project,
             scoped: true,
+            context: None,
             script_containers: None,
             attribute_ids: &attribute_ids,
         },
@@ -379,6 +380,7 @@ pub fn syncback_loop(
         new_tree: &new_tree,
         project,
         scoped: false,
+        context: None,
         script_containers: Some(&script_containers),
         attribute_ids: &attribute_ids,
     };

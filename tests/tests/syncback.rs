@@ -860,6 +860,10 @@ fn script_suffix_migration_review_regressions() {
                 "rule_ignored",
                 "rule_wrong_class",
                 "rule_broad",
+                "nested_new_rule_ignored",
+                "nested_new_rule_wrong_class",
+                "nested_new_rule_broad",
+                "nested_new_rule_valid",
             ] {
                 let temp = tempfile::tempdir().unwrap();
                 let project = temp.path().join("project");
@@ -1049,6 +1053,44 @@ fn script_suffix_migration_review_regressions() {
                                 .with_property("RunContext", Enum::from_u32(contexts["Client"])),
                         );
                     }
+                    "nested_new_rule_ignored"
+                    | "nested_new_rule_wrong_class"
+                    | "nested_new_rule_broad"
+                    | "nested_new_rule_valid" => {
+                        fs_err::remove_dir(project.join("src/Boot")).unwrap();
+                        fs_err::create_dir_all(project.join("src/Nested/Content")).unwrap();
+                        let broad = case.ends_with("broad");
+                        let rule = serde_json::json!({
+                            "pattern": if broad { "*.luau" } else { "*.local.luau" },
+                            "use": if case.ends_with("ignored") { "ignore" } else if case.ends_with("wrong_class") { "moduleScript" } else { "legacyClientScript" },
+                            "suffix": if broad { ".luau" } else { ".local.luau" }
+                        });
+                        fs_err::write(
+                            project.join("src/Nested/default.project.json"),
+                            serde_json::to_vec_pretty(&serde_json::json!({
+                                "name":"Nested", "tree":{"$className":"Folder","$path":"Content"},
+                                "syncRules":[rule]
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        if case.ends_with("valid") {
+                            config["syncRules"] = serde_json::json!([{
+                                "pattern":"*.local.luau", "use":"ignore"
+                            }]);
+                        }
+                        let nested =
+                            dom.insert(parent, InstanceBuilder::new("Folder").with_name("Nested"));
+                        let fresh =
+                            dom.insert(nested, InstanceBuilder::new("Folder").with_name("Fresh"));
+                        dom.insert(
+                            fresh,
+                            InstanceBuilder::new("LocalScript")
+                                .with_name("Effect")
+                                .with_property("Source", "return 2"),
+                        );
+                        expected = vec![("Effect", "LocalScript", "return 2", None)];
+                    }
                     "rule_ignored" | "rule_wrong_class" | "rule_broad" => {
                         let suffix = if case == "rule_broad" { "" } else { ".client" };
                         fs_err::write(
@@ -1110,12 +1152,13 @@ fn script_suffix_migration_review_regressions() {
                 let output = sync();
                 if case.starts_with("ignore_")
                     || case.starts_with("rule_")
+                    || (case.starts_with("nested_new_rule_") && !case.ends_with("valid"))
                     || case == "staged_collision"
                 {
                     assert!(!output.status.success(), "{case} {output:?}");
                     let message = if case == "staged_collision" {
                         "same destination"
-                    } else if case.starts_with("rule_") {
+                    } else if case.starts_with("rule_") || case.starts_with("nested_new_rule_") {
                         "incompatible sync rule"
                     } else {
                         "ignore pattern"

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    snapshot::{InstanceWithMeta, RojoTree},
+    snapshot::{InstanceContext, InstanceWithMeta, RojoTree},
     snapshot_middleware::{default_sync_rules, Middleware},
     Project,
 };
@@ -30,6 +30,8 @@ pub struct SyncbackData<'sync> {
     /// Whether this rewrites one instance's files for two-way sync, where the
     /// new tree only holds what that instance's own files store.
     pub(super) scoped: bool,
+    /// Effective destination context inherited by instances without tracked sources.
+    pub(super) context: Option<&'sync InstanceContext>,
     /// Instances in the new tree that are scripts or have script descendants,
     /// when they were computed ahead of time for the whole tree.
     pub(super) script_containers: Option<&'sync HashSet<Ref>>,
@@ -47,13 +49,22 @@ pub struct SyncbackSnapshot<'sync> {
 }
 
 impl<'sync> SyncbackSnapshot<'sync> {
+    fn context(&self) -> Option<&'sync InstanceContext> {
+        self.old_inst()
+            .map(|old| &old.metadata().context)
+            .or(self.data.context)
+    }
+
     /// Constructs a SyncbackSnapshot from the provided refs
     /// while inheriting this snapshot's path and data. This should be used for
     /// directories.
     #[inline]
     pub fn with_joined_path(&self, new_ref: Ref, old_ref: Option<Ref>) -> anyhow::Result<Self> {
         let mut snapshot = Self {
-            data: self.data,
+            data: SyncbackData {
+                context: self.context(),
+                ..self.data
+            },
             old: old_ref,
             new: new_ref,
             path: PathBuf::new(),
@@ -80,7 +91,10 @@ impl<'sync> SyncbackSnapshot<'sync> {
         stem: &str,
     ) -> Self {
         let mut snapshot = Self {
-            data: self.data,
+            data: SyncbackData {
+                context: self.context(),
+                ..self.data
+            },
             old: old_ref,
             new: new_ref,
             path: PathBuf::new(),
@@ -116,13 +130,11 @@ impl<'sync> SyncbackSnapshot<'sync> {
     /// also the stem of its adjacent `.meta.json` file.
     pub fn file_stem(&self) -> &str {
         let middleware = get_best_middleware(self);
-        for rule in self
-            .data
-            .project
-            .sync_rules
-            .iter()
-            .chain(default_sync_rules())
-        {
+        let rules = self
+            .context()
+            .map(|context| context.sync_rules.as_slice())
+            .unwrap_or(self.project().sync_rules.as_slice());
+        for rule in rules.iter().chain(default_sync_rules()) {
             if rule.middleware == middleware && rule.matches(&self.path) {
                 if let Ok(stem) = rule.file_name_for_path(&self.path) {
                     return stem;
@@ -146,7 +158,10 @@ impl<'sync> SyncbackSnapshot<'sync> {
         old_ref: Option<Ref>,
     ) -> anyhow::Result<Self> {
         let mut snapshot = Self {
-            data: self.data,
+            data: SyncbackData {
+                context: self.context(),
+                ..self.data
+            },
             old: old_ref,
             new: new_ref,
             path: PathBuf::new(),
@@ -164,7 +179,10 @@ impl<'sync> SyncbackSnapshot<'sync> {
     #[inline]
     pub fn with_new_path(&self, path: PathBuf, new_ref: Ref, old_ref: Option<Ref>) -> Self {
         Self {
-            data: self.data,
+            data: SyncbackData {
+                context: self.context(),
+                ..self.data
+            },
             old: old_ref,
             new: new_ref,
             path,
@@ -291,12 +309,12 @@ impl<'sync> SyncbackSnapshot<'sync> {
         if middleware.is_dir() || self.middleware.is_some() {
             return Ok(());
         }
-        let old = self.old_inst();
-        let rules = old
-            .map(|old| old.metadata().context.sync_rules.as_slice())
+        let context = self.context();
+        let rules = context
+            .map(|context| context.sync_rules.as_slice())
             .unwrap_or(self.project().sync_rules.as_slice());
-        let emit_legacy = old
-            .map(|old| old.metadata().context.emit_legacy_scripts)
+        let emit_legacy = context
+            .map(|context| context.emit_legacy_scripts)
             .or(self.project().emit_legacy_scripts)
             .unwrap_or_else(|| crate::snapshot::InstanceContext::default().emit_legacy_scripts);
         let rule = rules
