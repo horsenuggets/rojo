@@ -8,9 +8,9 @@ plugin. This enables automated workflows like connecting to a
 serve session, accepting sync confirmations, and checking
 connection status without manual UI interaction.
 
-The same API is also available as shared.Rojo for existing
-scripts. Use shared.RojoPlus when another Rojo build may be
-loaded alongside, since that one can claim shared.Rojo.
+The same API is also published as shared.Rojo for existing
+scripts, unless another Rojo build already holds that name.
+Use shared.RojoPlus to always reach Rojo+.
 
 API (shown as shared.Rojo, identical under shared.RojoPlus):
 > shared.Rojo.connect(host?, port?) - Connect to a Rojo
@@ -51,8 +51,34 @@ const SharedAPI = {}
 local registeredApp = nil
 local registeredApi = nil
 
--- shared.RojoPlus is unique to Rojo+. shared.Rojo is kept for existing scripts.
-SharedAPI.GLOBAL_NAMES = { "RojoPlus", "Rojo" }
+-- Unique to Rojo+, so it's always claimed.
+const OWN_NAME = "RojoPlus"
+-- Kept for existing scripts. Another Rojo build may use it too, so it's only
+-- claimed when free.
+const SHARED_NAME = "Rojo"
+
+--[[
+	Publishes `api` into `globals` (normally `shared`). Never replaces another
+	build's `shared.Rojo`.
+]]
+function SharedAPI.claimGlobals(globals, api)
+	globals[OWN_NAME] = api
+	if globals[SHARED_NAME] == nil then
+		globals[SHARED_NAME] = api
+	end
+end
+
+--[[
+	Removes `api` from `globals`, leaving any name that now points at something
+	else alone.
+]]
+function SharedAPI.releaseGlobals(globals, api)
+	for _, name in { OWN_NAME, SHARED_NAME } do
+		if api ~= nil and globals[name] == api then
+			globals[name] = nil
+		end
+	end
+end
 
 -- A session captures its two-way sync option when it starts connecting, so the
 -- setting can only change while no session is starting, confirming, or running.
@@ -357,21 +383,13 @@ function SharedAPI.register(app)
 	end
 
 	registeredApi = api
-	for _, name in SharedAPI.GLOBAL_NAMES do
-		shared[name] = api
-	end
+	SharedAPI.claimGlobals(shared, api)
 	Log.trace("Registered shared.RojoPlus API")
 end
 
 function SharedAPI.unregister()
 	registeredApp = nil
-	-- Another Rojo build may have taken over a name since, so only names that
-	-- still point at this API are cleared.
-	for _, name in SharedAPI.GLOBAL_NAMES do
-		if shared[name] == registeredApi then
-			shared[name] = nil
-		end
-	end
+	SharedAPI.releaseGlobals(shared, registeredApi)
 	registeredApi = nil
 	Log.trace("Unregistered shared.RojoPlus API")
 end

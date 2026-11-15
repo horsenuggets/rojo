@@ -16,32 +16,55 @@ return function()
 		end
 	end)
 
-	it("should never clear another Rojo build's shared API on unload", function()
-		-- Registration only happens in Edit mode.
-		if not game:GetService("RunService"):IsEdit() then
-			return
-		end
+	-- These use a plain table in place of `shared`, so the live plugin's API is
+	-- never touched.
+	describe("shared names", function()
+		it("should take shared.Rojo only when it's free", function()
+			local ours, other = {}, {}
 
-		local previous = {}
-		for _, name in SharedAPI.GLOBAL_NAMES do
-			previous[name] = shared[name]
-		end
+			local free = {}
+			SharedAPI.claimGlobals(free, ours)
+			expect(free.RojoPlus).to.equal(ours)
+			expect(free.Rojo).to.equal(ours)
 
-		SharedAPI.register({ state = {} })
-		local ours = shared.RojoPlus
-		expect(ours).to.be.ok()
-		expect(shared.Rojo).to.equal(ours)
+			-- Another Rojo build loaded first.
+			local taken = { Rojo = other }
+			SharedAPI.claimGlobals(taken, ours)
+			expect(taken.RojoPlus).to.equal(ours)
+			expect(taken.Rojo).to.equal(other)
+		end)
 
-		-- Another Rojo build claims shared.Rojo after Rojo+ loaded.
-		local other = {}
-		shared.Rojo = other
-		SharedAPI.unregister()
+		it("should never clear another build's API in either load order", function()
+			local ours, other = {}, {}
+			for _, otherFirst in { true, false } do
+				local globals = {}
+				if otherFirst then
+					globals.Rojo = other
+				end
+				SharedAPI.claimGlobals(globals, ours)
+				if not otherFirst then
+					-- Another build loads later and takes shared.Rojo over.
+					globals.Rojo = other
+				end
 
-		expect(shared.RojoPlus).to.equal(nil)
-		expect(shared.Rojo).to.equal(other)
+				SharedAPI.releaseGlobals(globals, ours)
+				expect(globals.RojoPlus).to.equal(nil)
+				expect(globals.Rojo).to.equal(other)
+			end
+		end)
 
-		for _, name in SharedAPI.GLOBAL_NAMES do
-			shared[name] = previous[name]
-		end
+		it("should clear both names when Rojo+ held them", function()
+			local ours = {}
+			local globals = {}
+			SharedAPI.claimGlobals(globals, ours)
+			SharedAPI.releaseGlobals(globals, ours)
+			expect(globals.RojoPlus).to.equal(nil)
+			expect(globals.Rojo).to.equal(nil)
+
+			-- Releasing without ever registering changes nothing.
+			local untouched = { Rojo = ours }
+			SharedAPI.releaseGlobals(untouched, nil)
+			expect(untouched.Rojo).to.equal(ours)
+		end)
 	end)
 end
