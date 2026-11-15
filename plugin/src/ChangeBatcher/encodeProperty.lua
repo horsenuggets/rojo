@@ -4,8 +4,42 @@ local RbxDom = require(Packages.RbxDom)
 
 local unmanagedAttributes = require(script.Parent.Parent.Reconciler.unmanagedAttributes)
 
-local function isNonFinite(value)
-	return type(value) == "number" and (value ~= value or value == math.huge or value == -math.huge)
+local function vector2(vector)
+	return { vector.X, vector.Y }
+end
+
+local function vector3(vector)
+	return { vector.X, vector.Y, vector.Z }
+end
+
+local function number(value)
+	return value
+end
+
+-- rbx_dom_lua stands in a large finite number for infinity in these types,
+-- including the vectors inside a Ray or Rect. msgpack holds infinity exactly
+-- and the filesystem writes it in a tagged form, so they're encoded from
+-- their raw components instead, which is the same encoding for finite values.
+local exactEncoders = {
+	Float32 = number,
+	Float64 = number,
+	Vector2 = vector2,
+	Vector3 = vector3,
+	Ray = function(ray)
+		return { origin = vector3(ray.Origin), direction = vector3(ray.Direction) }
+	end,
+	Rect = function(rect)
+		return { vector2(rect.Min), vector2(rect.Max) }
+	end,
+}
+
+local function encodeExactly(value, encoded)
+	local ty = next(encoded)
+	local encoder = exactEncoders[ty]
+	if encoder == nil then
+		return encoded
+	end
+	return { [ty] = encoder(value) }
 end
 
 return function(instance, propertyName, propertyDescriptor, instanceMap)
@@ -31,12 +65,12 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 		return true, { Ref = referentId }
 	end
 
-	-- Attributes the filesystem can't hold, like a Vector3 with a NaN component,
-	-- would otherwise be encoded and saved. The server keeps its own copies.
+	-- Attributes the filesystem doesn't hold, like `RBX` ones, would otherwise
+	-- be encoded and saved. The server keeps its own copies.
 	if dataType == "Attributes" and type(readResult) == "table" then
 		local managed = {}
 		for name, value in readResult do
-			if not unmanagedAttributes.isUnmanaged(name, value) then
+			if not unmanagedAttributes.isUnmanaged(name) then
 				managed[name] = value
 			end
 		end
@@ -55,16 +89,16 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 		return false, nil
 	end
 
-	-- rbx_dom_lua stands in a large finite number for infinity, but msgpack holds
-	-- it exactly and the filesystem writes it in a tagged form, so send it as is.
-	if (dataType == "Float32" or dataType == "Float64") and isNonFinite(readResult) then
-		encodeResult = { [dataType] = readResult }
-	elseif dataType == "Attributes" and type(readResult) == "table" then
+	if dataType == "Attributes" and type(readResult) == "table" then
+		local encodedAttributes = encodeResult.Attributes
 		for name, value in readResult do
-			if isNonFinite(value) then
-				encodeResult.Attributes[name] = { Float64 = value }
+			-- Attributes rbx_dom_lua couldn't encode were already warned about.
+			if encodedAttributes[name] ~= nil then
+				encodedAttributes[name] = encodeExactly(value, encodedAttributes[name])
 			end
 		end
+	else
+		encodeResult = encodeExactly(readResult, encodeResult)
 	end
 
 	return true, encodeResult

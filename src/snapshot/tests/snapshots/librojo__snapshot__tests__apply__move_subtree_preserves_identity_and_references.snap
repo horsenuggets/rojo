@@ -1,0 +1,13 @@
+---
+source: src/snapshot/tests/apply.rs
+expression: redactions.redacted_yaml(applied)
+---
+removed: []
+added: []
+updated:
+  - id: id-4
+    changed_name: ~
+    changed_class_name: ~
+    changedParent: id-3
+    changed_properties: {}
+    changed_metadata: ~

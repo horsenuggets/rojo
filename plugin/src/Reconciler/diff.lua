@@ -33,9 +33,15 @@ local function diff(instanceMap, virtualInstances, rootId)
 		updated = {},
 	}
 
-	-- Add a virtual instance and all of its descendants to the patch, marked as
-	-- being added.
+	local visited = {}
+	local diffInternal
+
+	-- Existing identities inside added subtrees are moves, not new instances.
 	local function markIdAdded(id)
+		if instanceMap.fromIds[id] ~= nil then
+			diffInternal(id)
+			return
+		end
 		local virtualInstance = virtualInstances[id]
 		patch.added[id] = virtualInstance
 
@@ -45,7 +51,11 @@ local function diff(instanceMap, virtualInstances, rootId)
 	end
 
 	-- Internal recursive kernel for diffing an instance with the given ID.
-	local function diffInternal(id)
+	diffInternal = function(id)
+		if visited[id] then
+			return true
+		end
+		visited[id] = true
 		local virtualInstance = virtualInstances[id]
 		local instance = instanceMap.fromIds[id]
 
@@ -65,6 +75,15 @@ local function diff(instanceMap, virtualInstances, rootId)
 		local changedName = nil
 		if virtualInstance.Name ~= instance.Name then
 			changedName = virtualInstance.Name
+		end
+
+		local changedParent = nil
+		if
+			id ~= rootId
+			and virtualInstance.Parent ~= nil
+			and instanceMap.fromInstances[instance.Parent] ~= virtualInstance.Parent
+		then
+			changedParent = virtualInstance.Parent
 		end
 
 		local changedProperties = {}
@@ -132,10 +151,11 @@ local function diff(instanceMap, virtualInstances, rootId)
 			end
 		end
 
-		if changedName ~= nil or changedClassName ~= nil or not isEmpty(changedProperties) then
+		if changedName ~= nil or changedClassName ~= nil or changedParent ~= nil or not isEmpty(changedProperties) then
 			table.insert(patch.updated, {
 				id = id,
 				changedName = changedName,
+				changedParent = changedParent,
 				changedClassName = changedClassName,
 				changedProperties = changedProperties,
 				changedMetadata = nil,
@@ -165,6 +185,10 @@ local function diff(instanceMap, virtualInstances, rootId)
 				if shouldDeleteUnknownInstances(virtualInstance) then
 					table.insert(patch.removed, childInstance)
 				end
+			elseif virtualInstances[childId] == nil then
+				if not services.isProtected(childInstance) then
+					table.insert(patch.removed, childId)
+				end
 			else
 				local diffSuccess, err = diffInternal(childId)
 
@@ -190,6 +214,11 @@ local function diff(instanceMap, virtualInstances, rootId)
 				-- This instance is present in the virtual DOM, but doesn't
 				-- exist in the real DOM.
 				markIdAdded(childId)
+			else
+				local diffSuccess, err = diffInternal(childId)
+				if not diffSuccess then
+					return false, err
+				end
 			end
 		end
 

@@ -1,18 +1,24 @@
 use blake3::Hasher;
 use rbx_dom_weak::types::{ContentType, PhysicalProperties, Variant, Vector3};
 
-use crate::syncback::property_filter::is_json_compatible;
+use crate::variant_eq::{compare_times, CanonicalNan};
 
 // Scaling a huge finite value can overflow to infinity, which would hash it the same as a
-// real infinity, so values that overflow are hashed unrounded instead.
+// real infinity, so values that overflow are hashed unrounded instead. Every NaN hashes
+// the same, since files don't keep its sign and arithmetic on it doesn't either.
 macro_rules! round {
-    ($value:expr) => {{
+    ($exact:expr, $value:expr) => {{
         let value = $value.clone();
-        let scaled = value * 10.0;
-        if scaled.is_finite() || !value.is_finite() {
-            scaled.round() / 10.0
+        if $exact {
+            value.canonical_nan()
         } else {
-            value
+            let scaled = value * 10.0;
+            let rounded = if scaled.is_finite() || !value.is_finite() {
+                scaled.round() / 10.0
+            } else {
+                value
+            };
+            rounded.canonical_nan()
         }
     }};
 }
@@ -31,19 +37,32 @@ macro_rules! hash {
     }};
 }
 
+pub fn hash_json_variant(hasher: &mut Hasher, value: &Variant) {
+    // JSON rounds near-integers and loses negative zero, unlike binary exports.
+    hash_variant_impl(
+        hasher,
+        &crate::resolution::normalize_json_variant(value.clone()),
+        true,
+    );
+}
+
+pub fn hash_exact_variant(hasher: &mut Hasher, value: &Variant) {
+    hash_variant_impl(hasher, value, true);
+}
+
 /// Places `value` into the provided hasher.
 pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
-    // We need to round floats, though I'm not sure to what degree we can
-    // realistically do that.
+    hash_variant_impl(hasher, value, false);
+}
+
+fn hash_variant_impl(hasher: &mut Hasher, value: &Variant, exact: bool) {
     match value {
         Variant::Attributes(attrs) => {
             let mut sorted: Vec<(&String, &Variant)> = attrs.iter().collect();
             sorted.sort_unstable_by_key(|(name, _)| *name);
             for (name, attribute) in sorted {
-                if is_json_compatible(attribute) {
-                    hasher.update(name.as_bytes());
-                    hash_variant(hasher, attribute);
-                }
+                hasher.update(name.as_bytes());
+                hash_variant_impl(hasher, attribute, exact);
             }
         }
         Variant::Axes(a) => hash!(hasher, &[a.bits()]),
@@ -51,13 +70,18 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
         Variant::Bool(bool) => hash!(hasher, &[*bool as u8]),
         Variant::BrickColor(color) => n_hash!(hasher, *color as u16),
         Variant::CFrame(cf) => {
-            vector_hash(hasher, cf.position);
-            vector_hash(hasher, cf.orientation.x);
-            vector_hash(hasher, cf.orientation.y);
-            vector_hash(hasher, cf.orientation.z);
+            vector_hash(exact, hasher, cf.position);
+            vector_hash(exact, hasher, cf.orientation.x);
+            vector_hash(exact, hasher, cf.orientation.y);
+            vector_hash(exact, hasher, cf.orientation.z);
         }
         Variant::Color3(color) => {
-            n_hash!(hasher, round!(color.r), round!(color.g), round!(color.b))
+            n_hash!(
+                hasher,
+                round!(exact, color.r),
+                round!(exact, color.g),
+                round!(exact, color.b)
+            )
         }
         Variant::Color3uint8(color) => hash!(hasher, &[color.r, color.b, color.g]),
         Variant::ColorSequence(seq) => {
@@ -65,14 +89,16 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             for keypoint in &seq.keypoints {
                 new.push(keypoint);
             }
-            new.sort_unstable_by(|a, b| round!(a.time).partial_cmp(&round!(b.time)).unwrap());
+            new.sort_unstable_by(|a, b| {
+                compare_times(round!(exact, a.time), round!(exact, b.time))
+            });
             for keypoint in new {
                 n_hash!(
                     hasher,
-                    round!(keypoint.time),
-                    round!(keypoint.color.r),
-                    round!(keypoint.color.g),
-                    round!(keypoint.color.b)
+                    round!(exact, keypoint.time),
+                    round!(exact, keypoint.color.r),
+                    round!(exact, keypoint.color.g),
+                    round!(exact, keypoint.color.b)
                 )
             }
         }
@@ -102,8 +128,8 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             n_hash!(hasher, e.value);
         }
         Variant::Faces(f) => hash!(hasher, &[f.bits()]),
-        Variant::Float32(n) => n_hash!(hasher, round!(*n)),
-        Variant::Float64(n) => n_hash!(hasher, round!(n)),
+        Variant::Float32(n) => n_hash!(hasher, round!(exact, *n)),
+        Variant::Float64(n) => n_hash!(hasher, round!(exact, n)),
         Variant::Font(f) => {
             n_hash!(hasher, f.weight as u16);
             n_hash!(hasher, f.style as u8);
@@ -119,29 +145,31 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
         Variant::Int64(n) => n_hash!(hasher, n),
         Variant::MaterialColors(n) => hash!(hasher, n.encode().as_slice()),
         Variant::NetAssetRef(net_asset) => hash!(hasher, net_asset.hash().as_bytes()),
-        Variant::NumberRange(nr) => n_hash!(hasher, round!(nr.max), round!(nr.min)),
+        Variant::NumberRange(nr) => n_hash!(hasher, round!(exact, nr.max), round!(exact, nr.min)),
         Variant::NumberSequence(seq) => {
             let mut new = Vec::with_capacity(seq.keypoints.len());
             for keypoint in &seq.keypoints {
                 new.push(keypoint);
             }
-            new.sort_unstable_by(|a, b| round!(a.time).partial_cmp(&round!(b.time)).unwrap());
+            new.sort_unstable_by(|a, b| {
+                compare_times(round!(exact, a.time), round!(exact, b.time))
+            });
             for keypoint in new {
                 n_hash!(
                     hasher,
-                    round!(keypoint.time),
-                    round!(keypoint.value),
-                    round!(keypoint.envelope)
+                    round!(exact, keypoint.time),
+                    round!(exact, keypoint.value),
+                    round!(exact, keypoint.envelope)
                 )
             }
         }
         Variant::OptionalCFrame(maybe_cf) => {
             if let Some(cf) = maybe_cf {
                 hash!(hasher, &[0x01]);
-                vector_hash(hasher, cf.position);
-                vector_hash(hasher, cf.orientation.x);
-                vector_hash(hasher, cf.orientation.y);
-                vector_hash(hasher, cf.orientation.z);
+                vector_hash(exact, hasher, cf.position);
+                vector_hash(exact, hasher, cf.orientation.x);
+                vector_hash(exact, hasher, cf.orientation.y);
+                vector_hash(exact, hasher, cf.orientation.z);
             } else {
                 hash!(hasher, &[0x00]);
             }
@@ -152,30 +180,30 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
                 hash!(hasher, &[0x00]);
                 n_hash!(
                     hasher,
-                    round!(custom.density()),
-                    round!(custom.friction()),
-                    round!(custom.elasticity()),
-                    round!(custom.friction_weight()),
-                    round!(custom.elasticity_weight()),
-                    round!(custom.acoustic_absorption())
+                    round!(exact, custom.density()),
+                    round!(exact, custom.friction()),
+                    round!(exact, custom.elasticity()),
+                    round!(exact, custom.friction_weight()),
+                    round!(exact, custom.elasticity_weight()),
+                    round!(exact, custom.acoustic_absorption())
                 )
             }
         },
         Variant::Ray(ray) => {
-            vector_hash(hasher, ray.origin);
-            vector_hash(hasher, ray.direction);
+            vector_hash(exact, hasher, ray.origin);
+            vector_hash(exact, hasher, ray.direction);
         }
         Variant::Rect(rect) => n_hash!(
             hasher,
-            round!(rect.max.x),
-            round!(rect.max.y),
-            round!(rect.min.x),
-            round!(rect.min.y)
+            round!(exact, rect.max.x),
+            round!(exact, rect.max.y),
+            round!(exact, rect.min.x),
+            round!(exact, rect.min.y)
         ),
         Variant::Ref(referent) => hash!(hasher, referent.to_string().as_bytes()),
         Variant::Region3(region) => {
-            vector_hash(hasher, region.max);
-            vector_hash(hasher, region.min);
+            vector_hash(exact, hasher, region.max);
+            vector_hash(exact, hasher, region.min);
         }
         Variant::Region3int16(region) => {
             n_hash!(
@@ -198,17 +226,17 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
                 hash!(hasher, tag.as_bytes())
             }
         }
-        Variant::UDim(udim) => n_hash!(hasher, round!(udim.scale), udim.offset),
+        Variant::UDim(udim) => n_hash!(hasher, round!(exact, udim.scale), udim.offset),
         Variant::UDim2(udim) => n_hash!(
             hasher,
-            round!(udim.y.scale),
+            round!(exact, udim.y.scale),
             udim.y.offset,
-            round!(udim.x.scale),
+            round!(exact, udim.x.scale),
             udim.x.offset
         ),
-        Variant::Vector2(v2) => n_hash!(hasher, round!(v2.x), round!(v2.y)),
+        Variant::Vector2(v2) => n_hash!(hasher, round!(exact, v2.x), round!(exact, v2.y)),
         Variant::Vector2int16(v2) => n_hash!(hasher, v2.x, v2.y),
-        Variant::Vector3(v3) => vector_hash(hasher, *v3),
+        Variant::Vector3(v3) => vector_hash(exact, hasher, *v3),
         Variant::Vector3int16(v3) => n_hash!(hasher, v3.x, v3.y, v3.z),
 
         // Hashing UniqueId properties doesn't make sense
@@ -223,29 +251,118 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
     }
 }
 
-fn vector_hash(hasher: &mut Hasher, vector: Vector3) {
-    n_hash!(hasher, round!(vector.x), round!(vector.y), round!(vector.z))
+fn vector_hash(exact: bool, hasher: &mut Hasher, vector: Vector3) {
+    n_hash!(
+        hasher,
+        round!(exact, vector.x),
+        round!(exact, vector.y),
+        round!(exact, vector.z)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbx_dom_weak::types::Attributes;
+    use rbx_dom_weak::types::{Attributes, NumberRange, NumberSequence, NumberSequenceKeypoint};
+
+    /// Non-finite composite values are written to metadata too, so each one
+    /// must hash differently from the others and from finite values, and the
+    /// same value must always hash the same.
+    #[test]
+    fn non_finite_composite_attributes_are_hashed() {
+        let hash = |value: Variant| {
+            let mut attributes = Attributes::new();
+            attributes.insert("Value".to_owned(), value);
+            let mut hasher = Hasher::new();
+            hash_variant(&mut hasher, &Variant::Attributes(attributes));
+            hasher.finalize()
+        };
+        let sequence = |time: f32| {
+            Variant::NumberSequence(NumberSequence {
+                keypoints: vec![
+                    NumberSequenceKeypoint::new(time, 0.0, 0.0),
+                    NumberSequenceKeypoint::new(1.0, 1.0, 0.0),
+                ],
+            })
+        };
+        let values = [
+            Vector3::new(0.0, 0.0, 0.0).into(),
+            Vector3::new(f32::NAN, 0.0, 0.0).into(),
+            Vector3::new(f32::INFINITY, 0.0, 0.0).into(),
+            Vector3::new(f32::NEG_INFINITY, 0.0, 0.0).into(),
+            Vector3::new(f32::MAX, 0.0, 0.0).into(),
+            NumberRange::new(0.0, 1.0).into(),
+            NumberRange::new(0.0, f32::INFINITY).into(),
+            sequence(0.0),
+            sequence(f32::NAN),
+        ];
+        let hashes: Vec<_> = values.iter().cloned().map(hash).collect();
+        for (index, a) in hashes.iter().enumerate() {
+            for b in &hashes[index + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        for value in values {
+            assert_eq!(hash(value.clone()), hash(value));
+        }
+
+        // Files read NaN back as positive, so its sign must not change a hash.
+        let negative_nan = -f32::NAN;
+        assert_eq!(
+            hash(Vector3::new(negative_nan, 0.0, 0.0).into()),
+            hash(Vector3::new(f32::NAN, 0.0, 0.0).into())
+        );
+        assert_eq!(hash(sequence(negative_nan)), hash(sequence(f32::NAN)));
+    }
 
     #[test]
-    fn invalid_attributes_do_not_hide_valid_attributes() {
-        let mut valid = Attributes::new();
-        valid.insert("Good".to_owned(), "kept".into());
+    fn rounded_zero_has_one_json_hash_regardless_of_sign() {
+        let hash = |value: Variant| {
+            let mut attributes = Attributes::new();
+            attributes.insert("Value".to_owned(), value);
+            let mut hasher = Hasher::new();
+            hash_json_variant(&mut hasher, &Variant::Attributes(attributes));
+            hasher.finalize()
+        };
+        for value in [-0.0, -0.0000005, 0.0, 0.0000005] {
+            assert_eq!(hash(Variant::Float64(value)), hash(Variant::Float64(0.0)));
+            assert_eq!(
+                hash(Variant::Float32(value as f32)),
+                hash(Variant::Float32(0.0))
+            );
+            assert_eq!(
+                hash(Vector3::new(value as f32, 0.0, 0.0).into()),
+                hash(Vector3::new(0.0, 0.0, 0.0).into())
+            );
+        }
+    }
 
-        let mut mixed = valid.clone();
-        mixed.insert("Bad".to_owned(), Vector3::new(f32::NAN, 0.0, 0.0).into());
-
-        let mut valid_hasher = Hasher::new();
-        hash_variant(&mut valid_hasher, &Variant::Attributes(valid));
-        let mut mixed_hasher = Hasher::new();
-        hash_variant(&mut mixed_hasher, &Variant::Attributes(mixed));
-
-        assert_eq!(valid_hasher.finalize(), mixed_hasher.finalize());
+    #[test]
+    fn json_hashes_keep_fractional_changes_in_attributes_and_composites() {
+        let values = |value: f32| {
+            let mut nested = Attributes::new();
+            nested.insert("Nested".into(), Variant::Float64(value as f64));
+            vec![
+                Variant::Float32(value),
+                Variant::Float64(value as f64),
+                Variant::Vector3(Vector3::new(value, 0.0, 0.0)),
+                Variant::NumberRange(NumberRange::new(value, 1.0)),
+                Variant::NumberSequence(NumberSequence {
+                    keypoints: vec![NumberSequenceKeypoint::new(0.0, value, 0.0)],
+                }),
+                Variant::Attributes(nested),
+            ]
+        };
+        for (before, after) in values(-0.0000005).into_iter().zip(values(0.01)) {
+            let hash = |value: Variant| {
+                let mut attributes = Attributes::new();
+                attributes.insert("Value".into(), value);
+                let mut hasher = Hasher::new();
+                hash_json_variant(&mut hasher, &Variant::Attributes(attributes));
+                hasher.finalize()
+            };
+            assert_ne!(hash(before), hash(after));
+        }
     }
 
     /// Non-finite numbers are written to metadata, so changing one must

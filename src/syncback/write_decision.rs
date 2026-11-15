@@ -2,7 +2,9 @@ use rbx_dom_weak::types::Variant;
 
 use crate::variant_eq::variant_eq;
 
-fn same_value(a: Option<&Variant>, b: Option<&Variant>) -> bool {
+/// Compares two optional values the way write decisions do, with float
+/// tolerance and NaN equal to itself.
+pub fn same_value(a: Option<&Variant>, b: Option<&Variant>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => variant_eq(a, b),
         (None, None) => true,

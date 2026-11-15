@@ -165,11 +165,16 @@ function ServeSession:__queueChange(instance, propertyName)
 end
 
 function ServeSession:__writePatch(patch, messageCursor)
+	-- Read when each batch is sent, so changing it applies to the next write
+	-- without reconnecting.
+	local authority = Settings:get("twoWaySyncAuthority")
+
 	-- One record per write, which moves from Pending to its outcome, so a write
 	-- is never reported as both pending and finished.
 	local record = {
 		status = "Pending",
 		patch = patch,
+		authority = authority,
 	}
 	table.insert(self.__syncResults, record)
 
@@ -182,7 +187,7 @@ function ServeSession:__writePatch(patch, messageCursor)
 	end
 
 	return self.__apiContext
-		:write(patch, messageCursor)
+		:write(patch, messageCursor, authority)
 		:andThen(function(result)
 			finish(ServeSession.getWriteStatus(result), result)
 			return result
@@ -450,12 +455,17 @@ function ServeSession:__replaceInstances(idList)
 		local id, replacement, oldInstance = swap.id, swap.replacement, swap.oldInstance
 
 		self.__instanceMap:insert(id, replacement)
+		self.__instanceMap:pauseInstance(replacement)
 		Log.trace("Swapping Instance {} out via api/models/ endpoint", id)
 		local oldParent = oldInstance.Parent
 		for _, child in oldInstance:GetChildren() do
+			self.__instanceMap:pauseInstance(child)
 			-- Some children cannot be reparented, such as a TouchTransmitter
 			local reparentSuccess, reparentError = attemptReparent(child, replacement)
-			if not reparentSuccess then
+			if reparentSuccess and self.__instanceMap.fromInstances[child] ~= nil then
+				self.__instanceMap.knownParents[child] = replacement
+				self.__instanceMap.observedParents[child] = replacement
+			elseif not reparentSuccess then
 				Log.warn(
 					"Could not reparent child {} of instance {} during sync replacement: {}",
 					child.Name,
@@ -481,14 +491,21 @@ function ServeSession:__replaceInstances(idList)
 
 			-- We need to revert the failed swap to avoid losing the old instance and children.
 			for _, child in replacement:GetChildren() do
-				attemptReparent(child, oldInstance)
+				if attemptReparent(child, oldInstance) and self.__instanceMap.fromInstances[child] ~= nil then
+					self.__instanceMap.knownParents[child] = oldInstance
+					self.__instanceMap.observedParents[child] = oldInstance
+				end
 			end
 			attemptReparent(oldInstance, oldParent)
+			self.__instanceMap:insert(id, oldInstance)
 
 			-- Our replacement should never have existed in the first place, so we can just destroy it.
 			replacement:Destroy()
 			continue
 		end
+
+		self.__instanceMap.knownParents[replacement] = oldParent
+		self.__instanceMap.observedParents[replacement] = oldParent
 
 		if selectionMap[oldInstance] then
 			-- This is a bit funky, but it saves the order of Selection
@@ -673,8 +690,24 @@ function ServeSession:__initialSync(serverInfo)
 					continue
 				end
 
-				local update = encodePatchUpdate(instance, change.id, change.changedProperties)
-				table.insert(inversePatch.updated, update)
+				local properties = table.clone(change.changedProperties)
+				if change.changedName ~= nil then
+					properties.Name = true
+				end
+				if change.changedParent ~= nil then
+					if instance.Parent == nil then
+						table.insert(inversePatch.removed, change.id)
+						continue
+					end
+					if self.__instanceMap.fromInstances[instance.Parent] == nil then
+						return Promise.reject("Cannot reject a parent change to an unmanaged Studio parent")
+					end
+					properties.Parent = true
+				end
+				local update = encodePatchUpdate(instance, change.id, properties, self.__instanceMap)
+				if update ~= nil then
+					table.insert(inversePatch.updated, update)
+				end
 			end
 			-- Add the removed instances back to Rojo
 			-- selene:allow(empty_if, unused_variable, empty_loop)
@@ -686,7 +719,9 @@ function ServeSession:__initialSync(serverInfo)
 				table.insert(inversePatch.removed, id)
 			end
 
-			return self.__apiContext:write(inversePatch)
+			-- Rejecting is an explicit choice to keep Studio's version, so Studio
+			-- wins even if the disk changes again before this write lands.
+			return self.__apiContext:write(inversePatch, nil, "Studio")
 		elseif userDecision == "Accept" then
 			self:__applyPatch(catchUpPatch)
 			return Promise.resolve()

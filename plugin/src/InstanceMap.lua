@@ -6,8 +6,6 @@ local Log = require(Packages.Log)
 --[[
 	A bidirectional map between instance IDs and Roblox instances. It lets us
 	keep track of every instance we know about.
-
-	TODO: Track ancestry to catch when stuff moves?
 ]]
 local InstanceMap = {}
 InstanceMap.__index = InstanceMap
@@ -19,6 +17,12 @@ function InstanceMap.new(onInstanceChanged)
 
 		-- A map from instances to IDs.
 		fromInstances = {},
+
+		-- Last authoritative parents, not speculative Studio moves awaiting a reply.
+		knownParents = {},
+
+		-- Also suppress deferred notifications for a parent we already observed.
+		observedParents = {},
 
 		-- A set of all instances that updates should be paused for. This set
 		-- should generally be empty, and will be filled by pauseInstance
@@ -87,6 +91,8 @@ function InstanceMap:insert(id, instance)
 
 	self.fromIds[id] = instance
 	self.fromInstances[instance] = id
+	self.knownParents[instance] = instance.Parent
+	self.observedParents[instance] = instance.Parent
 	self:__connectSignals(instance)
 end
 
@@ -193,10 +199,6 @@ function InstanceMap:__connectSignals(instance)
 			instance.AttributeChanged:Connect(function()
 				self:__maybeFireInstanceChanged(instance, "Attributes")
 			end),
-
-			instance.AncestryChanged:Connect(function()
-				self:__maybeFireInstanceChanged(instance, "Parent")
-			end),
 		}
 
 		self.instancesToSignal[instance] = signals
@@ -208,18 +210,30 @@ function InstanceMap:__connectSignals(instance)
 			instance.AttributeChanged:Connect(function()
 				self:__maybeFireInstanceChanged(instance, "Attributes")
 			end),
-
-			instance.AncestryChanged:Connect(function()
-				self:__maybeFireInstanceChanged(instance, "Parent")
-			end),
 		}
 	end
+
+	-- AncestryChanged is deliberately not watched. Changes to an instance's own Parent
+	-- already arrive through the signals above, while AncestryChanged also fires on every
+	-- descendant when an ancestor moves. Those descendants still have their parent, so
+	-- reporting them made two-way sync warn about every instance inside a moved or
+	-- deleted folder, and about every nested instance created by the initial sync.
 end
 
 function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
 	Log.trace("{}.{} changed", instance:GetFullName(), propertyName)
 
+	if propertyName == "Parent" then
+		if self.observedParents[instance] == instance.Parent then
+			return
+		end
+		self.observedParents[instance] = instance.Parent
+	end
+
 	if self.pausedUpdateInstances[instance] then
+		if propertyName == "Parent" then
+			self.knownParents[instance] = instance.Parent
+		end
 		return
 	end
 
@@ -227,7 +241,7 @@ function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
 		return
 	end
 
-	if RunService:IsRunning() then
+	if self:__isGameRunning() then
 		-- We probably don't want to pick up property changes to save to the
 		-- filesystem in a running game.
 		return
@@ -236,8 +250,17 @@ function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
 	self.onInstanceChanged(instance, propertyName)
 end
 
+-- Kept separate so tests, which the test place runs in a running game, can still exercise
+-- change reporting.
+function InstanceMap:__isGameRunning()
+	return RunService:IsRunning()
+end
+
 function InstanceMap:__disconnectSignals(instance)
 	local signals = self.instancesToSignal[instance]
+	self.knownParents[instance] = nil
+	self.observedParents[instance] = nil
+	self.pausedUpdateInstances[instance] = nil
 
 	if signals ~= nil then
 		-- In most cases, we only have a single signal, so we avoid keeping

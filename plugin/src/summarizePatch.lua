@@ -63,6 +63,7 @@ return function(patch, instanceMap, limit)
 			path = if instance then instance:GetFullName() else tostring(update.id),
 			properties = sortedKeys(update.changedProperties or {}),
 			changedName = update.changedName,
+			changedParent = update.changedParent,
 			changedClassName = update.changedClassName,
 		})
 	end

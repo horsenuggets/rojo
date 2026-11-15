@@ -24,6 +24,27 @@ local function rejectFailedRequests(response)
 	return response
 end
 
+-- Servers from before the switch to msgpack, including upstream Rojo, answer the info
+-- request with JSON. Decoding JSON as msgpack turns its leading "{" into the number 123,
+-- so fall back to JSON whenever msgpack doesn't produce a table. That way an old server
+-- reaches the protocol version check below and gets a clear message.
+local function decodeInfoResponse(response)
+	local msgpackOk, msgpackBody = pcall(Http.Response.msgpack, response)
+	if msgpackOk and type(msgpackBody) == "table" then
+		return msgpackBody
+	end
+
+	local jsonOk, jsonBody = pcall(Http.Response.json, response)
+	if jsonOk and type(jsonBody) == "table" then
+		return jsonBody
+	end
+
+	return Promise.reject(
+		"Found a server at this address, but couldn't read its response."
+			.. "\nMake sure the address points at a Rojo+ server."
+	)
+end
+
 local function rejectWrongProtocolVersion(infoResponseBody)
 	if infoResponseBody.protocolVersion ~= Config.protocolVersion then
 		local message = (
@@ -149,7 +170,7 @@ function ApiContext:connect()
 
 	return Http.get(url)
 		:andThen(rejectFailedRequests)
-		:andThen(Http.Response.msgpack)
+		:andThen(decodeInfoResponse)
 		:andThen(rejectWrongProtocolVersion)
 		:andThen(function(body)
 			assert(validateApiInfo(body))
@@ -178,7 +199,8 @@ function ApiContext:read(ids)
 	end)
 end
 
-function ApiContext:write(patch, messageCursor)
+function ApiContext:write(patch, messageCursor, authority)
+	assert(authority == "Filesystem" or authority == "Studio", "Write authority must be Filesystem or Studio")
 	local url = ("%s/api/write"):format(self.__baseUrl)
 
 	local updated = {}
@@ -186,6 +208,7 @@ function ApiContext:write(patch, messageCursor)
 		local fixedUpdate = {
 			id = update.id,
 			changedName = update.changedName,
+			changedParent = update.changedParent,
 		}
 
 		if next(update.changedProperties) ~= nil then
@@ -206,6 +229,7 @@ function ApiContext:write(patch, messageCursor)
 	local body = {
 		sessionId = self.__sessionId,
 		messageCursor = messageCursor or self.__messageCursor,
+		authority = authority,
 		removed = patch.removed,
 		updated = updated,
 		added = added,

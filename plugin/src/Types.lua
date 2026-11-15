@@ -24,6 +24,7 @@ local ApiInstance = t.interface({
 local ApiInstanceUpdate = t.interface({
 	id = RbxId,
 	changedName = t.optional(t.string),
+	changedParent = t.optional(RbxId),
 	changedClassName = t.optional(t.string),
 	changedProperties = t.map(t.string, ApiValue),
 	changedMetadata = t.optional(ApiInstanceMetadata),

@@ -93,7 +93,7 @@ pub fn receive_place(
     allowed_hosts: &[String],
     project_name: String,
     services: Vec<StudioService>,
-    on_listening: impl FnOnce(),
+    on_listening: impl FnOnce(SocketAddr),
 ) -> anyhow::Result<AssembledPlace> {
     let (place_sender, place_receiver) = oneshot::channel();
     let (stop_sender, stop_receiver) = oneshot::channel::<()>();
@@ -105,6 +105,18 @@ pub fn receive_place(
         upload: Mutex::new(Upload::default()),
         place_sender: Mutex::new(Some(place_sender)),
     });
+    let runtime =
+        Runtime::new().context("Failed to start the async runtime for the syncback server")?;
+    let _guard = runtime.enter();
+    let builder = Server::try_bind(&address).with_context(|| {
+        format!(
+            "Could not start the syncback server on {address}.\n\
+             Another Rojo server might already be running, or another program may be using \
+             that port.\n\
+             You can pick a different port with the --port option."
+        )
+    })?;
+    let address = builder.local_addr();
     let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), allowed_hosts);
 
     let make_service = make_service_fn(move |_conn: &AddrStream| {
@@ -130,24 +142,11 @@ pub fn receive_place(
         }
     });
 
-    let runtime =
-        Runtime::new().context("Failed to start the async runtime for the syncback server")?;
-    let _guard = runtime.enter();
-    let server = Server::try_bind(&address)
-        .with_context(|| {
-            format!(
-                "Could not start the syncback server on {address}.\n\
-                 Another Rojo server might already be running, or another program may be using \
-                 that port.\n\
-                 You can pick a different port with the --port option."
-            )
-        })?
-        .serve(make_service)
-        .with_graceful_shutdown(async {
-            let _ = stop_receiver.await;
-        });
+    let server = builder.serve(make_service).with_graceful_shutdown(async {
+        let _ = stop_receiver.await;
+    });
 
-    on_listening();
+    on_listening(address);
 
     runtime.block_on(async move {
         let mut server = tokio::spawn(server);

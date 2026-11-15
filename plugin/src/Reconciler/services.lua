@@ -51,14 +51,14 @@ function services.isProtected(instance)
 end
 
 -- Splits unapplied updates into those sync fallback may replace and those
--- targeting protected instances. Fallback replacement unparents the original
--- instance, so protected updates must stay unapplied instead.
+-- targeting protected instances or failed structural moves. Replacing an instance
+-- cannot repair a missing or invalid destination and would lose its identity.
 function services.splitReplaceableUpdates(updates, instanceMap)
 	local replaceable = {}
 	local protected = {}
 	for _, update in updates do
 		local instance = instanceMap.fromIds[update.id]
-		if instance ~= nil and services.isProtected(instance) then
+		if update.changedParent ~= nil or (instance ~= nil and services.isProtected(instance)) then
 			table.insert(protected, update)
 		else
 			table.insert(replaceable, update)

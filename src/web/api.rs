@@ -200,6 +200,7 @@ impl ApiService {
                     PatchUpdate {
                         id: update.id,
                         changed_class_name: update.changed_class_name,
+                        changed_parent: update.changed_parent,
                         changed_name: update.changed_name,
                         changed_properties,
                         changed_metadata: None,
@@ -212,6 +213,7 @@ impl ApiService {
         tree_mutation_sender
             .send(TreeMutation {
                 message_cursor: request.message_cursor,
+                authority: request.authority,
                 patch_set: PatchSet {
                     removed_instances: request.removed,
                     added_instances: Vec::new(),
@@ -399,6 +401,7 @@ impl ApiService {
                             .or_insert_with(|| InstanceUpdate {
                                 id: instance_id,
                                 changed_class_name: None,
+                                changed_parent: None,
                                 changed_name: None,
                                 changed_metadata: None,
                                 changed_properties: UstrMap::default(),

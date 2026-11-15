@@ -3,8 +3,11 @@ pub mod from_studio;
 mod fs_snapshot;
 mod hash;
 mod inline;
+pub(crate) mod promotion;
 mod property_filter;
 mod ref_properties;
+pub(crate) mod relocation;
+pub mod relocation_transaction;
 mod snapshot;
 mod write_decision;
 
@@ -38,9 +41,11 @@ pub use file_names::{
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
 pub(crate) use property_filter::{can_write_property, is_unset_binary_string};
-pub use property_filter::{filter_properties, filter_properties_preallocated, is_json_compatible};
+pub use property_filter::{
+    filter_json_properties_preallocated, filter_properties, filter_properties_preallocated,
+};
 pub use snapshot::{SyncbackData, SyncbackSnapshot};
-pub use write_decision::{decide_property_write, PropertyWriteDecision};
+pub use write_decision::{decide_property_write, same_value, PropertyWriteDecision};
 
 /// The name of an enviroment variable to use to override the behavior of
 /// syncback on model files.
@@ -372,6 +377,24 @@ pub fn syncback_loop(
 
         let middleware = get_best_middleware(&snapshot);
 
+        // Only a model owns its whole subtree. A directory may mix JSON and
+        // binary descendants, so its early comparison must remain exact.
+        let model_hasher: Option<fn(&Project, &WeakDom, Ref) -> _> = match middleware {
+            Middleware::JsonModel => Some(hash_json_tree),
+            Middleware::Rbxm | Middleware::Rbxmx => Some(hash_binary_tree),
+            _ => None,
+        };
+        if let (Some(hash_model), Some(old_ref)) = (
+            model_hasher,
+            snapshot.old.filter(|old| !relayout.contains(old)),
+        ) {
+            let old = hash_model(project, snapshot.old_tree(), old_ref);
+            let new = hash_model(project, snapshot.new_tree(), snapshot.new);
+            if old.get(&old_ref) == new.get(&snapshot.new) {
+                continue;
+            }
+        }
+
         log::trace!(
             "Middleware for {inst_path} is {:?} (path is {})",
             middleware,
@@ -563,7 +586,7 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
 pub struct SyncbackRules {
     /// A list of subtrees in a file that will be ignored by Syncback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ignore_trees: Vec<String>,
+    pub(crate) ignore_trees: Vec<String>,
     /// A list of patterns to check against the path an Instance would serialize
     /// to. If a path matches one of these, the Instance won't be syncbacked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1027,6 +1050,181 @@ mod test {
             Some("shared"),
             "{contents}"
         );
+    }
+
+    #[test]
+    fn normalized_json_syncback_schedules_no_repeated_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let project_path = temp.path().join("default.project.json");
+        std::fs::write(&project_path, r#"{"name":"Test","tree":{"$path":"src"}}"#).unwrap();
+        let input = || {
+            let mut dom = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("Folder"));
+            let attributes: Attributes = [("Zero".into(), Variant::Float64(-0.0))]
+                .into_iter()
+                .collect();
+            let holder = dom.insert(
+                dom.root_ref(),
+                rbx_dom_weak::InstanceBuilder::new("Folder")
+                    .with_name("Holder")
+                    .with_property("Attributes", attributes),
+            );
+            dom.insert(
+                holder,
+                rbx_dom_weak::InstanceBuilder::new("NumberValue")
+                    .with_name("Tiny")
+                    .with_property("Value", Variant::Float64(0.0000005)),
+            );
+            dom.insert(
+                holder,
+                rbx_dom_weak::InstanceBuilder::new("Part")
+                    .with_name("Solid")
+                    .with_property("Transparency", Variant::Float32(0.0000005)),
+            );
+            dom
+        };
+        for pass in 0..2 {
+            let vfs = Vfs::new_default().unwrap();
+            vfs.set_watch_enabled(false);
+            let session = crate::serve_session::ServeSession::new(vfs, &project_path).unwrap();
+            let snapshot = syncback_loop(
+                session.vfs(),
+                &mut session.tree(),
+                input(),
+                session.root_project(),
+            )
+            .unwrap();
+            if pass == 0 {
+                snapshot.write_to_vfs(temp.path(), session.vfs()).unwrap();
+            } else {
+                assert!(
+                    snapshot.added_paths().is_empty(),
+                    "{:?}",
+                    snapshot.added_paths()
+                );
+                assert!(
+                    snapshot.removed_paths().is_empty(),
+                    "{:?}",
+                    snapshot.removed_paths()
+                );
+            }
+        }
+        let binary = std::fs::File::open(src.join("Holder/Solid.rbxm")).unwrap();
+        let dom = rbx_binary::from_reader(binary).unwrap();
+        let part = dom.get_by_ref(dom.root().children()[0]).unwrap();
+        assert_eq!(
+            part.properties.get(&ustr("Transparency")),
+            Some(&Variant::Float32(0.0000005))
+        );
+    }
+
+    #[test]
+    fn json_model_fractional_attribute_edits_are_not_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        let project_path = root.join("default.project.json");
+        std::fs::write(&project_path, r#"{"name":"Test","tree":{"$path":"src"}}"#).unwrap();
+        for value in [-0.0000005, 0.01, 0.02] {
+            let mut attributes = Attributes::new();
+            attributes.insert("Amount".into(), Variant::Float64(value));
+            let input = WeakDom::new(
+                rbx_dom_weak::InstanceBuilder::new("Folder").with_child(
+                    rbx_dom_weak::InstanceBuilder::new("NumberValue")
+                        .with_name("Value")
+                        .with_property("Attributes", attributes),
+                ),
+            );
+            let vfs = Vfs::new_default().unwrap();
+            vfs.set_watch_enabled(false);
+            let session = crate::serve_session::ServeSession::new(vfs, &project_path).unwrap();
+            let snapshot = syncback_loop(
+                session.vfs(),
+                &mut session.tree(),
+                input,
+                session.root_project(),
+            )
+            .unwrap();
+            let path = src.join("Value.model.json");
+            assert!(snapshot.added_paths().contains(&path.as_path()));
+            snapshot.write_to_vfs(&root, session.vfs()).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(saved["attributes"]["Amount"].as_f64(), Some(value.max(0.0)));
+        }
+    }
+
+    #[test]
+    fn directory_json_comparison_does_not_skip_tiny_binary_changes() {
+        for (class, initial) in [
+            ("Part", 0.0),
+            ("Part", -0.0000005),
+            ("NumberValue", 0.0),
+            ("NumberValue", -0.0000005),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(temp.path()).unwrap();
+            let holder = root.join("src/Holder");
+            std::fs::create_dir_all(&holder).unwrap();
+            let project_path = temp.path().join("default.project.json");
+            std::fs::write(&project_path, r#"{"name":"Test","tree":{"$path":"src"}}"#).unwrap();
+            let (property, old_value, value) = if class == "Part" {
+                (
+                    "Transparency",
+                    Variant::Float32(initial as f32),
+                    Variant::Float32(0.0000005),
+                )
+            } else {
+                (
+                    "Value",
+                    Variant::Float64(initial),
+                    Variant::Float64(0.0000005),
+                )
+            };
+            let old = WeakDom::new(
+                rbx_dom_weak::InstanceBuilder::new("Folder").with_child(
+                    rbx_dom_weak::InstanceBuilder::new(class)
+                        .with_name("Binary")
+                        .with_property(property, old_value),
+                ),
+            );
+            let binary_path = holder.join("Binary.rbxm");
+            rbx_binary::to_writer(
+                std::fs::File::create(&binary_path).unwrap(),
+                &old,
+                old.root().children(),
+            )
+            .unwrap();
+            let mut input = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("Folder"));
+            let holder_ref = input.insert(
+                input.root_ref(),
+                rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Holder"),
+            );
+            input.insert(
+                holder_ref,
+                rbx_dom_weak::InstanceBuilder::new(class)
+                    .with_name("Binary")
+                    .with_property(property, value.clone()),
+            );
+            let vfs = Vfs::new_default().unwrap();
+            vfs.set_watch_enabled(false);
+            let session = crate::serve_session::ServeSession::new(vfs, &project_path).unwrap();
+            let snapshot = syncback_loop(
+                session.vfs(),
+                &mut session.tree(),
+                input,
+                session.root_project(),
+            )
+            .unwrap();
+            assert!(snapshot.added_paths().contains(&binary_path.as_path()));
+            snapshot.write_to_vfs(temp.path(), session.vfs()).unwrap();
+            let saved =
+                rbx_binary::from_reader(std::fs::File::open(&binary_path).unwrap()).unwrap();
+            let inst = saved.get_by_ref(saved.root().children()[0]).unwrap();
+            assert_eq!(inst.properties.get(&ustr(property)), Some(&value));
+        }
     }
 
     fn rules(ignore_paths: &[&str], create_ignore_dir_paths: Option<bool>) -> SyncbackRules {

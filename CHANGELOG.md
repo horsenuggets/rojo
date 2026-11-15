@@ -31,6 +31,56 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.2`
+
+* Persist two-way sync renames and parent changes for filesystem-backed instances as
+  recoverable, no-clobber relocations. Directory moves preserve unmanaged contents, file
+  moves include existing metadata sidecars, and moved instances keep their IDs and path
+  indexes. Validate batch parent graphs before applying moves, respect the selected
+  conflict authority, and recover interrupted relocations before loading a serve session.
+  Moving a child into a managed file-backed script promotes the parent to a directory
+  with its original initializer kind and `.lua` or `.luau` extension. Parent and child
+  metadata sidecars and unmanaged child files survive promotion, and empty promoted
+  parents stay directories. Promotions stage their output and originals in recoverable
+  journals before installation. Project-defined, aliased, custom-mapped, model, and
+  inline cross-owner moves are rejected without overwriting destination files. The
+  project's reserved `.rojo/` cache cannot be re-included by negated ignore patterns.
+* Report the actual listening port when `serve` or Studio syncback uses `--port 0`,
+  and use OS-assigned ports in live server tests to avoid socket collisions.
+* Write whole floating-point JSON values without `.0`, and round values within
+  `0.000001` of an integer (including zero) when writing metadata, projects, and JSON
+  models. Two-way sync acknowledges normalized values so repeated edits stay stable.
+  Hash rounded zero consistently regardless of sign so negative-zero attributes do not
+  trigger repeated syncback rewrites. Compare JSON-backed values after default-value
+  normalization and keep unchanged directory metadata files untouched, while preserving
+  tiny property changes in binary models.
+* Add a UI Labs storybook for the plugin. Serve `storybook.project.json`, connect, and
+  open UI Labs to preview the plugin's buttons, inputs, checkboxes, dropdowns, tags,
+  header, spinner, and its connecting, error, not connected, and settings pages one at a
+  time. Every story has controls for the brand color and transparency, and stories live in
+  `plugin/stories/` so they aren't included in the built plugin.
+* Add a Two-Way Sync Authority setting that chooses which side wins when a Studio edit
+  meets a file change Studio hasn't seen yet. `Filesystem`, the default, keeps today's
+  behavior and restores the disk value in Studio. `Studio` writes every value Studio
+  edited over the file, while disk changes to values Studio didn't touch are kept and
+  sent to Studio. Stale batches and deletions are saved too, deletions still never remove
+  files the server doesn't know about, and a file that keeps changing mid-write is retried
+  a few times before the edit fails. Set it in the plugin settings or with
+  `shared.RojoPlus.setTwoWaySyncAuthority`, and it applies from the next write.
+* Keep Studio's version when rejecting the sync confirmation, even if the file changes
+  again before the write lands.
+* Apply each saved two-way sync edit before the next one in the same batch, so editing a
+  child right after renaming its inline parent no longer conflicts with the rename.
+* Bump the server and plugin protocol version to 8, since write requests now carry the
+  chosen authority and managed parent changes.
+* Show the usual protocol version mismatch message when the plugin connects to an older
+  server that answers in JSON, like upstream Rojo. It used to fail with "attempt to index
+  number with 'protocolVersion'" instead.
+* Stop two-way sync from warning "Cannot sync non-nil Parent property changes yet" for
+  every instance inside a folder that moved. It fired for each nested instance on the
+  initial sync, and for everything inside a folder that was moved or deleted in Studio,
+  because a change to an ancestor was treated as a change to each descendant's own parent.
+
 ## `7.7.1-horse.1.1`
 
 * Stop syncback from rewriting files when the same place is synced again. Rewriting an
@@ -56,6 +106,16 @@ Making a new release? Simply add the new header with the version and date undern
 * Expose the plugin API as `shared.RojoPlus`. It's also published as `shared.Rojo` for
   existing scripts unless another Rojo build already holds that name, and unloading the
   plugin only clears names that still point at Rojo+.
+* Write composite values with a NaN or infinite component, like
+  `NumberRange.new(0, math.huge)` or a `UISizeConstraint.MaxSize` of `(300, inf)`, in a
+  tagged form such as `{"NumberRange": [0.0, "inf"]}` instead of skipping them. Syncback,
+  build, serve, and two-way sync keep them for properties and attributes, so they no
+  longer reset to a default on rebuild.
+* Stop treating infinity as equal to the largest finite float when comparing values, and
+  stop two-way sync from restoring the disk value over an identical NaN value.
+* Compare NaN and infinite components exactly in the plugin, so a value like
+  `Vector3.new(0/0, 0, 0)` no longer shows up as changed on every sync and two different
+  NaN vectors are no longer treated as equal.
 
 ## `7.7.1-horse.1.0`
 
