@@ -2,8 +2,10 @@ use std::borrow::Borrow;
 
 use anyhow::{bail, format_err};
 use rbx_dom_weak::types::{
-    Attributes, CFrame, Color3, Content, ContentId, ContentType, Enum, Font, MaterialColors,
-    Matrix3, Tags, Variant, VariantType, Vector2, Vector3,
+    Attributes, CFrame, Color3, ColorSequence, ColorSequenceKeypoint, Content, ContentId,
+    ContentType, Enum, Font, MaterialColors, Matrix3, NumberRange, NumberSequence,
+    NumberSequenceKeypoint, Ray, Rect, Region3, Tags, UDim, UDim2, Variant, VariantType, Vector2,
+    Vector3,
 };
 use rbx_reflection::{DataType, PropertyDescriptor};
 use serde::{Deserialize, Serialize};
@@ -20,16 +22,70 @@ use crate::REF_POINTER_ATTRIBUTE_PREFIX;
 #[serde(untagged)]
 pub enum UnresolvedValue {
     FullyQualified(Variant),
-    NonFinite(NonFiniteNumber),
+    NonFinite(NonFiniteValue),
     Ambiguous(AmbiguousValue),
 }
 
-/// A number JSON can't hold, written with its type and a string such as
-/// `{"Float64": "inf"}`. Roblox often uses `math.huge` to mean "forever".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NonFiniteNumber {
+/// A value JSON can't hold because it is or contains NaN or infinity. It's
+/// written in the same shape as its fully qualified form, with each non-finite
+/// number spelled as a string, such as `{"Float64": "inf"}` or
+/// `{"NumberRange": [0.0, "inf"]}`. Roblox often uses `math.huge` to mean
+/// "forever" or "unbounded", like the default `UISizeConstraint.MaxSize`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NonFiniteValue {
     Float32(NonFinite),
     Float64(NonFinite),
+    Vector2([Float; 2]),
+    Vector3([Float; 3]),
+    Color3([Float; 3]),
+    CFrame(TaggedCFrame),
+    OptionalCFrame(TaggedCFrame),
+    NumberRange([Float; 2]),
+    NumberSequence(TaggedSequence<TaggedNumberKeypoint>),
+    ColorSequence(TaggedSequence<TaggedColorKeypoint>),
+    Ray(TaggedRay),
+    Rect([[Float; 2]; 2]),
+    Region3([[Float; 3]; 2]),
+    UDim((Float, i32)),
+    UDim2([(Float, i32); 2]),
+}
+
+/// One component of a composite `NonFiniteValue`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Float {
+    Finite(f32),
+    NonFinite(NonFinite),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaggedCFrame {
+    position: [Float; 3],
+    orientation: [[Float; 3]; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaggedRay {
+    origin: [Float; 3],
+    direction: [Float; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaggedSequence<K> {
+    keypoints: Vec<K>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaggedNumberKeypoint {
+    time: Float,
+    value: Float,
+    envelope: Float,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaggedColorKeypoint {
+    time: Float,
+    color: [Float; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,20 +120,201 @@ impl NonFinite {
     }
 }
 
-impl NonFiniteNumber {
-    /// Returns the non-finite form of `variant`, if it's a non-finite number.
-    fn from_variant(variant: &Variant) -> Option<Self> {
-        match *variant {
-            Variant::Float32(value) => NonFinite::new(value.into()).map(Self::Float32),
-            Variant::Float64(value) => NonFinite::new(value).map(Self::Float64),
-            _ => None,
+impl Float {
+    fn value(self) -> f32 {
+        match self {
+            Self::Finite(value) => value,
+            Self::NonFinite(value) => value.value() as f32,
         }
+    }
+}
+
+/// Builds the tagged form of a value, noting whether any component needed it.
+#[derive(Default)]
+struct Encoder {
+    found_non_finite: bool,
+}
+
+impl Encoder {
+    fn float(&mut self, value: f32) -> Float {
+        match NonFinite::new(value.into()) {
+            Some(non_finite) => {
+                self.found_non_finite = true;
+                Float::NonFinite(non_finite)
+            }
+            None => Float::Finite(value),
+        }
+    }
+
+    fn vector2(&mut self, vector: Vector2) -> [Float; 2] {
+        [self.float(vector.x), self.float(vector.y)]
+    }
+
+    fn vector3(&mut self, vector: Vector3) -> [Float; 3] {
+        [
+            self.float(vector.x),
+            self.float(vector.y),
+            self.float(vector.z),
+        ]
+    }
+
+    fn cframe(&mut self, cframe: &CFrame) -> TaggedCFrame {
+        TaggedCFrame {
+            position: self.vector3(cframe.position),
+            orientation: [
+                self.vector3(cframe.orientation.x),
+                self.vector3(cframe.orientation.y),
+                self.vector3(cframe.orientation.z),
+            ],
+        }
+    }
+
+    fn udim(&mut self, udim: UDim) -> (Float, i32) {
+        (self.float(udim.scale), udim.offset)
+    }
+
+    /// Returns the tagged form of `variant` whether or not it holds a
+    /// non-finite number, or `None` for types that have no tagged form.
+    fn encode(&mut self, variant: &Variant) -> Option<NonFiniteValue> {
+        Some(match variant {
+            Variant::Float32(value) => {
+                let value = NonFinite::new((*value).into())?;
+                self.found_non_finite = true;
+                NonFiniteValue::Float32(value)
+            }
+            Variant::Float64(value) => {
+                let value = NonFinite::new(*value)?;
+                self.found_non_finite = true;
+                NonFiniteValue::Float64(value)
+            }
+            Variant::Vector2(vector) => NonFiniteValue::Vector2(self.vector2(*vector)),
+            Variant::Vector3(vector) => NonFiniteValue::Vector3(self.vector3(*vector)),
+            Variant::Color3(color) => NonFiniteValue::Color3([
+                self.float(color.r),
+                self.float(color.g),
+                self.float(color.b),
+            ]),
+            Variant::CFrame(cframe) => NonFiniteValue::CFrame(self.cframe(cframe)),
+            Variant::OptionalCFrame(Some(cframe)) => {
+                NonFiniteValue::OptionalCFrame(self.cframe(cframe))
+            }
+            Variant::NumberRange(range) => {
+                NonFiniteValue::NumberRange([self.float(range.min), self.float(range.max)])
+            }
+            Variant::NumberSequence(sequence) => NonFiniteValue::NumberSequence(TaggedSequence {
+                keypoints: sequence
+                    .keypoints
+                    .iter()
+                    .map(|point| TaggedNumberKeypoint {
+                        time: self.float(point.time),
+                        value: self.float(point.value),
+                        envelope: self.float(point.envelope),
+                    })
+                    .collect(),
+            }),
+            Variant::ColorSequence(sequence) => NonFiniteValue::ColorSequence(TaggedSequence {
+                keypoints: sequence
+                    .keypoints
+                    .iter()
+                    .map(|point| TaggedColorKeypoint {
+                        time: self.float(point.time),
+                        color: [
+                            self.float(point.color.r),
+                            self.float(point.color.g),
+                            self.float(point.color.b),
+                        ],
+                    })
+                    .collect(),
+            }),
+            Variant::Ray(ray) => NonFiniteValue::Ray(TaggedRay {
+                origin: self.vector3(ray.origin),
+                direction: self.vector3(ray.direction),
+            }),
+            Variant::Rect(rect) => {
+                NonFiniteValue::Rect([self.vector2(rect.min), self.vector2(rect.max)])
+            }
+            Variant::Region3(region) => {
+                NonFiniteValue::Region3([self.vector3(region.min), self.vector3(region.max)])
+            }
+            Variant::UDim(udim) => NonFiniteValue::UDim(self.udim(*udim)),
+            Variant::UDim2(udim) => NonFiniteValue::UDim2([self.udim(udim.x), self.udim(udim.y)]),
+            _ => return None,
+        })
+    }
+}
+
+fn vector2([x, y]: [Float; 2]) -> Vector2 {
+    Vector2::new(x.value(), y.value())
+}
+
+fn vector3([x, y, z]: [Float; 3]) -> Vector3 {
+    Vector3::new(x.value(), y.value(), z.value())
+}
+
+fn cframe(cframe: TaggedCFrame) -> CFrame {
+    let [x, y, z] = cframe.orientation;
+    CFrame::new(
+        vector3(cframe.position),
+        Matrix3::new(vector3(x), vector3(y), vector3(z)),
+    )
+}
+
+fn udim((scale, offset): (Float, i32)) -> UDim {
+    UDim::new(scale.value(), offset)
+}
+
+impl NonFiniteValue {
+    /// Returns the tagged form of `variant`, if it is or contains a non-finite
+    /// number.
+    fn from_variant(variant: &Variant) -> Option<Self> {
+        let mut encoder = Encoder::default();
+        let value = encoder.encode(variant)?;
+        encoder.found_non_finite.then_some(value)
     }
 
     fn into_variant(self) -> Variant {
         match self {
             Self::Float32(value) => Variant::Float32(value.value() as f32),
             Self::Float64(value) => Variant::Float64(value.value()),
+            Self::Vector2(value) => vector2(value).into(),
+            Self::Vector3(value) => vector3(value).into(),
+            Self::Color3([r, g, b]) => Color3::new(r.value(), g.value(), b.value()).into(),
+            Self::CFrame(value) => cframe(value).into(),
+            Self::OptionalCFrame(value) => Variant::OptionalCFrame(Some(cframe(value))),
+            Self::NumberRange([min, max]) => NumberRange::new(min.value(), max.value()).into(),
+            Self::NumberSequence(sequence) => NumberSequence {
+                keypoints: sequence
+                    .keypoints
+                    .into_iter()
+                    .map(|point| {
+                        NumberSequenceKeypoint::new(
+                            point.time.value(),
+                            point.value.value(),
+                            point.envelope.value(),
+                        )
+                    })
+                    .collect(),
+            }
+            .into(),
+            Self::ColorSequence(sequence) => ColorSequence {
+                keypoints: sequence
+                    .keypoints
+                    .into_iter()
+                    .map(|point| {
+                        let [r, g, b] = point.color;
+                        ColorSequenceKeypoint::new(
+                            point.time.value(),
+                            Color3::new(r.value(), g.value(), b.value()),
+                        )
+                    })
+                    .collect(),
+            }
+            .into(),
+            Self::Ray(ray) => Ray::new(vector3(ray.origin), vector3(ray.direction)).into(),
+            Self::Rect([min, max]) => Rect::new(vector2(min), vector2(max)).into(),
+            Self::Region3([min, max]) => Region3::new(vector3(min), vector3(max)).into(),
+            Self::UDim(value) => udim(value).into(),
+            Self::UDim2([x, y]) => UDim2::new(udim(x), udim(y)).into(),
         }
     }
 }
@@ -86,7 +323,7 @@ impl UnresolvedValue {
     pub fn resolve(self, class_name: &str, prop_name: &str) -> anyhow::Result<Variant> {
         match self {
             UnresolvedValue::FullyQualified(full) => Ok(full),
-            UnresolvedValue::NonFinite(number) => Ok(number.into_variant()),
+            UnresolvedValue::NonFinite(value) => Ok(value.into_variant()),
             UnresolvedValue::Ambiguous(partial) => partial.resolve(class_name, prop_name),
         }
     }
@@ -94,7 +331,7 @@ impl UnresolvedValue {
     pub fn resolve_unambiguous(self) -> anyhow::Result<Variant> {
         match self {
             UnresolvedValue::FullyQualified(full) => Ok(full),
-            UnresolvedValue::NonFinite(number) => Ok(number.into_variant()),
+            UnresolvedValue::NonFinite(value) => Ok(value.into_variant()),
             UnresolvedValue::Ambiguous(partial) => partial.resolve_unambiguous(),
         }
     }
@@ -102,8 +339,10 @@ impl UnresolvedValue {
     /// Creates an `UnresolvedValue` from a variant, using a class and property
     /// name to potentially allow for ambiguous Enum variants.
     pub fn from_variant(variant: Variant, class_name: &str, prop_name: &str) -> Self {
-        if let Some(number) = NonFiniteNumber::from_variant(&variant) {
-            return Self::NonFinite(number);
+        // Checked first, since the ambiguous forms would write NaN and infinity
+        // as `null`.
+        if let Some(value) = NonFiniteValue::from_variant(&variant) {
+            return Self::NonFinite(value);
         }
         let descriptor = find_descriptor(class_name, prop_name);
         if descriptor.is_some() {
@@ -180,8 +419,8 @@ impl UnresolvedValue {
     /// Creates an `UnresolvedValue` from a variant, only returning ambiguous
     /// values if they're able to be resolved in a context-free environment.
     pub fn from_variant_unambiguous(variant: Variant) -> Self {
-        if let Some(number) = NonFiniteNumber::from_variant(&variant) {
-            return Self::NonFinite(number);
+        if let Some(value) = NonFiniteValue::from_variant(&variant) {
+            return Self::NonFinite(value);
         }
         match variant {
             Variant::String(str) => Self::Ambiguous(AmbiguousValue::String(str)),
@@ -414,7 +653,7 @@ fn nonexhaustive_list(values: &[&str]) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::json;
+    use crate::{json, variant_eq::variant_eq};
 
     fn resolve(class: &str, prop: &str, json_value: &str) -> Variant {
         let unresolved: UnresolvedValue = json::from_str(json_value).unwrap();
@@ -515,6 +754,144 @@ mod test {
                 }
             }
         }
+    }
+
+    /// Builds one variant per float slot of `base`, with `value` in that slot.
+    fn per_slot<const N: usize>(
+        value: f32,
+        base: [f32; N],
+        build: impl Fn([f32; N]) -> Variant,
+    ) -> Vec<Variant> {
+        (0..N)
+            .map(|slot| {
+                let mut components = base;
+                components[slot] = value;
+                build(components)
+            })
+            .collect()
+    }
+
+    /// Every composite type with a tagged form, once per float slot.
+    fn composites(value: f32) -> Vec<Variant> {
+        let v3 = |c: &[f32]| Vector3::new(c[0], c[1], c[2]);
+        let cframe = |c: [f32; 12]| {
+            CFrame::new(
+                v3(&c[0..3]),
+                Matrix3::new(v3(&c[3..6]), v3(&c[6..9]), v3(&c[9..12])),
+            )
+        };
+        let cframe_base = [1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        [
+            per_slot(value, [1.0, 2.0], |c| Vector2::new(c[0], c[1]).into()),
+            per_slot(value, [1.0, 2.0, 3.0], |c| v3(&c).into()),
+            per_slot(value, [0.1, 0.2, 0.3], |c| {
+                Color3::new(c[0], c[1], c[2]).into()
+            }),
+            per_slot(value, cframe_base, |c| cframe(c).into()),
+            per_slot(value, cframe_base, |c| {
+                Variant::OptionalCFrame(Some(cframe(c)))
+            }),
+            per_slot(value, [0.0, 1.0], |c| NumberRange::new(c[0], c[1]).into()),
+            per_slot(value, [0.0, 0.5, 0.1, 1.0, 0.7, 0.2], |c| {
+                NumberSequence {
+                    keypoints: vec![
+                        NumberSequenceKeypoint::new(c[0], c[1], c[2]),
+                        NumberSequenceKeypoint::new(c[3], c[4], c[5]),
+                    ],
+                }
+                .into()
+            }),
+            per_slot(value, [0.0, 0.1, 0.2, 0.3, 1.0, 0.4, 0.5, 0.6], |c| {
+                ColorSequence {
+                    keypoints: vec![
+                        ColorSequenceKeypoint::new(c[0], Color3::new(c[1], c[2], c[3])),
+                        ColorSequenceKeypoint::new(c[4], Color3::new(c[5], c[6], c[7])),
+                    ],
+                }
+                .into()
+            }),
+            per_slot(value, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], |c| {
+                Ray::new(v3(&c[0..3]), v3(&c[3..6])).into()
+            }),
+            per_slot(value, [1.0, 2.0, 3.0, 4.0], |c| {
+                Rect::new(Vector2::new(c[0], c[1]), Vector2::new(c[2], c[3])).into()
+            }),
+            per_slot(value, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], |c| {
+                Region3::new(v3(&c[0..3]), v3(&c[3..6])).into()
+            }),
+            per_slot(value, [0.5], |c| UDim::new(c[0], 7).into()),
+            per_slot(value, [0.5, 0.25], |c| {
+                UDim2::new(UDim::new(c[0], 7), UDim::new(c[1], -3)).into()
+            }),
+        ]
+        .concat()
+    }
+
+    /// Every non-finite value in every float slot of every composite type is
+    /// detected, written as a tagged string, and read back into the same slot,
+    /// through both the property and attribute writers.
+    #[test]
+    fn non_finite_composites_round_trip_through_tagged_text() {
+        for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            for variant in composites(value) {
+                for unresolved in [
+                    UnresolvedValue::from_variant(variant.clone(), "Folder", "NotAProperty"),
+                    UnresolvedValue::from_variant_unambiguous(variant.clone()),
+                ] {
+                    assert!(
+                        matches!(unresolved, UnresolvedValue::NonFinite(_)),
+                        "{variant:?} was not detected as non-finite"
+                    );
+                    let written = serde_json::to_string(&unresolved).unwrap();
+                    assert!(!written.contains("null"), "{written}");
+                    let read: UnresolvedValue = json::from_str(&written).unwrap();
+                    let resolved = read.resolve_unambiguous().unwrap();
+                    assert!(
+                        variant_eq(&resolved, &variant),
+                        "{written} read back as {resolved:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tagged form must keep the exact shape of the fully qualified form,
+    /// so finite values encoded both ways must write the same JSON.
+    #[test]
+    fn tagged_composites_match_the_fully_qualified_shape() {
+        for variant in composites(0.75) {
+            let tagged = Encoder::default().encode(&variant).unwrap();
+            assert_eq!(
+                serde_json::to_value(&tagged).unwrap(),
+                serde_json::to_value(&variant).unwrap(),
+                "{variant:?}"
+            );
+            assert!(NonFiniteValue::from_variant(&variant).is_none());
+        }
+    }
+
+    #[test]
+    fn non_finite_composites_are_written_readably() {
+        let range =
+            UnresolvedValue::from_variant_unambiguous(NumberRange::new(0.0, f32::INFINITY).into());
+        assert_eq!(
+            serde_json::to_string(&range).unwrap(),
+            r#"{"NumberRange":[0.0,"inf"]}"#
+        );
+
+        // Properties known to the reflection database are normally written in
+        // an ambiguous form, which can't hold infinity.
+        let max_size = UnresolvedValue::from_variant(
+            Vector2::new(300.0, f32::INFINITY).into(),
+            "UISizeConstraint",
+            "MaxSize",
+        );
+        let written = serde_json::to_string(&max_size).unwrap();
+        assert_eq!(written, r#"{"Vector2":[300.0,"inf"]}"#);
+        assert_eq!(
+            resolve("UISizeConstraint", "MaxSize", &written),
+            Variant::Vector2(Vector2::new(300.0, f32::INFINITY))
+        );
     }
 
     /// A plain string must never be mistaken for a tagged non-finite number.

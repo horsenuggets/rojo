@@ -20,8 +20,8 @@ use crate::{
         snapshot_from_vfs, snapshot_project_node, snapshot_shallow_from_vfs, Middleware,
     },
     syncback::{
-        can_write_property, decide_property_write, get_property_filter, is_json_compatible,
-        source_file, syncback_instance, validate_write_targets, FsSnapshot, PropertyWriteDecision,
+        can_write_property, decide_property_write, get_property_filter, same_value, source_file,
+        syncback_instance, validate_write_targets, FsSnapshot, PropertyWriteDecision,
     },
     web::interface::{WriteError, WriteResult},
 };
@@ -657,15 +657,6 @@ impl JobThreadContext {
                             property: Some(key.to_string()),
                             message: "Script source must be a string".into(),
                         });
-                    } else if studio_value
-                        .as_ref()
-                        .is_some_and(|value| !is_json_compatible(value))
-                    {
-                        errors.push(WriteError {
-                            id,
-                            property: Some(key.to_string()),
-                            message: "This value cannot be represented in metadata".into(),
-                        });
                     } else {
                         accepted_properties.insert(*key, studio_value.clone());
                     }
@@ -689,7 +680,9 @@ impl JobThreadContext {
         }
         for (key, studio_value) in &update.changed_properties {
             let disk_value = disk_properties.get(key);
-            if !accepted_properties.contains_key(key) && disk_value != studio_value.as_ref() {
+            if !accepted_properties.contains_key(key)
+                && !same_value(disk_value, studio_value.as_ref())
+            {
                 conflict_properties.insert(*key, disk_value.cloned());
             }
         }
@@ -1213,7 +1206,10 @@ mod tests {
     use super::*;
     use crate::snapshot::InstanceMetadata;
     use memofs::{InMemoryFs, VfsSnapshot};
-    use rbx_dom_weak::{types::Attributes, ustr};
+    use rbx_dom_weak::{
+        types::{Attributes, CFrame, Matrix3, NumberRange, Vector3},
+        ustr,
+    };
     use std::path::Path;
 
     fn part_job() -> (JobThreadContext, Ref) {
@@ -1746,6 +1742,52 @@ mod tests {
         assert_eq!(
             job.vfs.read("/project/Part/init.meta.json").unwrap(),
             before
+        );
+    }
+
+    /// Studio writes with NaN or infinity inside a composite value are saved in
+    /// the tagged form, and sending the same values again matches the disk
+    /// instead of conflicting, since NaN must compare equal to itself.
+    #[test]
+    fn non_finite_composite_writes_are_saved_and_stay_in_sync() {
+        let (job, id) = part_job();
+        let mut attributes = Attributes::new();
+        attributes.insert("Range".into(), NumberRange::new(0.0, f32::INFINITY).into());
+        attributes.insert(
+            "Offset".into(),
+            Vector3::new(f32::NAN, 1.0, f32::NEG_INFINITY).into(),
+        );
+        let pivot = CFrame::new(Vector3::new(1.0, f32::INFINITY, 3.0), Matrix3::identity());
+        for attempt in 0..2 {
+            let mut patch =
+                property_update(id, "Attributes", Variant::Attributes(attributes.clone()));
+            patch.updated_instances[0]
+                .changed_properties
+                .insert(ustr("PivotOffset"), Some(pivot.into()));
+            let (accepted, conflicts, errors) = job.handle_tree_event(patch);
+            assert!(errors.is_empty(), "attempt {attempt}: {errors:?}");
+            assert_eq!(conflicts, PatchSet::new(), "attempt {attempt}");
+            // The repeat is already on disk, so there's nothing left to save.
+            let expected = if attempt == 0 { 1 } else { 0 };
+            assert_eq!(
+                accepted.updated_instances.len(),
+                expected,
+                "attempt {attempt}"
+            );
+        }
+        let meta: serde_json::Value =
+            serde_json::from_slice(&job.vfs.read("/project/Part/init.meta.json").unwrap()).unwrap();
+        assert_eq!(
+            meta["attributes"]["Range"],
+            serde_json::json!({"NumberRange": [0.0, "inf"]})
+        );
+        assert_eq!(
+            meta["attributes"]["Offset"],
+            serde_json::json!({"Vector3": ["nan", 1.0, "-inf"]})
+        );
+        assert_eq!(
+            meta["properties"]["PivotOffset"]["CFrame"]["position"],
+            serde_json::json!([1.0, "inf", 3.0])
         );
     }
 

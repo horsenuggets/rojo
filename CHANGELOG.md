@@ -49,6 +49,8 @@ Making a new release? Simply add the new header with the version and date undern
   `rojo build` and `rojo serve` swapped them.
 * Never give a referenced instance an ID another instance already has, which could
   happen when a referenced instance was renamed and a new one took its old name.
+* Keep the `Rojo_Id` of a referenced project root, like the root of a model project,
+  instead of making a new one every run.
 * Rebrand the fork as Rojo+. The CLI, plugin toolbar, panel title, and messages say Rojo+,
   and the panel header shows "Rojo+" instead of the version. `rojo plugin install` writes
   `Rojo+.rbxm` and the release asset is `Rojo+.rbxm`, so Rojo+ can be installed alongside
@@ -60,6 +62,16 @@ Making a new release? Simply add the new header with the version and date undern
 * Expose the plugin API as `shared.RojoPlus`. It's also published as `shared.Rojo` for
   existing scripts unless another Rojo build already holds that name, and unloading the
   plugin only clears names that still point at Rojo+.
+* Write composite values with a NaN or infinite component, like
+  `NumberRange.new(0, math.huge)` or a `UISizeConstraint.MaxSize` of `(300, inf)`, in a
+  tagged form such as `{"NumberRange": [0.0, "inf"]}` instead of skipping them. Syncback,
+  build, serve, and two-way sync keep them for properties and attributes, so they no
+  longer reset to a default on rebuild.
+* Stop treating infinity as equal to the largest finite float when comparing values, and
+  stop two-way sync from restoring the disk value over an identical NaN value.
+* Compare NaN and infinite components exactly in the plugin, so a value like
+  `Vector3.new(0/0, 0, 0)` no longer shows up as changed on every sync and two different
+  NaN vectors are no longer treated as equal.
 
 ## `7.7.1-horse.1.0`
 
