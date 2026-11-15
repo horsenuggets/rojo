@@ -18,6 +18,7 @@ use super::{descendants, filter_json_properties_preallocated, filter_properties_
 enum PropertyHashMode {
     Raw,
     Json,
+    Binary,
 }
 
 /// Returns a map of every `Ref` in the `WeakDom` to a hashed version of the
@@ -32,6 +33,10 @@ pub fn hash_tree(project: &Project, dom: &WeakDom, root_ref: Ref) -> HashMap<Ref
 
 pub fn hash_json_tree(project: &Project, dom: &WeakDom, root_ref: Ref) -> HashMap<Ref, Hash> {
     hash_tree_with_mode(project, dom, root_ref, PropertyHashMode::Json)
+}
+
+pub fn hash_binary_tree(project: &Project, dom: &WeakDom, root_ref: Ref) -> HashMap<Ref, Hash> {
+    hash_tree_with_mode(project, dom, root_ref, PropertyHashMode::Binary)
 }
 
 fn hash_tree_with_mode(
@@ -99,7 +104,9 @@ fn hash_inst_filtered<'inst>(
     mode: PropertyHashMode,
 ) -> Hasher {
     match mode {
-        PropertyHashMode::Raw => filter_properties_preallocated(project, inst, prop_list),
+        PropertyHashMode::Raw | PropertyHashMode::Binary => {
+            filter_properties_preallocated(project, inst, prop_list)
+        }
         PropertyHashMode::Json => filter_json_properties_preallocated(project, inst, prop_list),
     }
 
@@ -114,8 +121,9 @@ fn hash_inst_prefilled<'inst>(
     mode: PropertyHashMode,
 ) -> Hasher {
     let hash_value = match mode {
-        PropertyHashMode::Raw => hash_variant,
+        PropertyHashMode::Raw => hash_exact_variant,
         PropertyHashMode::Json => hash_json_variant,
+        PropertyHashMode::Binary => hash_variant,
     };
     let mut hasher = Hasher::new();
     hasher.update(inst.name.as_bytes());

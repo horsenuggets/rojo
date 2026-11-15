@@ -377,15 +377,21 @@ pub fn syncback_loop(
 
         let middleware = get_best_middleware(&snapshot);
 
-        // A JSON model owns its whole subtree. Directories can contain binary
-        // children, so their subtrees must keep the conservative raw comparison.
-        if middleware == Middleware::JsonModel {
-            if let Some(old_ref) = snapshot.old.filter(|old| !relayout.contains(old)) {
-                let old = hash_json_tree(project, snapshot.old_tree(), old_ref);
-                let new = hash_json_tree(project, snapshot.new_tree(), snapshot.new);
-                if old.get(&old_ref) == new.get(&snapshot.new) {
-                    continue;
-                }
+        // Only a model owns its whole subtree. A directory may mix JSON and
+        // binary descendants, so its early comparison must remain exact.
+        let model_hasher: Option<fn(&Project, &WeakDom, Ref) -> _> = match middleware {
+            Middleware::JsonModel => Some(hash_json_tree),
+            Middleware::Rbxm | Middleware::Rbxmx => Some(hash_binary_tree),
+            _ => None,
+        };
+        if let (Some(hash_model), Some(old_ref)) = (
+            model_hasher,
+            snapshot.old.filter(|old| !relayout.contains(old)),
+        ) {
+            let old = hash_model(project, snapshot.old_tree(), old_ref);
+            let new = hash_model(project, snapshot.new_tree(), snapshot.new);
+            if old.get(&old_ref) == new.get(&snapshot.new) {
+                continue;
             }
         }
 
@@ -1111,6 +1117,43 @@ mod test {
             part.properties.get(&ustr("Transparency")),
             Some(&Variant::Float32(0.0000005))
         );
+    }
+
+    #[test]
+    fn json_model_fractional_attribute_edits_are_not_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        let project_path = root.join("default.project.json");
+        std::fs::write(&project_path, r#"{"name":"Test","tree":{"$path":"src"}}"#).unwrap();
+        for value in [-0.0000005, 0.01, 0.02] {
+            let mut attributes = Attributes::new();
+            attributes.insert("Amount".into(), Variant::Float64(value));
+            let input = WeakDom::new(
+                rbx_dom_weak::InstanceBuilder::new("Folder").with_child(
+                    rbx_dom_weak::InstanceBuilder::new("NumberValue")
+                        .with_name("Value")
+                        .with_property("Attributes", attributes),
+                ),
+            );
+            let vfs = Vfs::new_default().unwrap();
+            vfs.set_watch_enabled(false);
+            let session = crate::serve_session::ServeSession::new(vfs, &project_path).unwrap();
+            let snapshot = syncback_loop(
+                session.vfs(),
+                &mut session.tree(),
+                input,
+                session.root_project(),
+            )
+            .unwrap();
+            let path = src.join("Value.model.json");
+            assert!(snapshot.added_paths().contains(&path.as_path()));
+            snapshot.write_to_vfs(&root, session.vfs()).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(saved["attributes"]["Amount"].as_f64(), Some(value.max(0.0)));
+        }
     }
 
     #[test]
