@@ -38,9 +38,9 @@ pub use file_names::{
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
 pub(crate) use property_filter::{can_write_property, is_unset_binary_string};
-pub use property_filter::{filter_properties, filter_properties_preallocated, is_json_compatible};
+pub use property_filter::{filter_properties, filter_properties_preallocated};
 pub use snapshot::{SyncbackData, SyncbackSnapshot};
-pub use write_decision::{decide_property_write, PropertyWriteDecision};
+pub use write_decision::{decide_property_write, same_value, PropertyWriteDecision};
 
 /// The name of an enviroment variable to use to override the behavior of
 /// syncback on model files.

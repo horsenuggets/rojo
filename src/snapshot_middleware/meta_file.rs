@@ -13,7 +13,7 @@ use crate::{
     json,
     resolution::UnresolvedValue,
     snapshot::{InstanceMetadata, InstanceSnapshot},
-    syncback::{is_json_compatible, SyncbackSnapshot},
+    syncback::SyncbackSnapshot,
     variant_eq::variant_eq,
     RojoRef,
 };
@@ -25,8 +25,7 @@ use crate::{
 /// so sorting is what makes a fresh syncback of the same place write the same
 /// files every time.
 ///
-/// Internal `RBX` attributes and values JSON cannot hold, like a Vector3 with
-/// a NaN component, are left out so the file can always be read back.
+/// Internal `RBX` attributes are left out.
 pub fn serialize_values<'a>(
     class: &str,
     values: impl IntoIterator<Item = (Ustr, &'a Variant)>,
@@ -43,7 +42,7 @@ pub fn serialize_values<'a>(
         match value {
             Variant::Attributes(attrs) => {
                 for (attr_name, attr_value) in attrs.iter() {
-                    if attr_name.starts_with("RBX") || !is_json_compatible(attr_value) {
+                    if attr_name.starts_with("RBX") {
                         continue;
                     }
                     attributes.insert(

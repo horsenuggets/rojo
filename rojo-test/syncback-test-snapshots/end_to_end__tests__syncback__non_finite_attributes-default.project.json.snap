@@ -15,6 +15,13 @@ expression: default.project.json
                 "Infinite": {
                     "Float64": "inf"
                 },
+                "InfiniteVector": {
+                    "Vector3": [
+                        "nan",
+                        0.0,
+                        0.0
+                    ]
+                },
                 "NotANumber": {
                     "Float64": "nan"
                 }
