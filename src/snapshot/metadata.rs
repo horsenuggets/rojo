@@ -167,6 +167,9 @@ pub struct InstanceContext {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub path_ignore_rules: Arc<Vec<PathIgnoreRule>>,
     pub emit_legacy_scripts: bool,
+    // Server-owned cache state cannot be re-included by project ignore rules.
+    #[serde(skip)]
+    reserved_cache_path: Option<PathBuf>,
     // Every instance's metadata keeps a context, and cloning a rule's compiled
     // glob regex allocates a fresh match cache pool, so the list is shared.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -196,6 +199,7 @@ impl InstanceContext {
     pub fn new() -> Self {
         Self {
             path_ignore_rules: Arc::new(Vec::new()),
+            reserved_cache_path: None,
             emit_legacy_scripts: emit_legacy_scripts_default().unwrap(),
             sync_rules: Arc::new(Vec::new()),
             require_context: None,
@@ -212,6 +216,22 @@ impl InstanceContext {
                 .unwrap(),
             ..Self::new()
         }
+    }
+
+    pub fn set_reserved_cache_path(&mut self, path: PathBuf) {
+        self.reserved_cache_path = Some(path);
+    }
+
+    pub fn reserved_cache_path(&self) -> Option<&Path> {
+        self.reserved_cache_path.as_deref()
+    }
+
+    /// Returns whether the path lexically names the reserved cache or a descendant.
+    /// Resolve ambiguous paths before using this to exclude snapshot sources.
+    pub fn is_reserved_path(&self, path: &Path) -> bool {
+        self.reserved_cache_path
+            .as_ref()
+            .is_some_and(|cache| path.starts_with(cache))
     }
 
     /// Extend the list of ignore rules in the context with the given new rules.
@@ -439,6 +459,55 @@ mod test {
             suffix: None,
             base_path: PathBuf::new(),
         }
+    }
+
+    #[test]
+    fn reserved_cache_matches_only_its_directory_and_descendants() {
+        let mut context = InstanceContext::new();
+        assert!(context.reserved_cache_path().is_none());
+        assert!(!context.is_reserved_path(Path::new("/project/.rojo")));
+        context.set_reserved_cache_path(PathBuf::from("/project/.rojo"));
+        assert_eq!(
+            context.reserved_cache_path(),
+            Some(Path::new("/project/.rojo"))
+        );
+
+        for path in ["/project/.rojo", "/project/.rojo/relocations/intent.json"] {
+            assert!(context.is_reserved_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/project",
+            "/project/.rojo-backup/intent.json",
+            "/project/Source/.rojo/intent.json",
+            "/other/.rojo/intent.json",
+        ] {
+            assert!(!context.is_reserved_path(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn reserved_cache_survives_cloning_and_metadata_context_retention() {
+        let mut context = InstanceContext::new();
+        context.set_reserved_cache_path(PathBuf::from("/project/.rojo"));
+        context.active_projects = Some(Arc::new(vec![PathBuf::from("/project")]));
+        context.active_directories = Some(Arc::new(vec![PathBuf::from("/project")]));
+        let cloned = context.clone();
+        let metadata = InstanceMetadata::new().context(&context);
+        assert!(metadata.context.active_projects.is_none());
+        assert!(metadata.context.active_directories.is_none());
+        for retained in [&cloned, &metadata.context] {
+            assert!(retained.is_reserved_path(Path::new("/project/.rojo/intent.json")));
+        }
+    }
+
+    #[test]
+    fn ordinary_ignore_negation_still_uses_the_last_matching_rule() {
+        let rules = ["*", "!*", "hidden.txt"].map(|pattern| PathIgnoreRule {
+            base_path: PathBuf::from("/project"),
+            glob: IgnorableGlob::new(pattern).unwrap(),
+        });
+        assert!(!is_path_ignored(&rules, "/project/visible.txt"));
+        assert!(is_path_ignored(&rules, "/project/hidden.txt"));
     }
 
     #[test]
