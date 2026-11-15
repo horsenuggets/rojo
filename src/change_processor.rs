@@ -15,9 +15,9 @@ use crate::{
     project::Project,
     resolution::normalize_json_variant,
     snapshot::{
-        apply_patch_set, compute_patch_set, compute_shallow_patch_set, AppliedPatchSet,
-        AppliedPatchUpdate, InstanceSnapshot, InstigatingSource, PatchAdd, PatchSet, PatchUpdate,
-        RojoTree,
+        apply_patch_set, compute_patch_set, compute_saved_patch_set, compute_shallow_patch_set,
+        AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, InstigatingSource, PatchAdd,
+        PatchSet, PatchUpdate, RojoTree,
     },
     snapshot_middleware::{
         snapshot_from_vfs, snapshot_project_node, snapshot_shallow_from_vfs, Middleware,
@@ -973,7 +973,7 @@ impl JobThreadContext {
                             return;
                         }
                     };
-                let saved_changes = compute_shallow_patch_set(saved_snapshot, tree, owner_id);
+                let saved_changes = compute_saved_patch_set(saved_snapshot, tree, owner_id);
                 let applied = apply_patch_set(tree, saved_changes);
                 if !applied.is_empty() {
                     messages.push(applied);
@@ -1654,34 +1654,73 @@ mod tests {
 
     #[test]
     fn rewriting_metadata_normalizes_preserved_float32_boundary_values() {
-        let (job, id) = script_job(
-            vec![(
-                "Part",
-                VfsSnapshot::dir([(
-                    "init.meta.json",
-                    VfsSnapshot::file(
-                        r#"{"className":"Part","properties":{"Size":[2.000001,3,4]},"attributes":{"Boundary":{"Vector3":[2.000001,3,4]}}}"#,
-                    ),
-                )]),
-            )],
-            "/project/Part",
-        );
-        let (accepted, conflicts, errors) =
-            job.handle_tree_event(property_update(id, "Reflectance", Variant::Float32(0.25)));
-        assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(conflicts, PatchSet::new());
-        assert_eq!(accepted.updated_instances.len(), 1);
-        let contents = read_text(&job.vfs, "/project/Part/init.meta.json").unwrap();
-        let metadata: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(metadata["properties"]["Size"], serde_json::json!([2, 3, 4]));
-        assert_eq!(
-            metadata["attributes"]["Boundary"]["Vector3"],
-            serde_json::json!([2, 3, 4])
-        );
-        let snapshot =
-            snapshot_from_vfs(&Default::default(), &job.vfs, Path::new("/project/Part")).unwrap();
-        let tree = job.tree.lock().unwrap();
-        assert_eq!(compute_patch_set(snapshot, &tree, id), PatchSet::new());
+        for boundary in [2.000001, 2.0000002] {
+            for inline in [false, true] {
+                let mut metadata = serde_json::json!({
+                    "className": "Part",
+                    "properties": {"Size": [boundary, 3, 4]},
+                    "attributes": {"Boundary": {"Vector3": [boundary, 3, 4]}},
+                });
+                if inline {
+                    metadata = serde_json::json!({"className": "Folder", "children": [metadata]});
+                }
+                let (job, owner) = script_job(
+                    vec![(
+                        "Part",
+                        VfsSnapshot::dir([(
+                            "init.meta.json",
+                            VfsSnapshot::file(metadata.to_string()),
+                        )]),
+                    )],
+                    "/project/Part",
+                );
+                let id = if inline {
+                    job.tree
+                        .lock()
+                        .unwrap()
+                        .get_instance(owner)
+                        .unwrap()
+                        .children()[0]
+                } else {
+                    owner
+                };
+                let (accepted, conflicts, errors) = job.handle_tree_event(property_update(
+                    id,
+                    "Reflectance",
+                    Variant::Float32(0.25),
+                ));
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(conflicts, PatchSet::new());
+                assert_eq!(accepted.updated_instances.len(), 1);
+                let contents = read_text(&job.vfs, "/project/Part/init.meta.json").unwrap();
+                let metadata: serde_json::Value = serde_json::from_str(&contents).unwrap();
+                let metadata = if inline {
+                    &metadata["children"][0]
+                } else {
+                    &metadata
+                };
+                assert_eq!(metadata["properties"]["Size"], serde_json::json!([2, 3, 4]));
+                assert_eq!(
+                    metadata["attributes"]["Boundary"]["Vector3"],
+                    serde_json::json!([2, 3, 4])
+                );
+                let expected = Variant::Vector3(Vector3::new(2.0, 3.0, 4.0));
+                let tree = job.tree.lock().unwrap();
+                assert_eq!(
+                    tree.get_instance(id).unwrap().properties()[&ustr("Size")],
+                    expected
+                );
+                let (_, messages) = job.message_queue.subscribe(0).try_recv().unwrap().unwrap();
+                assert!(messages
+                    .iter()
+                    .flat_map(|message| &message.updated)
+                    .any(|update| {
+                        update.id == id
+                            && update.changed_properties.get(&ustr("Size"))
+                                == Some(&Some(expected.clone()))
+                    }));
+            }
+        }
     }
 
     #[test]
