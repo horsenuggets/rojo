@@ -1,7 +1,4 @@
-use rbx_dom_weak::{
-    types::{CFrame, Variant, Vector2, Vector3},
-    Instance, Ustr, UstrMap,
-};
+use rbx_dom_weak::{types::Variant, Instance, Ustr, UstrMap};
 use rbx_reflection::{PropertyKind, PropertySerialization, Scriptability};
 
 use crate::{variant_eq::variant_eq, Project};
@@ -37,13 +34,6 @@ pub fn filter_properties_preallocated<'inst>(
         .get(inst.class.as_str());
 
     let predicate = |prop_name: &Ustr, prop_value: &Variant| {
-        // JSON has no representation for NaN or infinity inside composite
-        // values. Roblox uses NaN CFrames for unset values such as
-        // Model.ModelMeshCFrame, so leaving them in would make the metadata
-        // unreadable.
-        if !is_json_compatible(prop_value) {
-            return true;
-        }
         // We don't want to serialize Ref or UniqueId properties in JSON files
         if matches!(prop_value, Variant::Ref(_) | Variant::UniqueId(_)) {
             return true;
@@ -94,72 +84,6 @@ pub fn filter_properties_preallocated<'inst>(
 /// syncback would write an empty value into the metadata of every instance.
 pub(crate) fn is_unset_binary_string(value: &Variant) -> bool {
     matches!(value, Variant::BinaryString(bytes) if AsRef::<[u8]>::as_ref(bytes).is_empty())
-}
-
-/// Returns whether a value can be represented in JSON without `null` from
-/// non-finite numbers. Roblox uses NaN and infinity for some unset values.
-/// Plain numbers always can, since non-finite ones are written in a tagged
-/// form like `{"Float64": "inf"}`.
-pub fn is_json_compatible(value: &Variant) -> bool {
-    match value {
-        Variant::Vector2(value) => vector2_is_finite(value),
-        Variant::Vector3(value) => vector3_is_finite(value),
-        Variant::Color3(value) => [value.r, value.g, value.b].into_iter().all(f32::is_finite),
-        Variant::CFrame(value) => cframe_is_finite(value),
-        Variant::OptionalCFrame(value) => value.as_ref().is_some_and(cframe_is_finite),
-        Variant::NumberRange(value) => [value.min, value.max].into_iter().all(f32::is_finite),
-        Variant::NumberSequence(value) => value.keypoints.iter().all(|point| {
-            [point.time, point.value, point.envelope]
-                .into_iter()
-                .all(f32::is_finite)
-        }),
-        Variant::ColorSequence(value) => value.keypoints.iter().all(|point| {
-            point.time.is_finite()
-                && [point.color.r, point.color.g, point.color.b]
-                    .into_iter()
-                    .all(f32::is_finite)
-        }),
-        Variant::Ray(value) => {
-            vector3_is_finite(&value.origin) && vector3_is_finite(&value.direction)
-        }
-        Variant::Rect(value) => vector2_is_finite(&value.min) && vector2_is_finite(&value.max),
-        Variant::Region3(value) => vector3_is_finite(&value.min) && vector3_is_finite(&value.max),
-        Variant::UDim(value) => value.scale.is_finite(),
-        Variant::UDim2(value) => value.x.scale.is_finite() && value.y.scale.is_finite(),
-        // Attribute bags are filtered per entry when serialized and hashed so
-        // one non-finite attribute does not discard all the valid ones.
-        Variant::Attributes(_) => true,
-        _ => true,
-    }
-}
-
-fn vector2_is_finite(vector: &Vector2) -> bool {
-    vector.x.is_finite() && vector.y.is_finite()
-}
-
-fn vector3_is_finite(vector: &Vector3) -> bool {
-    vector.x.is_finite() && vector.y.is_finite() && vector.z.is_finite()
-}
-
-fn cframe_is_finite(cframe: &CFrame) -> bool {
-    let position = cframe.position;
-    let orientation = cframe.orientation;
-    [
-        position.x,
-        position.y,
-        position.z,
-        orientation.x.x,
-        orientation.x.y,
-        orientation.x.z,
-        orientation.y.x,
-        orientation.y.y,
-        orientation.y.z,
-        orientation.z.x,
-        orientation.z.y,
-        orientation.z.z,
-    ]
-    .into_iter()
-    .all(f32::is_finite)
 }
 
 pub(crate) fn can_write_property(project: &Project, class_name: &str, prop_name: &str) -> bool {
@@ -225,7 +149,10 @@ fn should_property_serialize(class_name: &str, prop_name: &str) -> bool {
 mod test {
     use super::*;
     use memofs::Vfs;
-    use rbx_dom_weak::{types::BinaryString, ustr, InstanceBuilder, WeakDom};
+    use rbx_dom_weak::{
+        types::{BinaryString, CFrame, Matrix3, Vector2, Vector3},
+        ustr, InstanceBuilder, WeakDom,
+    };
 
     fn load_project() -> (tempfile::TempDir, Project) {
         let temp = tempfile::tempdir().unwrap();
@@ -258,6 +185,52 @@ mod test {
                     bytes.len()
                 );
             }
+        }
+    }
+
+    /// Non-finite composite values are kept like any other value, so they're
+    /// only dropped when they match a default. `UISizeConstraint.MaxSize`
+    /// defaults to `(inf, inf)`, and Roblox leaves `Model.ModelMeshCFrame` NaN.
+    #[test]
+    fn non_finite_composites_are_kept_unless_they_are_the_default() {
+        let (_temp, project) = load_project();
+        let cases = [
+            (
+                "UISizeConstraint",
+                "MaxSize",
+                Vector2::new(f32::INFINITY, f32::INFINITY).into(),
+                false,
+            ),
+            (
+                "UISizeConstraint",
+                "MaxSize",
+                Vector2::new(300.0, f32::INFINITY).into(),
+                true,
+            ),
+            (
+                "UISizeConstraint",
+                "MaxSize",
+                Vector2::new(f32::MAX, f32::MAX).into(),
+                true,
+            ),
+            (
+                "Model",
+                "ModelMeshCFrame",
+                Variant::CFrame(CFrame::new(
+                    Vector3::new(f32::NAN, f32::NAN, f32::NAN),
+                    Matrix3::identity(),
+                )),
+                true,
+            ),
+        ];
+        for (class, prop, value, kept) in cases {
+            let name = ustr(prop);
+            let dom = WeakDom::new(InstanceBuilder::new(class).with_property(name, value.clone()));
+            assert_eq!(
+                filter_properties(&project, dom.root()).contains_key(&name),
+                kept,
+                "{class}.{prop} = {value:?}"
+            );
         }
     }
 

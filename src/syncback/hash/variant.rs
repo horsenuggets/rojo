@@ -1,19 +1,21 @@
 use blake3::Hasher;
 use rbx_dom_weak::types::{ContentType, PhysicalProperties, Variant, Vector3};
 
-use crate::syncback::property_filter::is_json_compatible;
+use crate::variant_eq::{compare_times, CanonicalNan};
 
 // Scaling a huge finite value can overflow to infinity, which would hash it the same as a
-// real infinity, so values that overflow are hashed unrounded instead.
+// real infinity, so values that overflow are hashed unrounded instead. Every NaN hashes
+// the same, since files don't keep its sign and arithmetic on it doesn't either.
 macro_rules! round {
     ($value:expr) => {{
         let value = $value.clone();
         let scaled = value * 10.0;
-        if scaled.is_finite() || !value.is_finite() {
+        let rounded = if scaled.is_finite() || !value.is_finite() {
             scaled.round() / 10.0
         } else {
             value
-        }
+        };
+        rounded.canonical_nan()
     }};
 }
 
@@ -40,10 +42,8 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             let mut sorted: Vec<(&String, &Variant)> = attrs.iter().collect();
             sorted.sort_unstable_by_key(|(name, _)| *name);
             for (name, attribute) in sorted {
-                if is_json_compatible(attribute) {
-                    hasher.update(name.as_bytes());
-                    hash_variant(hasher, attribute);
-                }
+                hasher.update(name.as_bytes());
+                hash_variant(hasher, attribute);
             }
         }
         Variant::Axes(a) => hash!(hasher, &[a.bits()]),
@@ -65,7 +65,7 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             for keypoint in &seq.keypoints {
                 new.push(keypoint);
             }
-            new.sort_unstable_by(|a, b| round!(a.time).partial_cmp(&round!(b.time)).unwrap());
+            new.sort_unstable_by(|a, b| compare_times(round!(a.time), round!(b.time)));
             for keypoint in new {
                 n_hash!(
                     hasher,
@@ -125,7 +125,7 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             for keypoint in &seq.keypoints {
                 new.push(keypoint);
             }
-            new.sort_unstable_by(|a, b| round!(a.time).partial_cmp(&round!(b.time)).unwrap());
+            new.sort_unstable_by(|a, b| compare_times(round!(a.time), round!(b.time)));
             for keypoint in new {
                 n_hash!(
                     hasher,
@@ -230,22 +230,56 @@ fn vector_hash(hasher: &mut Hasher, vector: Vector3) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbx_dom_weak::types::Attributes;
+    use rbx_dom_weak::types::{Attributes, NumberRange, NumberSequence, NumberSequenceKeypoint};
 
+    /// Non-finite composite values are written to metadata too, so each one
+    /// must hash differently from the others and from finite values, and the
+    /// same value must always hash the same.
     #[test]
-    fn invalid_attributes_do_not_hide_valid_attributes() {
-        let mut valid = Attributes::new();
-        valid.insert("Good".to_owned(), "kept".into());
+    fn non_finite_composite_attributes_are_hashed() {
+        let hash = |value: Variant| {
+            let mut attributes = Attributes::new();
+            attributes.insert("Value".to_owned(), value);
+            let mut hasher = Hasher::new();
+            hash_variant(&mut hasher, &Variant::Attributes(attributes));
+            hasher.finalize()
+        };
+        let sequence = |time: f32| {
+            Variant::NumberSequence(NumberSequence {
+                keypoints: vec![
+                    NumberSequenceKeypoint::new(time, 0.0, 0.0),
+                    NumberSequenceKeypoint::new(1.0, 1.0, 0.0),
+                ],
+            })
+        };
+        let values = [
+            Vector3::new(0.0, 0.0, 0.0).into(),
+            Vector3::new(f32::NAN, 0.0, 0.0).into(),
+            Vector3::new(f32::INFINITY, 0.0, 0.0).into(),
+            Vector3::new(f32::NEG_INFINITY, 0.0, 0.0).into(),
+            Vector3::new(f32::MAX, 0.0, 0.0).into(),
+            NumberRange::new(0.0, 1.0).into(),
+            NumberRange::new(0.0, f32::INFINITY).into(),
+            sequence(0.0),
+            sequence(f32::NAN),
+        ];
+        let hashes: Vec<_> = values.iter().cloned().map(hash).collect();
+        for (index, a) in hashes.iter().enumerate() {
+            for b in &hashes[index + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        for value in values {
+            assert_eq!(hash(value.clone()), hash(value));
+        }
 
-        let mut mixed = valid.clone();
-        mixed.insert("Bad".to_owned(), Vector3::new(f32::NAN, 0.0, 0.0).into());
-
-        let mut valid_hasher = Hasher::new();
-        hash_variant(&mut valid_hasher, &Variant::Attributes(valid));
-        let mut mixed_hasher = Hasher::new();
-        hash_variant(&mut mixed_hasher, &Variant::Attributes(mixed));
-
-        assert_eq!(valid_hasher.finalize(), mixed_hasher.finalize());
+        // Files read NaN back as positive, so its sign must not change a hash.
+        let negative_nan = -f32::NAN;
+        assert_eq!(
+            hash(Vector3::new(negative_nan, 0.0, 0.0).into()),
+            hash(Vector3::new(f32::NAN, 0.0, 0.0).into())
+        );
+        assert_eq!(hash(sequence(negative_nan)), hash(sequence(f32::NAN)));
     }
 
     /// Non-finite numbers are written to metadata, so changing one must

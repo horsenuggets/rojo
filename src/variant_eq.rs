@@ -1,13 +1,54 @@
+use std::cmp::Ordering;
+
 use rbx_dom_weak::types::{PhysicalProperties, Variant, Vector3};
+
+/// Replaces any NaN with one canonical NaN. Files store NaN without its sign or
+/// payload, and Luau's `0/0` is a negative NaN on some platforms, so every NaN
+/// must sort and hash the same or a value would never match its saved copy.
+pub trait CanonicalNan: Copy {
+    fn canonical_nan(self) -> Self;
+}
+
+impl CanonicalNan for f32 {
+    fn canonical_nan(self) -> Self {
+        if self.is_nan() {
+            f32::NAN
+        } else {
+            self
+        }
+    }
+}
+
+impl CanonicalNan for f64 {
+    fn canonical_nan(self) -> Self {
+        if self.is_nan() {
+            f64::NAN
+        } else {
+            self
+        }
+    }
+}
+
+/// Orders keypoint times, with every NaN equal and after every number.
+pub fn compare_times(a: f32, b: f32) -> Ordering {
+    a.canonical_nan().total_cmp(&b.canonical_nan())
+}
 
 /// Accepts three argumets: a float type and two values to compare.
 ///
 /// Returns a bool indicating whether they're equal. This accounts for NaN such
-/// that `approx_eq!(f32, f32::NAN, f32::NAN)` is `true`.
+/// that `approx_eq!(f32, f32::NAN, f32::NAN)` is `true`. Infinity only equals
+/// itself, since `float_cmp` counts it as one ULP away from the largest finite
+/// value.
 macro_rules! approx_eq {
-    ($Ty:ty, $a:expr, $b:expr) => {
-        float_cmp::approx_eq!($Ty, $a, $b) || $a.is_nan() && $b.is_nan()
-    };
+    ($Ty:ty, $a:expr, $b:expr) => {{
+        let (a, b): ($Ty, $Ty) = ($a, $b);
+        if a.is_finite() && b.is_finite() {
+            float_cmp::approx_eq!($Ty, a, b)
+        } else {
+            a == b || a.is_nan() && b.is_nan()
+        }
+    }};
 }
 
 /// Compares two variants to determine if they're equal. This correctly takes
@@ -54,8 +95,8 @@ pub fn variant_eq(variant_a: &Variant, variant_b: &Variant) -> bool {
             }
             let mut a_keypoints: Vec<_> = a.keypoints.iter().collect();
             let mut b_keypoints: Vec<_> = b.keypoints.iter().collect();
-            a_keypoints.sort_unstable_by(|k1, k2| k1.time.partial_cmp(&k2.time).unwrap());
-            b_keypoints.sort_unstable_by(|k1, k2| k1.time.partial_cmp(&k2.time).unwrap());
+            a_keypoints.sort_unstable_by(|k1, k2| compare_times(k1.time, k2.time));
+            b_keypoints.sort_unstable_by(|k1, k2| compare_times(k1.time, k2.time));
 
             for (a_kp, b_kp) in a_keypoints.iter().zip(b_keypoints) {
                 if !(approx_eq!(f32, a_kp.time, b_kp.time)
@@ -94,8 +135,8 @@ pub fn variant_eq(variant_a: &Variant, variant_b: &Variant) -> bool {
             }
             let mut a_keypoints: Vec<_> = a.keypoints.iter().collect();
             let mut b_keypoints: Vec<_> = b.keypoints.iter().collect();
-            a_keypoints.sort_unstable_by(|k1, k2| k1.time.partial_cmp(&k2.time).unwrap());
-            b_keypoints.sort_unstable_by(|k1, k2| k1.time.partial_cmp(&k2.time).unwrap());
+            a_keypoints.sort_unstable_by(|k1, k2| compare_times(k1.time, k2.time));
+            b_keypoints.sort_unstable_by(|k1, k2| compare_times(k1.time, k2.time));
 
             for (a_kp, b_kp) in a_keypoints.iter().zip(b_keypoints) {
                 if !(approx_eq!(f32, a_kp.time, b_kp.time)
@@ -189,4 +230,95 @@ pub fn variant_eq(variant_a: &Variant, variant_b: &Variant) -> bool {
 #[inline(always)]
 fn vector_eq(a: &Vector3, b: &Vector3) -> bool {
     approx_eq!(f32, a.x, b.x) && approx_eq!(f32, a.y, b.y) && approx_eq!(f32, a.z, b.z)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rbx_dom_weak::types::{
+        Color3, ColorSequence, ColorSequenceKeypoint, NumberSequence, NumberSequenceKeypoint,
+    };
+
+    /// Compares every pair of special values, which must only equal themselves.
+    #[test]
+    fn special_floats_only_equal_themselves() {
+        let values = [
+            0.0,
+            1.0,
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for (i, &a) in values.iter().enumerate() {
+            for (j, &b) in values.iter().enumerate() {
+                for (left, right) in [
+                    (Variant::Float32(a), Variant::Float32(b)),
+                    (Variant::Float64(a.into()), Variant::Float64(b.into())),
+                    (
+                        Vector3::new(0.0, a, 0.0).into(),
+                        Vector3::new(0.0, b, 0.0).into(),
+                    ),
+                ] {
+                    assert_eq!(variant_eq(&left, &right), i == j, "{left:?} and {right:?}");
+                }
+            }
+        }
+        assert!(variant_eq(
+            &Variant::Float32(1.0),
+            &Variant::Float32(1.0 + f32::EPSILON)
+        ));
+    }
+
+    #[test]
+    fn sequences_with_nan_times_compare_without_panicking() {
+        let sequence = |time: f32| {
+            Variant::NumberSequence(NumberSequence {
+                keypoints: vec![
+                    NumberSequenceKeypoint::new(time, 0.0, 0.0),
+                    NumberSequenceKeypoint::new(1.0, 1.0, 0.0),
+                ],
+            })
+        };
+        assert!(variant_eq(&sequence(f32::NAN), &sequence(f32::NAN)));
+        assert!(!variant_eq(&sequence(f32::NAN), &sequence(0.0)));
+    }
+
+    /// A NaN time read back from a file is always positive, so a sequence with
+    /// a negative NaN time must still equal its saved copy, in both sequence
+    /// types and whichever side the NaN keypoint starts on.
+    #[test]
+    fn sequences_match_their_saved_copy_whatever_the_nan_sign() {
+        let negative_nan = -f32::NAN;
+        assert!(negative_nan.is_sign_negative());
+        for first in [true, false] {
+            let order = |nan_time: f32| {
+                let mut times = vec![nan_time, 0.5];
+                if !first {
+                    times.reverse();
+                }
+                times
+            };
+            let numbers = |nan_time: f32| {
+                Variant::NumberSequence(NumberSequence {
+                    keypoints: order(nan_time)
+                        .into_iter()
+                        .map(|time| NumberSequenceKeypoint::new(time, 1.0, 0.0))
+                        .collect(),
+                })
+            };
+            let colors = |nan_time: f32| {
+                Variant::ColorSequence(ColorSequence {
+                    keypoints: order(nan_time)
+                        .into_iter()
+                        .map(|time| ColorSequenceKeypoint::new(time, Color3::new(1.0, 0.0, 0.0)))
+                        .collect(),
+                })
+            };
+            for build in [&numbers as &dyn Fn(f32) -> Variant, &colors] {
+                assert!(variant_eq(&build(negative_nan), &build(f32::NAN)));
+            }
+        }
+    }
 }
