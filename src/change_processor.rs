@@ -923,9 +923,8 @@ impl JobThreadContext {
                     changed_properties: accepted_properties,
                     changed_metadata: None,
                 };
-                // Applied now rather than with the rest of the batch, so a later
-                // update to the same file doesn't mistake this edit for a change
-                // made on disk.
+                // Apply requested renames first so reparsing the owner matches its
+                // existing inline referents instead of replacing renamed children.
                 let applied = apply_patch_set(
                     tree,
                     PatchSet {
@@ -933,6 +932,26 @@ impl JobThreadContext {
                         ..PatchSet::new()
                     },
                 );
+                if !applied.is_empty() {
+                    messages.push(applied);
+                }
+                // Rewriting metadata can normalize untouched properties and inline
+                // descendants too. Reconcile the entire owner before the next edit
+                // so those changes cannot be mistaken for filesystem conflicts.
+                let saved_snapshot =
+                    match snapshot_shallow_from_vfs(&owner_context, &self.vfs, &path) {
+                        Ok(snapshot) => snapshot,
+                        Err(err) => {
+                            errors.push(WriteError {
+                                id,
+                                property: None,
+                                message: format!("Could not read saved filesystem state: {err:#}"),
+                            });
+                            return;
+                        }
+                    };
+                let saved_changes = compute_shallow_patch_set(saved_snapshot, tree, owner_id);
+                let applied = apply_patch_set(tree, saved_changes);
                 if !applied.is_empty() {
                     messages.push(applied);
                 }
@@ -1561,6 +1580,53 @@ mod tests {
             snapshot_from_vfs(&Default::default(), &job.vfs, Path::new("/project/Part")).unwrap();
         let tree = job.tree.lock().unwrap();
         assert_eq!(compute_patch_set(snapshot, &tree, id), PatchSet::new());
+    }
+
+    #[test]
+    fn rewriting_untouched_numbers_reconciles_the_entire_owner_before_the_next_edit() {
+        for inline in [false, true] {
+            let mut metadata = serde_json::json!({
+                "className": "Part",
+                "properties": {"Transparency": 0.0000005},
+            });
+            if inline {
+                metadata["children"] = serde_json::json!([{
+                    "name": "Inline",
+                    "className": "Part",
+                    "properties": {"Transparency": 0.0000005},
+                }]);
+            }
+            let (job, owner) = script_job(
+                vec![(
+                    "Part",
+                    VfsSnapshot::dir([("init.meta.json", VfsSnapshot::file(metadata.to_string()))]),
+                )],
+                "/project/Part",
+            );
+            let target = if inline {
+                job.tree
+                    .lock()
+                    .unwrap()
+                    .get_instance(owner)
+                    .unwrap()
+                    .children()[0]
+            } else {
+                owner
+            };
+            let mut patch = property_update(owner, "Reflectance", Variant::Float32(0.25));
+            patch.updated_instances.extend(
+                property_update(target, "Transparency", Variant::Float32(0.5)).updated_instances,
+            );
+            let (accepted, conflicts, errors) = job.handle_tree_event(patch);
+            assert!(errors.is_empty(), "inline {inline}, {errors:?}");
+            assert_eq!(conflicts, PatchSet::new(), "inline {inline}");
+            assert_eq!(accepted.updated_instances.len(), 2, "inline {inline}");
+            let snapshot =
+                snapshot_from_vfs(&Default::default(), &job.vfs, Path::new("/project/Part"))
+                    .unwrap();
+            let tree = job.tree.lock().unwrap();
+            assert_eq!(compute_patch_set(snapshot, &tree, owner), PatchSet::new());
+        }
     }
 
     fn read_text(vfs: &Vfs, path: &str) -> Option<String> {
