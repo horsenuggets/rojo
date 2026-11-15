@@ -199,7 +199,8 @@ function ApiContext:read(ids)
 	end)
 end
 
-function ApiContext:write(patch, messageCursor)
+function ApiContext:write(patch, messageCursor, authority)
+	assert(authority == "Filesystem" or authority == "Studio", "Write authority must be Filesystem or Studio")
 	local url = ("%s/api/write"):format(self.__baseUrl)
 
 	local updated = {}
@@ -227,6 +228,7 @@ function ApiContext:write(patch, messageCursor)
 	local body = {
 		sessionId = self.__sessionId,
 		messageCursor = messageCursor or self.__messageCursor,
+		authority = authority,
 		removed = patch.removed,
 		updated = updated,
 		added = added,

@@ -25,6 +25,9 @@ API (shown as shared.Rojo, identical under shared.RojoPlus):
   Connect and auto-accept confirmation
 > shared.Rojo.setTwoWaySync(enabled) - Configure two-way sync before connecting
 > shared.Rojo.getTwoWaySync() - Get whether two-way sync is enabled
+> shared.Rojo.setTwoWaySyncAuthority(authority) - Choose "Filesystem" or "Studio" to
+  win when a two-way sync edit meets an unseen file change, applied from the next write
+> shared.Rojo.getTwoWaySyncAuthority() - Get the current two-way sync authority
 > shared.Rojo.getSyncResults() - Get pending, saved, conflicted, and failed writes
 > shared.Rojo.getConfirmationSummary(limit?) - Describe the pending sync confirmation
 > shared.Rojo.getNotifications() - Get current write and connection notifications
@@ -90,6 +93,12 @@ const ACTIVE_SESSION_STATUSES = {
 
 function SharedAPI.canConfigureTwoWaySync(appStatus)
 	return not ACTIVE_SESSION_STATUSES[appStatus]
+end
+
+-- Each write carries the authority, so unlike two-way sync itself it can be
+-- changed mid-session and only needs to be a known value.
+function SharedAPI.isWriteAuthority(authority)
+	return authority == "Filesystem" or authority == "Studio"
 end
 
 function SharedAPI.register(app)
@@ -246,6 +255,28 @@ function SharedAPI.register(app)
 	function api.getTwoWaySync()
 		return {
 			enabled = Settings:get("twoWaySync"),
+		}
+	end
+
+	function api.setTwoWaySyncAuthority(authority)
+		if not SharedAPI.isWriteAuthority(authority) then
+			return {
+				success = false,
+				error = `Two-way sync authority must be "Filesystem" or "Studio", not {tostring(authority)}`,
+			}
+		end
+
+		Settings:set("twoWaySyncAuthority", authority)
+
+		return {
+			success = true,
+			authority = authority,
+		}
+	end
+
+	function api.getTwoWaySyncAuthority()
+		return {
+			authority = Settings:get("twoWaySyncAuthority"),
 		}
 	end
 
