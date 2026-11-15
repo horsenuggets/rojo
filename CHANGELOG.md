@@ -31,6 +31,11 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Stop syncback from rewriting files when the same place is synced again. Rewriting an
+  instance's metadata no longer adds an `id` next to the `Rojo_Id` it was read from, and
+  instances that references point at keep the `Rojo_Id` they have on disk instead of
+  getting a new one every run. That second case affected every `--from-studio` run, since
+  Studio hands out new UniqueIds each time, and place files without UniqueIds.
 * Rebrand the fork as Rojo+. The CLI, plugin toolbar, panel title, and messages say Rojo+,
   and the panel header shows "Rojo+" instead of the version. `rojo plugin install` writes
   `Rojo+.rbxm` and the release asset is `Rojo+.rbxm`, so Rojo+ can be installed alongside
