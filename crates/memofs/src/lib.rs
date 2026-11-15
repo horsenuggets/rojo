@@ -19,6 +19,7 @@ memofs is currently an unstable minimum viable library. Its primary consumer is
 
 mod in_memory_fs;
 mod noop_backend;
+mod relocation;
 mod snapshot;
 mod std_backend;
 
@@ -64,6 +65,14 @@ impl<T> IoResultExt<T> for io::Result<T> {
     }
 }
 
+/// Owns an exclusive backend lock until dropped. Disk locks are released by the OS
+/// on process exit as well. Never delete the lock file while it may have waiters.
+#[derive(Debug)]
+#[must_use = "Dropping the guard immediately releases the filesystem lock"]
+pub struct VfsLockGuard {
+    pub(crate) _file: Option<std::fs::File>,
+}
+
 /// Backend that can be used to create a `Vfs`.
 ///
 /// This trait is sealed and cannot not be implemented outside this crate.
@@ -84,6 +93,47 @@ pub trait VfsBackend: sealed::Sealed + Send + Sync + 'static {
         }
         self.write(path, data)
     }
+    /// Capture every file and directory, including unmanaged children.
+    /// Backends must reject symbolic links and special files.
+    fn snapshot_tree(&self, path: &Path) -> io::Result<VfsSnapshot> {
+        relocation::snapshot_tree(self, path)
+    }
+
+    /// Check the source, then move it without replacing any destination entry.
+    /// Cross-filesystem moves fail, without copying. An external source edit can race
+    /// validation on disk, so callers must validate the moved tree again. Destination
+    /// exclusion is atomic; source-content comparison and rename are not a disk CAS.
+    fn move_no_replace(
+        &mut self,
+        _source: &Path,
+        _destination: &Path,
+        _expected: &VfsSnapshot,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Backend cannot move entries",
+        ))
+    }
+
+    /// Flush an existing file or directory entry to stable storage. Directory flushes
+    /// are platform dependent; see StdBackend's implementation.
+    fn sync_path(&mut self, _path: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Backend cannot flush entries",
+        ))
+    }
+
+    /// Acquire a blocking exclusive lock independent of the Vfs borrow. Implementations
+    /// must not truncate existing files or follow links. Virtual backends may return a
+    /// no-op guard when their coordinator already serializes access in this process.
+    fn lock_exclusive(&self, _path: &Path) -> io::Result<VfsLockGuard> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Backend cannot lock entries",
+        ))
+    }
+
     fn exists(&self, path: &Path) -> io::Result<bool>;
     fn read_dir(&self, path: &Path) -> io::Result<ReadDir>;
     fn create_dir(&mut self, path: &Path) -> io::Result<()>;
@@ -378,6 +428,35 @@ impl Vfs {
         self.inner.write().unwrap().write(path, contents)
     }
 
+    /// Capture a tree without registering watches.
+    pub fn snapshot_tree(&self, path: &Path) -> io::Result<VfsSnapshot> {
+        self.inner.read().unwrap().backend.snapshot_tree(path)
+    }
+
+    /// Move a checked tree without replacing an existing destination.
+    pub fn move_no_replace(
+        &self,
+        source: &Path,
+        destination: &Path,
+        expected: &VfsSnapshot,
+    ) -> io::Result<()> {
+        self.inner
+            .write()
+            .unwrap()
+            .backend
+            .move_no_replace(source, destination, expected)
+    }
+
+    /// Flush a file or directory through the backend.
+    pub fn sync_path(&self, path: &Path) -> io::Result<()> {
+        self.inner.write().unwrap().backend.sync_path(path)
+    }
+
+    /// Hold backend exclusion across multiple operations, without holding a Vfs lock.
+    pub fn lock_exclusive(&self, path: &Path) -> io::Result<VfsLockGuard> {
+        self.inner.read().unwrap().backend.lock_exclusive(path)
+    }
+
     /// Read all of the children of a directory.
     ///
     /// Roughly equivalent to [`std::fs::read_dir`][std::fs::read_dir].
@@ -538,6 +617,32 @@ impl VfsLock<'_> {
         expected: Option<&[u8]>,
     ) -> io::Result<()> {
         self.inner.backend.write_atomic(path, contents, expected)
+    }
+
+    /// Capture a complete tree without registering watches.
+    pub fn snapshot_tree(&self, path: &Path) -> io::Result<VfsSnapshot> {
+        self.inner.backend.snapshot_tree(path)
+    }
+
+    /// Move a checked tree without replacing an existing destination.
+    pub fn move_no_replace(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        expected: &VfsSnapshot,
+    ) -> io::Result<()> {
+        self.inner
+            .backend
+            .move_no_replace(source, destination, expected)
+    }
+
+    /// Flush a file or directory through the backend.
+    pub fn sync_path(&mut self, path: &Path) -> io::Result<()> {
+        self.inner.backend.sync_path(path)
+    }
+
+    pub fn lock_exclusive(&self, path: &Path) -> io::Result<VfsLockGuard> {
+        self.inner.backend.lock_exclusive(path)
     }
 
     /// Read all of the children of a directory.

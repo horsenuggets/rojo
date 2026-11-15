@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{Metadata, ReadDir, VfsBackend, VfsEvent};
 
-/// `VfsBackend` that returns an error on every operation.
+/// `VfsBackend` that returns an error on I/O operations. Coordinator locks are no-ops.
 #[non_exhaustive]
 pub struct NoopBackend;
 
@@ -14,11 +14,28 @@ impl NoopBackend {
 }
 
 impl VfsBackend for NoopBackend {
+    fn lock_exclusive(&self, _path: &Path) -> io::Result<crate::VfsLockGuard> {
+        Ok(crate::VfsLockGuard { _file: None })
+    }
+
     fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
         Err(io::Error::other("NoopBackend doesn't do anything"))
     }
 
     fn write(&mut self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+        Err(io::Error::other("NoopBackend doesn't do anything"))
+    }
+
+    fn move_no_replace(
+        &mut self,
+        _source: &Path,
+        _destination: &Path,
+        _expected: &crate::VfsSnapshot,
+    ) -> io::Result<()> {
+        Err(io::Error::other("NoopBackend doesn't do anything"))
+    }
+
+    fn sync_path(&mut self, _path: &Path) -> io::Result<()> {
         Err(io::Error::other("NoopBackend doesn't do anything"))
     }
 

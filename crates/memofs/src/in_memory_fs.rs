@@ -114,7 +114,38 @@ impl InMemoryFsInner {
         Ok(())
     }
 
+    fn snapshot_tree(&self, path: &Path) -> io::Result<VfsSnapshot> {
+        match self.entries.get(path) {
+            Some(Entry::File { contents }) => Ok(VfsSnapshot::file(contents.clone())),
+            Some(Entry::Dir { children }) => {
+                let mut snapshots = std::collections::BTreeMap::new();
+                for child in children {
+                    let name = child
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Tree contains a non-UTF-8 name",
+                            )
+                        })?;
+                    snapshots.insert(name.to_owned(), self.snapshot_tree(child)?);
+                }
+                Ok(VfsSnapshot::Dir {
+                    children: snapshots,
+                })
+            }
+            None => not_found(path),
+        }
+    }
+
     fn remove(&mut self, root_path: PathBuf) {
+        if let Some(Entry::Dir { children }) = root_path
+            .parent()
+            .and_then(|parent| self.entries.get_mut(parent))
+        {
+            children.remove(&root_path);
+        }
         self.orphans.remove(&root_path);
 
         let mut to_remove = VecDeque::new();
@@ -136,6 +167,10 @@ enum Entry {
 }
 
 impl VfsBackend for InMemoryFs {
+    fn lock_exclusive(&self, _path: &Path) -> io::Result<crate::VfsLockGuard> {
+        Ok(crate::VfsLockGuard { _file: None })
+    }
+
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
 
@@ -155,6 +190,72 @@ impl VfsBackend for InMemoryFs {
                 contents: data.to_owned(),
             },
         )
+    }
+
+    fn snapshot_tree(&self, path: &Path) -> io::Result<VfsSnapshot> {
+        self.inner.lock().unwrap().snapshot_tree(path)
+    }
+
+    fn move_no_replace(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        expected: &VfsSnapshot,
+    ) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if destination.starts_with(source) || source.starts_with(destination) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Move paths overlap",
+            ));
+        }
+        if inner.entries.contains_key(destination) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Destination already exists",
+            ));
+        }
+        let parent = destination.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Destination has no parent")
+        })?;
+        match inner.entries.get(parent) {
+            Some(Entry::Dir { .. }) => {}
+            Some(_) => return must_be_dir(parent),
+            None => return not_found(parent),
+        }
+        let snapshot = inner.snapshot_tree(source)?;
+        if &snapshot != expected {
+            return Err(crate::relocation::changed());
+        }
+        // The shared mutex covers validation, exclusion and the entire subtree move.
+        inner.remove(source.to_owned());
+        inner.load_snapshot(destination.to_owned(), snapshot)
+    }
+
+    fn sync_path(&mut self, path: &Path) -> io::Result<()> {
+        if self.inner.lock().unwrap().entries.contains_key(path) {
+            Ok(())
+        } else {
+            not_found(path)
+        }
+    }
+
+    fn write_atomic(
+        &mut self,
+        path: &Path,
+        data: &[u8],
+        expected: Option<&[u8]>,
+    ) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let contents = match inner.entries.get(path) {
+            Some(Entry::File { contents }) => Some(contents.as_slice()),
+            Some(_) => return must_be_file(path),
+            None => None,
+        };
+        if contents != expected {
+            return Err(crate::relocation::changed());
+        }
+        inner.load_snapshot(path.to_owned(), VfsSnapshot::file(data.to_owned()))
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
@@ -183,17 +284,38 @@ impl VfsBackend for InMemoryFs {
 
     fn create_dir(&mut self, path: &Path) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.entries.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Directory already exists",
+            ));
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            match inner.entries.get(parent) {
+                Some(Entry::Dir { .. }) => {}
+                Some(_) => return must_be_dir(parent),
+                None => return not_found(parent),
+            }
+        }
         inner.load_snapshot(path.to_path_buf(), VfsSnapshot::empty_dir())
     }
 
     fn create_dir_all(&mut self, path: &Path) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let mut path_buf = path.to_path_buf();
-        while let Some(parent) = path_buf.parent() {
-            inner.load_snapshot(parent.to_path_buf(), VfsSnapshot::empty_dir())?;
-            path_buf.pop();
+        for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            match inner.entries.get(ancestor) {
+                Some(Entry::Dir { .. }) => {}
+                Some(_) => return must_be_dir(ancestor),
+                None => inner.load_snapshot(ancestor.to_owned(), VfsSnapshot::empty_dir())?,
+            }
         }
-        inner.load_snapshot(path.to_path_buf(), VfsSnapshot::empty_dir())
+        Ok(())
     }
 
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
