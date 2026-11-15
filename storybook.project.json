@@ -1,0 +1,16 @@
+{
+  "name": "Rojo+ Storybook",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "Rojo": {
+        "$path": "plugin.project.json",
+
+        "Stories": {
+          "$path": "plugin/stories"
+        }
+      }
+    }
+  }
+}
