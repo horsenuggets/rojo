@@ -62,7 +62,15 @@ const function createStory(options: StoryOptions)
 								Position = UDim2.fromScale(0.5, 0.5),
 								Size = options.size or DEFAULT_SIZE,
 							}, {
-								Story = options.render(values, transparency),
+								-- Pages return layouts and padding as loose children, so the
+								-- story gets its own frame to keep them from arranging the
+								-- tooltip layer, the same way the plugin's Page does.
+								Story = e("Frame", {
+									BackgroundTransparency = 1,
+									Size = UDim2.fromScale(1, 1),
+								}, {
+									Content = options.render(values, transparency),
+								}),
 								TooltipContainer = e(Tooltip.Container, nil),
 							})
 						end),
