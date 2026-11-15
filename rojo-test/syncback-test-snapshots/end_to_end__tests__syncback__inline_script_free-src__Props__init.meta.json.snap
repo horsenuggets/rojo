@@ -12,7 +12,7 @@ expression: src/Props/init.meta.json
             },
             "attributes": {
                 "Count": {
-                    "Float32": 3.0
+                    "Float32": 3
                 },
                 "Rojo_Id": "base-id"
             }
@@ -25,7 +25,7 @@ expression: src/Props/init.meta.json
                     "className": "IntValue",
                     "name": "Value",
                     "properties": {
-                        "Value": 5.0
+                        "Value": 5
                     }
                 }
             ]

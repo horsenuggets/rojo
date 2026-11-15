@@ -3,14 +3,90 @@
 //! This module provides convenient wrappers around `jsonc_parser` and `serde_json`
 //! to reduce boilerplate and improve ergonomics when working with JSONC files.
 
+use std::io::{self, Write};
+
 use anyhow::Context as _;
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::ser::{Formatter, PrettyFormatter};
+
+const INTEGER_TOLERANCE: f64 = 0.000001;
+
+/// An absolute tolerance avoids discarding meaningful fractions at large magnitudes.
+pub(crate) fn rounded_integer(value: f64) -> Option<f64> {
+    let rounded = value.round();
+    (value.is_finite() && (value - rounded).abs() <= INTEGER_TOLERANCE)
+        .then_some(if rounded == 0.0 { 0.0 } else { rounded })
+}
+
+struct FileFormatter(PrettyFormatter<'static>);
+
+impl Formatter for FileFormatter {
+    fn write_f32<W: ?Sized + Write>(&mut self, writer: &mut W, value: f32) -> io::Result<()> {
+        if let Some(integer) = rounded_integer(f64::from(value)) {
+            write!(writer, "{integer:.0}")
+        } else {
+            self.0.write_f32(writer, value)
+        }
+    }
+
+    fn write_f64<W: ?Sized + Write>(&mut self, writer: &mut W, value: f64) -> io::Result<()> {
+        if let Some(integer) = rounded_integer(value) {
+            write!(writer, "{integer:.0}")
+        } else {
+            self.0.write_f64(writer, value)
+        }
+    }
+
+    fn begin_array<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.0.begin_array(writer)
+    }
+
+    fn end_array<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.0.end_array(writer)
+    }
+
+    fn begin_array_value<W: ?Sized + Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
+        self.0.begin_array_value(writer, first)
+    }
+
+    fn end_array_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.0.end_array_value(writer)
+    }
+
+    fn begin_object<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.0.begin_object(writer)
+    }
+
+    fn end_object<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.0.end_object(writer)
+    }
+
+    fn begin_object_key<W: ?Sized + Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
+        self.0.begin_object_key(writer, first)
+    }
+
+    fn begin_object_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.0.begin_object_value(writer)
+    }
+
+    fn end_object_value<W: ?Sized + Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.0.end_object_value(writer)
+    }
+}
 
 /// Serializes a value as pretty JSON using four-space indentation and a
 /// trailing newline, which is the default format for files written by Rojo.
 pub fn to_vec_pretty<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
     let mut output = Vec::new();
-    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let formatter = FileFormatter(PrettyFormatter::with_indent(b"    "));
     let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
     value.serialize(&mut serializer)?;
     output.push(b'\n');
@@ -161,6 +237,82 @@ mod tests {
             "{\n    \"outer\": {\n        \"inner\": true\n    }\n}\n"
         );
         assert_eq!(to_vec_pretty(&value).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn floats_near_integers_are_normalized() {
+        for (input, expected) in [
+            (2.0, "2"),
+            (-2.0, "-2"),
+            (-0.0, "0"),
+            (1.0000005, "1"),
+            (0.9999995, "1"),
+            (-1.0000005, "-1"),
+            (-0.9999995, "-1"),
+            (0.000001, "0"),
+            (-0.000001, "0"),
+            (1.000002, "1.000002"),
+            (0.999998, "0.999998"),
+            (0.000002, "2e-6"),
+            (0.25, "0.25"),
+            (1_000_000_000.25, "1000000000.25"),
+        ] {
+            let expected = format!("{expected}\n");
+            let actual = to_string_pretty(&input).unwrap();
+            assert_eq!(actual, expected, "{input}");
+            assert_eq!(to_string_pretty(&input).unwrap(), actual);
+            let parsed: f64 = from_str(&actual).unwrap();
+            assert_eq!(to_string_pretty(&parsed).unwrap(), actual);
+        }
+        assert_eq!(to_string_pretty(&2.0_f32).unwrap(), "2\n");
+        assert_eq!(to_string_pretty(&1.0000005_f32).unwrap(), "1\n");
+        assert_eq!(to_string_pretty(&1.000002_f32).unwrap(), "1.000002\n");
+        assert_eq!(to_string_pretty(&0.6_f32).unwrap(), "0.6\n");
+    }
+
+    #[test]
+    fn numeric_formatting_preserves_other_json_values_and_layout() {
+        let value = serde_json::json!({
+            "array": [1.0, {"Float64": -2.0000005}, [], {}],
+            "integer": u64::MAX,
+            "text": "1.0\n\"quoted\"",
+        });
+        assert_eq!(
+            to_string_pretty(&value).unwrap(),
+            concat!(
+                "{\n",
+                "    \"array\": [\n",
+                "        1,\n",
+                "        {\n",
+                "            \"Float64\": -2\n",
+                "        },\n",
+                "        [],\n",
+                "        {}\n",
+                "    ],\n",
+                "    \"integer\": 18446744073709551615,\n",
+                "    \"text\": \"1.0\\n\\\"quoted\\\"\"\n",
+                "}\n",
+            )
+        );
+        assert_eq!(
+            to_string_pretty(&i64::MIN).unwrap(),
+            "-9223372036854775808\n"
+        );
+        assert_eq!(to_string_pretty(&f64::INFINITY).unwrap(), "null\n");
+        assert_eq!(to_string_pretty(&f64::NAN).unwrap(), "null\n");
+    }
+
+    #[test]
+    fn large_integral_floats_do_not_overflow_integer_casts() {
+        for value in [f64::MAX, f64::MIN, 1e20, -1e20, f64::from(f32::MAX)] {
+            let text = to_string_pretty(&value).unwrap();
+            assert!(!text.contains('.'));
+            assert_eq!(from_str::<f64>(&text).unwrap(), value);
+            assert_eq!(
+                to_string_pretty(&from_str::<f64>(&text).unwrap()).unwrap(),
+                text
+            );
+        }
     }
 
     /// Metadata keeps the text of unchanged numbers by parsing and writing

@@ -3,9 +3,9 @@ use std::borrow::Borrow;
 use anyhow::{bail, format_err};
 use rbx_dom_weak::types::{
     Attributes, CFrame, Color3, ColorSequence, ColorSequenceKeypoint, Content, ContentId,
-    ContentType, Enum, Font, MaterialColors, Matrix3, NumberRange, NumberSequence,
-    NumberSequenceKeypoint, Ray, Rect, Region3, Tags, UDim, UDim2, Variant, VariantType, Vector2,
-    Vector3,
+    ContentType, CustomPhysicalProperties, Enum, Font, MaterialColors, Matrix3, NumberRange,
+    NumberSequence, NumberSequenceKeypoint, PhysicalProperties, Ray, Rect, Region3, Tags, UDim,
+    UDim2, Variant, VariantType, Vector2, Vector3,
 };
 use rbx_reflection::{DataType, PropertyDescriptor};
 use serde::{Deserialize, Serialize};
@@ -142,7 +142,7 @@ impl Encoder {
                 self.found_non_finite = true;
                 Float::NonFinite(non_finite)
             }
-            None => Float::Finite(value),
+            None => Float::Finite(normalize_float32(value)),
         }
     }
 
@@ -339,6 +339,7 @@ impl UnresolvedValue {
     /// Creates an `UnresolvedValue` from a variant, using a class and property
     /// name to potentially allow for ambiguous Enum variants.
     pub fn from_variant(variant: Variant, class_name: &str, prop_name: &str) -> Self {
+        let variant = normalize_json_variant(variant);
         // Checked first, since the ambiguous forms would write NaN and infinity
         // as `null`.
         if let Some(value) = NonFiniteValue::from_variant(&variant) {
@@ -419,6 +420,7 @@ impl UnresolvedValue {
     /// Creates an `UnresolvedValue` from a variant, only returning ambiguous
     /// values if they're able to be resolved in a context-free environment.
     pub fn from_variant_unambiguous(variant: Variant) -> Self {
+        let variant = normalize_json_variant(variant);
         if let Some(value) = NonFiniteValue::from_variant(&variant) {
             return Self::NonFinite(value);
         }
@@ -435,6 +437,43 @@ impl UnresolvedValue {
             _ => Self::FullyQualified(variant),
         }
     }
+}
+
+/// Uses the same numeric representation as JSON files before acknowledging a
+/// Studio write, so the server does not retain values the file rounded away.
+pub(crate) fn normalize_json_variant(value: Variant) -> Variant {
+    match value {
+        Variant::Float32(value) => normalize_float32(value).into(),
+        Variant::Float64(value) => crate::json::rounded_integer(value).unwrap_or(value).into(),
+        Variant::Attributes(attributes) => {
+            let mut normalized = Attributes::new();
+            for (name, value) in attributes.iter() {
+                normalized.insert(name.clone(), normalize_json_variant(value.clone()));
+            }
+            normalized.into()
+        }
+        Variant::PhysicalProperties(PhysicalProperties::Custom(value)) => {
+            PhysicalProperties::Custom(CustomPhysicalProperties::new(
+                normalize_float32(value.density()),
+                normalize_float32(value.friction()),
+                normalize_float32(value.elasticity()),
+                normalize_float32(value.friction_weight()),
+                normalize_float32(value.elasticity_weight()),
+                normalize_float32(value.acoustic_absorption()),
+            ))
+            .into()
+        }
+        // The tagged encoder visits every floating-point component, even when
+        // all components are finite. Reuse it to preserve datatype structure.
+        value => Encoder::default()
+            .encode(&value)
+            .map(NonFiniteValue::into_variant)
+            .unwrap_or(value),
+    }
+}
+
+fn normalize_float32(value: f32) -> f32 {
+    crate::json::rounded_integer(f64::from(value)).map_or(value, |integer| integer as f32)
 }
 
 /// Widens an `f32` through its shortest decimal form, so `0.6` is written as
@@ -666,6 +705,61 @@ mod test {
     }
 
     #[test]
+    fn json_normalization_preserves_variant_types_and_is_idempotent() {
+        let cases = [
+            (Variant::Float32(1.0000005), Variant::Float32(1.0)),
+            (Variant::Float64(-5.0000005), Variant::Float64(-5.0)),
+            (Variant::Float64(0.0000005), Variant::Float64(0.0)),
+            (Variant::Float64(1.000002), Variant::Float64(1.000002)),
+            (Variant::Int64(i64::MAX), Variant::Int64(i64::MAX)),
+            (Variant::String("2.0".into()), Variant::String("2.0".into())),
+            (
+                Variant::Vector3(Vector3::new(1.0000005, -0.0000005, 0.6)),
+                Variant::Vector3(Vector3::new(1.0, 0.0, 0.6)),
+            ),
+            (
+                Variant::NumberRange(NumberRange::new(0.0000005, f32::INFINITY)),
+                Variant::NumberRange(NumberRange::new(0.0, f32::INFINITY)),
+            ),
+            (Variant::Float64(f64::NAN), Variant::Float64(f64::NAN)),
+        ];
+        for (input, expected) in cases {
+            let actual = normalize_json_variant(input);
+            assert!(variant_eq(&actual, &expected), "{actual:?} != {expected:?}");
+            assert!(variant_eq(&normalize_json_variant(actual.clone()), &actual,));
+        }
+        let mut attributes = Attributes::new();
+        attributes.insert("Integer".into(), Variant::Float64(2.0000005));
+        attributes.insert("Infinity".into(), Variant::Float64(f64::INFINITY));
+        attributes.insert("Fraction".into(), Variant::Float32(0.6));
+        let Variant::Attributes(normalized) = normalize_json_variant(attributes.into()) else {
+            panic!("Attributes must keep their variant type.");
+        };
+        assert_eq!(normalized.get("Integer"), Some(&Variant::Float64(2.0)));
+        assert_eq!(
+            normalized.get("Infinity"),
+            Some(&Variant::Float64(f64::INFINITY))
+        );
+        assert_eq!(normalized.get("Fraction"), Some(&Variant::Float32(0.6)));
+    }
+
+    #[test]
+    fn float32_integer_tolerance_is_independent_of_json_shape() {
+        let vector = Variant::Vector3(Vector3::new(2.000001, -2.000001, 0.6));
+        let reflected = UnresolvedValue::from_variant(vector.clone(), "Part", "Size");
+        let tagged = UnresolvedValue::from_variant_unambiguous(vector);
+        let expected = Variant::Vector3(Vector3::new(2.0, -2.0, 0.6));
+        assert_eq!(
+            resolve("Part", "Size", &json::to_string_pretty(&reflected).unwrap()),
+            expected
+        );
+        assert_eq!(
+            resolve_unambiguous(&json::to_string_pretty(&tagged).unwrap()),
+            expected
+        );
+    }
+
+    #[test]
     fn float32_values_are_written_in_their_shortest_form() {
         let unresolved =
             UnresolvedValue::from_variant(Variant::Float32(0.6), "Part", "Transparency");
@@ -681,15 +775,14 @@ mod test {
                 .unwrap()
                 .split_whitespace()
                 .collect::<String>(),
-            "[179.694,0.1,2.0]"
+            "[179.694,0.1,2]"
         );
     }
 
-    /// Shortening must never change the value. Checks values across the whole
-    /// `f32` range, including subnormals and both signs, survive a trip through
-    /// JSON text and back to the exact same bits.
+    /// Fractions outside the integer tolerance must still round-trip exactly,
+    /// across the entire `f32` range and both signs.
     #[test]
-    fn float32_values_round_trip_exactly() {
+    fn float32_values_round_trip_except_near_integers() {
         let mut bits: u32 = 1;
         for _ in 0..200_000 {
             bits = bits.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -703,9 +796,16 @@ mod test {
                 "Transparency",
             ))
             .unwrap();
+            let decimal = f64::from(value);
+            let integer = decimal.round();
+            let expected = if (decimal - integer).abs() <= 0.000001 {
+                integer as f32
+            } else {
+                value
+            };
             assert_eq!(
                 resolve("Part", "Transparency", &text),
-                Variant::Float32(value),
+                Variant::Float32(expected),
                 "{value:e} was written as {text}"
             );
         }

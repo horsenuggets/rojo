@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     json,
-    resolution::{AmbiguousValue, UnresolvedValue},
+    resolution::{normalize_json_variant, AmbiguousValue, UnresolvedValue},
     snapshot::{InstanceMetadata, InstanceSnapshot},
     syncback::SyncbackSnapshot,
     variant_eq::variant_eq,
@@ -160,7 +160,14 @@ impl ExistingMetadata {
 }
 
 fn same_value(old: anyhow::Result<Variant>, new: anyhow::Result<Variant>) -> bool {
-    matches!((old, new), (Ok(old), Ok(new)) if variant_eq(&old, &new))
+    let (Ok(old), Ok(new)) = (old, new) else {
+        return false;
+    };
+    // Approximate equality preserves decimal spellings, but must not restore values
+    // whose original datatype still needs numeric normalization.
+    variant_eq(&old, &new)
+        && serde_json::to_value(&old).expect("Variants must serialize")
+            == serde_json::to_value(normalize_json_variant(old)).expect("Variants must serialize")
 }
 
 impl ExistingKeyOrder {

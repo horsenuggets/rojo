@@ -1,7 +1,13 @@
-use std::fs;
+use std::{
+    fs, thread,
+    time::{Duration, Instant},
+};
 
 use insta::{assert_snapshot, assert_yaml_snapshot, with_settings};
-use rbx_dom_weak::types::Ref;
+use rbx_dom_weak::{
+    types::{Ref, Variant},
+    ustr, UstrMap,
+};
 use reqwest::StatusCode;
 use tempfile::tempdir;
 
@@ -10,7 +16,207 @@ use crate::rojo_test::{
     serve_util::{deserialize_msgpack, run_serve_test, serialize_msgpack, serialize_to_xml_model},
 };
 
-use librojo::web_api::{SerializeResponse, SocketPacketType};
+use librojo::web_api::{
+    InstanceUpdate, SerializeResponse, SocketPacketBody, SocketPacketType, WriteAuthority,
+    WriteRequest,
+};
+
+#[test]
+fn numeric_api_writes_normalize_disk_json_and_converge() {
+    assert_numeric_api_writes_converge(&[(5.0000005, 5.0), (-5.0000005, -5.0)]);
+}
+
+#[test]
+fn numeric_api_writes_normalize_near_zero_and_converge() {
+    assert_numeric_api_writes_converge(&[(0.0000005, 0.0), (-0.0000005, 0.0)]);
+}
+
+#[test]
+fn numeric_api_writes_emit_whole_values_as_integers() {
+    assert_numeric_api_writes_converge(&[(8.0, 8.0)]);
+}
+
+#[test]
+fn numeric_api_writes_preserve_fractional_values_and_converge() {
+    assert_numeric_api_writes_converge(&[(8.000002, 8.000002), (-0.000002, -0.000002)]);
+}
+
+fn assert_numeric_api_writes_converge(cases: &[(f64, f64)]) {
+    run_serve_test("add_folder", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let root_id = info.root_instance_id;
+        let numeric_path = session.path().join("src/Numeric");
+        fs::create_dir(&numeric_path).unwrap();
+        let metadata_path = numeric_path.join("init.meta.json");
+        fs::write(
+            &metadata_path,
+            r#"{"className":"NumberValue","properties":{"Value":0.25}}"#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let id =
+            loop {
+                let read = session.get_api_read(root_id).unwrap();
+                if let Some(instance) = read.instances.values().find(|instance| {
+                    instance.name == "Numeric" && instance.class_name == "NumberValue"
+                }) {
+                    break instance.id;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Numeric metadata was not loaded."
+                );
+                thread::sleep(Duration::from_millis(20));
+            };
+
+        for &(input, expected) in cases {
+            let mut saved = None;
+            for attempt in 0..3 {
+                let read = session.get_api_read(root_id).unwrap();
+                let response = session.post_api_write(&WriteRequest {
+                    session_id: info.session_id,
+                    message_cursor: Some(read.message_cursor),
+                    authority: WriteAuthority::Filesystem,
+                    removed: Vec::new(),
+                    added: Default::default(),
+                    updated: vec![InstanceUpdate {
+                        id,
+                        changed_name: None,
+                        changed_class_name: None,
+                        changed_parent: None,
+                        changed_metadata: None,
+                        changed_properties: UstrMap::from_iter([(
+                            ustr("Value"),
+                            Some(Variant::Float64(input)),
+                        )]),
+                    }],
+                });
+                assert_eq!(response.session_id, info.session_id);
+                assert!(
+                    response.errors.is_empty(),
+                    "Input {input}, attempt {attempt}, errors {:?}",
+                    response.errors
+                );
+                assert!(
+                    response.conflicts.removed_instances.is_empty()
+                        && response.conflicts.added_instances.is_empty()
+                        && response.conflicts.updated_instances.is_empty(),
+                    "Input {input}, attempt {attempt}, conflicts {:?}",
+                    response.conflicts
+                );
+                if attempt > 0 {
+                    assert!(
+                        response.accepted.removed_instances.is_empty()
+                            && response.accepted.added_instances.is_empty()
+                            && response.accepted.updated_instances.is_empty(),
+                        "Repeated input {input} must already be synchronized, got {:?}.",
+                        response.accepted
+                    );
+                }
+
+                if attempt > 0 && input != expected {
+                    let packet = session
+                        .get_api_socket_packet(SocketPacketType::Messages, read.message_cursor)
+                        .unwrap();
+                    let SocketPacketBody::Messages(packet) = packet.body;
+                    assert!(
+                        packet
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.updated)
+                            .any(|update| {
+                                update.id == id
+                                    && update.changed_properties.get(&ustr("Value"))
+                                        == Some(&Some(Variant::Float64(expected)))
+                            }),
+                        "Studio must receive the canonical value for {input}."
+                    );
+                }
+                let contents = fs::read_to_string(&metadata_path).unwrap();
+                let metadata: serde_json::Value = serde_json::from_str(&contents).unwrap();
+                let value = &metadata["properties"]["Value"];
+                // NumberValue.Value defaults to zero, so syncback may omit it.
+                let omitted_default = expected == 0.0 && value.is_null();
+                assert_eq!(
+                    if omitted_default {
+                        Some(0.0)
+                    } else {
+                        value.as_f64()
+                    },
+                    Some(expected),
+                    "Saved input {input} as {contents}"
+                );
+                if expected.fract() == 0.0 && !omitted_default {
+                    assert!(
+                        value.is_i64() || value.is_u64(),
+                        "Expected a literal integer for {input}, got {contents}"
+                    );
+                }
+                if let Some(saved) = &saved {
+                    assert_eq!(
+                        &contents, saved,
+                        "Repeated writes must not rewrite or oscillate."
+                    );
+                }
+                for update in &response.accepted.updated_instances {
+                    assert_eq!(
+                        update.changed_properties.get(&ustr("Value")),
+                        Some(&if expected == 0.0 {
+                            None
+                        } else {
+                            Some(Variant::Float64(expected))
+                        }),
+                        "Acknowledgment and disk disagree for {input}."
+                    );
+                }
+                let read = session.get_api_read(root_id).unwrap();
+                assert_eq!(
+                    read.instances[&id]
+                        .properties
+                        .get(&ustr("Value"))
+                        .map(|value| value.as_ref())
+                        .unwrap_or(&Variant::Float64(0.0)),
+                    &Variant::Float64(expected),
+                    "Server and disk disagree immediately after saving {input}."
+                );
+
+                // A changed attribute in the same metadata file proves its filesystem
+                // feedback was processed before checking the acknowledged numeric value.
+                let marker = format!("{input}-{attempt}");
+                let mut feedback = metadata;
+                feedback["attributes"] = serde_json::json!({"Feedback": marker});
+                fs::write(&metadata_path, serde_json::to_vec(&feedback).unwrap()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let read = session.get_api_read(root_id).unwrap();
+                    let properties = &read.instances[&id].properties;
+                    let observed = properties.get(&ustr("Attributes")).is_some_and(|value| {
+                        matches!(value.as_ref(), Variant::Attributes(attributes)
+                            if attributes.get("Feedback") == Some(&Variant::String(marker.clone())))
+                    });
+                    if observed {
+                        assert_eq!(
+                            properties
+                                .get(&ustr("Value"))
+                                .map(|value| value.as_ref())
+                                .unwrap_or(&Variant::Float64(0.0)),
+                            &Variant::Float64(expected),
+                            "Server and disk disagree after feedback for {input}."
+                        );
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "Filesystem feedback was not processed for {input}."
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                // Preserve the independent disk edit while comparing subsequent writes.
+                saved = Some(fs::read_to_string(&metadata_path).unwrap());
+            }
+        }
+    });
+}
 
 #[test]
 fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {

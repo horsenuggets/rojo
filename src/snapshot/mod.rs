@@ -59,6 +59,7 @@ pub use instance_snapshot::InstanceSnapshot;
 pub use metadata::*;
 pub use patch::*;
 pub use patch_apply::*;
+pub(crate) use patch_compute::compute_saved_patch_set;
 pub use patch_compute::{compute_patch_set, compute_shallow_patch_set};
 pub use tree::*;
 

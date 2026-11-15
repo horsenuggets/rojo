@@ -17,7 +17,7 @@ use super::{
 
 #[profiling::function]
 pub fn compute_patch_set(snapshot: Option<InstanceSnapshot>, tree: &RojoTree, id: Ref) -> PatchSet {
-    compute_patch_set_with(snapshot, tree, id, false)
+    compute_patch_set_with(snapshot, tree, id, false, false)
 }
 
 /// Like [`compute_patch_set`], for a snapshot from `snapshot_shallow_from_vfs`.
@@ -28,7 +28,17 @@ pub fn compute_shallow_patch_set(
     tree: &RojoTree,
     id: Ref,
 ) -> PatchSet {
-    compute_patch_set_with(snapshot, tree, id, true)
+    compute_patch_set_with(snapshot, tree, id, true, false)
+}
+
+/// Reconciles a saved owner exactly so approximate float equality cannot hide
+/// canonical numeric corrections. Independently sourced children remain untouched.
+pub(crate) fn compute_saved_patch_set(
+    snapshot: Option<InstanceSnapshot>,
+    tree: &RojoTree,
+    id: Ref,
+) -> PatchSet {
+    compute_patch_set_with(snapshot, tree, id, true, true)
 }
 
 fn compute_patch_set_with(
@@ -36,11 +46,13 @@ fn compute_patch_set_with(
     tree: &RojoTree,
     id: Ref,
     keep_sourced_children: bool,
+    exact_values: bool,
 ) -> PatchSet {
     let mut patch_set = PatchSet::new();
 
     if let Some(snapshot) = snapshot {
         let mut context = ComputePatchContext {
+            exact_values,
             keep_sourced_children,
             ..Default::default()
         };
@@ -62,6 +74,7 @@ fn compute_patch_set_with(
 struct ComputePatchContext {
     snapshot_id_to_instance_id: HashMap<Ref, Ref>,
     keep_sourced_children: bool,
+    exact_values: bool,
 }
 
 fn rewrite_refs_in_updates(context: &ComputePatchContext, updates: &mut [PatchUpdate]) {
@@ -113,7 +126,13 @@ fn compute_patch_set_internal(
         .get_instance(id)
         .expect("Instance did not exist in tree");
 
-    compute_property_patches(&mut snapshot, &instance, patch_set, tree);
+    compute_property_patches(
+        &mut snapshot,
+        &instance,
+        patch_set,
+        tree,
+        context.exact_values,
+    );
     compute_children_patches(context, &mut snapshot, tree, id, patch_set);
 }
 
@@ -122,6 +141,7 @@ fn compute_property_patches(
     instance: &InstanceWithMeta,
     patch_set: &mut PatchSet,
     tree: &RojoTree,
+    exact_values: bool,
 ) {
     let mut visited_properties = UstrSet::default();
     let mut changed_properties = UstrMap::new();
@@ -156,7 +176,12 @@ fn compute_property_patches(
 
         match instance.properties().get(&name) {
             Some(instance_value) => {
-                if !variant_eq(&snapshot_value, instance_value) {
+                let equal = variant_eq(&snapshot_value, instance_value)
+                    && (!exact_values
+                        || serde_json::to_value(&snapshot_value).expect("Variants must serialize")
+                            == serde_json::to_value(instance_value)
+                                .expect("Variants must serialize"));
+                if !equal {
                     changed_properties.insert(name, Some(snapshot_value));
                 }
             }

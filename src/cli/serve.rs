@@ -62,8 +62,8 @@ impl ServeCommand {
 
         let server = LiveServer::new(session);
 
-        server.start((ip, port).into(), allowed_hosts, || {
-            let _ = show_start_message(ip, port, global.color.into());
+        server.start((ip, port).into(), allowed_hosts, |address| {
+            let _ = show_start_message(address.ip(), address.port(), global.color.into());
         })?;
 
         Ok(())
