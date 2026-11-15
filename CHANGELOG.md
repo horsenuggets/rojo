@@ -31,6 +31,17 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Rebrand the fork as Rojo+. The CLI, plugin toolbar, panel title, and messages say Rojo+,
+  and the panel header shows "Rojo+" instead of the version. `rojo plugin install` writes
+  `Rojo+.rbxm` and the release asset is `Rojo+.rbxm`, so Rojo+ can be installed alongside
+  upstream Rojo without either replacing the other.
+* Give Rojo+ its own plugin action IDs, sound widget ID, and dock widget ID, so it runs
+  next to another Rojo plugin in the same Studio. The panel's dock position no longer
+  resets on every update, but keyboard shortcuts bound to the old actions need to be bound
+  again.
+* Expose the plugin API as `shared.RojoPlus`, keeping `shared.Rojo` for existing scripts.
+  Unloading the plugin only clears names that still point at Rojo+.
+
 ## `7.7.1-horse.1.0`
 
 * Add `rojo syncback --from-studio`, which syncs back the place open in Studio without
