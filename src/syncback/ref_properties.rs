@@ -230,20 +230,30 @@ fn write_id_attributes(
 /// trees, could be affected, and those already broke on every run when IDs were
 /// made up anew. An ID that some instance in `new` already has is never handed
 /// out again.
-pub fn ids_on_disk(new: &WeakDom, old: &WeakDom) -> HashMap<Ref, String> {
+pub fn ids_on_disk<'a>(new: &'a WeakDom, old: &'a WeakDom) -> HashMap<Ref, String> {
     let mut taken: HashSet<&str> = new.descendants().filter_map(get_existing_id).collect();
 
     let mut ids = HashMap::new();
+    let mut inherit = |new_inst: &Instance, old_inst: &'a Instance| {
+        if get_existing_id(new_inst).is_none() {
+            if let Some(id) = get_existing_id(old_inst) {
+                if taken.insert(id) {
+                    ids.insert(new_inst.referent(), id.to_owned());
+                }
+            }
+        }
+    };
+
+    // The root can be referenced too, like the root of a model project.
+    let (new_root, old_root) = (new.root(), old.root());
+    if new_root.class == old_root.class {
+        inherit(new_root, old_root);
+    }
+
     let mut pending = vec![(new.root_ref(), old.root_ref())];
     while let Some((new_ref, old_ref)) = pending.pop() {
         for (child, old_child) in matched_children(new, new_ref, old, old_ref) {
-            if get_existing_id(child).is_none() {
-                if let Some(id) = get_existing_id(old_child) {
-                    if taken.insert(id) {
-                        ids.insert(child.referent(), id.to_owned());
-                    }
-                }
-            }
+            inherit(child, old_child);
             pending.push((child.referent(), old_child.referent()));
         }
     }
@@ -567,6 +577,30 @@ mod test {
         let moved_id = get_existing_id(new.get_by_ref(moved).unwrap()).unwrap();
         assert_eq!(target_id, unique_id.to_string());
         assert_ne!(moved_id, target_id);
+    }
+
+    #[test]
+    fn a_referenced_root_keeps_its_id_on_disk() {
+        // A model project whose root a child points at.
+        let old = WeakDom::new(with_id(InstanceBuilder::new("Model"), "root-id"));
+
+        let mut new = WeakDom::new(InstanceBuilder::new("Model"));
+        let root = new.root_ref();
+        new.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("ToRoot")
+                .with_property("Value", Variant::Ref(root)),
+        );
+
+        let links = collect_referents(&new);
+        let ids = ids_on_disk(&new, &old);
+        link_referents(links, &mut new, &ids).unwrap();
+        assert_eq!(get_existing_id(new.root()), Some("root-id"));
+
+        // A root of another class is a different instance.
+        let folder = WeakDom::new(InstanceBuilder::new("Folder"));
+        assert!(ids_on_disk(&folder, &old).is_empty());
     }
 
     #[test]
