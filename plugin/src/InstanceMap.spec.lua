@@ -112,6 +112,26 @@ return function()
 		task.wait()
 	end
 
+	it("should retain authoritative parents until a paused move replaces them", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		expect(map.knownParents[tree.Leaf]).to.equal(tree.Ancestor)
+		tree.Leaf.Parent = tree.Other
+		settle()
+		expect(map.knownParents[tree.Leaf]).to.equal(tree.Ancestor)
+		map:pauseInstance(tree.Leaf)
+		tree.Leaf.Parent = tree.Container
+		settle()
+		expect(map.knownParents[tree.Leaf]).to.equal(tree.Container)
+		map:removeInstance(tree.Leaf)
+		expect(map.knownParents[tree.Leaf]).to.equal(nil)
+		expect(map.observedParents[tree.Leaf]).to.equal(nil)
+		expect(map.pausedUpdateInstances[tree.Leaf]).to.equal(nil)
+		map:stop()
+		expect(next(map.knownParents)).to.equal(nil)
+		tree.Container:Destroy()
+	end)
+
 	it("should report a leaf's Parent only when its own parent changes", function()
 		for _, className in CLASS_NAMES do
 			for _, action in ACTIONS do

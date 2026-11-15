@@ -43,6 +43,13 @@ pub struct PatchUpdate {
     pub id: Ref,
     pub changed_name: Option<String>,
     pub changed_class_name: Option<Ustr>,
+    /// The existing tree instance that becomes this instance's parent.
+    #[serde(
+        default,
+        rename = "changedParent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub changed_parent: Option<Ref>,
 
     /// Contains all changed properties. If a property is assigned to `None`,
     /// then that property has been removed.
@@ -90,6 +97,13 @@ pub struct AppliedPatchUpdate {
     // TODO: Store previous values in order to detect application conflicts
     pub changed_name: Option<String>,
     pub changed_class_name: Option<Ustr>,
+    /// The existing tree instance that becomes this instance's parent.
+    #[serde(
+        default,
+        rename = "changedParent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub changed_parent: Option<Ref>,
     pub changed_properties: UstrMap<Option<Variant>>,
     pub changed_metadata: Option<InstanceMetadata>,
 }
@@ -100,6 +114,7 @@ impl AppliedPatchUpdate {
             id,
             changed_name: None,
             changed_class_name: None,
+            changed_parent: None,
             changed_properties: UstrMap::new(),
             changed_metadata: None,
         }

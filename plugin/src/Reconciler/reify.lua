@@ -19,7 +19,9 @@ local function addAllToPatch(patchSet, virtualInstances, id)
 	patchSet.added[id] = virtualInstance
 
 	for _, childId in ipairs(virtualInstance.Children) do
-		addAllToPatch(patchSet, virtualInstances, childId)
+		if virtualInstances[childId] ~= nil then
+			addAllToPatch(patchSet, virtualInstances, childId)
+		end
 	end
 end
 
@@ -96,7 +98,10 @@ function reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualIn
 	end
 
 	for _, childId in ipairs(virtualInstance.Children) do
-		reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, childId, instance)
+		-- A known child keeps its identity and receives a separate parent update.
+		if instanceMap.fromIds[childId] == nil then
+			reifyInstanceInner(unappliedPatch, deferredRefs, instanceMap, virtualInstances, childId, instance)
+		end
 	end
 
 	instance.Parent = parentInstance

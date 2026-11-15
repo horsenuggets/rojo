@@ -4,6 +4,86 @@ return function()
 
 	local createPatchSet = require(script.Parent.createPatchSet)
 
+	it("should preserve a managed move alongside Name and properties", function()
+		local instanceMap = InstanceMap.new()
+		local oldParent = Instance.new("Folder")
+		local parent = Instance.new("Folder")
+		local part = Instance.new("Part")
+		part.Parent = oldParent
+		instanceMap:insert("PART", part)
+		instanceMap:insert("PARENT", parent)
+		part.Parent = parent
+		part.Name = "Moved"
+		part.Transparency = 0.5
+		local changes = { [part] = { Parent = true, Name = true, Transparency = true } }
+		local patch = createPatchSet(instanceMap, changes)
+		expect(#patch.removed).to.equal(0)
+		expect(#patch.updated).to.equal(1)
+		expect(patch.updated[1].changedParent).to.equal("PARENT")
+		expect(patch.updated[1].changedName).to.equal("Moved")
+		expect(patch.updated[1].changedProperties.Transparency.Float32).to.equal(0.5)
+		expect(patch.updated[1].changedProperties.Parent).to.equal(nil)
+		expect(next(changes)).to.equal(nil)
+		instanceMap:stop()
+		oldParent:Destroy()
+		parent:Destroy()
+	end)
+
+	it("should restore unmanaged destinations without reporting the restoration", function()
+		for _, className in { "Folder", "StringValue" } do
+			local reports = {}
+			local instanceMap = InstanceMap.new(function(instance, property)
+				table.insert(reports, { instance, property })
+			end)
+			instanceMap.__isGameRunning = function()
+				return false
+			end
+			local authoritative = Instance.new("Folder")
+			local accepted = Instance.new("Folder")
+			local unmanaged = Instance.new("Folder")
+			local instance = Instance.new(className)
+			instance.Parent = authoritative
+			instanceMap:insert("INSTANCE", instance)
+			instanceMap:insert("ACCEPTED", accepted)
+			-- A server move supersedes the parent captured at insertion.
+			instanceMap:pauseInstance(instance)
+			instance.Parent = accepted
+			task.wait()
+			instanceMap:unpauseInstance(instance)
+			instance.Parent = unmanaged
+			task.wait()
+			table.clear(reports)
+			instance.Name = "Kept"
+			local patch = createPatchSet(instanceMap, {
+				[instance] = { Parent = true, Name = true },
+			})
+			expect(instance.Parent).to.equal(accepted)
+			expect(patch.updated[1].changedName).to.equal("Kept")
+			expect(patch.updated[1].changedParent).to.equal(nil)
+			task.wait()
+			for _, report in reports do
+				expect(report[2] == "Parent").to.equal(false)
+			end
+			instanceMap:stop()
+			authoritative:Destroy()
+			accepted:Destroy()
+			unmanaged:Destroy()
+		end
+	end)
+
+	it("should remove rather than encode an unparented renamed instance", function()
+		local instanceMap = InstanceMap.new()
+		local instance = Instance.new("Folder")
+		instanceMap:insert("INSTANCE", instance)
+		local patch = createPatchSet(instanceMap, {
+			[instance] = { Parent = true, Name = true },
+		})
+		expect(patch.removed[1]).to.equal("INSTANCE")
+		expect(#patch.updated).to.equal(0)
+		instanceMap:stop()
+		instance:Destroy()
+	end)
+
 	it("should return a patch", function()
 		local patch = createPatchSet(InstanceMap.new(), {})
 

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 /// A slice of a tree of files. Can be loaded into an
 /// [`InMemoryFs`](struct.InMemoryFs.html).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum VfsSnapshot {
     File {

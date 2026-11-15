@@ -208,6 +208,7 @@ function ApiContext:write(patch, messageCursor, authority)
 		local fixedUpdate = {
 			id = update.id,
 			changedName = update.changedName,
+			changedParent = update.changedParent,
 		}
 
 		if next(update.changedProperties) ~= nil then

@@ -3,6 +3,39 @@ return function()
 	local Http = require(script.Parent.Parent.Packages.Http)
 	local Promise = require(script.Parent.Parent.Packages.Promise)
 
+	it("should round-trip parent updates with and without other changes", function()
+		local Types = require(script.Parent.Types)
+		local originalPost = Http.post
+		local success, err = pcall(function()
+			Http.post = function(_url, body)
+				local updates = Http.msgpackDecode(body).updated
+				expect(updates[1].changedParent).to.equal("PARENT")
+				expect(updates[1].changedProperties).to.equal(nil)
+				expect(updates[2].changedParent).to.equal("OTHER")
+				expect(updates[2].changedName).to.equal("Moved")
+				expect(updates[2].changedProperties.Value.String).to.equal("value")
+				return Promise.resolve({ code = 200, body = Http.msgpackEncode({ sessionId = "session" }) })
+			end
+			local updates = {
+				{ id = "FIRST", changedParent = "PARENT", changedProperties = {} },
+				{
+					id = "SECOND",
+					changedParent = "OTHER",
+					changedName = "Moved",
+					changedProperties = { Value = { String = "value" } },
+				},
+			}
+			for _, update in updates do
+				assert(Types.ApiInstanceUpdate(Http.msgpackDecode(Http.msgpackEncode(update))))
+			end
+			local context = ApiContext.new("http://localhost")
+			context.__sessionId = "session"
+			expect(context:write({ added = {}, removed = {}, updated = updates }, nil, "Studio"):await()).to.equal(true)
+		end)
+		Http.post = originalPost
+		assert(success, err)
+	end)
+
 	it("should send the captured batch cursor instead of a newer cursor", function()
 		local originalPost = Http.post
 		local success, err = pcall(function()

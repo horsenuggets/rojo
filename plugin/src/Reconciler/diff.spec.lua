@@ -21,6 +21,108 @@ return function()
 		return len
 	end
 
+	it("should diff known parent changes once without adding or removing their identities", function()
+		local applyPatch = require(script.Parent.applyPatch)
+		for _, destinationKind in { "known", "added", "outside" } do
+			local instanceMap = InstanceMap.new()
+			local root = Instance.new("Folder")
+			root.Name = "Root"
+			local destination = Instance.new("Folder")
+			destination.Name = "Destination"
+			if destinationKind ~= "added" then
+				destination.Parent = root
+				instanceMap:insert("DESTINATION", destination)
+			end
+			local child = Instance.new("Folder")
+			child.Name = "Before"
+			child.Parent = if destinationKind == "outside" then destination else root
+			instanceMap:insert("ROOT", root)
+			instanceMap:insert("CHILD", child)
+			local virtual = {
+				ROOT = {
+					Id = "ROOT",
+					ClassName = "Folder",
+					Name = "Root",
+					Properties = {},
+					Children = { "DESTINATION" },
+				},
+				DESTINATION = {
+					Id = "DESTINATION",
+					Parent = "ROOT",
+					ClassName = "Folder",
+					Name = "Destination",
+					Properties = {},
+					Children = { "CHILD" },
+				},
+				CHILD = {
+					Id = "CHILD",
+					Parent = "DESTINATION",
+					ClassName = "Folder",
+					Name = "After",
+					Properties = {},
+					Children = {},
+				},
+			}
+			if destinationKind == "outside" then
+				child.Parent = nil
+			end
+			local ok, patch = diff(instanceMap, virtual, "ROOT")
+			assert(ok, "Expected a successful structural diff")
+			expect(#patch.updated).to.equal(1)
+			expect(patch.updated[1].id).to.equal("CHILD")
+			expect(patch.updated[1].changedParent).to.equal("DESTINATION")
+			expect(patch.updated[1].changedName).to.equal("After")
+			expect(#patch.removed).to.equal(0)
+			expect(patch.added.CHILD).to.equal(nil)
+			expect(PatchSet.isEmpty(applyPatch(instanceMap, patch))).to.equal(true)
+			expect(instanceMap.fromIds.CHILD).to.equal(child)
+			local againOk, again = diff(instanceMap, virtual, "ROOT")
+			assert(againOk, "Expected a successful diff after applying the move")
+			expect(PatchSet.isEmpty(again)).to.equal(true)
+			instanceMap:stop()
+			root:Destroy()
+			destination:Destroy()
+		end
+	end)
+
+	it("should never reparent the synchronized root to the null-parent ID", function()
+		for _, parentKind in { "nil", "unmanaged", "managed" } do
+			local instanceMap = InstanceMap.new()
+			local outer = Instance.new("Folder")
+			local root = Instance.new("Folder")
+			root.Name = "Root"
+			if parentKind ~= "nil" then
+				root.Parent = outer
+			end
+			if parentKind == "managed" then
+				instanceMap:insert("OUTER", outer)
+			end
+			instanceMap:insert("ROOT", root)
+			local virtual = {
+				ROOT = {
+					Id = "ROOT",
+					Parent = "00000000000000000000000000000000",
+					ClassName = "Folder",
+					Name = "Root",
+					Properties = {},
+					Children = {},
+				},
+			}
+			local ok, patch = diff(instanceMap, virtual, "ROOT")
+			assert(ok, tostring(patch))
+			expect(PatchSet.isEmpty(patch)).to.equal(true)
+			virtual.ROOT.Name = "Renamed"
+			local renamedOk, renamed = diff(instanceMap, virtual, "ROOT")
+			assert(renamedOk, tostring(renamed))
+			expect(#renamed.updated).to.equal(1)
+			expect(renamed.updated[1].changedName).to.equal("Renamed")
+			expect(renamed.updated[1].changedParent).to.equal(nil)
+			instanceMap:stop()
+			root:Destroy()
+			outer:Destroy()
+		end
+	end)
+
 	it("should generate an empty patch for empty instances", function()
 		local knownInstances = InstanceMap.new()
 		local virtualInstances = {

@@ -6,8 +6,6 @@ local Log = require(Packages.Log)
 --[[
 	A bidirectional map between instance IDs and Roblox instances. It lets us
 	keep track of every instance we know about.
-
-	TODO: Track ancestry to catch when stuff moves?
 ]]
 local InstanceMap = {}
 InstanceMap.__index = InstanceMap
@@ -19,6 +17,12 @@ function InstanceMap.new(onInstanceChanged)
 
 		-- A map from instances to IDs.
 		fromInstances = {},
+
+		-- Last authoritative parents, not speculative Studio moves awaiting a reply.
+		knownParents = {},
+
+		-- Also suppress deferred notifications for a parent we already observed.
+		observedParents = {},
 
 		-- A set of all instances that updates should be paused for. This set
 		-- should generally be empty, and will be filled by pauseInstance
@@ -87,6 +91,8 @@ function InstanceMap:insert(id, instance)
 
 	self.fromIds[id] = instance
 	self.fromInstances[instance] = id
+	self.knownParents[instance] = instance.Parent
+	self.observedParents[instance] = instance.Parent
 	self:__connectSignals(instance)
 end
 
@@ -217,7 +223,17 @@ end
 function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
 	Log.trace("{}.{} changed", instance:GetFullName(), propertyName)
 
+	if propertyName == "Parent" then
+		if self.observedParents[instance] == instance.Parent then
+			return
+		end
+		self.observedParents[instance] = instance.Parent
+	end
+
 	if self.pausedUpdateInstances[instance] then
+		if propertyName == "Parent" then
+			self.knownParents[instance] = instance.Parent
+		end
 		return
 	end
 
@@ -242,6 +258,9 @@ end
 
 function InstanceMap:__disconnectSignals(instance)
 	local signals = self.instancesToSignal[instance]
+	self.knownParents[instance] = nil
+	self.observedParents[instance] = nil
+	self.pausedUpdateInstances[instance] = nil
 
 	if signals ~= nil then
 		-- In most cases, we only have a single signal, so we avoid keeping

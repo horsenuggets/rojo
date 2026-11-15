@@ -1,6 +1,22 @@
 return function()
 	local encodePatchUpdate = require(script.Parent.encodePatchUpdate)
 
+	it("should retain parent-only updates and omit unmanaged or nil parents", function()
+		local instance = Instance.new("Folder")
+		local parent = Instance.new("Folder")
+		local instanceMap = { fromInstances = { [parent] = "PARENT" } }
+		instance.Parent = parent
+		local update = encodePatchUpdate(instance, "INSTANCE", { Parent = true }, instanceMap)
+		expect(update.changedParent).to.equal("PARENT")
+		expect(next(update.changedProperties)).to.equal(nil)
+		instanceMap.fromInstances[parent] = nil
+		expect(encodePatchUpdate(instance, "INSTANCE", { Parent = true }, instanceMap)).to.equal(nil)
+		instance.Parent = nil
+		expect(encodePatchUpdate(instance, "INSTANCE", { Parent = true }, instanceMap)).to.equal(nil)
+		instance:Destroy()
+		parent:Destroy()
+	end)
+
 	it("should never encode attributes the filesystem doesn't hold", function()
 		local part = Instance.new("Part")
 		part:SetAttribute("Health", 5)

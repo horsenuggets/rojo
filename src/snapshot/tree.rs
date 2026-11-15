@@ -140,6 +140,27 @@ impl RojoTree {
         referent
     }
 
+    /// Reparents an existing subtree without changing its referents or metadata indexes.
+    /// Unlike `WeakDom::transfer_within`, this rejects detached nodes and cycles.
+    pub fn reparent(&mut self, id: Ref, parent: Ref) -> anyhow::Result<()> {
+        anyhow::ensure!(id != self.get_root_id(), "Cannot reparent the tree root");
+        let instance = self
+            .get_instance(id)
+            .ok_or_else(|| anyhow::anyhow!("Reparented instance does not exist"))?;
+        anyhow::ensure!(self.get_instance(parent).is_some(), "Parent does not exist");
+
+        let mut ancestor = parent;
+        while ancestor.is_some() {
+            anyhow::ensure!(ancestor != id, "Reparenting would create a cycle");
+            ancestor = self.get_instance(ancestor).unwrap().parent();
+        }
+
+        if instance.parent() != parent {
+            self.inner.transfer_within(id, parent);
+        }
+        Ok(())
+    }
+
     pub fn remove(&mut self, id: Ref) {
         let mut to_move = VecDeque::new();
         to_move.push_back(id);
@@ -400,6 +421,33 @@ mod test {
     };
 
     use super::RojoTree;
+
+    #[test]
+    fn checked_reparent_rejects_invalid_moves_and_keeps_same_parent_order() {
+        use rbx_dom_weak::types::Ref;
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let a = tree.insert_instance(root, InstanceSnapshot::new());
+        let b = tree.insert_instance(a, InstanceSnapshot::new());
+        let c = tree.insert_instance(root, InstanceSnapshot::new());
+        for (id, parent) in [
+            (root, a),
+            (a, a),
+            (a, b),
+            (a, Ref::none()),
+            (Ref::new(), root),
+            (a, Ref::new()),
+        ] {
+            assert!(tree.reparent(id, parent).is_err());
+            assert_eq!(tree.root().children(), &[a, c]);
+            assert_eq!(tree.get_instance(a).unwrap().children(), &[b]);
+        }
+        tree.reparent(a, root).unwrap();
+        assert_eq!(tree.root().children(), &[a, c]);
+        tree.reparent(a, c).unwrap();
+        assert_eq!(tree.get_instance(c).unwrap().children(), &[a]);
+        assert_eq!(tree.get_instance(a).unwrap().children(), &[b]);
+    }
 
     #[test]
     fn swap_duped_specified_ids() {

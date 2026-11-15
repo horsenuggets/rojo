@@ -232,6 +232,9 @@ function PatchSet.countChanges(patch)
 		if update.changedClassName ~= nil then
 			count += 1
 		end
+		if update.changedParent ~= nil then
+			count += 1
+		end
 	end
 
 	return count
@@ -329,7 +332,9 @@ function PatchSet.humanSummary(instanceMap, patchSet)
 		additionsMentioned[virtualInstance.Id] = true
 
 		for _, childId in ipairs(virtualInstance.Children) do
-			addAllDescendents(patchSet.added[childId])
+			if patchSet.added[childId] ~= nil then
+				addAllDescendents(patchSet.added[childId])
+			end
 		end
 	end
 
@@ -351,6 +356,8 @@ function PatchSet.humanSummary(instanceMap, patchSet)
 
 			virtualInstance = virtualParent
 		end
+
+		addAllDescendents(virtualInstance)
 
 		local parentDisplayName = "nil (how strange!)"
 		if virtualInstance.Parent ~= nil then
@@ -384,6 +391,10 @@ function PatchSet.humanSummary(instanceMap, patchSet)
 
 		if update.changedClassName ~= nil then
 			table.insert(updatedProperties, "ClassName")
+		end
+
+		if update.changedParent ~= nil then
+			table.insert(updatedProperties, "Parent")
 		end
 
 		for name in pairs(update.changedProperties) do

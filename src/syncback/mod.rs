@@ -3,8 +3,11 @@ pub mod from_studio;
 mod fs_snapshot;
 mod hash;
 mod inline;
+pub(crate) mod promotion;
 mod property_filter;
 mod ref_properties;
+pub(crate) mod relocation;
+pub mod relocation_transaction;
 mod snapshot;
 mod write_decision;
 
@@ -565,7 +568,7 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
 pub struct SyncbackRules {
     /// A list of subtrees in a file that will be ignored by Syncback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ignore_trees: Vec<String>,
+    pub(crate) ignore_trees: Vec<String>,
     /// A list of patterns to check against the path an Instance would serialize
     /// to. If a path matches one of these, the Instance won't be syncbacked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

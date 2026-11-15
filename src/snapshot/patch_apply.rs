@@ -21,12 +21,127 @@ use crate::{multimap::MultiMap, RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTR
 /// tree in sync with Rojo's.
 #[profiling::function]
 pub fn apply_patch_set(tree: &mut RojoTree, patch_set: PatchSet) -> AppliedPatchSet {
+    try_apply_patch_set(tree, patch_set).expect("Invalid patch set")
+}
+
+/// Validates the complete final parent graph before making any changes.
+/// Structural references are tree IDs, not transient snapshot IDs.
+/// Updates and additions must target instances that survive the final removals.
+/// Descendants explicitly moved out of a removed subtree survive with their identities.
+pub fn validate_patch_set(tree: &RojoTree, patch_set: &PatchSet) -> anyhow::Result<()> {
+    // Ordinary source edits must stay scoped to the edited instances, not walk
+    // the entire project merely because structural patches are supported.
+    if patch_set.removed_instances.is_empty()
+        && patch_set
+            .updated_instances
+            .iter()
+            .all(|update| update.changed_parent.is_none())
+    {
+        for update in &patch_set.updated_instances {
+            anyhow::ensure!(
+                tree.get_instance(update.id).is_some(),
+                "Updated instance does not exist"
+            );
+        }
+        for addition in &patch_set.added_instances {
+            anyhow::ensure!(
+                tree.get_instance(addition.parent_id).is_some(),
+                "Addition parent does not exist"
+            );
+        }
+        return Ok(());
+    }
+    let root = tree.get_root_id();
+    let mut parents: HashMap<_, _> = tree
+        .descendants(root)
+        .map(|instance| (instance.id(), instance.parent()))
+        .collect();
+    let removed: HashSet<_> = patch_set.removed_instances.iter().copied().collect();
+    for id in &removed {
+        anyhow::ensure!(*id != root, "Cannot remove the tree root");
+        anyhow::ensure!(parents.contains_key(id), "Removed instance does not exist");
+    }
+    let mut moved = HashSet::new();
+    for update in &patch_set.updated_instances {
+        anyhow::ensure!(
+            parents.contains_key(&update.id),
+            "Updated instance does not exist"
+        );
+        if let Some(parent) = update.changed_parent {
+            anyhow::ensure!(update.id != root, "Cannot reparent the tree root");
+            anyhow::ensure!(parents.contains_key(&parent), "Parent does not exist");
+            anyhow::ensure!(moved.insert(update.id), "Duplicate reparent update");
+            parents.insert(update.id, parent);
+        }
+    }
+
+    // Resolve against the final graph, not update order or the old ancestry.
+    let mut survives = HashMap::from([(root, true)]);
+    for id in parents.keys().copied() {
+        let mut path = Vec::new();
+        let mut visiting = HashSet::new();
+        let mut current = id;
+        while !survives.contains_key(&current) {
+            anyhow::ensure!(visiting.insert(current), "Patch would create a cycle");
+            path.push(current);
+            current = parents[&current];
+        }
+        let mut alive = survives[&current];
+        for node in path.into_iter().rev() {
+            alive &= !removed.contains(&node);
+            survives.insert(node, alive);
+        }
+    }
+    for update in &patch_set.updated_instances {
+        anyhow::ensure!(
+            survives[&update.id],
+            "Updated instance is removed by the patch"
+        );
+    }
+    for addition in &patch_set.added_instances {
+        anyhow::ensure!(
+            survives.get(&addition.parent_id) == Some(&true),
+            "Addition parent does not survive the patch"
+        );
+    }
+    Ok(())
+}
+
+/// Applies a valid patch atomically with respect to structural validation errors.
+/// Invalid input leaves the tree and all its metadata indexes untouched.
+pub fn try_apply_patch_set(
+    tree: &mut RojoTree,
+    patch_set: PatchSet,
+) -> anyhow::Result<AppliedPatchSet> {
+    validate_patch_set(tree, &patch_set)?;
     let mut context = PatchApplyContext::default();
+    let root = tree.get_root_id();
+
+    // Staging movers under the root breaks old ancestry without cloning or deleting
+    // anything. A valid final graph can then be assembled in any update order.
+    let moves: Vec<_> = patch_set
+        .updated_instances
+        .iter()
+        .filter_map(|update| {
+            let parent = update.changed_parent?;
+            (tree.get_instance(update.id).unwrap().parent() != parent)
+                .then_some((update.id, parent))
+        })
+        .collect();
+    for &(id, _) in &moves {
+        tree.reparent(id, root)?;
+    }
+    for (id, parent) in moves {
+        tree.reparent(id, parent)?;
+    }
 
     {
         profiling::scope!("removals");
         for removed_id in patch_set.removed_instances {
-            apply_remove_instance(&mut context, tree, removed_id);
+            // An earlier removal may already have removed this descendant.
+            if tree.get_instance(removed_id).is_some() {
+                apply_remove_instance(&mut context, tree, removed_id);
+            }
         }
     }
 
@@ -46,7 +161,7 @@ pub fn apply_patch_set(tree: &mut RojoTree, patch_set: PatchSet) -> AppliedPatch
         }
     }
 
-    finalize_patch_application(context, tree)
+    Ok(finalize_patch_application(context, tree))
 }
 
 /// All of the ephemeral state needing during application of a patch.
@@ -173,6 +288,7 @@ fn apply_add_child(
 
 fn apply_update_child(context: &mut PatchApplyContext, tree: &mut RojoTree, patch: PatchUpdate) {
     let mut applied_patch = AppliedPatchUpdate::new(patch.id);
+    applied_patch.changed_parent = patch.changed_parent;
 
     if let Some(metadata) = patch.changed_metadata {
         tree.update_metadata(patch.id, metadata.clone());
@@ -345,6 +461,47 @@ mod test {
     }
 
     #[test]
+    fn ordinary_updates_validate_every_target_before_mutation() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Unchanged"));
+        let root = tree.get_root_id();
+        let update = |id| PatchUpdate {
+            id,
+            changed_name: Some("Changed".into()),
+            changed_class_name: None,
+            changed_parent: None,
+            changed_properties: UstrMap::default(),
+            changed_metadata: None,
+        };
+        let patch = PatchSet {
+            updated_instances: vec![update(root), update(Ref::none())],
+            ..PatchSet::new()
+        };
+        assert!(try_apply_patch_set(&mut tree, patch).is_err());
+        assert_eq!(tree.root().name(), "Unchanged");
+    }
+
+    #[test]
+    fn ordinary_additions_reject_missing_parents_before_mutation() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let patch = PatchSet {
+            added_instances: vec![
+                PatchAdd {
+                    parent_id: root,
+                    instance: InstanceSnapshot::new().name("Valid"),
+                },
+                PatchAdd {
+                    parent_id: Ref::none(),
+                    instance: InstanceSnapshot::new().name("Invalid"),
+                },
+            ],
+            ..PatchSet::new()
+        };
+        assert!(try_apply_patch_set(&mut tree, patch).is_err());
+        assert!(tree.root().children().is_empty());
+    }
+
+    #[test]
     fn update_existing() {
         let _ = env_logger::try_init();
 
@@ -363,6 +520,7 @@ mod test {
             id: root_id,
             changed_name: Some("Foo".to_owned()),
             changed_class_name: Some(ustr("NewClassName")),
+            changed_parent: None,
             changed_properties: UstrMap::from_iter([
                 // The value of Foo has changed
                 (ustr("Foo"), Some(Variant::Int32(8))),
