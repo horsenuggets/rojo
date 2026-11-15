@@ -44,6 +44,8 @@ Making a new release? Simply add the new header with the version and date undern
   migrations excluded by ignore paths, and retain explicit execution-context overrides
   for fixed project paths while respecting ignored properties. Use effective nested sync
   rules and reject conflicting staged source or metadata destinations before persistence.
+  Reject destinations whose sync rules would change the script kind or decoded name, and
+  preserve tracked script representations when execution context is ignored.
 
 * Drop an obsolete metadata `id` immediately when a new `Rojo_Id` attribute replaces it,
   so exporting a place does not need a second syncback to remove the stale ID.

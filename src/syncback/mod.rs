@@ -88,7 +88,7 @@ pub fn syncback_instance(
         anyhow::bail!("Model-file updates require subtree serialization");
     }
     if let (Some(script), Some(source)) = (
-        file_names::script_middleware_for_instance(new_tree.root()),
+        script_middleware_for_syncback(new_tree.root(), Some(old_inst), project),
         source_file(&old_inst),
     ) {
         if let Some(name) = source.file_name().and_then(|name| name.to_str()) {
@@ -346,7 +346,7 @@ pub fn syncback_loop(
         ) {
             continue;
         }
-        let Some(middleware) = file_names::script_middleware_for_instance(instance) else {
+        let Some(middleware) = script_middleware_for_syncback(instance, Some(old), project) else {
             continue;
         };
         let Some(source) = source_file(&old) else {
@@ -556,6 +556,26 @@ pub struct SyncbackReturn<'sync> {
     pub removed_children: Vec<InstanceWithMeta<'sync>>,
 }
 
+fn script_middleware_for_syncback(
+    instance: &Instance,
+    old: Option<InstanceWithMeta>,
+    project: &Project,
+) -> Option<Middleware> {
+    if instance.class.as_str() == "Script"
+        && get_property_filter(project, instance)
+            .is_some_and(|ignored| ignored.contains(&"RunContext".into()))
+    {
+        if let Some(middleware) = old
+            .filter(|old| old.class_name() == "Script")
+            .and_then(|old| old.metadata().middleware)
+            .filter(|middleware| file_names::script_kind_suffix(*middleware).is_some())
+        {
+            return Some(middleware);
+        }
+    }
+    file_names::script_middleware_for_instance(instance)
+}
+
 pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
     // At some point, we're better off using an O(1) method for checking
     // equality for classes like this.
@@ -598,8 +618,10 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
 
     if let Some(override_middleware) = snapshot.middleware {
         return override_middleware;
-    } else if let Some(script) = file_names::script_middleware_for_instance(inst)
-        .filter(|_| old_middleware.is_none_or(|old| file_names::script_kind_suffix(old).is_some()))
+    } else if let Some(script) =
+        script_middleware_for_syncback(inst, snapshot.old_inst(), snapshot.project()).filter(|_| {
+            old_middleware.is_none_or(|old| file_names::script_kind_suffix(old).is_some())
+        })
     {
         if !inst.children().is_empty() || old_middleware.is_some_and(|old| old.is_dir()) {
             return file_names::directory_variant(script);

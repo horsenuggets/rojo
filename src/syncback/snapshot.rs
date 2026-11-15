@@ -286,6 +286,46 @@ impl<'sync> SyncbackSnapshot<'sync> {
         Ok(())
     }
 
+    fn validate_script_rule(&self, path: &Path) -> anyhow::Result<()> {
+        let middleware = get_best_middleware(self);
+        if middleware.is_dir() || self.middleware.is_some() {
+            return Ok(());
+        }
+        let old = self.old_inst();
+        let rules = old
+            .map(|old| old.metadata().context.sync_rules.as_slice())
+            .unwrap_or(self.project().sync_rules.as_slice());
+        let emit_legacy = old
+            .map(|old| old.metadata().context.emit_legacy_scripts)
+            .or(self.project().emit_legacy_scripts)
+            .unwrap_or_else(|| crate::snapshot::InstanceContext::default().emit_legacy_scripts);
+        let rule = rules
+            .iter()
+            .chain(default_sync_rules())
+            .find(|rule| rule.matches(path))
+            .ok_or_else(|| {
+                anyhow::anyhow!("No sync rule matches script destination {}", path.display())
+            })?;
+        let reader = match rule.middleware {
+            Middleware::ServerScript if emit_legacy => Middleware::LegacyServerScript,
+            Middleware::ClientScript if emit_legacy => Middleware::LegacyClientScript,
+            other => other,
+        };
+        let suffix = super::file_names::script_kind_suffix(middleware);
+        let stem = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(|stem| suffix.and_then(|suffix| stem.strip_suffix(suffix)));
+        anyhow::ensure!(
+            suffix.is_some()
+                && super::file_names::script_kind_suffix(reader) == suffix
+                && rule.file_name_for_path(path).ok() == stem,
+            "Cannot write a script destination with an incompatible sync rule at {}",
+            path.display()
+        );
+        Ok(())
+    }
+
     /// Refuses to install a renamed source over a file the old tree does not own.
     pub fn validate_script_destination(&self, path: &Path) -> anyhow::Result<()> {
         if self
@@ -298,7 +338,9 @@ impl<'sync> SyncbackSnapshot<'sync> {
         }
         match self.vfs().metadata(path) {
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.validate_script_rule(path)
+            }
             Err(error) => return Err(error.into()),
         }
         if self.middleware.is_some()

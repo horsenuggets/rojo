@@ -853,6 +853,13 @@ fn script_suffix_migration_review_regressions() {
                 "adjacent",
                 "fixed",
                 "ignored_context",
+                "ignored_leaf_context",
+                "ignored_init_context",
+                "ignored_leaf_unchanged",
+                "ignored_init_unchanged",
+                "rule_ignored",
+                "rule_wrong_class",
+                "rule_broad",
             ] {
                 let temp = tempfile::tempdir().unwrap();
                 let project = temp.path().join("project");
@@ -1014,6 +1021,59 @@ fn script_suffix_migration_review_regressions() {
                                 .with_property("Source", "return 2"),
                         );
                     }
+                    "ignored_leaf_context"
+                    | "ignored_init_context"
+                    | "ignored_leaf_unchanged"
+                    | "ignored_init_unchanged" => {
+                        let initializer = case.starts_with("ignored_init");
+                        let source = if case.ends_with("unchanged") {
+                            "return 1"
+                        } else {
+                            "return 2"
+                        };
+                        let path = if initializer {
+                            format!("src/Boot/init.server.{extension}")
+                        } else {
+                            fs_err::remove_dir(project.join("src/Boot")).unwrap();
+                            format!("src/Boot.server.{extension}")
+                        };
+                        fs_err::write(project.join(path), "return 1").unwrap();
+                        config["syncbackRules"]["ignoreProperties"] =
+                            serde_json::json!({"LuaSourceContainer":["RunContext"]});
+                        expected = vec![("Boot", "Script", source, Some("Server"))];
+                        dom.insert(
+                            parent,
+                            InstanceBuilder::new("Script")
+                                .with_name("Boot")
+                                .with_property("Source", source)
+                                .with_property("RunContext", Enum::from_u32(contexts["Client"])),
+                        );
+                    }
+                    "rule_ignored" | "rule_wrong_class" | "rule_broad" => {
+                        let suffix = if case == "rule_broad" { "" } else { ".client" };
+                        fs_err::write(
+                            project.join(format!("src/Effect{suffix}.{extension}")),
+                            "return 1",
+                        )
+                        .unwrap();
+                        config["syncRules"] = if case == "rule_broad" {
+                            serde_json::json!([{
+                                "pattern":format!("*.{extension}"),
+                                "use":"legacyClientScript", "suffix":format!(".{extension}")
+                            }])
+                        } else {
+                            serde_json::json!([
+                                {"pattern":format!("*.client.{extension}"), "use":"legacyClientScript", "suffix":format!(".client.{extension}")},
+                                {"pattern":format!("*.local.{extension}"), "use":if case == "rule_ignored" { "ignore" } else { "moduleScript" }, "suffix":format!(".local.{extension}")}
+                            ])
+                        };
+                        dom.insert(
+                            parent,
+                            InstanceBuilder::new("LocalScript")
+                                .with_name("Effect")
+                                .with_property("Source", "return 2"),
+                        );
+                    }
                     _ => unreachable!(),
                 }
                 // The unused directory must not mask an adjacent script of the same name.
@@ -1025,6 +1085,9 @@ fn script_suffix_migration_review_regressions() {
                         | "adjacent"
                         | "fixed"
                         | "ignored_context"
+                        | "rule_ignored"
+                        | "rule_wrong_class"
+                        | "rule_broad"
                 ) {
                     fs_err::remove_dir(project.join("src/Boot")).unwrap();
                 }
@@ -1045,10 +1108,15 @@ fn script_suffix_migration_review_regressions() {
                         .unwrap()
                 };
                 let output = sync();
-                if case.starts_with("ignore_") || case == "staged_collision" {
+                if case.starts_with("ignore_")
+                    || case.starts_with("rule_")
+                    || case == "staged_collision"
+                {
                     assert!(!output.status.success(), "{case} {output:?}");
                     let message = if case == "staged_collision" {
                         "same destination"
+                    } else if case.starts_with("rule_") {
+                        "incompatible sync rule"
                     } else {
                         "ignore pattern"
                     };
@@ -1065,6 +1133,14 @@ fn script_suffix_migration_review_regressions() {
                 );
                 let first = read_files(&project);
                 match case {
+                    "ignored_leaf_context" | "ignored_leaf_unchanged" => {
+                        assert!(first.contains_key(&format!("src/Boot.server.{extension}")));
+                        assert!(!first.contains_key(&format!("src/Boot.legacy.{extension}")));
+                    }
+                    "ignored_init_context" | "ignored_init_unchanged" => {
+                        assert!(first.contains_key(&format!("src/Boot/init.server.{extension}")));
+                        assert!(!first.contains_key(&format!("src/Boot/init.legacy.{extension}")));
+                    }
                     "initializer" => {
                         assert!(first.contains_key(&format!("src/Boot/init.legacy.{extension}")));
                         assert!(!first.contains_key(&format!("src/Boot/init.server.{extension}")));
