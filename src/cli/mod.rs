@@ -26,9 +26,9 @@ pub use self::sourcemap::SourcemapCommand;
 pub use self::syncback::SyncbackCommand;
 pub use self::upload::UploadCommand;
 
-/// Command line options that Rojo accepts, defined using the clap crate.
+/// Command line options that Rojo+ accepts, defined using the clap crate.
 #[derive(Debug, Parser)]
-#[clap(name = "Rojo", version, about)]
+#[clap(name = "Rojo+", version, about)]
 pub struct Options {
     #[clap(flatten)]
     pub global: GlobalOptions,
@@ -132,7 +132,7 @@ pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
     } else {
         let current_dir = env::current_dir().context(
             "Could not determine the current working directory. \
-             It may have been deleted, or Rojo may not have permission to access it.",
+             It may have been deleted, or Rojo+ may not have permission to access it.",
         )?;
         Ok(Cow::Owned(current_dir.join(path)))
     }

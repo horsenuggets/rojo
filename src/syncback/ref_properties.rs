@@ -1,7 +1,7 @@
 //! Implements iterating through an entire WeakDom and linking all Ref
 //! properties using attributes.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use rbx_dom_weak::{
     types::{Attributes, Ref, UniqueId, Variant},
@@ -106,8 +106,15 @@ pub fn collect_referents(dom: &WeakDom) -> RefLinks {
     }
 }
 
-pub fn link_referents(links: RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> {
-    write_id_attributes(&links, dom)?;
+/// Links Ref properties through attributes. An instance that needs an ID it
+/// doesn't have takes its entry in `ids_on_disk` (see [`ids_on_disk`]) when it
+/// has one, so the same place gets the same IDs every time it's synced back.
+pub fn link_referents(
+    links: RefLinks,
+    dom: &mut WeakDom,
+    ids_on_disk: &HashMap<Ref, String>,
+) -> anyhow::Result<()> {
+    write_id_attributes(&links, dom, ids_on_disk)?;
 
     let mut prop_list = Vec::new();
 
@@ -154,17 +161,39 @@ pub fn link_referents(links: RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn write_id_attributes(links: &RefLinks, dom: &mut WeakDom) -> anyhow::Result<()> {
+fn write_id_attributes(
+    links: &RefLinks,
+    dom: &mut WeakDom,
+    ids_on_disk: &HashMap<Ref, String>,
+) -> anyhow::Result<()> {
+    // Every ID already given out. A made-up ID can match one of these, like when
+    // a referenced instance is renamed and a new one takes its old name and ID.
+    let mut reserved = attribute_ids(dom);
+    reserved.extend(ids_on_disk.values().cloned());
+
     for referent in &links.need_rewrite {
         let inst = match dom.get_by_ref_mut(*referent) {
             Some(inst) => inst,
             None => continue,
         };
-        let unique_id = match inst.properties.get(&ustr("UniqueId")) {
-            Some(Variant::UniqueId(id)) => Some(*id),
-            _ => None,
-        }
-        .unwrap_or_else(|| UniqueId::now().unwrap());
+        // Studio hands out new UniqueIds every time it serializes, and some place
+        // files have none, so an ID made from one can change from run to run.
+        // The ID already on disk is kept instead whenever there is one.
+        let id = match ids_on_disk.get(referent) {
+            Some(id) => id.clone(),
+            None => {
+                let mut id = match inst.properties.get(&ustr("UniqueId")) {
+                    Some(Variant::UniqueId(id)) => *id,
+                    _ => UniqueId::now().unwrap(),
+                }
+                .to_string();
+                while reserved.contains(&id) {
+                    id = UniqueId::now().unwrap().to_string();
+                }
+                reserved.insert(id.clone());
+                id
+            }
+        };
 
         let attributes = match inst.properties.get_mut(&ustr("Attributes")) {
             Some(Variant::Attributes(attrs)) => attrs,
@@ -183,12 +212,89 @@ fn write_id_attributes(links: &RefLinks, dom: &mut WeakDom) -> anyhow::Result<()
                 );
             }
         };
-        attributes.insert(
-            REF_ID_ATTRIBUTE_NAME.into(),
-            Variant::String(unique_id.to_string()),
-        );
+        attributes.insert(REF_ID_ATTRIBUTE_NAME.into(), Variant::String(id));
     }
     Ok(())
+}
+
+/// Finds the `Rojo_Id` each instance in `new` has on disk, for instances that
+/// don't carry one themselves.
+///
+/// Instances are matched by path from the roots of `new` and `old`, and need the
+/// same class. Siblings that share a name, which Roblox models are full of, are
+/// matched in order, but only when both sides have the same number of them.
+///
+/// If siblings were reordered, two of them can trade IDs. Syncback relinks every
+/// reference it writes in the same run, so those all still point at the right
+/// instance. Only references outside what syncback writes, like ones in ignored
+/// trees, could be affected, and those already broke on every run when IDs were
+/// made up anew. An ID that some instance in `new` already has is never handed
+/// out again.
+pub fn ids_on_disk<'a>(new: &'a WeakDom, old: &'a WeakDom) -> HashMap<Ref, String> {
+    let mut taken: HashSet<&str> = new.descendants().filter_map(get_existing_id).collect();
+
+    let mut ids = HashMap::new();
+    let mut inherit = |new_inst: &Instance, old_inst: &'a Instance| {
+        if get_existing_id(new_inst).is_none() {
+            if let Some(id) = get_existing_id(old_inst) {
+                if taken.insert(id) {
+                    ids.insert(new_inst.referent(), id.to_owned());
+                }
+            }
+        }
+    };
+
+    // The root can be referenced too, like the root of a model project.
+    let (new_root, old_root) = (new.root(), old.root());
+    if new_root.class == old_root.class {
+        inherit(new_root, old_root);
+    }
+
+    let mut pending = vec![(new.root_ref(), old.root_ref())];
+    while let Some((new_ref, old_ref)) = pending.pop() {
+        for (child, old_child) in matched_children(new, new_ref, old, old_ref) {
+            inherit(child, old_child);
+            pending.push((child.referent(), old_child.referent()));
+        }
+    }
+    ids
+}
+
+/// Pairs the children of `new_parent` with the children of `old_parent` that have
+/// the same name and class, matching siblings that share a name in order when
+/// both sides have the same number of them.
+fn matched_children<'a>(
+    new: &'a WeakDom,
+    new_parent: Ref,
+    old: &'a WeakDom,
+    old_parent: Ref,
+) -> Vec<(&'a Instance, &'a Instance)> {
+    let old_groups = children_by_name(old, old_parent);
+    let mut pairs = Vec::new();
+    for (name, new_group) in children_by_name(new, new_parent) {
+        let Some(old_group) = old_groups.get(name) else {
+            continue;
+        };
+        if old_group.len() != new_group.len() {
+            continue;
+        }
+        for (new_child, old_child) in new_group.into_iter().zip(old_group) {
+            if new_child.class == old_child.class {
+                pairs.push((new_child, *old_child));
+            }
+        }
+    }
+    pairs
+}
+
+/// Groups the children of `parent` by name, keeping their order within each group.
+fn children_by_name(dom: &WeakDom, parent: Ref) -> BTreeMap<&str, Vec<&Instance>> {
+    let mut groups: BTreeMap<&str, Vec<&Instance>> = BTreeMap::new();
+    for child_ref in dom.get_by_ref(parent).unwrap().children() {
+        let child = dom.get_by_ref(*child_ref).unwrap();
+        groups.entry(child.name.as_str()).or_default().push(child);
+    }
+    groups
 }
 
 /// Returns every ID that an instance in `dom` holds through its `Rojo_Id`
@@ -217,5 +323,298 @@ fn get_existing_id(inst: &Instance) -> Option<&str> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use rbx_dom_weak::InstanceBuilder;
+
+    use super::*;
+
+    fn with_id(builder: InstanceBuilder, id: &str) -> InstanceBuilder {
+        let mut attributes = Attributes::new();
+        attributes.insert(REF_ID_ATTRIBUTE_NAME.into(), Variant::String(id.into()));
+        builder.with_property("Attributes", attributes)
+    }
+
+    fn named(dom: &WeakDom, name: &str) -> Vec<Ref> {
+        dom.descendants()
+            .filter(|inst| inst.name == name)
+            .map(Instance::referent)
+            .collect()
+    }
+
+    /// The project as it is on disk, after an earlier syncback gave IDs out.
+    fn project() -> WeakDom {
+        let mut old = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let storage = old.insert(
+            old.root_ref(),
+            InstanceBuilder::new("ReplicatedStorage").with_name("ReplicatedStorage"),
+        );
+        let rig = old.insert(
+            storage,
+            with_id(InstanceBuilder::new("Model").with_name("Rig"), "rig-id"),
+        );
+        old.insert(
+            rig,
+            with_id(InstanceBuilder::new("Part").with_name("Head"), "head-id"),
+        );
+        for suffix in ["a", "b"] {
+            let twin = old.insert(
+                storage,
+                with_id(
+                    InstanceBuilder::new("Part").with_name("Twin"),
+                    &format!("twin-{suffix}"),
+                ),
+            );
+            old.insert(
+                twin,
+                with_id(
+                    InstanceBuilder::new("Attachment").with_name("Socket"),
+                    &format!("socket-{suffix}"),
+                ),
+            );
+            old.insert(
+                storage,
+                with_id(
+                    InstanceBuilder::new("Part").with_name("Extra"),
+                    &format!("extra-{suffix}"),
+                ),
+            );
+        }
+        old.insert(
+            storage,
+            with_id(
+                InstanceBuilder::new("Part").with_name("Swapped"),
+                "swapped-id",
+            ),
+        );
+        old
+    }
+
+    /// The same place from Studio, where nothing carries a `Rojo_Id` yet.
+    fn upload() -> WeakDom {
+        let mut new = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let storage = new.insert(
+            new.root_ref(),
+            InstanceBuilder::new("ReplicatedStorage").with_name("ReplicatedStorage"),
+        );
+        let rig = new.insert(storage, InstanceBuilder::new("Model").with_name("Rig"));
+        new.insert(rig, InstanceBuilder::new("Part").with_name("Head"));
+        for _ in 0..2 {
+            let twin = new.insert(storage, InstanceBuilder::new("Part").with_name("Twin"));
+            new.insert(twin, InstanceBuilder::new("Attachment").with_name("Socket"));
+        }
+        // There were two on disk, so there's no telling which one is new.
+        for _ in 0..3 {
+            new.insert(storage, InstanceBuilder::new("Part").with_name("Extra"));
+        }
+        // Became a different class, so it's a different instance.
+        new.insert(storage, InstanceBuilder::new("Folder").with_name("Swapped"));
+        new
+    }
+
+    fn id_for<'a>(ids: &'a HashMap<Ref, String>, referent: &Ref) -> Option<&'a str> {
+        ids.get(referent).map(String::as_str)
+    }
+
+    #[test]
+    fn instances_keep_the_ids_they_have_on_disk() {
+        let new = upload();
+        let ids = ids_on_disk(&new, &project());
+
+        assert_eq!(
+            ids.get(&named(&new, "Rig")[0]).map(String::as_str),
+            Some("rig-id")
+        );
+        assert_eq!(
+            ids.get(&named(&new, "Head")[0]).map(String::as_str),
+            Some("head-id")
+        );
+    }
+
+    #[test]
+    fn siblings_sharing_a_name_are_matched_in_order() {
+        let new = upload();
+        let ids = ids_on_disk(&new, &project());
+
+        let twins = named(&new, "Twin");
+        assert_eq!(id_for(&ids, &twins[0]), Some("twin-a"));
+        assert_eq!(id_for(&ids, &twins[1]), Some("twin-b"));
+        // Their children are matched too.
+        let sockets = named(&new, "Socket");
+        assert_eq!(id_for(&ids, &sockets[0]), Some("socket-a"));
+        assert_eq!(id_for(&ids, &sockets[1]), Some("socket-b"));
+    }
+
+    #[test]
+    fn ids_are_not_guessed_for_changed_counts_or_classes() {
+        let new = upload();
+        let ids = ids_on_disk(&new, &project());
+
+        for referent in named(&new, "Extra")
+            .into_iter()
+            .chain(named(&new, "Swapped"))
+        {
+            assert_eq!(ids.get(&referent), None);
+        }
+        // Rig, Head, two Twins, and two Sockets.
+        assert_eq!(ids.len(), 6);
+    }
+
+    #[test]
+    fn ids_an_instance_already_has_are_kept_and_never_duplicated() {
+        let mut new = upload();
+        let rig = named(&new, "Rig")[0];
+        let mut attributes = Attributes::new();
+        attributes.insert(
+            REF_ID_ATTRIBUTE_NAME.into(),
+            Variant::String("own-id".into()),
+        );
+        new.get_by_ref_mut(rig)
+            .unwrap()
+            .properties
+            .insert(ustr("Attributes"), attributes.into());
+        // Another instance already holds the ID Head has on disk.
+        let storage = named(&new, "ReplicatedStorage")[0];
+        new.insert(
+            storage,
+            with_id(
+                InstanceBuilder::new("Folder").with_name("Holder"),
+                "head-id",
+            ),
+        );
+
+        let ids = ids_on_disk(&new, &project());
+        assert_eq!(id_for(&ids, &rig), None);
+        assert_eq!(id_for(&ids, &named(&new, "Head")[0]), None);
+        assert!(!ids.values().any(|id| id == "own-id" || id == "head-id"));
+    }
+
+    #[test]
+    fn linking_uses_the_id_on_disk_for_a_target_without_one() {
+        let mut new = upload();
+        let rig = named(&new, "Rig")[0];
+        let head = named(&new, "Head")[0];
+        new.get_by_ref_mut(rig)
+            .unwrap()
+            .properties
+            .insert(ustr("PrimaryPart"), Variant::Ref(head));
+        // Extra is also referenced, but has no match on disk, so it still gets a
+        // made-up ID.
+        let extra = named(&new, "Extra")[0];
+        new.get_by_ref_mut(rig)
+            .unwrap()
+            .properties
+            .insert(ustr("Extra"), Variant::Ref(extra));
+
+        let links = collect_referents(&new);
+        let ids = ids_on_disk(&new, &project());
+        link_referents(links, &mut new, &ids).unwrap();
+
+        assert_eq!(
+            get_existing_id(new.get_by_ref(head).unwrap()),
+            Some("head-id")
+        );
+        let extra_id = get_existing_id(new.get_by_ref(extra).unwrap()).unwrap();
+        assert!(!extra_id.starts_with("extra-"));
+        let Some(Variant::Attributes(attributes)) = new
+            .get_by_ref(rig)
+            .unwrap()
+            .properties
+            .get(&ustr("Attributes"))
+        else {
+            panic!("Rig should have link attributes");
+        };
+        assert_eq!(
+            attributes.get("Rojo_Target_PrimaryPart"),
+            Some(&Variant::String("head-id".into()))
+        );
+    }
+
+    #[test]
+    fn made_up_ids_never_collide_with_ids_from_disk() {
+        // On disk, Target got the ID made from its UniqueId. It was then renamed
+        // to Moved, and a new Target took its place.
+        let unique_id = UniqueId::now().unwrap();
+        let mut old = WeakDom::new(InstanceBuilder::new("DataModel"));
+        old.insert(
+            old.root_ref(),
+            with_id(
+                InstanceBuilder::new("Part").with_name("Target"),
+                &unique_id.to_string(),
+            ),
+        );
+
+        let mut new = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = new.root_ref();
+        let moved = new.insert(
+            root,
+            InstanceBuilder::new("Part")
+                .with_name("Moved")
+                .with_property("UniqueId", Variant::UniqueId(unique_id)),
+        );
+        let target = new.insert(root, InstanceBuilder::new("Part").with_name("Target"));
+        new.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("ToMoved")
+                .with_property("Value", Variant::Ref(moved)),
+        );
+        new.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("ToTarget")
+                .with_property("Value", Variant::Ref(target)),
+        );
+
+        let links = collect_referents(&new);
+        let ids = ids_on_disk(&new, &old);
+        link_referents(links, &mut new, &ids).unwrap();
+
+        let target_id = get_existing_id(new.get_by_ref(target).unwrap()).unwrap();
+        let moved_id = get_existing_id(new.get_by_ref(moved).unwrap()).unwrap();
+        assert_eq!(target_id, unique_id.to_string());
+        assert_ne!(moved_id, target_id);
+    }
+
+    #[test]
+    fn a_referenced_root_keeps_its_id_on_disk() {
+        // A model project whose root a child points at.
+        let old = WeakDom::new(with_id(InstanceBuilder::new("Model"), "root-id"));
+
+        let mut new = WeakDom::new(InstanceBuilder::new("Model"));
+        let root = new.root_ref();
+        new.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("ToRoot")
+                .with_property("Value", Variant::Ref(root)),
+        );
+
+        let links = collect_referents(&new);
+        let ids = ids_on_disk(&new, &old);
+        link_referents(links, &mut new, &ids).unwrap();
+        assert_eq!(get_existing_id(new.root()), Some("root-id"));
+
+        // A root of another class is a different instance.
+        let folder = WeakDom::new(InstanceBuilder::new("Folder"));
+        assert!(ids_on_disk(&folder, &old).is_empty());
+    }
+
+    #[test]
+    fn finding_ids_on_disk_is_pure() {
+        let new = upload();
+        let old = project();
+        let sorted = |ids: HashMap<Ref, String>| {
+            let mut ids: Vec<_> = ids.into_values().collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            sorted(ids_on_disk(&new, &old)),
+            sorted(ids_on_disk(&new, &old))
+        );
     }
 }

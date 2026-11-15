@@ -8,7 +8,7 @@ use crate::project::Project;
 
 use super::resolve_path;
 
-/// Reformat a Rojo project using the standard JSON formatting rules.
+/// Reformat a Rojo+ project using the standard JSON formatting rules.
 #[derive(Debug, Parser)]
 pub struct FmtProjectCommand {
     /// Path to the project to format. Defaults to the current directory.

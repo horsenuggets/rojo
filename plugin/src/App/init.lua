@@ -64,7 +64,9 @@ function App:init()
 	self.notifId = 0
 
 	self.waypointConnection = ChangeHistoryService.OnUndo:Connect(function(action: string)
-		if not string.find(action, "^Rojo: Patch") then
+		-- A plain prefix comparison, because "+" in the prefix is special in patterns.
+		local prefix = ServeSession.PATCH_RECORDING_PREFIX
+		if string.sub(action, 1, #prefix) ~= prefix then
 			return
 		end
 
@@ -575,7 +577,7 @@ function App:isAutoConnectPlaytestServerAvailable()
 		and RunService:IsStudio()
 		and RunService:IsServer()
 		and Settings:get("autoConnectPlaytestServer")
-		and workspace:GetAttribute("__Rojo_ConnectionUrl")
+		and workspace:GetAttribute("__RojoPlus_ConnectionUrl")
 end
 
 function App:isAutoConnectPlaytestServerWriteable()
@@ -588,7 +590,7 @@ function App:setRunningConnectionInfo(baseUrl: string)
 	end
 
 	Log.trace("Setting connection info for play solo auto-connect")
-	workspace:SetAttribute("__Rojo_ConnectionUrl", baseUrl)
+	workspace:SetAttribute("__RojoPlus_ConnectionUrl", baseUrl)
 end
 
 function App:clearRunningConnectionInfo()
@@ -598,11 +600,11 @@ function App:clearRunningConnectionInfo()
 	end
 
 	Log.trace("Clearing connection info for play solo auto-connect")
-	workspace:SetAttribute("__Rojo_ConnectionUrl", nil)
+	workspace:SetAttribute("__RojoPlus_ConnectionUrl", nil)
 end
 
 function App:useRunningConnectionInfo()
-	local connectionInfo = workspace:GetAttribute("__Rojo_ConnectionUrl")
+	local connectionInfo = workspace:GetAttribute("__RojoPlus_ConnectionUrl")
 	if not connectionInfo then
 		return
 	end
@@ -887,7 +889,9 @@ function App:endSession()
 end
 
 function App:render()
-	local pluginName = "Rojo " .. Version.display(Config.version)
+	-- The widget ID used to include the version, which reset the dock layout on
+	-- every update, so the name alone is used now.
+	local pluginName = "Rojo+"
 
 	local function createPageElement(appStatus, additionalProps)
 		additionalProps = additionalProps or {}
@@ -1012,7 +1016,7 @@ function App:render()
 					}),
 				}),
 
-				RojoNotifications = e("ScreenGui", {
+				RojoPlusNotifications = e("ScreenGui", {
 					ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 					ResetOnSpawn = false,
 					DisplayOrder = 100,
@@ -1028,9 +1032,9 @@ function App:render()
 			}),
 
 			toggleAction = e(StudioPluginAction, {
-				name = "RojoConnection",
-				title = "Rojo: Connect/Disconnect",
-				description = "Toggles the server for a Rojo sync session",
+				name = "RojoPlusConnection",
+				title = "Rojo+: Connect/Disconnect",
+				description = "Toggles the server for a Rojo+ sync session",
 				icon = Assets.Images.PluginButton,
 				bindable = true,
 				onTriggered = function()
@@ -1045,9 +1049,9 @@ function App:render()
 			}),
 
 			connectAction = e(StudioPluginAction, {
-				name = "RojoConnect",
-				title = "Rojo: Connect",
-				description = "Connects the server for a Rojo sync session",
+				name = "RojoPlusConnect",
+				title = "Rojo+: Connect",
+				description = "Connects the server for a Rojo+ sync session",
 				icon = Assets.Images.PluginButton,
 				bindable = true,
 				onTriggered = function()
@@ -1058,9 +1062,9 @@ function App:render()
 			}),
 
 			disconnectAction = e(StudioPluginAction, {
-				name = "RojoDisconnect",
-				title = "Rojo: Disconnect",
-				description = "Disconnects the server for a Rojo sync session",
+				name = "RojoPlusDisconnect",
+				title = "Rojo+: Disconnect",
+				description = "Disconnects the server for a Rojo+ sync session",
 				icon = Assets.Images.PluginButton,
 				bindable = true,
 				onTriggered = function()
@@ -1074,8 +1078,8 @@ function App:render()
 				name = pluginName,
 			}, {
 				button = e(StudioToggleButton, {
-					name = "Rojo",
-					tooltip = "Show or hide the Rojo panel",
+					name = "Rojo+",
+					tooltip = "Show or hide the Rojo+ panel",
 					icon = self.state.toolbarIcon,
 					active = self.state.guiEnabled,
 					enabled = true,

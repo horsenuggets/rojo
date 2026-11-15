@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     json,
-    resolution::UnresolvedValue,
+    resolution::{AmbiguousValue, UnresolvedValue},
     snapshot::{InstanceMetadata, InstanceSnapshot},
     syncback::{is_json_compatible, SyncbackSnapshot},
     variant_eq::variant_eq,
-    RojoRef,
+    RojoRef, REF_ID_ATTRIBUTE_NAME,
 };
 
 /// Splits serializable values into metadata properties and attributes, sorted
@@ -61,6 +61,25 @@ pub fn serialize_values<'a>(
         }
     }
     (properties, attributes)
+}
+
+/// Returns the `id` to write to a metadata file, given the ID the instance
+/// already has and the attributes being written.
+///
+/// Reading a file copies its `Rojo_Id` attribute into the instance's ID, so
+/// writing that ID back as `id` would add a duplicate on every syncback after
+/// the first. It's only written when the attributes don't already carry it.
+fn metadata_id(
+    specified_id: Option<&RojoRef>,
+    attributes: &IndexMap<String, UnresolvedValue>,
+) -> Option<String> {
+    let id = specified_id?.to_string();
+    let carried = match attributes.get(REF_ID_ATTRIBUTE_NAME) {
+        Some(UnresolvedValue::FullyQualified(Variant::String(value))) => *value == id,
+        Some(UnresolvedValue::Ambiguous(AmbiguousValue::String(value))) => *value == id,
+        _ => false,
+    };
+    (!carried).then_some(id)
 }
 
 /// The key order of a metadata file that already exists. Rewriting the file in
@@ -378,6 +397,13 @@ impl AdjacentMetadata {
             );
         }
 
+        let id = metadata_id(
+            snapshot
+                .old_inst()
+                .and_then(|inst| inst.metadata().specified_id.as_ref()),
+            &attributes,
+        );
+
         Ok(Some(Self {
             ignore_unknown_instances: if ignore_unknown_instances {
                 Some(true)
@@ -388,12 +414,7 @@ impl AdjacentMetadata {
             properties,
             attributes,
             path,
-            id: snapshot.old_inst().and_then(|inst| {
-                inst.metadata()
-                    .specified_id
-                    .as_ref()
-                    .map(ToString::to_string)
-            }),
+            id,
             schema,
         }))
     }
@@ -608,6 +629,13 @@ impl DirectoryMetadata {
             &mut attributes,
         );
 
+        let id = metadata_id(
+            snapshot
+                .old_inst()
+                .and_then(|inst| inst.metadata().specified_id.as_ref()),
+            &attributes,
+        );
+
         Ok(Some(Self {
             ignore_unknown_instances: if ignore_unknown_instances {
                 Some(true)
@@ -620,12 +648,7 @@ impl DirectoryMetadata {
             children: Vec::new(),
             class_name: None,
             path,
-            id: snapshot.old_inst().and_then(|inst| {
-                inst.metadata()
-                    .specified_id
-                    .as_ref()
-                    .map(ToString::to_string)
-            }),
+            id,
             schema,
         }))
     }
@@ -774,6 +797,39 @@ mod test {
     use rbx_dom_weak::ustr;
 
     use super::*;
+
+    #[test]
+    fn metadata_ids_are_only_written_when_no_attribute_carries_them() {
+        let id = RojoRef::new("abc".into());
+        let attributes_with =
+            |value: UnresolvedValue| IndexMap::from([(REF_ID_ATTRIBUTE_NAME.to_owned(), value)]);
+
+        // An ID read from a Rojo_Id attribute is already written by the attribute.
+        let carried = [
+            attributes_with(UnresolvedValue::FullyQualified(Variant::String(
+                "abc".into(),
+            ))),
+            attributes_with(UnresolvedValue::Ambiguous(AmbiguousValue::String(
+                "abc".into(),
+            ))),
+        ];
+        for attributes in &carried {
+            assert_eq!(metadata_id(Some(&id), attributes), None);
+        }
+
+        // Otherwise the ID has nowhere else to go, so it's kept.
+        let elsewhere = [
+            IndexMap::new(),
+            attributes_with(UnresolvedValue::Ambiguous(AmbiguousValue::String(
+                "different".into(),
+            ))),
+        ];
+        for attributes in &elsewhere {
+            assert_eq!(metadata_id(Some(&id), attributes).as_deref(), Some("abc"));
+        }
+
+        assert_eq!(metadata_id(None, &carried[0]), None);
+    }
 
     #[test]
     fn existing_key_order_follows_the_file_including_jsonc() {

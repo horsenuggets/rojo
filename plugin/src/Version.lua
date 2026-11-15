@@ -257,7 +257,7 @@ function Version.getUpdateMessage(): string?
 	end
 
 	return string.format(
-		"A newer compatible version of Rojo, %s, was published %s! Go to the Rojo releases page to learn more.",
+		"A newer compatible version of Rojo+, %s, was published %s! Go to the Rojo+ releases page to learn more.",
 		Version.display(latestCompatibleVersion.version),
 		timeUtil.elapsedToText(DateTime.now().UnixTimestamp - latestCompatibleVersion.publishedUnixTimestamp)
 	)

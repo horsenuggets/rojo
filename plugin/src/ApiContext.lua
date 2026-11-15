@@ -27,8 +27,8 @@ end
 local function rejectWrongProtocolVersion(infoResponseBody)
 	if infoResponseBody.protocolVersion ~= Config.protocolVersion then
 		local message = (
-			"Found a Rojo dev server, but it's using a different protocol version, and is incompatible."
-			.. "\nMake sure you have matching versions of both the Rojo plugin and server!"
+			"Found a Rojo+ dev server, but it's using a different protocol version, and is incompatible."
+			.. "\nMake sure you have matching versions of both the Rojo+ plugin and server!"
 			.. "\n\nYour client is version %s, with protocol version %s. It expects server version %s."
 			.. "\nYour server is version %s, with protocol version %s."
 			.. "\n\nGo to https://github.com/rojo-rbx/rojo for more details."
@@ -57,7 +57,7 @@ local function rejectWrongPlaceId(infoResponseBody)
 			end
 
 			local message = (
-				"Found a Rojo server, but its project is set to only be used with a specific list of places."
+				"Found a Rojo+ server, but its project is set to only be used with a specific list of places."
 				.. "\nYour place ID is %u, but needs to be one of these:"
 				.. "\n%s"
 				.. "\n\nTo change this list, edit 'servePlaceIds' in your .project.json file."
@@ -77,7 +77,7 @@ local function rejectWrongPlaceId(infoResponseBody)
 			end
 
 			local message = (
-				"Found a Rojo server, but its project is set to not be used with a specific list of places."
+				"Found a Rojo+ server, but its project is set to not be used with a specific list of places."
 				.. "\nYour place ID is %u, but needs to not be one of these:"
 				.. "\n%s"
 				.. "\n\nTo change this list, edit 'blockedPlaceIds' in your .project.json file."

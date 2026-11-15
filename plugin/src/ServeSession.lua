@@ -61,6 +61,10 @@ ServeSession.__index = ServeSession
 
 ServeSession.Status = Status
 
+-- Names the undo waypoint for each applied patch. The app watches for it to
+-- notice when a patch is undone.
+ServeSession.PATCH_RECORDING_PREFIX = "Rojo+: Patch "
+
 function ServeSession.getWriteStatus(result)
 	assert(t.table(result))
 
@@ -521,7 +525,8 @@ end
 
 function ServeSession:__applyPatch(patch)
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
-	local historyRecording = ChangeHistoryService:TryBeginRecording("Rojo: Patch " .. patchTimestamp)
+	local historyRecording =
+		ChangeHistoryService:TryBeginRecording(ServeSession.PATCH_RECORDING_PREFIX .. patchTimestamp)
 	if not historyRecording then
 		-- There can only be one recording at a time
 		Log.debug("Failed to begin history recording for " .. patchTimestamp .. ". Another recording is in progress.")
@@ -584,7 +589,7 @@ function ServeSession:__applyPatch(patch)
 
 	if not PatchSet.isEmpty(unappliedPatch) then
 		Log.debug(
-			"Could not apply all changes requested by the Rojo server:\n{}",
+			"Could not apply all changes requested by the Rojo+ server:\n{}",
 			PatchSet.humanSummary(self.__instanceMap, unappliedPatch)
 		)
 	end
@@ -637,7 +642,7 @@ function ServeSession:__initialSync(serverInfo)
 				-- message instead of crashing.
 				return Promise.reject(
 					"Cannot sync a model as a place."
-						.. "\nEnsure Rojo is serving a project file that has a DataModel at the root of its tree and try again."
+						.. "\nEnsure Rojo+ is serving a project file that has a DataModel at the root of its tree and try again."
 						.. "\nSee project file docs: https://rojo.space/docs/v7/project-format/"
 				)
 			end
@@ -651,7 +656,7 @@ function ServeSession:__initialSync(serverInfo)
 		end
 
 		if userDecision == "Abort" then
-			return Promise.reject("Aborted Rojo sync operation")
+			return Promise.reject("Aborted Rojo+ sync operation")
 		elseif userDecision == "Reject" then
 			if not self.__twoWaySync then
 				return Promise.reject("Cannot reject sync operation without two-way sync enabled")
