@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.2`
+
 * Persist two-way sync renames and parent changes for filesystem-backed instances as
   recoverable, no-clobber relocations. Directory moves preserve unmanaged contents, file
   moves include existing metadata sidecars, and moved instances keep their IDs and path
