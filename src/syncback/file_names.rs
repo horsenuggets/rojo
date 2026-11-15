@@ -8,7 +8,10 @@ use std::{
 };
 
 use anyhow::Context;
-use rbx_dom_weak::{types::Ref, Instance, WeakDom};
+use rbx_dom_weak::{
+    types::{Ref, Variant},
+    Instance, WeakDom,
+};
 
 use crate::{snapshot::InstanceWithMeta, snapshot_middleware::Middleware};
 
@@ -19,11 +22,16 @@ pub fn name_for_inst<'old>(
 ) -> anyhow::Result<Cow<'old, str>> {
     if let Some(old_inst) = old_inst {
         if let Some(source) = old_inst.metadata().relevant_paths.first() {
-            source
+            let name = source
                 .file_name()
                 .and_then(|s| s.to_str())
-                .map(Cow::Borrowed)
-                .context("sources on the file system should be valid unicode and not be stubs")
+                .context("sources on the file system should be valid unicode and not be stubs")?;
+            Ok(canonical_script_source_name(
+                middleware,
+                source,
+                &old_inst.metadata().context.sync_rules,
+            )
+            .unwrap_or(Cow::Borrowed(name)))
         } else {
             // This is technically not /always/ true, but we want to avoid
             // running syncback on anything that has no instigating source
@@ -55,6 +63,80 @@ pub fn name_for_inst<'old>(
     }
 }
 
+/// Keeps a script's physical stem and source extension while replacing an
+/// incompatible script-kind suffix. Directories retain their existing names.
+pub(super) fn canonical_script_file_name(
+    middleware: Middleware,
+    name: &str,
+) -> Option<Cow<'_, str>> {
+    if middleware.is_dir() {
+        return None;
+    }
+    let kind = script_kind_suffix(middleware)?;
+    let (base, extension) = name.rsplit_once('.')?;
+    if !matches!(extension, "lua" | "luau") {
+        return None;
+    }
+    let stem = [".server", ".client", ".legacy", ".local", ".plugin"]
+        .into_iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+        .unwrap_or(base);
+    let canonical = format!("{stem}{kind}.{extension}");
+    Some(if canonical == name {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(canonical)
+    })
+}
+
+/// Uses the forward rule's actual stem, so custom suffixes do not change names
+/// or collapse distinct script sources onto the same destination.
+pub(super) fn canonical_script_source_name<'a>(
+    middleware: Middleware,
+    source: &'a Path,
+    rules: &[crate::snapshot::SyncRule],
+) -> Option<Cow<'a, str>> {
+    if middleware.is_dir() {
+        return None;
+    }
+    let name = source.file_name()?.to_str()?;
+    let kind = script_kind_suffix(middleware)?;
+    let extension = source.extension()?.to_str()?;
+    if !matches!(extension, "lua" | "luau") {
+        return None;
+    }
+    let Some(rule) = rules
+        .iter()
+        .chain(crate::snapshot_middleware::default_sync_rules())
+        .find(|rule| rule.matches(source))
+    else {
+        return canonical_script_file_name(middleware, name);
+    };
+    let stem = rule.file_name_for_path(source).ok()?;
+    let canonical = format!("{stem}{kind}.{extension}");
+    Some(if canonical == name {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(canonical)
+    })
+}
+
+pub(super) fn script_kind_suffix(middleware: Middleware) -> Option<&'static str> {
+    match middleware {
+        Middleware::ServerScript
+        | Middleware::RunContextServerScript
+        | Middleware::ServerScriptDir => Some(".server"),
+        Middleware::ClientScript
+        | Middleware::RunContextClientScript
+        | Middleware::ClientScriptDir => Some(".client"),
+        Middleware::LegacyServerScript | Middleware::LegacyServerScriptDir => Some(".legacy"),
+        Middleware::LegacyClientScript | Middleware::LegacyClientScriptDir => Some(".local"),
+        Middleware::ModuleScript | Middleware::ModuleScriptDir => Some(""),
+        Middleware::PluginScript | Middleware::PluginScriptDir => Some(".plugin"),
+        _ => None,
+    }
+}
+
 /// Returns the file name to use for a new Instance with the given middleware
 /// and a stem from [`unique_child_stems`], which is already safe to write.
 pub fn file_name_for_stem(middleware: Middleware, stem: &str) -> String {
@@ -82,8 +164,10 @@ pub fn extension_for_middleware(middleware: Middleware) -> &'static str {
         Middleware::Csv => "csv",
         Middleware::JsonModel => "model.json",
         Middleware::Json => "json",
-        Middleware::ServerScript => "server.luau",
-        Middleware::ClientScript => "client.luau",
+        Middleware::ServerScript | Middleware::RunContextServerScript => "server.luau",
+        Middleware::ClientScript | Middleware::RunContextClientScript => "client.luau",
+        Middleware::LegacyServerScript => "legacy.luau",
+        Middleware::LegacyClientScript => "local.luau",
         Middleware::ModuleScript => "luau",
         Middleware::PluginScript => "plugin.luau",
         Middleware::Project => "project.json",
@@ -92,13 +176,6 @@ pub fn extension_for_middleware(middleware: Middleware) -> &'static str {
         Middleware::Toml => "toml",
         Middleware::Text => "txt",
         Middleware::Yaml => "yml",
-
-        Middleware::LegacyServerScript
-        | Middleware::LegacyClientScript
-        | Middleware::RunContextServerScript
-        | Middleware::RunContextClientScript => {
-            todo!("syncback does not work on the middleware {middleware:?} yet")
-        }
         // These are manually specified and not `_` to guard against future
         // middleware additions missing this function.
         Middleware::Ignore => unimplemented!("syncback does not work on Ignore middleware"),
@@ -162,29 +239,64 @@ pub fn validate_file_name<S: AsRef<str>>(name: S) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Selects a script's representation from its class and execution context, not
+/// from the historical meaning of `.server` and `.client` files.
+pub fn script_middleware_for_instance(inst: &Instance) -> Option<Middleware> {
+    match inst.class.as_str() {
+        "LocalScript" => Some(Middleware::LegacyClientScript),
+        "ModuleScript" => Some(Middleware::ModuleScript),
+        "Script" => {
+            let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+            let context = match inst.properties.get(&"RunContext".into()) {
+                Some(Variant::Enum(context)) => context.to_u32(),
+                _ => contexts["Legacy"],
+            };
+            Some(if context == contexts["Client"] {
+                Middleware::RunContextClientScript
+            } else if context == contexts["Server"] {
+                Middleware::RunContextServerScript
+            } else if context == contexts["Plugin"] {
+                Middleware::PluginScript
+            } else {
+                Middleware::LegacyServerScript
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Returns the middleware used for an Instance in `instancesAsDirectories`
 /// mode, including the directory variant when it has children.
 pub fn directory_middleware_for_instance(inst: &Instance) -> Middleware {
-    let middleware = match inst.class.as_str() {
-        "Script" => Middleware::ServerScript,
-        "LocalScript" => Middleware::ClientScript,
-        "ModuleScript" => Middleware::ModuleScript,
-        "StringValue" => Middleware::Text,
-        "LocalizationTable" => Middleware::Csv,
-        _ => Middleware::Dir,
-    };
+    let middleware =
+        script_middleware_for_instance(inst).unwrap_or_else(|| match inst.class.as_str() {
+            "StringValue" => Middleware::Text,
+            "LocalizationTable" => Middleware::Csv,
+            _ => Middleware::Dir,
+        });
 
     if inst.children().is_empty() {
         middleware
     } else {
-        match middleware {
-            Middleware::ServerScript => Middleware::ServerScriptDir,
-            Middleware::ClientScript => Middleware::ClientScriptDir,
-            Middleware::ModuleScript => Middleware::ModuleScriptDir,
-            Middleware::Csv => Middleware::CsvDir,
-            Middleware::Text => Middleware::Dir,
-            other => other,
+        directory_variant(middleware)
+    }
+}
+
+pub(super) fn directory_variant(middleware: Middleware) -> Middleware {
+    match middleware {
+        Middleware::ServerScript | Middleware::RunContextServerScript => {
+            Middleware::ServerScriptDir
         }
+        Middleware::ClientScript | Middleware::RunContextClientScript => {
+            Middleware::ClientScriptDir
+        }
+        Middleware::LegacyServerScript => Middleware::LegacyServerScriptDir,
+        Middleware::LegacyClientScript => Middleware::LegacyClientScriptDir,
+        Middleware::PluginScript => Middleware::PluginScriptDir,
+        Middleware::ModuleScript => Middleware::ModuleScriptDir,
+        Middleware::Csv => Middleware::CsvDir,
+        Middleware::Text | Middleware::JsonModel => Middleware::Dir,
+        other => other,
     }
 }
 
@@ -350,6 +462,127 @@ mod test {
         refs.iter()
             .map(|referent| stems[referent].clone())
             .collect()
+    }
+
+    #[test]
+    fn script_kinds_follow_class_and_run_context() {
+        use rbx_dom_weak::types::Enum;
+
+        let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+        for (class, context, extension, directory) in [
+            ("ModuleScript", None, "luau", Middleware::ModuleScriptDir),
+            (
+                "LocalScript",
+                None,
+                "local.luau",
+                Middleware::LegacyClientScriptDir,
+            ),
+            (
+                "Script",
+                None,
+                "legacy.luau",
+                Middleware::LegacyServerScriptDir,
+            ),
+            (
+                "Script",
+                Some("Legacy"),
+                "legacy.luau",
+                Middleware::LegacyServerScriptDir,
+            ),
+            (
+                "Script",
+                Some("Server"),
+                "server.luau",
+                Middleware::ServerScriptDir,
+            ),
+            (
+                "Script",
+                Some("Client"),
+                "client.luau",
+                Middleware::ClientScriptDir,
+            ),
+            (
+                "Script",
+                Some("Plugin"),
+                "plugin.luau",
+                Middleware::PluginScriptDir,
+            ),
+            (
+                "LocalScript",
+                Some("Client"),
+                "local.luau",
+                Middleware::LegacyClientScriptDir,
+            ),
+        ] {
+            for has_children in [false, true] {
+                let mut builder = InstanceBuilder::new(class);
+                if let Some(context) = context {
+                    builder =
+                        builder.with_property("RunContext", Enum::from_u32(contexts[context]));
+                }
+                if has_children {
+                    builder = builder.with_child(InstanceBuilder::new("Folder"));
+                }
+                let dom = WeakDom::new(builder);
+                let actual = directory_middleware_for_instance(dom.root());
+                if has_children {
+                    assert_eq!(actual, directory, "{class} {context:?}");
+                } else {
+                    assert_eq!(
+                        extension_for_middleware(actual),
+                        extension,
+                        "{class} {context:?}"
+                    );
+                    assert_eq!(
+                        file_name_for_stem(actual, "Code"),
+                        format!("Code.{extension}")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn existing_script_names_keep_stems_and_correct_the_kind() {
+        for extension in ["lua", "luau"] {
+            assert_eq!(
+                canonical_script_file_name(
+                    Middleware::LegacyClientScript,
+                    &format!("Effect.client.{extension}")
+                )
+                .unwrap(),
+                format!("Effect.local.{extension}")
+            );
+            assert_eq!(
+                canonical_script_file_name(
+                    Middleware::RunContextClientScript,
+                    &format!("Effect.server.{extension}")
+                )
+                .unwrap(),
+                format!("Effect.client.{extension}")
+            );
+            assert_eq!(
+                canonical_script_file_name(
+                    Middleware::LegacyServerScript,
+                    &format!("Physical.extra.server.{extension}")
+                )
+                .unwrap(),
+                format!("Physical.extra.legacy.{extension}")
+            );
+            let name = format!("Effect.local.{extension}");
+            assert!(matches!(
+                canonical_script_file_name(Middleware::LegacyClientScript, &name),
+                Some(Cow::Borrowed(_))
+            ));
+        }
+        assert_eq!(
+            canonical_script_file_name(Middleware::LegacyClientScriptDir, "Effect.client.luau"),
+            None
+        );
+        assert_eq!(
+            canonical_script_file_name(Middleware::JsonModel, "Effect.model.json"),
+            None
+        );
     }
 
     fn sorted_by_sibling_order(names: &[&str]) -> Vec<String> {

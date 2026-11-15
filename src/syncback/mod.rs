@@ -87,6 +87,25 @@ pub fn syncback_instance(
     ) {
         anyhow::bail!("Model-file updates require subtree serialization");
     }
+    if let (Some(script), Some(source)) = (
+        script_middleware_for_syncback(new_tree.root(), Some(old_inst), project),
+        source_file(&old_inst),
+    ) {
+        if let Some(name) = source.file_name().and_then(|name| name.to_str()) {
+            if file_names::canonical_script_source_name(
+                script,
+                &source,
+                &old_inst.metadata().context.sync_rules,
+            )
+            .is_some_and(|canonical| canonical != name)
+            {
+                anyhow::bail!(
+                    "This script's class or RunContext requires a different source filename. \
+                     Run a full syncback to safely update the script suffix."
+                );
+            }
+        }
+    }
     let attribute_ids = attribute_ids(&new_tree);
     let snapshot = SyncbackSnapshot {
         data: SyncbackData {
@@ -95,6 +114,7 @@ pub fn syncback_instance(
             new_tree: &new_tree,
             project,
             scoped: true,
+            context: None,
             script_containers: None,
             attribute_ids: &attribute_ids,
         },
@@ -314,11 +334,44 @@ pub fn syncback_loop(
 
     let project_path = project.folder_location();
 
-    let relayout = if instances_as_directories(project) {
+    let mut relayout = if instances_as_directories(project) {
         inline::needs_relayout(old_tree)
     } else {
         HashSet::new()
     };
+    for instance in old_tree.inner().descendants() {
+        let old = old_tree.get_instance(instance.referent()).unwrap();
+        if !matches!(
+            old.metadata().instigating_source,
+            Some(crate::snapshot::InstigatingSource::Path(_))
+        ) {
+            continue;
+        }
+        let Some(middleware) = script_middleware_for_syncback(instance, Some(old), project) else {
+            continue;
+        };
+        let Some(source) = source_file(&old) else {
+            continue;
+        };
+        let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_names::canonical_script_source_name(
+            middleware,
+            &source,
+            &old.metadata().context.sync_rules,
+        )
+        .is_some_and(|canonical| canonical != name)
+        {
+            let mut current = old.id();
+            while relayout.insert(current) {
+                match old_tree.get_instance(current) {
+                    Some(ancestor) if ancestor.parent().is_some() => current = ancestor.parent(),
+                    _ => break,
+                }
+            }
+        }
+    }
     let script_containers = inline::script_containers(&new_tree);
     let attribute_ids = attribute_ids(&new_tree);
     let syncback_data = SyncbackData {
@@ -327,6 +380,7 @@ pub fn syncback_loop(
         new_tree: &new_tree,
         project,
         scoped: false,
+        context: None,
         script_containers: Some(&script_containers),
         attribute_ids: &attribute_ids,
     };
@@ -340,6 +394,7 @@ pub fn syncback_loop(
     }];
 
     let mut fs_snapshot = FsSnapshot::new();
+    let mut file_owners = HashMap::new();
 
     'syncback: while let Some(snapshot) = snapshots.pop() {
         let inst_path = snapshot.get_new_inst_path(snapshot.new);
@@ -361,6 +416,10 @@ pub fn syncback_loop(
             }
         }
 
+        if snapshot.is_script_suffix_migration(&snapshot.path) {
+            let old_source = snapshot.old_inst().as_ref().and_then(source_file).unwrap();
+            snapshot.validate_script_migration(&old_source, &snapshot.path)?;
+        }
         if !is_valid_path(&ignore_patterns, project_path, &snapshot.path) {
             log::debug!("Skipping {inst_path} because its path matches ignore pattern");
             continue;
@@ -480,9 +539,12 @@ pub fn syncback_loop(
 
         // TODO provide replacement snapshots for e.g. two way sync
 
-        fs_snapshot.merge_with_filter(syncback.fs_snapshot, |path| {
-            is_valid_path(&ignore_patterns, project_path, path)
-        });
+        fs_snapshot.merge_with_filter(
+            syncback.fs_snapshot,
+            |path| is_valid_path(&ignore_patterns, project_path, path),
+            snapshot.new,
+            &mut file_owners,
+        )?;
 
         snapshots.extend(syncback.children);
     }
@@ -494,6 +556,26 @@ pub struct SyncbackReturn<'sync> {
     pub fs_snapshot: FsSnapshot,
     pub children: Vec<SyncbackSnapshot<'sync>>,
     pub removed_children: Vec<InstanceWithMeta<'sync>>,
+}
+
+fn script_middleware_for_syncback(
+    instance: &Instance,
+    old: Option<InstanceWithMeta>,
+    project: &Project,
+) -> Option<Middleware> {
+    if instance.class.as_str() == "Script"
+        && get_property_filter(project, instance)
+            .is_some_and(|ignored| ignored.contains(&"RunContext".into()))
+    {
+        if let Some(middleware) = old
+            .filter(|old| old.class_name() == "Script")
+            .and_then(|old| old.metadata().middleware)
+            .filter(|middleware| file_names::script_kind_suffix(*middleware).is_some())
+        {
+            return Some(middleware);
+        }
+    }
+    file_names::script_middleware_for_instance(instance)
 }
 
 pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
@@ -538,6 +620,17 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
 
     if let Some(override_middleware) = snapshot.middleware {
         return override_middleware;
+    } else if let Some(script) =
+        script_middleware_for_syncback(inst, snapshot.old_inst(), snapshot.project()).filter(|_| {
+            old_middleware.is_none_or(|old| file_names::script_kind_suffix(old).is_some())
+        })
+    {
+        if !inst.children().is_empty() || old_middleware.is_some_and(|old| old.is_dir()) {
+            return file_names::directory_variant(script);
+        }
+        return script;
+    } else if old_middleware == Some(Middleware::Project) {
+        return Middleware::Project;
     } else if instances_as_directories(snapshot.project()) {
         return directory_middleware_for_instance(inst);
     } else if let Some(old_middleware) = old_middleware {
@@ -559,15 +652,7 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
     }
 
     if !inst.children().is_empty() {
-        middleware = match middleware {
-            Middleware::ServerScript => Middleware::ServerScriptDir,
-            Middleware::ClientScript => Middleware::ClientScriptDir,
-            Middleware::PluginScript => Middleware::PluginScriptDir,
-            Middleware::ModuleScript => Middleware::ModuleScriptDir,
-            Middleware::Csv => Middleware::CsvDir,
-            Middleware::JsonModel | Middleware::Text => Middleware::Dir,
-            _ => middleware,
-        }
+        middleware = file_names::directory_variant(middleware)
     }
 
     if middleware == Middleware::Rbxm {
@@ -776,6 +861,67 @@ mod test {
     use super::*;
     use crate::snapshot::{InstanceMetadata, InstanceSnapshot};
     use rbx_dom_weak::{types::Attributes, UstrMap};
+
+    #[test]
+    fn scoped_script_writes_reject_suffix_changes_without_touching_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let project_path = temp.path().join("default.project.json");
+        vfs.write(
+            &project_path,
+            r#"{"name":"Test","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        let project = Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+        for (name, class, middleware) in [
+            (
+                "Server.server.luau",
+                "Script",
+                Middleware::RunContextServerScript,
+            ),
+            (
+                "Local.client.luau",
+                "LocalScript",
+                Middleware::LegacyClientScript,
+            ),
+        ] {
+            let path = temp.path().join(name);
+            vfs.write(&path, "return 1").unwrap();
+            let tree = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("Code")
+                    .class_name(class)
+                    .metadata(
+                        InstanceMetadata::new()
+                            .instigating_source(path.clone())
+                            .middleware(middleware),
+                    ),
+            );
+            let mut builder = rbx_dom_weak::InstanceBuilder::new(class)
+                .with_name("Code")
+                .with_property("Source", "return 2");
+            if class == "Script" {
+                let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+                builder = builder.with_property(
+                    "RunContext",
+                    rbx_dom_weak::types::Enum::from_u32(contexts["Client"]),
+                );
+            }
+            let error = syncback_instance(
+                &vfs,
+                &tree,
+                &project,
+                tree.get_root_id(),
+                WeakDom::new(builder),
+            )
+            .err()
+            .expect("A suffix-changing scoped write must be rejected");
+            assert!(error.to_string().contains("full syncback"), "{error}");
+            assert_eq!(fs_err::read_to_string(&path).unwrap(), "return 1");
+            assert!(!temp.path().join("Code.meta.json").exists());
+        }
+    }
 
     #[test]
     fn scoped_instance_write_preserves_properties_and_orders_class_name_first() {

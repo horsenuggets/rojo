@@ -1,5 +1,5 @@
 ---
 source: tests/tests/syncback.rs
-expression: src/Expand/Holder/Added.server.luau
+expression: src/Expand/Holder/Added.legacy.luau
 ---
 print('added')

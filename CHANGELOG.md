@@ -31,6 +31,26 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Choose syncback script suffixes from the instance class and `RunContext`. LocalScripts
+  use `.local.luau`, legacy Scripts use `.legacy.luau`, and Scripts with Server or Client
+  context use `.server.luau` or `.client.luau`. Recognize `.local` and `.legacy` script
+  suffixes without custom sync rules, and interpret the default `.server` and `.client`
+  suffixes as explicit RunContexts regardless of `emitLegacyScripts`. Preserve script
+  kinds when rebuilding exported files, including scripts with children. Normalize
+  unchanged script filenames during full syncback without overwriting unmanaged files.
+  Reject scoped two-way edits that require a filename change and direct them to full
+  syncback instead of saving a mismatched script kind. Preserve custom-rule stems,
+  adjacent metadata, and initializer source extensions during suffix migrations. Reject
+  migrations excluded by ignore paths, and retain explicit execution-context overrides
+  for fixed project paths while respecting ignored properties. Use effective nested sync
+  rules and reject conflicting staged source or metadata destinations before persistence.
+  Reject destinations whose sync rules would change the script kind or decoded name, and
+  preserve tracked script representations when execution context is ignored. Apply
+  destination context to newly added scripts, including new folders inside nested projects.
+
+* Drop an obsolete metadata `id` immediately when a new `Rojo_Id` attribute replaces it,
+  so exporting a place does not need a second syncback to remove the stale ID.
+
 ## `7.7.1-horse.1.2`
 
 * Persist two-way sync renames and parent changes for filesystem-backed instances as
