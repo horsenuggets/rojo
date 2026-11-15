@@ -17,7 +17,8 @@ use crate::rojo_test::{
 };
 
 use librojo::web_api::{
-    InstanceUpdate, SerializeResponse, SocketPacketType, WriteAuthority, WriteRequest,
+    InstanceUpdate, SerializeResponse, SocketPacketBody, SocketPacketType, WriteAuthority,
+    WriteRequest,
 };
 
 #[test]
@@ -112,6 +113,24 @@ fn assert_numeric_api_writes_converge(cases: &[(f64, f64)]) {
                     );
                 }
 
+                if attempt > 0 && input != expected {
+                    let packet = session
+                        .get_api_socket_packet(SocketPacketType::Messages, read.message_cursor)
+                        .unwrap();
+                    let SocketPacketBody::Messages(packet) = packet.body;
+                    assert!(
+                        packet
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.updated)
+                            .any(|update| {
+                                update.id == id
+                                    && update.changed_properties.get(&ustr("Value"))
+                                        == Some(&Some(Variant::Float64(expected)))
+                            }),
+                        "Studio must receive the canonical value for {input}."
+                    );
+                }
                 let contents = fs::read_to_string(&metadata_path).unwrap();
                 let metadata: serde_json::Value = serde_json::from_str(&contents).unwrap();
                 let value = &metadata["properties"]["Value"];

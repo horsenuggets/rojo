@@ -16,7 +16,8 @@ use crate::{
     resolution::normalize_json_variant,
     snapshot::{
         apply_patch_set, compute_patch_set, compute_shallow_patch_set, AppliedPatchSet,
-        InstanceSnapshot, InstigatingSource, PatchAdd, PatchSet, PatchUpdate, RojoTree,
+        AppliedPatchUpdate, InstanceSnapshot, InstigatingSource, PatchAdd, PatchSet, PatchUpdate,
+        RojoTree,
     },
     snapshot_middleware::{
         snapshot_from_vfs, snapshot_project_node, snapshot_shallow_from_vfs, Middleware,
@@ -686,6 +687,7 @@ impl JobThreadContext {
             .classes
             .get(instance.class_name().as_str())
             .map(|class| &class.default_properties);
+        let requested_update = update;
         let mut normalized_update = update.clone();
         for (key, value) in &mut normalized_update.changed_properties {
             if let Some(original) = value {
@@ -706,6 +708,7 @@ impl JobThreadContext {
             Some(_) => (instance.name(), instance.properties()),
             None => (disk_root.name.as_ref() as &str, &disk_root.properties),
         };
+        let mut normalization_corrections = UstrMap::new();
         let mut accepted_properties = UstrMap::new();
         let mut conflict_properties = UstrMap::new();
         let mut accepted_name = None;
@@ -739,7 +742,18 @@ impl JobThreadContext {
                 disk_value,
                 studio_value.as_ref().or(default),
             ) {
-                PropertyWriteDecision::AlreadySynchronized => {}
+                PropertyWriteDecision::AlreadySynchronized => {
+                    let requested = requested_update.changed_properties[key].as_ref();
+                    // Compare exact finite values, but let serde's null representation
+                    // keep unchanged NaNs from triggering redundant corrections.
+                    if requested.is_some()
+                        && requested != disk_value
+                        && serde_json::to_value(requested).expect("Variants must serialize")
+                            != serde_json::to_value(disk_value).expect("Variants must serialize")
+                    {
+                        normalization_corrections.insert(*key, disk_properties.get(key).cloned());
+                    }
+                }
                 PropertyWriteDecision::RestoreFilesystem => {
                     conflict_properties.insert(*key, disk_value.cloned());
                 }
@@ -806,6 +820,15 @@ impl JobThreadContext {
                 changed_class_name: None,
                 changed_properties: conflict_properties,
                 changed_metadata: None,
+            });
+        }
+        if !normalization_corrections.is_empty() {
+            messages.push(AppliedPatchSet {
+                updated: vec![AppliedPatchUpdate {
+                    changed_properties: normalization_corrections,
+                    ..AppliedPatchUpdate::new(id)
+                }],
+                ..AppliedPatchSet::new()
             });
         }
         if accepted_properties.is_empty() && accepted_name.is_none() {
@@ -1626,6 +1649,59 @@ mod tests {
                     .unwrap();
             let tree = job.tree.lock().unwrap();
             assert_eq!(compute_patch_set(snapshot, &tree, owner), PatchSet::new());
+        }
+    }
+
+    #[test]
+    fn already_saved_numbers_publish_only_needed_normalization_corrections() {
+        for (metadata, input, correction) in [
+            (
+                r#"{"className":"NumberValue","properties":{"Value":5}}"#,
+                5.0000005,
+                Some(Some(Variant::Float64(5.0))),
+            ),
+            (r#"{"className":"NumberValue"}"#, 0.0000005, Some(None)),
+            (
+                r#"{"className":"NumberValue","properties":{"Value":5}}"#,
+                5.0,
+                None,
+            ),
+            (r#"{"className":"NumberValue"}"#, 0.0, None),
+            (
+                r#"{"className":"NumberValue","properties":{"Value":{"Float64":"nan"}}}"#,
+                f64::NAN,
+                None,
+            ),
+        ] {
+            let (job, id) = script_job(
+                vec![(
+                    "Number",
+                    VfsSnapshot::dir([("init.meta.json", VfsSnapshot::file(metadata))]),
+                )],
+                "/project/Number",
+            );
+            let (accepted, conflicts, errors) =
+                job.handle_tree_event(property_update(id, "Value", Variant::Float64(input)));
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(accepted, PatchSet::new());
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(
+                read_text(&job.vfs, "/project/Number/init.meta.json").unwrap(),
+                metadata
+            );
+            let messages = job.message_queue.subscribe(0).try_recv().unwrap();
+            assert_eq!(messages.is_some(), correction.is_some(), "{input}");
+            if let Some(expected) = correction {
+                let (_, messages) = messages.unwrap();
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].updated.len(), 1);
+                assert_eq!(
+                    messages[0].updated[0]
+                        .changed_properties
+                        .get(&ustr("Value")),
+                    Some(&expected)
+                );
+            }
         }
     }
 
