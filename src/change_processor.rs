@@ -2666,7 +2666,11 @@ mod tests {
                 .unwrap()
                 .path()
                 .as_os_str(),
-            Path::new("/project/src/Right/Code.server.lua").as_os_str()
+            Path::new("/project")
+                .join("src")
+                .join("Right")
+                .join("Code.server.lua")
+                .as_os_str()
         );
     }
 
