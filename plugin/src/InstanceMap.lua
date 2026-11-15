@@ -225,13 +225,19 @@ function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
 		return
 	end
 
-	if RunService:IsRunning() then
+	if self:__isGameRunning() then
 		-- We probably don't want to pick up property changes to save to the
 		-- filesystem in a running game.
 		return
 	end
 
 	self.onInstanceChanged(instance, propertyName)
+end
+
+-- Kept separate so tests, which the test place runs in a running game, can still exercise
+-- change reporting.
+function InstanceMap:__isGameRunning()
+	return RunService:IsRunning()
 end
 
 function InstanceMap:__disconnectSignals(instance)

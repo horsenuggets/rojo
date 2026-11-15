@@ -52,15 +52,25 @@ return function()
 		},
 	}
 
-	-- Builds container > ancestor > leaf, tracks the ancestor and leaf, and records every
-	-- Parent change the map reports.
-	const function createTree(leafClassName)
-		const reports = {}
+	-- Creates a map that records every Parent change it reports. The test place runs tests
+	-- in a running game, where the map ignores all changes, so the running check is
+	-- replaced with the given answer.
+	const function createInstanceMap(reports, gameRunning)
 		const instanceMap = InstanceMap.new(function(instance, propertyName)
 			if propertyName == "Parent" then
 				table.insert(reports, instance)
 			end
 		end)
+		instanceMap.__isGameRunning = function()
+			return gameRunning
+		end
+		return instanceMap
+	end
+
+	-- Builds container > ancestor > leaf and tracks the ancestor and leaf.
+	const function createTree(leafClassName, gameRunning)
+		const reports = {}
+		const instanceMap = createInstanceMap(reports, gameRunning == true)
 
 		const container = Instance.new("Folder")
 		const other = Instance.new("Folder")
@@ -146,11 +156,7 @@ return function()
 		-- Mirrors how the reconciler builds new instances. Children are parented and
 		-- tracked before their own parent is placed into the tree.
 		const reports = {}
-		const instanceMap = InstanceMap.new(function(instance, propertyName)
-			if propertyName == "Parent" then
-				table.insert(reports, instance)
-			end
-		end)
+		const instanceMap = createInstanceMap(reports, false)
 
 		const container = Instance.new("Folder")
 		const top = Instance.new("Folder")
@@ -169,5 +175,19 @@ return function()
 
 		instanceMap:stop()
 		container:Destroy()
+	end)
+
+	it("should report nothing while the game is running", function()
+		for _, action in ACTIONS do
+			const tree = createTree("Folder", true)
+
+			action.Run(tree)
+			settle()
+
+			expect(#tree.Reports).to.equal(0)
+
+			tree.InstanceMap:stop()
+			tree.Container:Destroy()
+		end
 	end)
 end
