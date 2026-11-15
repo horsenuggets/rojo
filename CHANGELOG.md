@@ -31,6 +31,9 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Write whole floating-point JSON values without `.0`, and round values within
+  `0.000001` of an integer (including zero) when writing metadata, projects, and JSON
+  models. Two-way sync acknowledges normalized values so repeated edits stay stable.
 * Add a UI Labs storybook for the plugin. Serve `storybook.project.json`, connect, and
   open UI Labs to preview the plugin's buttons, inputs, checkboxes, dropdowns, tags,
   header, spinner, and its connecting, error, not connected, and settings pages one at a

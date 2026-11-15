@@ -16,7 +16,7 @@ use tempfile::{tempdir, TempDir};
 use librojo::{
     web_api::{
         ReadResponse, SerializeRequest, SerializeResponse, ServerInfoResponse, SocketPacket,
-        SocketPacketType,
+        SocketPacketType, WriteRequest, WriteResponse,
     },
     SessionId,
 };
@@ -236,6 +236,19 @@ impl TestServeSession {
                 }
             }
         }
+    }
+
+    pub fn post_api_write(&self, request: &WriteRequest) -> WriteResponse {
+        let url = format!("http://localhost:{}/api/write", self.port);
+        let body = serialize_msgpack(request).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(url)
+            .body(body)
+            .send()
+            .expect("Failed to send write request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        deserialize_msgpack(&response.bytes().unwrap())
+            .expect("Server returned malformed write response")
     }
 
     pub fn post_api_serialize(

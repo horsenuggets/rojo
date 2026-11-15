@@ -1,7 +1,7 @@
 use rbx_dom_weak::{types::Variant, Instance, Ustr, UstrMap};
 use rbx_reflection::{PropertyKind, PropertySerialization, Scriptability};
 
-use crate::{variant_eq::variant_eq, Project};
+use crate::{resolution::normalize_json_variant, variant_eq::variant_eq, Project};
 
 /// Returns a map of properties from `inst` that are both allowed under the
 /// user-provided settings, are not their default value, and serialize.
@@ -10,7 +10,7 @@ pub fn filter_properties<'inst>(
     inst: &'inst Instance,
 ) -> UstrMap<&'inst Variant> {
     let mut map: Vec<(Ustr, &Variant)> = Vec::with_capacity(inst.properties.len());
-    filter_properties_preallocated(project, inst, &mut map);
+    filter_json_properties_preallocated(project, inst, &mut map);
 
     map.into_iter().collect()
 }
@@ -21,6 +21,25 @@ pub fn filter_properties_preallocated<'inst>(
     project: &Project,
     inst: &'inst Instance,
     allocation: &mut Vec<(Ustr, &'inst Variant)>,
+) {
+    filter_properties_impl(project, inst, allocation, false);
+}
+
+/// Filters JSON properties after numeric normalization, so rounded defaults are
+/// omitted on the first export rather than disappearing on the next export.
+pub fn filter_json_properties_preallocated<'inst>(
+    project: &Project,
+    inst: &'inst Instance,
+    allocation: &mut Vec<(Ustr, &'inst Variant)>,
+) {
+    filter_properties_impl(project, inst, allocation, true);
+}
+
+fn filter_properties_impl<'inst>(
+    project: &Project,
+    inst: &'inst Instance,
+    allocation: &mut Vec<(Ustr, &'inst Variant)>,
+    normalize_defaults: bool,
 ) {
     let sync_unscriptable = project
         .syncback_rules
@@ -60,7 +79,14 @@ pub fn filter_properties_preallocated<'inst>(
                 continue;
             }
             if let Some(default) = defaults.get(name.as_str()) {
-                if !variant_eq(value, default) {
+                let normalized;
+                let comparable = if normalize_defaults {
+                    normalized = normalize_json_variant(value.clone());
+                    &normalized
+                } else {
+                    value
+                };
+                if !variant_eq(comparable, default) {
                     allocation.push((*name, value));
                 }
             } else if !is_unset_binary_string(value) {
@@ -163,6 +189,24 @@ mod test {
             .unwrap();
         let project = Project::load_exact(&vfs, &path, Some("Test")).unwrap();
         (temp, project)
+    }
+
+    #[test]
+    fn json_filter_omits_rounded_defaults_without_changing_binary_hash_filtering() {
+        let (_temp, project) = load_project();
+        let name = ustr("Transparency");
+        for (value, kept) in [(0.0000005, false), (0.000002, true)] {
+            let dom = WeakDom::new(
+                InstanceBuilder::new("Part").with_property(name, Variant::Float32(value)),
+            );
+            assert_eq!(
+                filter_properties(&project, dom.root()).contains_key(&name),
+                kept
+            );
+            let mut raw = Vec::new();
+            filter_properties_preallocated(&project, dom.root(), &mut raw);
+            assert_eq!(raw, vec![(name, &Variant::Float32(value))]);
+        }
     }
 
     /// Walks every combination of a class with and without reflection data and

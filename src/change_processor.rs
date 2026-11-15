@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::{
     message_queue::MessageQueue,
     project::Project,
+    resolution::normalize_json_variant,
     snapshot::{
         apply_patch_set, compute_patch_set, compute_shallow_patch_set, AppliedPatchSet,
         InstanceSnapshot, InstigatingSource, PatchAdd, PatchSet, PatchUpdate, RojoTree,
@@ -680,6 +681,24 @@ impl JobThreadContext {
                 .extend(restoration.updated_instances);
             return;
         }
+        let database = rbx_reflection_database::get().unwrap();
+        let defaults = database
+            .classes
+            .get(instance.class_name().as_str())
+            .map(|class| &class.default_properties);
+        let mut normalized_update = update.clone();
+        for (key, value) in &mut normalized_update.changed_properties {
+            if let Some(original) = value {
+                let normalized = normalize_json_variant(original.clone());
+                let default = defaults.and_then(|values| values.get(key.as_str()));
+                *value = if same_value(Some(&normalized), default) && key != "Source" {
+                    None
+                } else {
+                    Some(normalized)
+                };
+            }
+        }
+        let update = &normalized_update;
         // With no discrepancy on disk, an inline instance's values on the server
         // are exactly what its owner's file stores.
         let disk_root = snapshot.as_ref().unwrap();
@@ -709,10 +728,17 @@ impl JobThreadContext {
                 }
             }
         }
+        // Syncback omits reflected defaults, including values rounded to zero.
+        // An omitted default and its explicit value must compare identically.
         for (key, studio_value) in &update.changed_properties {
-            let baseline_value = instance.properties().get(key);
-            let disk_value = disk_properties.get(key);
-            match decide_property_write(baseline_value, disk_value, studio_value.as_ref()) {
+            let default = defaults.and_then(|values| values.get(key.as_str()));
+            let baseline_value = instance.properties().get(key).or(default);
+            let disk_value = disk_properties.get(key).or(default);
+            match decide_property_write(
+                baseline_value,
+                disk_value,
+                studio_value.as_ref().or(default),
+            ) {
                 PropertyWriteDecision::AlreadySynchronized => {}
                 PropertyWriteDecision::RestoreFilesystem => {
                     conflict_properties.insert(*key, disk_value.cloned());
@@ -765,9 +791,10 @@ impl JobThreadContext {
             });
         }
         for (key, studio_value) in &update.changed_properties {
+            let default = defaults.and_then(|values| values.get(key.as_str()));
             let disk_value = disk_properties.get(key);
             if !accepted_properties.contains_key(key)
-                && !same_value(disk_value, studio_value.as_ref())
+                && !same_value(disk_value.or(default), studio_value.as_ref().or(default))
             {
                 conflict_properties.insert(*key, disk_value.cloned());
             }
@@ -1513,6 +1540,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rounded_defaults_do_not_conflict_with_the_next_update_in_a_batch() {
+        let (job, id) = part_job();
+        let mut patch = property_update(id, "Transparency", Variant::Float32(0.0000005));
+        patch
+            .updated_instances
+            .extend(property_update(id, "Transparency", Variant::Float32(0.5)).updated_instances);
+        let (accepted, conflicts, errors) = job.handle_tree_event(patch);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(conflicts, PatchSet::new());
+        assert_eq!(accepted.updated_instances.len(), 2);
+        assert_eq!(
+            accepted.updated_instances[0]
+                .changed_properties
+                .get(&ustr("Transparency")),
+            Some(&None),
+        );
+        let snapshot =
+            snapshot_from_vfs(&Default::default(), &job.vfs, Path::new("/project/Part")).unwrap();
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(compute_patch_set(snapshot, &tree, id), PatchSet::new());
+    }
+
     fn read_text(vfs: &Vfs, path: &str) -> Option<String> {
         vfs.read(path)
             .with_not_found()
@@ -1997,15 +2047,15 @@ mod tests {
             serde_json::from_slice(&job.vfs.read("/project/Part/init.meta.json").unwrap()).unwrap();
         assert_eq!(
             meta["attributes"]["Range"],
-            serde_json::json!({"NumberRange": [0.0, "inf"]})
+            serde_json::json!({"NumberRange": [0, "inf"]})
         );
         assert_eq!(
             meta["attributes"]["Offset"],
-            serde_json::json!({"Vector3": ["nan", 1.0, "-inf"]})
+            serde_json::json!({"Vector3": ["nan", 1, "-inf"]})
         );
         assert_eq!(
             meta["properties"]["PivotOffset"]["CFrame"]["position"],
-            serde_json::json!([1.0, "inf", 3.0])
+            serde_json::json!([1, "inf", 3])
         );
     }
 
@@ -2927,10 +2977,9 @@ mod tests {
                     Edit::Property => {
                         assert_eq!(entry.unwrap()["properties"]["Transparency"], 0.75)
                     }
-                    Edit::Attribute => assert_eq!(
-                        entry.unwrap()["attributes"]["Count"],
-                        serde_json::json!(2.0)
-                    ),
+                    Edit::Attribute => {
+                        assert_eq!(entry.unwrap()["attributes"]["Count"], serde_json::json!(2))
+                    }
                     Edit::Rename if path.is_empty() => assert_eq!(meta["name"], "Renamed"),
                     Edit::Rename => assert!(entry.is_some(), "{case}: {meta:#}"),
                     Edit::Delete => assert!(entry.is_none(), "{case}: {meta:#}"),

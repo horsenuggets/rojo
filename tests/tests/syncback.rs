@@ -186,6 +186,158 @@ fn read_files(dir: &Path) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+/// Every CLI JSON writer normalizes numbers without losing meaningful fractions,
+/// and rebuilding or syncing again must not bring the original float tokens back.
+#[test]
+fn json_numeric_normalization_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs_err::create_dir_all(project.join("src/Metadata")).unwrap();
+    fs_err::write(
+        project.join("default.project.json"),
+        r#"{
+  "name": "Numbers",
+  "tree": {
+    "$className": "Folder",
+    "src": { "$path": "src" }
+  }
+}"#,
+    )
+    .unwrap();
+    for (file, contents) in [
+        (
+            "src/Metadata/init.meta.json",
+            r#"{"className":"NumberValue"}"#,
+        ),
+        ("src/Model.model.json", r#"{"className":"NumberValue"}"#),
+        ("src/Default.model.json", r#"{"className":"NumberValue"}"#),
+        (
+            "src/Project.project.json",
+            r#"{"name":"Project","tree":{"$className":"NumberValue"}}"#,
+        ),
+    ] {
+        fs_err::write(project.join(file), contents).unwrap();
+    }
+
+    let cases = [
+        ("Integral", 2.0, 2.0),
+        ("NearAbove", 1.0000005, 1.0),
+        ("NearBelow", 0.9999995, 1.0),
+        ("Negative", -1.0000005, -1.0),
+        ("NegativeZero", -0.0, 0.0),
+        ("ZeroAbove", 0.000001, 0.0),
+        ("ZeroBelow", -0.000001, 0.0),
+        ("OutsideTolerance", 1.000002, 1.000002),
+        ("SmallFraction", 0.000002, 0.000002),
+        ("Fraction", 0.25, 0.25),
+        ("LargeFraction", 1_000_000_000.25, 1_000_000_000.25),
+    ];
+    let mut attributes = rbx_dom_weak::types::Attributes::new();
+    for (name, input, _) in cases {
+        attributes.insert(name.into(), Variant::Float64(input));
+    }
+    let mut place = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("Folder"));
+    let src = place.insert(
+        place.root_ref(),
+        rbx_dom_weak::InstanceBuilder::new("Folder").with_name("src"),
+    );
+    for name in ["Metadata", "Model", "Project"] {
+        place.insert(
+            src,
+            rbx_dom_weak::InstanceBuilder::new("NumberValue")
+                .with_name(name)
+                .with_property("Attributes", attributes.clone())
+                .with_property("Value", 2.0000005_f64),
+        );
+    }
+    place.insert(
+        src,
+        rbx_dom_weak::InstanceBuilder::new("NumberValue")
+            .with_name("Default")
+            .with_property("Value", 0.0000005_f64),
+    );
+    let input = dir.path().join("input.rbxm");
+    rbx_binary::to_writer(
+        fs_err::File::create(&input).unwrap(),
+        &place,
+        &[place.root_ref()],
+    )
+    .unwrap();
+    let sync = |input: &Path| {
+        let status = Command::new(ROJO_PATH)
+            .args(["--color", "never", "syncback"])
+            .arg(&project)
+            .arg("--input")
+            .arg(input)
+            .arg("--non-interactive")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        read_files(&project)
+    };
+    let first = sync(&input);
+    let default: serde_json::Value =
+        serde_json::from_str(&first["src/Default.model.json"]).unwrap();
+    assert!(default["properties"].get("Value").is_none());
+    for (file, properties_path, attributes_path) in [
+        ("src/Metadata/init.meta.json", "/properties", "/attributes"),
+        ("src/Model.model.json", "/properties", "/attributes"),
+        (
+            "src/Project.project.json",
+            "/tree/$properties",
+            "/tree/$attributes",
+        ),
+    ] {
+        // Integer JSON number types distinguish `2` from `2.0` without snapshots.
+        let json: serde_json::Value = serde_json::from_str(&first[file]).unwrap();
+        let properties = json.pointer(properties_path).unwrap();
+        assert_eq!(properties["Value"].as_i64(), Some(2), "{file}");
+        let attributes = json.pointer(attributes_path).unwrap();
+        for (name, _, expected) in cases {
+            let number = &attributes[name];
+            assert_eq!(number.as_f64(), Some(expected), "{file} {name}");
+            if expected.fract() == 0.0 {
+                assert_eq!(number.as_i64(), Some(expected as i64), "{file} {name}");
+            }
+        }
+    }
+    pretty_assertions::assert_eq!(sync(&input), first);
+
+    let output = dir.path().join("rebuilt.rbxm");
+    let status = Command::new(ROJO_PATH)
+        .args(["--color", "never", "build"])
+        .arg(&project)
+        .arg("--output")
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let built = rbx_binary::from_reader(fs_err::read(&output).unwrap().as_slice()).unwrap();
+    for name in ["Metadata", "Model", "Project"] {
+        let instance = built
+            .descendants()
+            .find(|instance| instance.name == name)
+            .unwrap();
+        assert_eq!(
+            instance.properties.get(&ustr("Value")),
+            Some(&Variant::Float64(2.0))
+        );
+        let Some(Variant::Attributes(attributes)) = instance.properties.get(&ustr("Attributes"))
+        else {
+            panic!("{name} should retain its numeric attributes");
+        };
+        for (attribute, _, expected) in cases {
+            assert_eq!(
+                attributes.get(attribute),
+                Some(&Variant::Float64(expected)),
+                "{name} {attribute}"
+            );
+        }
+    }
+    pretty_assertions::assert_eq!(sync(&output), first);
+    pretty_assertions::assert_eq!(sync(&output), first);
+}
+
 /// Syncing a place again must only change files for what actually changed.
 ///
 /// Instances a reference points at need a `Rojo_Id`. Two bugs made later runs

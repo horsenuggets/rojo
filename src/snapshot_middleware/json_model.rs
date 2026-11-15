@@ -14,7 +14,7 @@ use crate::{
     resolution::UnresolvedValue,
     snapshot::{InstanceContext, InstanceSnapshot},
     snapshot_middleware::meta_file::serialize_values,
-    syncback::{filter_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
+    syncback::{filter_json_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
     RojoRef,
 };
 
@@ -103,7 +103,7 @@ fn json_model_from_pair<'sync>(
         .get_new_instance(new)
         .expect("all new referents passed to json_model_from_pair should exist");
 
-    filter_properties_preallocated(snapshot.project(), new_inst, prop_buffer);
+    filter_json_properties_preallocated(snapshot.project(), new_inst, prop_buffer);
     let (properties, attributes) = serialize_values(&new_inst.class, prop_buffer.drain(..));
 
     let mut children = Vec::with_capacity(new_inst.children().len());
