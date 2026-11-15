@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.1`
+
 * Stop syncback from rewriting files when the same place is synced again. Rewriting an
   instance's metadata no longer adds an `id` next to the `Rojo_Id` it was read from, and
   instances that references point at keep the `Rojo_Id` they have on disk instead of
