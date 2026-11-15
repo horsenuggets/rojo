@@ -24,6 +24,7 @@ return createStory({
 			anchorPoint = Vector2.new(0.5, 0.5),
 			locked = controls.Locked,
 			lockedTooltip = controls.LockedTooltip,
+			onClick = function() end,
 			position = UDim2.fromScale(0.5, 0.5),
 			transparency = transparency,
 		})

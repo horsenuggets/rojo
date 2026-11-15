@@ -22,6 +22,7 @@ return createStory({
 		return Roact.createElement(TextInput, {
 			anchorPoint = Vector2.new(0.5, 0.5),
 			enabled = controls.Enabled,
+			onEntered = function() end,
 			placeholder = controls.Placeholder,
 			position = UDim2.fromScale(0.5, 0.5),
 			size = UDim2.fromOffset(200, 34),
