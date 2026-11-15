@@ -166,3 +166,154 @@ fn inline_script_free_round_trip() {
         assert_eq!(describe_src(&built), describe_src(&input));
     });
 }
+
+/// Reads every file under `dir` into a map from relative path to contents. Paths
+/// always use `/`, so tests can name them the same way on every platform.
+fn read_files(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| {
+            let path = entry.path().strip_prefix(dir).unwrap();
+            let key = path
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            (key, fs_err::read_to_string(entry.path()).unwrap())
+        })
+        .collect()
+}
+
+/// Syncing a place again must only change files for what actually changed.
+///
+/// Instances a reference points at need a `Rojo_Id`. Two bugs made later runs
+/// rewrite them. An instance with no `UniqueId` got a new made-up ID every run,
+/// and rewriting an instance's metadata added an `id` next to the `Rojo_Id` it
+/// was read from.
+#[test]
+fn syncing_back_again_only_changes_what_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs_err::create_dir_all(project.join("src")).unwrap();
+    fs_err::write(
+        project.join("default.project.json"),
+        r#"{
+  "name": "Rerun",
+  "syncbackRules": { "instancesAsDirectories": true },
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": { "$path": "src" }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let mut place = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel"));
+    let storage = place.insert(
+        place.root_ref(),
+        rbx_dom_weak::InstanceBuilder::new("ReplicatedStorage").with_name("ReplicatedStorage"),
+    );
+    let model = place.insert(
+        storage,
+        rbx_dom_weak::InstanceBuilder::new("Model").with_name("Rig"),
+    );
+    let head = place.insert(
+        model,
+        rbx_dom_weak::InstanceBuilder::new("Part").with_name("Head"),
+    );
+    place
+        .get_by_ref_mut(model)
+        .unwrap()
+        .properties
+        .insert(ustr("PrimaryPart"), Variant::Ref(head));
+
+    // A referenced script with children is written as a directory with
+    // init.luau and an init.meta.json holding its Rojo_Id.
+    let module = place.insert(
+        storage,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Gradients")
+            .with_property("Source", "return {}"),
+    );
+    place.insert(
+        module,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Palette")
+            .with_property("Source", "return {}"),
+    );
+    place.insert(
+        storage,
+        rbx_dom_weak::InstanceBuilder::new("ObjectValue")
+            .with_name("Pointer")
+            .with_property("Value", Variant::Ref(module)),
+    );
+
+    // Same-named scripts written differently, as `Twin.luau` and `Twin~2/`, used
+    // to load back in reverse and trade IDs on every run.
+    let twin_file = place.insert(
+        storage,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Twin")
+            .with_property("Source", "return 1"),
+    );
+    let twin_dir = place.insert(
+        storage,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Twin")
+            .with_property("Source", "return 2"),
+    );
+    place.insert(
+        twin_dir,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Child")
+            .with_property("Source", "return 3"),
+    );
+    for (name, target) in [("ToFirstTwin", twin_file), ("ToSecondTwin", twin_dir)] {
+        place.insert(
+            storage,
+            rbx_dom_weak::InstanceBuilder::new("ObjectValue")
+                .with_name(name)
+                .with_property("Value", Variant::Ref(target)),
+        );
+    }
+    let input = dir.path().join("place.rbxl");
+    let sync = |place: &WeakDom| {
+        let file = std::io::BufWriter::new(fs_err::File::create(&input).unwrap());
+        rbx_binary::to_writer(file, place, &[storage]).unwrap();
+        let status = Command::new(ROJO_PATH)
+            .args(["--color", "never", "syncback"])
+            .arg(&project)
+            .arg("--input")
+            .arg(&input)
+            .arg("-y")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        read_files(&project)
+    };
+
+    let first = sync(&place);
+    assert!(
+        first
+            .values()
+            .any(|contents| contents.contains("\"Rojo_Id\"")),
+        "the referenced instances should have been given a Rojo_Id"
+    );
+
+    // The same place again changes nothing.
+    pretty_assertions::assert_eq!(sync(&place), first);
+
+    // Editing the referenced script rewrites only its source.
+    place.get_by_ref_mut(module).unwrap().properties.insert(
+        ustr("Source"),
+        Variant::String("return { edited = true }".into()),
+    );
+    let mut expected = first.clone();
+    expected.insert(
+        "src/Gradients/init.luau".to_owned(),
+        "return { edited = true }".to_owned(),
+    );
+    pretty_assertions::assert_eq!(sync(&place), expected);
+}

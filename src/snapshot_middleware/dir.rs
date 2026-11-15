@@ -110,7 +110,15 @@ pub fn snapshot_dir_no_meta(
             .map(snapshot_child)
             .collect::<anyhow::Result<_>>()?
     };
-    let snapshot_children: Vec<_> = children.into_iter().flatten().collect();
+    let numbered_children = entries
+        .iter()
+        .zip(children)
+        .filter_map(|(entry, child)| {
+            let file_name = entry.path().file_name()?.to_string_lossy();
+            Some((sibling_order_key(&file_name).1, child?))
+        })
+        .collect();
+    let snapshot_children = order_duplicate_siblings(numbered_children);
 
     // Init files that don't exist yet are not listed. Change processing walks up
     // from an unknown path to the nearest tracked ancestor, so creating one still
@@ -130,6 +138,37 @@ pub fn snapshot_dir_no_meta(
         );
 
     Ok(Some(snapshot))
+}
+
+/// Puts children that share a name back in the order syncback numbered them, given
+/// each child with the `~N` number from its file name (1 when it has none).
+///
+/// Sorting directory entries by file name keeps `Twin~2.luau` after `Twin.luau`,
+/// but not when the siblings are written differently. `Twin~2/` sorts before
+/// `Twin.luau`, which would reverse them. Only same-named children move, and each
+/// group keeps the positions it had. Syncback numbers names regardless of case, so
+/// they're grouped the same way.
+fn order_duplicate_siblings(children: Vec<(u64, InstanceSnapshot)>) -> Vec<InstanceSnapshot> {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, (_, child)) in children.iter().enumerate() {
+        groups
+            .entry(child.name.to_lowercase())
+            .or_default()
+            .push(index);
+    }
+
+    let mut slots: Vec<_> = children.into_iter().map(Some).collect();
+    for positions in groups.values().filter(|positions| positions.len() > 1) {
+        let mut members: Vec<_> = positions
+            .iter()
+            .map(|index| slots[*index].take().unwrap())
+            .collect();
+        members.sort_by_key(|(number, _)| *number);
+        for (index, member) in positions.iter().zip(members) {
+            slots[*index] = Some(member);
+        }
+    }
+    slots.into_iter().map(|slot| slot.unwrap().1).collect()
 }
 
 pub fn syncback_dir<'sync>(
@@ -668,6 +707,70 @@ mod test {
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    fn names(children: &[InstanceSnapshot]) -> Vec<(String, String)> {
+        children
+            .iter()
+            .map(|child| (child.name.to_string(), child.class_name.to_string()))
+            .collect()
+    }
+
+    fn numbered(items: &[(u64, &str, &str)]) -> Vec<(u64, InstanceSnapshot)> {
+        items
+            .iter()
+            .map(|(number, name, class)| {
+                (
+                    *number,
+                    InstanceSnapshot::new().name(*name).class_name(*class),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_siblings_go_back_in_numbered_order() {
+        // `Twin~2/` sorts before `Twin.luau`, so the second Twin is listed first.
+        let ordered = order_duplicate_siblings(numbered(&[
+            (1, "Alpha", "Folder"),
+            (2, "Twin", "Folder"),
+            (1, "Twin", "ModuleScript"),
+            (1, "Zeta", "Folder"),
+        ]));
+        assert_eq!(
+            names(&ordered),
+            [
+                ("Alpha".into(), "Folder".into()),
+                ("Twin".into(), "ModuleScript".into()),
+                ("Twin".into(), "Folder".into()),
+                ("Zeta".into(), "Folder".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_siblings_are_grouped_regardless_of_case() {
+        let ordered = order_duplicate_siblings(numbered(&[
+            (3, "twin", "Part"),
+            (1, "Other", "Folder"),
+            (1, "Twin", "Part"),
+            (2, "TWIN", "Part"),
+        ]));
+        let order: Vec<_> = names(&ordered).into_iter().map(|(name, _)| name).collect();
+        assert_eq!(order, ["Twin", "Other", "TWIN", "twin"]);
+    }
+
+    #[test]
+    fn unique_children_keep_their_order() {
+        for count in 0..5 {
+            let items: Vec<_> = (0..count)
+                .map(|i| (1, ["E", "D", "C", "B", "A"][i], "Folder"))
+                .collect();
+            let ordered = order_duplicate_siblings(numbered(&items));
+            let order: Vec<_> = names(&ordered).into_iter().map(|(name, _)| name).collect();
+            let expected: Vec<_> = items.iter().map(|(_, name, _)| name.to_string()).collect();
+            assert_eq!(order, expected);
+        }
+    }
 
     fn keys(items: &[(&'static str, &'static str)]) -> Vec<(&'static str, Ustr)> {
         items

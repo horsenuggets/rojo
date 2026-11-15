@@ -27,7 +27,7 @@ use crate::{
     glob::{Glob, IgnorableGlob},
     snapshot::{InstanceWithMeta, RojoTree},
     snapshot_middleware::{dir_init_files, Middleware},
-    syncback::ref_properties::{attribute_ids, collect_referents, link_referents},
+    syncback::ref_properties::{attribute_ids, collect_referents, ids_on_disk, link_referents},
     Project,
 };
 
@@ -242,6 +242,7 @@ pub fn syncback_loop(
 
     log::debug!("Collecting referents for new DOM...");
     let deferred_referents = collect_referents(&new_tree);
+    let ids_on_disk = ids_on_disk(&new_tree, old_tree.inner());
 
     // Remove any properties that are manually blocked from syncback via the
     // project file.
@@ -291,7 +292,7 @@ pub fn syncback_loop(
         .unwrap_or_default();
     if !ignore_referents {
         log::debug!("Linking referents for new DOM");
-        link_referents(deferred_referents, &mut new_tree)?;
+        link_referents(deferred_referents, &mut new_tree, &ids_on_disk)?;
     } else {
         log::debug!("Skipping referent linking as per project syncback rules");
     }
