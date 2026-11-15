@@ -17,8 +17,11 @@ return function()
 		part:SetAttribute("Offset", Vector3.new(0 / 0, math.huge, -math.huge))
 		part:SetAttribute("Size", Vector2.new(300, math.huge))
 		part:SetAttribute("Range", NumberRange.new(0, math.huge))
+		part:SetAttribute("Bounds", Rect.new(0, 0, math.huge, 5))
 		local update = encodePatchUpdate(part, "PART", { Attributes = true })
 		local attributes = update.changedProperties.Attributes.Attributes
+		expect(attributes.Bounds.Rect[2][1]).to.equal(math.huge)
+		expect(attributes.Bounds.Rect[2][2]).to.equal(5)
 		local offset = attributes.Offset.Vector3
 		expect(offset[1] ~= offset[1]).to.equal(true)
 		expect(offset[2]).to.equal(math.huge)
@@ -36,6 +39,19 @@ return function()
 		expect(update.changedProperties.MaxSize.Vector2[1]).to.equal(300)
 		expect(update.changedProperties.MaxSize.Vector2[2]).to.equal(math.huge)
 		constraint:Destroy()
+	end)
+
+	-- Ray attributes are rejected by Roblox, but Ray values are still encoded
+	-- through the same path, so the encoder is checked directly.
+	it("should encode Rays with infinite components exactly", function()
+		local value = Instance.new("RayValue")
+		value.Value = Ray.new(Vector3.new(0, math.huge, 0), Vector3.new(-math.huge, 1, 2))
+		local update = encodePatchUpdate(value, "VALUE", { Value = true })
+		local ray = update.changedProperties.Value.Ray
+		expect(ray.origin[2]).to.equal(math.huge)
+		expect(ray.direction[1]).to.equal(-math.huge)
+		expect(ray.direction[3]).to.equal(2)
+		value:Destroy()
 	end)
 
 	it("should encode non-finite number attributes exactly", function()

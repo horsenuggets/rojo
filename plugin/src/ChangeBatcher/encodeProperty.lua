@@ -4,23 +4,42 @@ local RbxDom = require(Packages.RbxDom)
 
 local unmanagedAttributes = require(script.Parent.Parent.Reconciler.unmanagedAttributes)
 
-local function isNonFinite(value)
-	return type(value) == "number" and (value ~= value or value == math.huge or value == -math.huge)
+local function vector2(vector)
+	return { vector.X, vector.Y }
 end
 
--- rbx_dom_lua stands in a large finite number for infinity in numbers,
--- Vector2s, and Vector3s, but msgpack holds it exactly and the filesystem writes
--- it in a tagged form, so those values are sent as they are.
-local function restoreNonFinite(value, encoded)
+local function vector3(vector)
+	return { vector.X, vector.Y, vector.Z }
+end
+
+local function number(value)
+	return value
+end
+
+-- rbx_dom_lua stands in a large finite number for infinity in these types,
+-- including the vectors inside a Ray or Rect. msgpack holds infinity exactly
+-- and the filesystem writes it in a tagged form, so they're encoded from
+-- their raw components instead, which is the same encoding for finite values.
+local exactEncoders = {
+	Float32 = number,
+	Float64 = number,
+	Vector2 = vector2,
+	Vector3 = vector3,
+	Ray = function(ray)
+		return { origin = vector3(ray.Origin), direction = vector3(ray.Direction) }
+	end,
+	Rect = function(rect)
+		return { vector2(rect.Min), vector2(rect.Max) }
+	end,
+}
+
+local function encodeExactly(value, encoded)
 	local ty = next(encoded)
-	if (ty == "Float32" or ty == "Float64") and isNonFinite(value) then
-		return { [ty] = value }
-	elseif ty == "Vector2" and (isNonFinite(value.X) or isNonFinite(value.Y)) then
-		return { Vector2 = { value.X, value.Y } }
-	elseif ty == "Vector3" and (isNonFinite(value.X) or isNonFinite(value.Y) or isNonFinite(value.Z)) then
-		return { Vector3 = { value.X, value.Y, value.Z } }
+	local encoder = exactEncoders[ty]
+	if encoder == nil then
+		return encoded
 	end
-	return encoded
+	return { [ty] = encoder(value) }
 end
 
 return function(instance, propertyName, propertyDescriptor, instanceMap)
@@ -75,11 +94,11 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 		for name, value in readResult do
 			-- Attributes rbx_dom_lua couldn't encode were already warned about.
 			if encodedAttributes[name] ~= nil then
-				encodedAttributes[name] = restoreNonFinite(value, encodedAttributes[name])
+				encodedAttributes[name] = encodeExactly(value, encodedAttributes[name])
 			end
 		end
 	else
-		encodeResult = restoreNonFinite(readResult, encodeResult)
+		encodeResult = encodeExactly(readResult, encodeResult)
 	end
 
 	return true, encodeResult
