@@ -22,7 +22,7 @@ return strict("Config", {
 	version = realVersion,
 	expectedServerVersionString = ("%d.%d or newer"):format(realVersion[1], realVersion[2]),
 	-- Must match the server's PROTOCOL_VERSION.
-	protocolVersion = 6,
+	protocolVersion = 7,
 	defaultHost = "localhost",
 	defaultPort = "34872",
 	syncRemindersEnabled = false,

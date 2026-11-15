@@ -110,4 +110,33 @@ return function()
 		table.insert(result.conflicts.added_instances, {})
 		expect(ServeSession.getWriteStatus(result)).to.equal("Failed")
 	end)
+
+	-- The setting is read for each write, so a change mid-session applies to
+	-- the next write and is recorded with it.
+	it("should send and record the authority set when each write starts", function()
+		local Settings = require(script.Parent.Settings)
+		local original = Settings:get("twoWaySyncAuthority")
+		local success, err = pcall(function()
+			local sent = {}
+			local session = setmetatable({
+				__apiContext = {
+					write = function(_self, _patch, _cursor, authority)
+						table.insert(sent, authority)
+						return Promise.resolve(writeResult())
+					end,
+				},
+				__syncResults = {},
+			}, ServeSession)
+			for _, authority in { "Studio", "Filesystem", "Studio" } do
+				Settings:set("twoWaySyncAuthority", authority)
+				session:__writePatch({ updated = {}, added = {}, removed = {} }):await()
+			end
+			expect(table.concat(sent, ",")).to.equal("Studio,Filesystem,Studio")
+			local results = session:getSyncResults()
+			expect(results[1].authority).to.equal("Studio")
+			expect(results[2].authority).to.equal("Filesystem")
+		end)
+		Settings:set("twoWaySyncAuthority", original)
+		assert(success, err)
+	end)
 end
