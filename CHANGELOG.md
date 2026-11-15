@@ -43,6 +43,8 @@ Making a new release? Simply add the new header with the version and date undern
   `rojo build` and `rojo serve` swapped them.
 * Never give a referenced instance an ID another instance already has, which could
   happen when a referenced instance was renamed and a new one took its old name.
+* Keep the `Rojo_Id` of a referenced project root, like the root of a model project,
+  instead of making a new one every run.
 * Rebrand the fork as Rojo+. The CLI, plugin toolbar, panel title, and messages say Rojo+,
   and the panel header shows "Rojo+" instead of the version. `rojo plugin install` writes
   `Rojo+.rbxm` and the release asset is `Rojo+.rbxm`, so Rojo+ can be installed alongside
