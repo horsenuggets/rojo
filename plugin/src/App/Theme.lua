@@ -261,7 +261,10 @@ local function with(callback)
 end
 
 return {
+	BrandColor = BRAND_COLOR,
 	StudioProvider = StudioProvider,
+	-- Exposed so storybook stories can wrap components in an edited copy of the theme.
+	Provider = Context.Provider,
 	Consumer = Context.Consumer,
 	with = with,
 }

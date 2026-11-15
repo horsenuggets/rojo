@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Add a UI Labs storybook for the plugin. Serve `storybook.project.json`, connect, and
+  open UI Labs to preview the plugin's buttons, inputs, checkboxes, dropdowns, tags,
+  header, spinner, and its connecting, error, not connected, and settings pages one at a
+  time. Every story has controls for the brand color and transparency, and stories live in
+  `plugin/stories/` so they aren't included in the built plugin.
+
 ## `7.7.1-horse.1.1`
 
 * Stop syncback from rewriting files when the same place is synced again. Rewriting an
