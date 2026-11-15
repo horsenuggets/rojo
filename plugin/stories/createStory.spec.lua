@@ -10,8 +10,32 @@ frame, pushes control changes through `subscribe`, and runs the cleanup function
 return function()
 	const Roact = require("../Packages/Roact")
 	const Theme = require("../Plugin/App/Theme")
+	const strict = require("../Plugin/strict")
 
 	const createStory = require("./createStory")
+
+	const FAKE_THEME = strict("StoryTestTheme", {
+		BackgroundColor = Color3.fromHex("2E2E2E"),
+		BrandColor = Theme.BrandColor,
+	})
+
+	-- The real provider reads Studio's settings, which the test place can't reach because
+	-- it runs tests from a server script, so the specs provide a fixed theme instead.
+	const function FakeStudioProvider(props)
+		return Roact.createElement(Theme.Provider, {
+			value = FAKE_THEME,
+		}, props[Roact.Children])
+	end
+
+	const realStudioProvider = Theme.StudioProvider
+
+	beforeAll(function()
+		Theme.StudioProvider = FakeStudioProvider
+	end)
+
+	afterAll(function()
+		Theme.StudioProvider = realStudioProvider
+	end)
 
 	-- Stands in for UI Labs. It calls `render` with the story's default control values and
 	-- hands back the subscribed listener so tests can push control changes.
