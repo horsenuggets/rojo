@@ -19,7 +19,7 @@ use crate::{
     },
     syncback::{
         directory_middleware_for_instance, extension_for_middleware, filter_properties,
-        hash_instance, instances_as_directories, is_valid_path, sibling_order_key,
+        hash_json_instance, instances_as_directories, is_valid_path, sibling_order_key,
         unique_child_stems, FsSnapshot, SyncbackReturn, SyncbackSnapshot,
     },
     REF_ID_ATTRIBUTE_NAME,
@@ -215,11 +215,11 @@ pub fn syncback_dir<'sync>(
         // Metadata that used to hold inline children is rewritten even when it
         // ends up empty, or the removed children would load again from it.
         if !meta.is_empty() || (inline && was_inline) {
-            dir_syncback.fs_snapshot.add_file(
-                &meta_path,
-                crate::json::to_vec_pretty(&meta)
-                    .context("could not serialize new init.meta.json")?,
-            );
+            let contents = crate::json::to_vec_pretty(&meta)
+                .context("could not serialize new init.meta.json")?;
+            if snapshot.vfs().read(&meta_path).with_not_found()?.as_deref() != Some(&contents) {
+                dir_syncback.fs_snapshot.add_file(&meta_path, contents);
+            }
             wrote_meta = true;
         }
     }
@@ -605,9 +605,9 @@ pub fn syncback_dir_no_meta<'sync>(
     let mut fs_snapshot = FsSnapshot::new();
 
     if let Some(old_ref) = snapshot.old {
-        let new_hash = hash_instance(snapshot.project(), snapshot.new_tree(), snapshot.new)
+        let new_hash = hash_json_instance(snapshot.project(), snapshot.new_tree(), snapshot.new)
             .expect("new Instance should be hashable");
-        let old_hash = hash_instance(snapshot.project(), snapshot.old_tree(), old_ref)
+        let old_hash = hash_json_instance(snapshot.project(), snapshot.old_tree(), old_ref)
             .expect("old Instance should be hashable");
 
         if old_hash != new_hash {
