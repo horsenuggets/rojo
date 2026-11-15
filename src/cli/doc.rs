@@ -1,6 +1,6 @@
 use clap::Parser;
 
-/// Open Rojo's documentation in your browser.
+/// Open Rojo+'s documentation in your browser.
 #[derive(Debug, Parser)]
 pub struct DocCommand {}
 

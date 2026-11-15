@@ -23,7 +23,7 @@ const UNKNOWN_OUTPUT_KIND_ERR: &str = "Could not detect what kind of file to bui
 const UNKNOWN_PLUGIN_KIND_ERR: &str = "Could not detect what kind of file to build. \
                                        Expected plugin file to end in .rbxm or .rbxmx.";
 
-/// Generates a model or place file from the Rojo project.
+/// Generates a model or place file from the Rojo+ project.
 #[derive(Debug, Parser)]
 pub struct BuildCommand {
     /// Path to the project to build. Defaults to the current directory.
@@ -136,7 +136,7 @@ impl BuildCommand {
     }
 }
 
-/// The different kinds of output that Rojo can build to.
+/// The different kinds of output that Rojo+ can build to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputKind {
     /// An XML model file.

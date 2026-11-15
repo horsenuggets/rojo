@@ -86,8 +86,8 @@ impl LiveServer {
         let server = Server::try_bind(&address)
             .with_context(|| {
                 format!(
-                    "Could not start the Rojo server on {address}.\n\
-                     The address may already be in use or reserved. Another Rojo server might already \
+                    "Could not start the Rojo+ server on {address}.\n\
+                     The address may already be in use or reserved. Another Rojo+ server might already \
                      be running, or another program may be using that port.\n\
                      You can pick a different port with the --port option."
                 )
@@ -98,7 +98,7 @@ impl LiveServer {
         on_listening();
 
         rt.block_on(server)
-            .context("The Rojo web server encountered a fatal error")?;
+            .context("The Rojo+ web server encountered a fatal error")?;
 
         Ok(())
     }
