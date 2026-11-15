@@ -12,6 +12,9 @@ local Roact = require(Packages.Roact)
 local defaultSettings = {
 	openScriptsExternally = false,
 	twoWaySync = false,
+	-- Which side wins when a two-way sync edit meets a disk change Studio
+	-- hasn't seen yet. Studio only replaces the values it edited.
+	twoWaySyncAuthority = "Filesystem" :: "Filesystem" | "Studio",
 	autoReconnect = false,
 	showNotifications = true,
 	enableSyncFallback = true,

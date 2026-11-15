@@ -36,6 +36,20 @@ Making a new release? Simply add the new header with the version and date undern
   header, spinner, and its connecting, error, not connected, and settings pages one at a
   time. Every story has controls for the brand color and transparency, and stories live in
   `plugin/stories/` so they aren't included in the built plugin.
+* Add a Two-Way Sync Authority setting that chooses which side wins when a Studio edit
+  meets a file change Studio hasn't seen yet. `Filesystem`, the default, keeps today's
+  behavior and restores the disk value in Studio. `Studio` writes every value Studio
+  edited over the file, while disk changes to values Studio didn't touch are kept and
+  sent to Studio. Stale batches and deletions are saved too, deletions still never remove
+  files the server doesn't know about, and a file that keeps changing mid-write is retried
+  a few times before the edit fails. Set it in the plugin settings or with
+  `shared.RojoPlus.setTwoWaySyncAuthority`, and it applies from the next write.
+* Keep Studio's version when rejecting the sync confirmation, even if the file changes
+  again before the write lands.
+* Apply each saved two-way sync edit before the next one in the same batch, so editing a
+  child right after renaming its inline parent no longer conflicts with the rename.
+* Bump the server and plugin protocol version to 7, since write requests now carry the
+  chosen authority.
 
 ## `7.7.1-horse.1.1`
 

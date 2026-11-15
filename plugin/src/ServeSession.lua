@@ -165,11 +165,16 @@ function ServeSession:__queueChange(instance, propertyName)
 end
 
 function ServeSession:__writePatch(patch, messageCursor)
+	-- Read when each batch is sent, so changing it applies to the next write
+	-- without reconnecting.
+	local authority = Settings:get("twoWaySyncAuthority")
+
 	-- One record per write, which moves from Pending to its outcome, so a write
 	-- is never reported as both pending and finished.
 	local record = {
 		status = "Pending",
 		patch = patch,
+		authority = authority,
 	}
 	table.insert(self.__syncResults, record)
 
@@ -182,7 +187,7 @@ function ServeSession:__writePatch(patch, messageCursor)
 	end
 
 	return self.__apiContext
-		:write(patch, messageCursor)
+		:write(patch, messageCursor, authority)
 		:andThen(function(result)
 			finish(ServeSession.getWriteStatus(result), result)
 			return result
@@ -686,7 +691,9 @@ function ServeSession:__initialSync(serverInfo)
 				table.insert(inversePatch.removed, id)
 			end
 
-			return self.__apiContext:write(inversePatch)
+			-- Rejecting is an explicit choice to keep Studio's version, so Studio
+			-- wins even if the disk changes again before this write lands.
+			return self.__apiContext:write(inversePatch, nil, "Studio")
 		elseif userDecision == "Accept" then
 			self:__applyPatch(catchUpPatch)
 			return Promise.resolve()

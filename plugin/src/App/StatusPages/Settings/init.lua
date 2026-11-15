@@ -29,6 +29,7 @@ end
 local invertedLevels = invertTbl(Log.Level)
 local confirmationBehaviors = { "Initial", "Always", "Large Changes", "Unlisted PlaceId", "Never" }
 local syncReminderModes = { "None", "Notify", "Fullscreen" }
+local writeAuthorities = { "Filesystem", "Studio" }
 
 local function Navbar(props)
 	return Theme.with(function(theme)
@@ -235,6 +236,18 @@ function SettingsPage:render()
 				tag = "unstable",
 				transparency = self.props.transparency,
 				layoutOrder = layoutIncrement(),
+			}),
+
+			TwoWaySyncAuthority = e(Setting, {
+				id = "twoWaySyncAuthority",
+				name = "Two-Way Sync Authority",
+				description = "Which side wins when a Studio edit meets a file change Studio hasn't seen yet. Studio only replaces the values it edited.",
+				tag = "unstable",
+				transparency = self.props.transparency,
+				layoutOrder = layoutIncrement(),
+				visible = Settings:getBinding("twoWaySync"),
+
+				options = writeAuthorities,
 			}),
 
 			LogLevel = e(Setting, {

@@ -30,8 +30,9 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Current protocol version, which is required to match. Version 6 added write
 /// cursors to write requests and accepted, conflicted, and failed results to write
-/// responses, which older peers neither send nor understand.
-pub const PROTOCOL_VERSION: u64 = 6;
+/// responses, which older peers neither send nor understand. Version 7 made write
+/// requests carry the plugin's chosen `WriteAuthority`.
+pub const PROTOCOL_VERSION: u64 = 7;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,6 +225,17 @@ pub struct ReadResponse<'a> {
     pub instances: HashMap<Ref, Instance<'a>>,
 }
 
+/// Which side wins when a two-way sync write meets a change on disk that
+/// Studio hasn't seen yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WriteAuthority {
+    /// The disk value is restored in Studio and the write is dropped.
+    Filesystem,
+    /// The server catches up with the disk, then writes every value Studio
+    /// changed over it. Disk changes Studio didn't touch are kept.
+    Studio,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteRequest {
@@ -231,6 +243,7 @@ pub struct WriteRequest {
     /// The last server revision applied before this Studio batch began.
     #[serde(default)]
     pub message_cursor: Option<u32>,
+    pub authority: WriteAuthority,
     pub removed: Vec<Ref>,
 
     #[serde(default)]
