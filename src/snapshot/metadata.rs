@@ -222,7 +222,12 @@ impl InstanceContext {
         self.reserved_cache_path = Some(path);
     }
 
-    /// Returns whether the path is the reserved cache directory or a descendant.
+    pub fn reserved_cache_path(&self) -> Option<&Path> {
+        self.reserved_cache_path.as_deref()
+    }
+
+    /// Returns whether the path lexically names the reserved cache or a descendant.
+    /// Resolve ambiguous paths before using this to exclude snapshot sources.
     pub fn is_reserved_path(&self, path: &Path) -> bool {
         self.reserved_cache_path
             .as_ref()
@@ -459,8 +464,13 @@ mod test {
     #[test]
     fn reserved_cache_matches_only_its_directory_and_descendants() {
         let mut context = InstanceContext::new();
+        assert!(context.reserved_cache_path().is_none());
         assert!(!context.is_reserved_path(Path::new("/project/.rojo")));
         context.set_reserved_cache_path(PathBuf::from("/project/.rojo"));
+        assert_eq!(
+            context.reserved_cache_path(),
+            Some(Path::new("/project/.rojo"))
+        );
 
         for path in ["/project/.rojo", "/project/.rojo/relocations/intent.json"] {
             assert!(context.is_reserved_path(Path::new(path)), "{path}");

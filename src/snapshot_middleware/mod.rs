@@ -21,7 +21,7 @@ mod util;
 mod yaml;
 
 use std::{
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -95,8 +95,21 @@ pub fn snapshot_from_vfs(
     vfs: &Vfs,
     path: &Path,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
-    if context.is_reserved_path(path) {
-        return Ok(None);
+    if context.reserved_cache_path().is_some() {
+        // Unambiguous cache descendants must be rejected even when probing below a
+        // file would fail. Parent components can instead lead back out of the cache.
+        if !path.components().any(|part| part == Component::ParentDir)
+            && context.is_reserved_path(path)
+        {
+            return Ok(None);
+        }
+        let resolved = match vfs.canonicalize(path).with_not_found()? {
+            Some(resolved) => resolved,
+            None => return Ok(None),
+        };
+        if context.is_reserved_path(&resolved) {
+            return Ok(None);
+        }
     }
 
     let meta = match vfs.metadata(path).with_not_found()? {
@@ -598,6 +611,107 @@ mod test {
             .metadata
             .context
             .is_reserved_path(Path::new("/root/.rojo/intent.json")));
+    }
+
+    #[test]
+    fn reserved_cache_checks_resolved_parent_paths_without_changing_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir(root.join(".rojo")).unwrap();
+        std::fs::create_dir(root.join("Source")).unwrap();
+        std::fs::write(root.join(".rojo/intent.json"), "invalid JSON").unwrap();
+        std::fs::write(root.join("Source/Code.luau"), "return 42").unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let mut context = InstanceContext::new();
+        context.set_reserved_cache_path(root.join(".rojo"));
+
+        for suffix in [
+            "Source/../.rojo/intent.json",
+            "Source/../.rojo",
+            "Source/../missing.luau",
+            ".rojo/../Source/missing.luau",
+            "missing.luau",
+        ] {
+            let path = root.join(suffix);
+            assert!(
+                snapshot_from_vfs(&context, &vfs, &path).unwrap().is_none(),
+                "{path:?}"
+            );
+        }
+        for suffix in [".rojo/../Source/Code.luau", "Source/Code.luau"] {
+            let path = root.join(suffix);
+            let source = snapshot_from_vfs(&context, &vfs, &path).unwrap().unwrap();
+            assert_eq!(source.name, "Code");
+            assert_eq!(source.class_name, "ModuleScript");
+            assert_eq!(source.metadata.instigating_source.unwrap().path(), path);
+        }
+    }
+
+    #[test]
+    fn reserved_cache_does_not_exclude_other_cache_named_sources() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                (
+                    ".rojo",
+                    VfsSnapshot::dir([("value.txt", VfsSnapshot::file("private"))]),
+                ),
+                (
+                    ".rojo-backup",
+                    VfsSnapshot::dir([("value.txt", VfsSnapshot::file("backup"))]),
+                ),
+                (
+                    "Source",
+                    VfsSnapshot::dir([(
+                        ".rojo",
+                        VfsSnapshot::dir([("value.txt", VfsSnapshot::file("source"))]),
+                    )]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+        let mut context = InstanceContext::new();
+        context.set_reserved_cache_path(PathBuf::from("/root/.rojo"));
+        for path in [
+            "/root/.rojo-backup/value.txt",
+            "/root/Source/.rojo/value.txt",
+        ] {
+            assert!(snapshot_from_vfs(&context, &vfs, Path::new(path))
+                .unwrap()
+                .is_some());
+        }
+        assert!(snapshot_from_vfs(
+            &InstanceContext::new(),
+            &vfs,
+            Path::new("/root/.rojo/value.txt")
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_cache_rejects_file_and_directory_symlink_aliases() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let cache = root.join(".rojo");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("intent.json"), "invalid JSON").unwrap();
+        symlink(&cache, root.join("cache-alias")).unwrap();
+        symlink(cache.join("intent.json"), root.join("file-alias.json")).unwrap();
+        let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+        let mut context = InstanceContext::new();
+        context.set_reserved_cache_path(cache);
+        for path in ["cache-alias", "cache-alias/intent.json", "file-alias.json"] {
+            assert!(snapshot_from_vfs(&context, &vfs, &root.join(path))
+                .unwrap()
+                .is_none());
+        }
     }
 
     fn middleware_for_dir(entries: Vec<(&str, VfsSnapshot)>) -> Middleware {
