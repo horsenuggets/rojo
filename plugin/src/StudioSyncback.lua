@@ -191,7 +191,7 @@ function StudioSyncback.run(baseUrl)
 			const info = response:msgpack()
 			if info.protocolVersion ~= Config.protocolVersion then
 				return Promise.reject(
-					`The Rojo server uses protocol version {info.protocolVersion}, but this plugin `
+					`The Rojo+ server uses protocol version {info.protocolVersion}, but this plugin `
 						.. `uses {Config.protocolVersion}. Make sure the plugin and server versions match.`
 				)
 			end

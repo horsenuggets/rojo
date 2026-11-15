@@ -2,13 +2,17 @@
 
 SharedAPI
 
-Exposes a shared.Rojo API that allows external code (such as
-the Studio MCP) to programmatically interact with the Rojo
+Exposes a shared.RojoPlus API that allows external code (such as
+the Studio MCP) to programmatically interact with the Rojo+
 plugin. This enables automated workflows like connecting to a
 serve session, accepting sync confirmations, and checking
 connection status without manual UI interaction.
 
-API:
+The same API is also available as shared.Rojo for existing
+scripts. Use shared.RojoPlus when another Rojo build may be
+loaded alongside, since that one can claim shared.Rojo.
+
+API (shown as shared.Rojo, identical under shared.RojoPlus):
 > shared.Rojo.connect(host?, port?) - Connect to a Rojo
   serve session
 > shared.Rojo.disconnect() - Disconnect from the current
@@ -45,6 +49,10 @@ const summarizePatch = require(script.Parent.summarizePatch)
 const SharedAPI = {}
 
 local registeredApp = nil
+local registeredApi = nil
+
+-- shared.RojoPlus is unique to Rojo+. shared.Rojo is kept for existing scripts.
+SharedAPI.GLOBAL_NAMES = { "RojoPlus", "Rojo" }
 
 -- A session captures its two-way sync option when it starts connecting, so the
 -- setting can only change while no session is starting, confirming, or running.
@@ -71,7 +79,7 @@ function SharedAPI.register(app)
 		if registeredApp == nil then
 			return {
 				success = false,
-				error = "Rojo plugin is not loaded",
+				error = "Rojo+ plugin is not loaded",
 			}
 		end
 
@@ -93,7 +101,7 @@ function SharedAPI.register(app)
 		if registeredApp == nil then
 			return {
 				success = false,
-				error = "Rojo plugin is not loaded",
+				error = "Rojo+ plugin is not loaded",
 			}
 		end
 
@@ -108,7 +116,7 @@ function SharedAPI.register(app)
 		if registeredApp == nil then
 			return {
 				success = false,
-				error = "Rojo plugin is not loaded",
+				error = "Rojo+ plugin is not loaded",
 			}
 		end
 
@@ -130,7 +138,7 @@ function SharedAPI.register(app)
 		if registeredApp == nil then
 			return {
 				success = false,
-				error = "Rojo plugin is not loaded",
+				error = "Rojo+ plugin is not loaded",
 			}
 		end
 
@@ -190,7 +198,7 @@ function SharedAPI.register(app)
 		if registeredApp == nil then
 			return {
 				success = false,
-				error = "Rojo plugin is not loaded",
+				error = "Rojo+ plugin is not loaded",
 			}
 		end
 
@@ -263,7 +271,7 @@ function SharedAPI.register(app)
 		if registeredApp.serveSession == nil then
 			return {
 				success = false,
-				error = "Rojo is not connected",
+				error = "Rojo+ is not connected",
 			}
 		end
 
@@ -274,7 +282,7 @@ function SharedAPI.register(app)
 		if registeredApp == nil then
 			return {
 				success = false,
-				error = "Rojo plugin is not loaded",
+				error = "Rojo+ plugin is not loaded",
 			}
 		end
 
@@ -321,7 +329,7 @@ function SharedAPI.register(app)
 		if registeredApp == nil then
 			return {
 				success = false,
-				error = "Rojo plugin is not loaded",
+				error = "Rojo+ plugin is not loaded",
 			}
 		end
 
@@ -337,7 +345,7 @@ function SharedAPI.register(app)
 		if registeredApp == nil then
 			return {
 				success = false,
-				error = "Rojo plugin is not loaded",
+				error = "Rojo+ plugin is not loaded",
 			}
 		end
 
@@ -348,14 +356,24 @@ function SharedAPI.register(app)
 		}
 	end
 
-	shared.Rojo = api
-	Log.trace("Registered shared.Rojo API")
+	registeredApi = api
+	for _, name in SharedAPI.GLOBAL_NAMES do
+		shared[name] = api
+	end
+	Log.trace("Registered shared.RojoPlus API")
 end
 
 function SharedAPI.unregister()
 	registeredApp = nil
-	shared.Rojo = nil
-	Log.trace("Unregistered shared.Rojo API")
+	-- Another Rojo build may have taken over a name since, so only names that
+	-- still point at this API are cleared.
+	for _, name in SharedAPI.GLOBAL_NAMES do
+		if shared[name] == registeredApi then
+			shared[name] = nil
+		end
+	end
+	registeredApi = nil
+	Log.trace("Unregistered shared.RojoPlus API")
 end
 
 return SharedAPI
