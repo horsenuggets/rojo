@@ -39,8 +39,9 @@ Making a new release? Simply add the new header with the version and date undern
   next to another Rojo plugin in the same Studio. The panel's dock position no longer
   resets on every update, but keyboard shortcuts bound to the old actions need to be bound
   again.
-* Expose the plugin API as `shared.RojoPlus`, keeping `shared.Rojo` for existing scripts.
-  Unloading the plugin only clears names that still point at Rojo+.
+* Expose the plugin API as `shared.RojoPlus`. It's also published as `shared.Rojo` for
+  existing scripts unless another Rojo build already holds that name, and unloading the
+  plugin only clears names that still point at Rojo+.
 
 ## `7.7.1-horse.1.0`
 
