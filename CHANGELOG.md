@@ -36,6 +36,11 @@ Making a new release? Simply add the new header with the version and date undern
   instances that references point at keep the `Rojo_Id` they have on disk instead of
   getting a new one every run. That second case affected every `--from-studio` run, since
   Studio hands out new UniqueIds each time, and place files without UniqueIds.
+* Load same-named siblings in the order syncback numbered them when they're written
+  differently, like `Twin.luau` and `Twin~2/`. They used to load in reverse, so
+  `rojo build` and `rojo serve` swapped them.
+* Never give a referenced instance an ID another instance already has, which could
+  happen when a referenced instance was renamed and a new one took its old name.
 * Rebrand the fork as Rojo+. The CLI, plugin toolbar, panel title, and messages say Rojo+,
   and the panel header shows "Rojo+" instead of the version. `rojo plugin install` writes
   `Rojo+.rbxm` and the release asset is `Rojo+.rbxm`, so Rojo+ can be installed alongside
