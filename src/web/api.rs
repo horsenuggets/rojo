@@ -212,6 +212,7 @@ impl ApiService {
         tree_mutation_sender
             .send(TreeMutation {
                 message_cursor: request.message_cursor,
+                authority: request.authority,
                 patch_set: PatchSet {
                     removed_instances: request.removed,
                     added_instances: Vec::new(),

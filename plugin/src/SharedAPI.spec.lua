@@ -16,6 +16,21 @@ return function()
 		end
 	end)
 
+	it("should only accept the two write authorities", function()
+		local cases = {
+			{ "Filesystem", true },
+			{ "Studio", true },
+			{ "filesystem", false },
+			{ "studio", false },
+			{ "", false },
+			{ true, false },
+			{ nil, false },
+		}
+		for _, case in cases do
+			expect(SharedAPI.isWriteAuthority(case[1])).to.equal(case[2])
+		end
+	end)
+
 	-- These use a plain table in place of `shared`, so the live plugin's API is
 	-- never touched.
 	describe("shared names", function()
