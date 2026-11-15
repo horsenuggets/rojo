@@ -126,10 +126,7 @@ impl ServeSession {
             InstanceContext::with_emit_legacy_scripts(root_project.emit_legacy_scripts);
 
         // Journals are private server state, never source instances.
-        instance_context.add_path_ignore_rules([crate::snapshot::PathIgnoreRule {
-            base_path: root_project.folder_location().to_path_buf(),
-            glob: crate::glob::IgnorableGlob::new(".rojo").unwrap(),
-        }]);
+        instance_context.set_reserved_cache_path(root_project.folder_location().join(".rojo"));
 
         // Enable .luaurc alias resolution. Alias requires are
         // transformed into relative require-by-string paths during
@@ -319,6 +316,119 @@ mod test {
     use super::*;
 
     use memofs::StdBackend;
+
+    fn root_mapping_with_reserved_cache() -> memofs::InMemoryFs {
+        use memofs::{InMemoryFs, VfsSnapshot};
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                (
+                    "serve.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "CacheTest",
+                            "globIgnorePaths": ["!*", "serve.project.json"],
+                            "tree": { "$path": "." }
+                        }"#,
+                    ),
+                ),
+                (
+                    ".rojo",
+                    VfsSnapshot::dir([("intent.json", VfsSnapshot::file("invalid JSON"))]),
+                ),
+                ("Code.luau", VfsSnapshot::file("return 1")),
+                (
+                    ".rojo-backup",
+                    VfsSnapshot::dir([("Backup.luau", VfsSnapshot::file("return {}"))]),
+                ),
+                (
+                    "Source",
+                    VfsSnapshot::dir([(
+                        ".rojo",
+                        VfsSnapshot::dir([("Nested.luau", VfsSnapshot::file("return {}"))]),
+                    )]),
+                ),
+            ]),
+        )
+        .unwrap();
+        imfs
+    }
+
+    #[test]
+    fn root_mapping_cannot_reinclude_reserved_cache_with_ignore_negation() {
+        let session = ServeSession::new(
+            Vfs::new(root_mapping_with_reserved_cache()),
+            "/root/serve.project.json",
+        )
+        .unwrap();
+        let tree = session.tree();
+        let mut children: Vec<_> = tree
+            .root()
+            .children()
+            .iter()
+            .map(|id| tree.get_instance(*id).unwrap().name())
+            .collect();
+        children.sort();
+        assert_eq!(children, [".rojo-backup", "Code", "Source"]);
+        for path in [
+            "/root/Code.luau",
+            "/root/.rojo-backup/Backup.luau",
+            "/root/Source/.rojo/Nested.luau",
+        ] {
+            assert!(!tree.get_ids_at_path(Path::new(path)).is_empty(), "{path}");
+        }
+        assert!(tree.get_ids_at_path(Path::new("/root/.rojo")).is_empty());
+        assert!(tree
+            .get_metadata(tree.get_root_id())
+            .unwrap()
+            .context
+            .is_reserved_path(Path::new("/root/.rojo/intent.json")));
+    }
+
+    #[test]
+    fn watch_reload_keeps_reserved_cache_excluded_while_normal_source_changes() {
+        use memofs::{VfsEvent, VfsSnapshot};
+        let mut imfs = root_mapping_with_reserved_cache();
+        let session =
+            ServeSession::new(Vfs::new(imfs.clone()), "/root/serve.project.json").unwrap();
+        let cursor = session.message_queue().cursor();
+        imfs.load_snapshot(
+            "/root/.rojo/another.json",
+            VfsSnapshot::file("invalid JSON"),
+        )
+        .unwrap();
+        imfs.raise_event(VfsEvent::Create("/root/.rojo/another.json".into()));
+        // A root directory reload must skip the cache and still reconcile source changes.
+        imfs.load_snapshot("/root/Code.luau", VfsSnapshot::file("return 42"))
+            .unwrap();
+        imfs.raise_event(VfsEvent::Write("/root/Code.luau".into()));
+        imfs.raise_event(VfsEvent::Write("/root".into()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut cursor = cursor;
+                loop {
+                    let (next_cursor, _) = session.message_queue().subscribe(cursor).await.unwrap();
+                    cursor = next_cursor;
+                    let tree = session.tree();
+                    assert!(tree.get_ids_at_path(Path::new("/root/.rojo")).is_empty());
+                    let ids = tree.get_ids_at_path(Path::new("/root/Code.luau"));
+                    let code = tree.get_instance(*ids.iter().next().unwrap()).unwrap();
+                    if code.properties().get(&rbx_dom_weak::ustr("Source"))
+                        == Some(&rbx_dom_weak::types::Variant::String("return 42".into()))
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("Normal source watch reload timed out");
+        });
+    }
 
     #[test]
     fn watch_reload_keeps_build_pool_and_discovers_new_initializer() {

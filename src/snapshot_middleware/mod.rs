@@ -95,6 +95,10 @@ pub fn snapshot_from_vfs(
     vfs: &Vfs,
     path: &Path,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
+    if context.is_reserved_path(path) {
+        return Ok(None);
+    }
+
     let meta = match vfs.metadata(path).with_not_found()? {
         Some(meta) => meta,
         None => return Ok(None),
@@ -554,6 +558,47 @@ mod test {
 
     use memofs::{InMemoryFs, VfsSnapshot};
     use std::path::Path;
+
+    #[test]
+    fn reserved_cache_is_rejected_before_directory_or_file_dispatch() {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/root",
+            VfsSnapshot::dir([
+                (
+                    ".rojo",
+                    VfsSnapshot::dir([
+                        ("default.project.json", VfsSnapshot::file("invalid JSON")),
+                        ("intent.json", VfsSnapshot::file("invalid JSON")),
+                    ]),
+                ),
+                ("Code.luau", VfsSnapshot::file("return 42")),
+            ]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(imfs);
+        let mut context = InstanceContext::new();
+        context.set_reserved_cache_path(PathBuf::from("/root/.rojo"));
+        for path in [
+            "/root/.rojo",
+            "/root/.rojo/default.project.json",
+            "/root/.rojo/intent.json",
+            // Probing below a file would fail if metadata were read first.
+            "/root/.rojo/intent.json/child",
+        ] {
+            assert!(snapshot_from_vfs(&context, &vfs, Path::new(path))
+                .unwrap()
+                .is_none());
+        }
+        let source = snapshot_from_vfs(&context, &vfs, Path::new("/root/Code.luau"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.name, "Code");
+        assert!(source
+            .metadata
+            .context
+            .is_reserved_path(Path::new("/root/.rojo/intent.json")));
+    }
 
     fn middleware_for_dir(entries: Vec<(&str, VfsSnapshot)>) -> Middleware {
         let mut imfs = InMemoryFs::new();
