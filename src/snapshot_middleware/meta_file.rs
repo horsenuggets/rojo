@@ -65,17 +65,21 @@ pub fn serialize_values<'a>(
 /// Returns the `id` to write to a metadata file, given the ID the instance
 /// already has and the attributes being written.
 ///
-/// Reading a file copies its `Rojo_Id` attribute into the instance's ID, so
-/// writing that ID back as `id` would add a duplicate on every syncback after
-/// the first. It's only written when the attributes don't already carry it.
+/// Reading a file lets its `Rojo_Id` attribute override the metadata ID. Keeping
+/// an old ID beside a new attribute would write a stale value that disappears
+/// on the next syncback. Only keep the metadata ID when no valid attribute
+/// supplies the instance's ID.
 fn metadata_id(
     specified_id: Option<&RojoRef>,
     attributes: &IndexMap<String, UnresolvedValue>,
 ) -> Option<String> {
     let id = specified_id?.to_string();
     let carried = match attributes.get(REF_ID_ATTRIBUTE_NAME) {
-        Some(UnresolvedValue::FullyQualified(Variant::String(value))) => *value == id,
-        Some(UnresolvedValue::Ambiguous(AmbiguousValue::String(value))) => *value == id,
+        Some(UnresolvedValue::FullyQualified(Variant::String(_)))
+        | Some(UnresolvedValue::Ambiguous(AmbiguousValue::String(_))) => true,
+        Some(UnresolvedValue::FullyQualified(Variant::BinaryString(value))) => {
+            str::from_utf8(value.as_ref()).is_ok()
+        }
         _ => false,
     };
     (!carried).then_some(id)
@@ -805,18 +809,27 @@ mod test {
     use super::*;
 
     #[test]
-    fn metadata_ids_are_only_written_when_no_attribute_carries_them() {
+    fn metadata_ids_defer_to_valid_attribute_ids() {
         let id = RojoRef::new("abc".into());
         let attributes_with =
             |value: UnresolvedValue| IndexMap::from([(REF_ID_ATTRIBUTE_NAME.to_owned(), value)]);
 
-        // An ID read from a Rojo_Id attribute is already written by the attribute.
+        // Attribute IDs are authoritative even when they replace the old metadata ID.
         let carried = [
             attributes_with(UnresolvedValue::FullyQualified(Variant::String(
                 "abc".into(),
             ))),
             attributes_with(UnresolvedValue::Ambiguous(AmbiguousValue::String(
                 "abc".into(),
+            ))),
+            attributes_with(UnresolvedValue::FullyQualified(Variant::String(
+                "different".into(),
+            ))),
+            attributes_with(UnresolvedValue::Ambiguous(AmbiguousValue::String(
+                "different".into(),
+            ))),
+            attributes_with(UnresolvedValue::FullyQualified(Variant::BinaryString(
+                b"different".to_vec().into(),
             ))),
         ];
         for attributes in &carried {
@@ -826,8 +839,9 @@ mod test {
         // Otherwise the ID has nowhere else to go, so it's kept.
         let elsewhere = [
             IndexMap::new(),
-            attributes_with(UnresolvedValue::Ambiguous(AmbiguousValue::String(
-                "different".into(),
+            attributes_with(UnresolvedValue::FullyQualified(Variant::Bool(true))),
+            attributes_with(UnresolvedValue::FullyQualified(Variant::BinaryString(
+                vec![0xff].into(),
             ))),
         ];
         for attributes in &elsewhere {

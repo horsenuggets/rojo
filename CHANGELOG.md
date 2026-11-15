@@ -31,6 +31,19 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Choose syncback script suffixes from the instance class and `RunContext`. LocalScripts
+  use `.local.luau`, legacy Scripts use `.legacy.luau`, and Scripts with Server or Client
+  context use `.server.luau` or `.client.luau`. Recognize `.local` and `.legacy` script
+  suffixes without custom sync rules, and interpret the default `.server` and `.client`
+  suffixes as explicit RunContexts regardless of `emitLegacyScripts`. Preserve script
+  kinds when rebuilding exported files, including scripts with children. Normalize
+  unchanged script filenames during full syncback without overwriting unmanaged files.
+  Reject scoped two-way edits that require a filename change and direct them to full
+  syncback instead of saving a mismatched script kind.
+
+* Drop an obsolete metadata `id` immediately when a new `Rojo_Id` attribute replaces it,
+  so exporting a place does not need a second syncback to remove the stale ID.
+
 ## `7.7.1-horse.1.2`
 
 * Persist two-way sync renames and parent changes for filesystem-backed instances as

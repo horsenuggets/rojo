@@ -25,7 +25,7 @@ instances:
     Parent: id-2
     Properties:
       RunContext:
-        Enum: 0
+        Enum: 1
       Source:
         String: "-- Hello, from bar!"
   id-4:

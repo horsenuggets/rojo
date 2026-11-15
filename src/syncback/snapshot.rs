@@ -92,7 +92,11 @@ impl<'sync> SyncbackSnapshot<'sync> {
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str());
         let name = match old_name {
-            Some(name) => name.to_owned(),
+            Some(name) => {
+                super::file_names::canonical_script_file_name(get_best_middleware(&snapshot), name)
+                    .map(|name| name.into_owned())
+                    .unwrap_or_else(|| name.to_owned())
+            }
             None => file_name_for_stem(get_best_middleware(&snapshot), stem),
         };
         snapshot.path = base_path.join(name);
@@ -240,6 +244,45 @@ impl<'sync> SyncbackSnapshot<'sync> {
             .new_tree
             .get_by_ref(self.new)
             .expect("SyncbackSnapshot should not contain invalid referents")
+    }
+
+    /// Refuses to install a renamed source over a file the old tree does not own.
+    pub fn validate_script_destination(&self, path: &Path) -> anyhow::Result<()> {
+        if self
+            .old_inst()
+            .as_ref()
+            .and_then(super::source_file)
+            .is_some_and(|source| source == path)
+        {
+            return Ok(());
+        }
+        match self.vfs().metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        if self.middleware.is_some()
+            && self.old_inst().is_some_and(|old| {
+                old.metadata()
+                    .relevant_paths
+                    .iter()
+                    .any(|source| source == path)
+            })
+        {
+            return Ok(());
+        }
+        let owned = self.old_tree().descendants().any(|instance| {
+            self.get_old_instance(instance.referent())
+                .as_ref()
+                .and_then(super::source_file)
+                .is_some_and(|source| source == path)
+        });
+        anyhow::ensure!(
+            owned,
+            "Cannot write script source because an unmanaged file already exists at {}",
+            path.display()
+        );
+        Ok(())
     }
 
     /// Returns the root Project that was used to make this snapshot.

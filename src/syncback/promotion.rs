@@ -20,8 +20,8 @@ pub(crate) fn plan_promotion(
 ) -> anyhow::Result<PromotionPaths> {
     let kind = match middleware {
         Middleware::ModuleScript => "",
-        Middleware::ServerScript => ".server",
-        Middleware::ClientScript => ".client",
+        Middleware::ServerScript | Middleware::RunContextServerScript => ".server",
+        Middleware::ClientScript | Middleware::RunContextClientScript => ".client",
         Middleware::LegacyServerScript => ".legacy",
         Middleware::LegacyClientScript => ".local",
         Middleware::PluginScript => ".plugin",
@@ -50,7 +50,8 @@ pub(crate) fn plan_promotion(
         .find(|rule| rule.matches(source))
         .context("The destination has no default mapping")?;
     ensure!(
-        mapped.middleware == middleware,
+        super::file_names::script_kind_suffix(mapped.middleware)
+            == super::file_names::script_kind_suffix(middleware),
         "Custom script mappings cannot be promoted"
     );
     let parent = source
@@ -83,6 +84,10 @@ mod tests {
             ("", Middleware::ModuleScript),
             (".server", Middleware::ServerScript),
             (".client", Middleware::ClientScript),
+            (".server", Middleware::RunContextServerScript),
+            (".client", Middleware::RunContextClientScript),
+            (".legacy", Middleware::LegacyServerScript),
+            (".local", Middleware::LegacyClientScript),
             (".plugin", Middleware::PluginScript),
         ] {
             for extension in ["lua", "luau"] {
