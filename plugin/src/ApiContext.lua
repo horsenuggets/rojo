@@ -24,6 +24,27 @@ local function rejectFailedRequests(response)
 	return response
 end
 
+-- Servers from before the switch to msgpack, including upstream Rojo, answer the info
+-- request with JSON. Decoding JSON as msgpack turns its leading "{" into the number 123,
+-- so fall back to JSON whenever msgpack doesn't produce a table. That way an old server
+-- reaches the protocol version check below and gets a clear message.
+local function decodeInfoResponse(response)
+	local msgpackOk, msgpackBody = pcall(Http.Response.msgpack, response)
+	if msgpackOk and type(msgpackBody) == "table" then
+		return msgpackBody
+	end
+
+	local jsonOk, jsonBody = pcall(Http.Response.json, response)
+	if jsonOk and type(jsonBody) == "table" then
+		return jsonBody
+	end
+
+	return Promise.reject(
+		"Found a server at this address, but couldn't read its response."
+			.. "\nMake sure the address points at a Rojo+ server."
+	)
+end
+
 local function rejectWrongProtocolVersion(infoResponseBody)
 	if infoResponseBody.protocolVersion ~= Config.protocolVersion then
 		local message = (
@@ -149,7 +170,7 @@ function ApiContext:connect()
 
 	return Http.get(url)
 		:andThen(rejectFailedRequests)
-		:andThen(Http.Response.msgpack)
+		:andThen(decodeInfoResponse)
 		:andThen(rejectWrongProtocolVersion)
 		:andThen(function(body)
 			assert(validateApiInfo(body))

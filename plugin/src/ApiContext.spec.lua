@@ -102,4 +102,59 @@ return function()
 		Http.post = originalPost
 		assert(success, err)
 	end)
+
+	-- Connects with Http.get answering the info request with the given body, and returns
+	-- what the connect promise settled with.
+	local function connectWithInfoBody(body)
+		local originalGet = Http.get
+		local results
+		local success, err = pcall(function()
+			Http.get = function()
+				return Promise.resolve({ code = 200, body = body })
+			end
+			results = table.pack(ApiContext.new("http://localhost"):connect():await())
+		end)
+		Http.get = originalGet
+		assert(success, err)
+		return table.unpack(results, 1, results.n)
+	end
+
+	it("should report a protocol mismatch when the server answers with JSON", function()
+		local HttpService = game:GetService("HttpService")
+		local Config = require(script.Parent.Config)
+
+		local connected, message = connectWithInfoBody(HttpService:JSONEncode({
+			sessionId = "old-session",
+			serverVersion = "7.5.1",
+			protocolVersion = 4,
+			projectName = "Old Project",
+		}))
+
+		expect(connected).to.equal(false)
+		expect(message:find("different protocol version", 1, true)).to.be.ok()
+		expect(message:find("Your server is version 7.5.1, with protocol version 4.", 1, true)).to.be.ok()
+		expect(message:find(`with protocol version {Config.protocolVersion}.`, 1, true)).to.be.ok()
+	end)
+
+	it("should report an unreadable response when the body is neither msgpack nor JSON", function()
+		local connected, message = connectWithInfoBody("<html>Not a Rojo+ server</html>")
+
+		expect(connected).to.equal(false)
+		expect(message:find("couldn't read its response", 1, true)).to.be.ok()
+	end)
+
+	it("should connect when the server answers with msgpack", function()
+		local Config = require(script.Parent.Config)
+
+		local connected, body = connectWithInfoBody(Http.msgpackEncode({
+			sessionId = "new-session",
+			serverVersion = "7.7.1",
+			protocolVersion = Config.protocolVersion,
+			projectName = "New Project",
+			rootInstanceId = "root",
+		}))
+
+		expect(connected).to.equal(true)
+		expect(body.sessionId).to.equal("new-session")
+	end)
 end

@@ -50,6 +50,9 @@ Making a new release? Simply add the new header with the version and date undern
   child right after renaming its inline parent no longer conflicts with the rename.
 * Bump the server and plugin protocol version to 7, since write requests now carry the
   chosen authority.
+* Show the usual protocol version mismatch message when the plugin connects to an older
+  server that answers in JSON, like upstream Rojo. It used to fail with "attempt to index
+  number with 'protocolVersion'" instead.
 
 ## `7.7.1-horse.1.1`
 
