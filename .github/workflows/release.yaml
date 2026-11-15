@@ -123,13 +123,13 @@ jobs:
         uses: CompeyDev/setup-rokit@v0.1.2
 
       - name: Build plugin
-        run: rojo build plugin.project.json --output Rojo.rbxm
+        run: rojo build plugin.project.json --output "Rojo+.rbxm"
 
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v4
         with:
           name: rojo-${{ needs.init.outputs.version }}-plugin
-          path: Rojo.rbxm
+          path: Rojo+.rbxm
 
   release-github:
     name: Release (GitHub)
@@ -151,7 +151,7 @@ jobs:
         run: |
           PLUGIN_DIR="releases/rojo-${{ needs.init.outputs.version }}-plugin"
           if [ -d "$PLUGIN_DIR" ]; then
-            mv "$PLUGIN_DIR/Rojo.rbxm" "releases/Rojo.rbxm"
+            mv "$PLUGIN_DIR/Rojo+.rbxm" "releases/Rojo+.rbxm"
             rm -rf "$PLUGIN_DIR"
           fi
 
@@ -169,4 +169,4 @@ jobs:
             --title "${{ needs.init.outputs.version }}" \
             --notes-file /tmp/changelog.txt \
             ./releases/*.zip \
-            ./releases/Rojo.rbxm
+            "./releases/Rojo+.rbxm"
