@@ -1,17 +1,21 @@
 use blake3::Hasher;
 use rbx_dom_weak::types::{ContentType, PhysicalProperties, Variant, Vector3};
 
+use crate::variant_eq::{compare_times, CanonicalNan};
+
 // Scaling a huge finite value can overflow to infinity, which would hash it the same as a
-// real infinity, so values that overflow are hashed unrounded instead.
+// real infinity, so values that overflow are hashed unrounded instead. Every NaN hashes
+// the same, since files don't keep its sign and arithmetic on it doesn't either.
 macro_rules! round {
     ($value:expr) => {{
         let value = $value.clone();
         let scaled = value * 10.0;
-        if scaled.is_finite() || !value.is_finite() {
+        let rounded = if scaled.is_finite() || !value.is_finite() {
             scaled.round() / 10.0
         } else {
             value
-        }
+        };
+        rounded.canonical_nan()
     }};
 }
 
@@ -61,7 +65,7 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             for keypoint in &seq.keypoints {
                 new.push(keypoint);
             }
-            new.sort_unstable_by(|a, b| round!(a.time).total_cmp(&round!(b.time)));
+            new.sort_unstable_by(|a, b| compare_times(round!(a.time), round!(b.time)));
             for keypoint in new {
                 n_hash!(
                     hasher,
@@ -121,7 +125,7 @@ pub fn hash_variant(hasher: &mut Hasher, value: &Variant) {
             for keypoint in &seq.keypoints {
                 new.push(keypoint);
             }
-            new.sort_unstable_by(|a, b| round!(a.time).total_cmp(&round!(b.time)));
+            new.sort_unstable_by(|a, b| compare_times(round!(a.time), round!(b.time)));
             for keypoint in new {
                 n_hash!(
                     hasher,
@@ -268,6 +272,14 @@ mod tests {
         for value in values {
             assert_eq!(hash(value.clone()), hash(value));
         }
+
+        // Files read NaN back as positive, so its sign must not change a hash.
+        let negative_nan = -f32::NAN;
+        assert_eq!(
+            hash(Vector3::new(negative_nan, 0.0, 0.0).into()),
+            hash(Vector3::new(f32::NAN, 0.0, 0.0).into())
+        );
+        assert_eq!(hash(sequence(negative_nan)), hash(sequence(f32::NAN)));
     }
 
     /// Non-finite numbers are written to metadata, so changing one must
