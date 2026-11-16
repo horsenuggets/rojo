@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    snapshot::{InstanceContext, InstanceWithMeta, InstigatingSource, RojoTree},
+    snapshot::{InstanceContext, InstanceWithMeta, RojoTree},
     snapshot_middleware::{default_sync_rules, Middleware},
     Project,
 };
@@ -17,7 +17,7 @@ use rbx_dom_weak::{
 
 use super::{
     file_names::{file_name_for_stem, stem_for_path},
-    get_best_middleware, is_model_file, name_for_inst,
+    get_best_middleware, is_model_file, is_project_owned, name_for_inst,
     property_filter::filter_properties,
     ModelTrees,
 };
@@ -417,15 +417,12 @@ impl<'sync> SyncbackSnapshot<'sync> {
 
     /// Returns the model middleware a `modelTrees` rule assigns to this
     /// snapshot's Instance. Sources named by a project node keep the path and
-    /// format the project gives them.
+    /// format the project gives them, and a nested project file stays one.
     pub fn model_tree_middleware(&self) -> Option<Middleware> {
         let middleware = self.data.model_trees?.middleware(self.new)?;
-        let from_project = self.old_inst().is_some_and(|old| {
-            matches!(
-                old.metadata().instigating_source,
-                Some(InstigatingSource::ProjectNode { .. })
-            )
-        });
+        let from_project = self
+            .old_inst()
+            .is_some_and(|old| is_project_owned(old.metadata()));
         (!from_project).then_some(middleware)
     }
 
@@ -461,23 +458,28 @@ impl<'sync> SyncbackSnapshot<'sync> {
         };
         let globs = Some(rules.compile_globs()?);
         let base = self.project().folder_location();
-        let mut pending = vec![old];
-        while let Some(instance) = pending.pop() {
-            pending.extend(
-                instance
-                    .children()
-                    .iter()
-                    .filter_map(|child| self.get_old_instance(*child)),
-            );
-            for path in &instance.metadata().relevant_paths {
-                if !super::is_valid_path(&globs, base, path) && self.vfs().metadata(path).is_ok() {
-                    return Err(super::IgnoreConflict(format!(
-                        "Cannot change how {} is stored because the project's ignorePaths \
-                         rule excludes {}",
-                        self.get_old_inst_path(old.id()),
-                        path.display()
-                    ))
-                    .into());
+        // The directory is removed with everything in it, including files
+        // Rojo doesn't turn into Instances, so this walks the disk itself
+        // rather than the old tree.
+        let mut pending: Vec<PathBuf> = old.metadata().relevant_paths.clone();
+        while let Some(path) = pending.pop() {
+            let metadata = match fs_err::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !super::is_valid_path(&globs, base, &path) {
+                return Err(super::IgnoreConflict(format!(
+                    "Cannot change how {} is stored because the project's ignorePaths rule \
+                     excludes {}",
+                    self.get_old_inst_path(old.id()),
+                    path.display()
+                ))
+                .into());
+            }
+            if metadata.is_dir() {
+                for entry in fs_err::read_dir(&path)? {
+                    pending.push(entry?.path());
                 }
             }
         }
