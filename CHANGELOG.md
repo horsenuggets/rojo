@@ -35,7 +35,14 @@ Making a new release? Simply add the new header with the version and date undern
   place no longer runs past Studio's script timeout. Studio stops a timed-out script
   without an error the plugin can catch, which left the session stuck on "Connecting"
   with nothing reported. A place with about 340,000 instances used to block Studio for
-  18 seconds in one stretch while connecting, and now stays responsive.
+  18 seconds in one stretch while connecting, and now stays responsive. Disconnecting
+  partway through stops the sync where it is, and Studio edits made while it runs are
+  held until the whole place is known, so they are saved instead of reverted.
+
+## `7.7.1-horse.1.6`
+
+* Fixed a live edit place falling back to the user's sync settings when its session
+  address and its `__RojoPlus_LiveEditUrl` marker differ only by an `http://` prefix.
 * Added `syncbackRules.modelTrees`, a list of rules that store whole subtrees in a single
   model file. Each rule has a `pattern` glob that is matched against the path of an
   Instance in the DataModel (like `Workspace/Maps/*/Effects`) and an optional `format` of
