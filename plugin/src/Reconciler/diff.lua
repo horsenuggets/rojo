@@ -28,8 +28,9 @@ end
 
 local function noStep() end
 
--- `step` is called once per instance, so a caller walking a large place can
--- yield between instances. Without one, diffing never yields.
+-- `step` is called for every instance the walk touches, whether it is diffed,
+-- added, or unknown, so a caller walking a large place can yield along the
+-- way. Without one, diffing never yields.
 local function diff(instanceMap, virtualInstances, rootId, step)
 	step = step or noStep
 
@@ -44,6 +45,7 @@ local function diff(instanceMap, virtualInstances, rootId, step)
 
 	-- Existing identities inside added subtrees are moves, not new instances.
 	local function markIdAdded(id)
+		step()
 		if instanceMap.fromIds[id] ~= nil then
 			diffInternal(id)
 			return
@@ -173,6 +175,9 @@ local function diff(instanceMap, virtualInstances, rootId, step)
 		-- corresponding virtual instance should be removed. Any instance that
 		-- does have a corresponding virtual instance is recursively diffed.
 		for _, childInstance in ipairs(instance:GetChildren()) do
+			-- Unknown children are only recorded here and never recursed into,
+			-- so a wide folder of them needs its own chances to yield.
+			step()
 			local childId = instanceMap.fromInstances[childInstance]
 
 			if childId == nil then

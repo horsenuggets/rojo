@@ -39,6 +39,10 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 	-- exact, with no way for one to bleed into the other.
 	local buckets = {}
 	for _, childInstance in existingChildren do
+		-- Children that match nothing never reach the recursive call, so a
+		-- wide folder of them needs its own chances to yield.
+		step()
+
 		-- We guard accessing Name and ClassName in order to avoid tripping over
 		-- children of DataModel that Rojo won't have permissions to access at all.
 		local accessSuccess, name, className = pcall(function()
@@ -68,6 +72,7 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 	local visited = {}
 
 	for _, childId in ipairs(virtualInstance.Children) do
+		step()
 		local virtualChild = virtualInstances[childId]
 
 		local bucketsByClassName = buckets[virtualChild.Name]
@@ -177,8 +182,9 @@ end
 
 local function noStep() end
 
--- `step` is called once per instance, so a caller walking a large place can
--- yield between instances. Without one, hydration never yields.
+-- `step` is called for every instance the walk touches, matched or not, so a
+-- caller walking a large place can yield along the way. Without one, hydration
+-- never yields.
 local function hydrate(instanceMap, virtualInstances, rootId, rootInstance, step)
 	-- Tallies of the work hydration did, surfaced in a single debug log below so
 	-- the cost of property-based disambiguation is visible without per-node spam.

@@ -460,7 +460,7 @@ return function()
 
 	-- The caller yields from `step`, so a walk that skipped it for part of the
 	-- tree could still outlast Studio's script timeout.
-	it("should call step once for every diffed instance", function()
+	it("should call step at least once for every diffed instance", function()
 		for _, width in { 0, 1, 9 } do
 			local knownInstances, virtualInstances, rootInstance = renamedTree(width)
 			local steps = 0
@@ -468,11 +468,84 @@ return function()
 				steps += 1
 			end)
 			assert(ok, tostring(patch))
-			expect(steps).to.equal(1 + width)
+			expect(steps >= 1 + width).to.equal(true)
 			expect(#patch.updated).to.equal(width)
 			knownInstances:stop()
 			rootInstance:Destroy()
 		end
+	end)
+
+	-- Unknown Studio children are recorded without being recursed into, so a
+	-- wide folder of them must still give the caller chances to yield.
+	it("should call step for unknown children", function()
+		local knownInstances = InstanceMap.new()
+		local virtualInstances = {
+			ROOT = { ClassName = "Folder", Name = "Folder", Properties = {}, Children = {} },
+		}
+		local rootInstance = Instance.new("Folder")
+		knownInstances:insert("ROOT", rootInstance)
+		local count = 40
+		for index = 1, count do
+			local child = Instance.new("Folder")
+			child.Name = "Unknown" .. index
+			child.Parent = rootInstance
+		end
+
+		local steps = 0
+		local ok, patch = diff(knownInstances, virtualInstances, "ROOT", function()
+			steps += 1
+		end)
+		assert(ok, tostring(patch))
+		expect(#patch.removed).to.equal(count)
+		expect(steps >= count).to.equal(true)
+		knownInstances:stop()
+		rootInstance:Destroy()
+	end)
+
+	-- An added subtree is walked by its own function, which has to step too.
+	it("should call step for every instance in an added subtree", function()
+		local knownInstances = InstanceMap.new()
+		local virtualInstances = {
+			ROOT = { ClassName = "Folder", Name = "Folder", Properties = {}, Children = { "ADDED_1" } },
+		}
+		local depth = 30
+		for index = 1, depth do
+			virtualInstances["ADDED_" .. index] = {
+				ClassName = "Folder",
+				Name = "Added" .. index,
+				Properties = {},
+				Children = if index < depth then { "ADDED_" .. (index + 1) } else {},
+			}
+		end
+		local rootInstance = Instance.new("Folder")
+		knownInstances:insert("ROOT", rootInstance)
+
+		local steps = 0
+		local ok, patch = diff(knownInstances, virtualInstances, "ROOT", function()
+			steps += 1
+		end)
+		assert(ok, tostring(patch))
+		expect(size(patch.added)).to.equal(depth)
+		expect(steps >= depth).to.equal(true)
+		knownInstances:stop()
+		rootInstance:Destroy()
+	end)
+
+	-- A caller stops the walk by raising from step.
+	it("should stop diffing when step raises", function()
+		local knownInstances, virtualInstances, rootInstance = renamedTree(9)
+		local steps = 0
+		local ok, err = pcall(diff, knownInstances, virtualInstances, "ROOT", function()
+			steps += 1
+			if steps == 4 then
+				error("stop", 0)
+			end
+		end)
+		expect(ok).to.equal(false)
+		expect(err).to.equal("stop")
+		expect(steps).to.equal(4)
+		knownInstances:stop()
+		rootInstance:Destroy()
 	end)
 
 	it("should compute the same patch when step yields", function()
