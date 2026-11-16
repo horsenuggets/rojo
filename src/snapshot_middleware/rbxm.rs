@@ -8,6 +8,8 @@ use crate::{
     syncback::{FsSnapshot, SyncbackReturn, SyncbackSnapshot},
 };
 
+use super::{lua::metadata_exists, meta_file::AdjacentMetadata};
+
 #[profiling::function]
 pub fn snapshot_rbxm(
     context: &InstanceContext,
@@ -23,7 +25,7 @@ pub fn snapshot_rbxm(
 
     if children.len() == 1 {
         let child = children[0];
-        let snapshot = InstanceSnapshot::from_tree(temp_tree, child)
+        let mut snapshot = InstanceSnapshot::from_tree(temp_tree, child)
             .name(name)
             .metadata(
                 InstanceMetadata::new()
@@ -31,6 +33,8 @@ pub fn snapshot_rbxm(
                     .relevant_paths(vec![vfs.canonicalize(path)?])
                     .context(context),
             );
+
+        AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
 
         Ok(Some(snapshot))
     } else {
@@ -53,11 +57,38 @@ pub fn syncback_rbxm<'sync>(
     rbx_binary::to_writer(&mut serialized, snapshot.new_tree(), &[inst.referent()])
         .context("failed to serialize new rbxm")?;
 
+    let mut fs_snapshot = FsSnapshot::new().with_added_file(&snapshot.path, serialized);
+    syncback_model_name(snapshot, &mut fs_snapshot)?;
+
     Ok(SyncbackReturn {
-        fs_snapshot: FsSnapshot::new().with_added_file(&snapshot.path, serialized),
+        fs_snapshot,
         children: Vec::new(),
         removed_children: Vec::new(),
     })
+}
+
+/// Keeps the adjacent metadata of a model file in step with its root's name.
+/// The root is named after the file when it is read, so a name the file system
+/// can't hold, or one shared with a sibling, is stored in the metadata.
+pub(super) fn syncback_model_name(
+    snapshot: &SyncbackSnapshot,
+    fs_snapshot: &mut FsSnapshot,
+) -> anyhow::Result<()> {
+    let meta_path = snapshot
+        .path
+        .parent()
+        .context("model files should have a parent directory")?
+        .join(format!("{}.meta.json", snapshot.file_stem()));
+    match snapshot.name_override() {
+        Some(name) => fs_snapshot.add_file(
+            meta_path,
+            crate::json::to_vec_pretty(&serde_json::json!({ "name": name }))
+                .context("could not serialize metadata")?,
+        ),
+        None if metadata_exists(snapshot.vfs(), &meta_path) => fs_snapshot.remove_file(meta_path),
+        None => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]

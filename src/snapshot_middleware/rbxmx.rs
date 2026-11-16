@@ -9,6 +9,8 @@ use crate::{
     syncback::{FsSnapshot, SyncbackReturn, SyncbackSnapshot},
 };
 
+use super::{meta_file::AdjacentMetadata, rbxm::syncback_model_name};
+
 pub fn snapshot_rbxmx(
     context: &InstanceContext,
     vfs: &Vfs,
@@ -26,7 +28,7 @@ pub fn snapshot_rbxmx(
 
     if children.len() == 1 {
         let child = children[0];
-        let snapshot = InstanceSnapshot::from_tree(temp_tree, child)
+        let mut snapshot = InstanceSnapshot::from_tree(temp_tree, child)
             .name(name)
             .metadata(
                 InstanceMetadata::new()
@@ -34,6 +36,8 @@ pub fn snapshot_rbxmx(
                     .relevant_paths(vec![vfs.canonicalize(path)?])
                     .context(context),
             );
+
+        AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
 
         Ok(Some(snapshot))
     } else {
@@ -64,8 +68,11 @@ pub fn syncback_rbxmx<'sync>(
     )
     .context("failed to serialize new rbxmx")?;
 
+    let mut fs_snapshot = FsSnapshot::new().with_added_file(&snapshot.path, serialized);
+    syncback_model_name(snapshot, &mut fs_snapshot)?;
+
     Ok(SyncbackReturn {
-        fs_snapshot: FsSnapshot::new().with_added_file(&snapshot.path, serialized),
+        fs_snapshot,
         children: Vec::new(),
         removed_children: Vec::new(),
     })
