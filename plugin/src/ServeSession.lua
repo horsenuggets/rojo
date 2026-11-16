@@ -83,6 +83,9 @@ end
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
+	-- Pins the authority for this session, so a live edit place always resolves
+	-- conflicts in favor of the filesystem without changing the user's setting.
+	twoWaySyncAuthority = t.optional(t.string),
 })
 
 function ServeSession.new(options)
@@ -123,6 +126,7 @@ function ServeSession.new(options)
 		__status = Status.NotStarted,
 		__apiContext = options.apiContext,
 		__twoWaySync = options.twoWaySync,
+		__twoWaySyncAuthority = options.twoWaySyncAuthority,
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
 		__changeBatcher = changeBatcher,
@@ -166,8 +170,8 @@ end
 
 function ServeSession:__writePatch(patch, messageCursor)
 	-- Read when each batch is sent, so changing it applies to the next write
-	-- without reconnecting.
-	local authority = Settings:get("twoWaySyncAuthority")
+	-- without reconnecting. A pinned session authority wins over the setting.
+	local authority = self.__twoWaySyncAuthority or Settings:get("twoWaySyncAuthority")
 
 	-- One record per write, which moves from Pending to its outcome, so a write
 	-- is never reported as both pending and finished.

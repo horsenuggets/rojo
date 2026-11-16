@@ -62,6 +62,7 @@ function App:init()
 	self.confirmationEvent = self.confirmationBindable.Event
 	self.knownProjects = {}
 	self.notifId = 0
+	self.liveEditConnection = self:readLiveEditMarker()
 
 	self.waypointConnection = ChangeHistoryService.OnUndo:Connect(function(action: string)
 		-- A plain prefix comparison, because "+" in the prefix is special in patterns.
@@ -152,11 +153,24 @@ function App:init()
 			end
 		end)
 
-		self:tryAutoReconnect():andThen(function(didReconnect)
-			if not didReconnect then
-				self:checkSyncReminder()
-			end
-		end)
+		if self.liveEditConnection then
+			-- A live edit place already names its server, so a prior manual
+			-- session would only be a guess.
+			Log.trace(
+				"Connecting to live edit session at {}:{}",
+				self.liveEditConnection.host,
+				self.liveEditConnection.port
+			)
+			self.setHost(self.liveEditConnection.host)
+			self.setPort(self.liveEditConnection.port)
+			self:startSession()
+		else
+			self:tryAutoReconnect():andThen(function(didReconnect)
+				if not didReconnect then
+					self:checkSyncReminder()
+				end
+			end)
+		end
 	end
 
 	SharedAPI.register(self)
@@ -572,6 +586,38 @@ function App:sendSyncReminder(message: string, shownActions: { string })
 	})
 end
 
+--[[
+	Reads the `host:port` marker a build bakes into a live edit place. Its
+	presence is what makes a place connect with no UI, so a malformed value is
+	reported rather than silently treated as a normal place.
+]]
+function App:readLiveEditMarker()
+	local value = workspace:GetAttribute(Config.liveEditAttribute)
+	if value == nil then
+		return nil
+	end
+
+	if type(value) ~= "string" then
+		Log.warn("Ignoring live edit marker that is a {} instead of a string", type(value))
+		return nil
+	end
+
+	local host, port = string.match(value, "^(.-):(%d+)$")
+	if host == nil or #host == 0 then
+		Log.warn("Ignoring malformed live edit marker '{}'", value)
+		return nil
+	end
+
+	return {
+		host = host,
+		port = port,
+	}
+end
+
+function App:isLiveEditPlace()
+	return self.liveEditConnection ~= nil
+end
+
 function App:isAutoConnectPlaytestServerAvailable()
 	return RunService:IsRunning()
 		and RunService:IsStudio()
@@ -642,9 +688,15 @@ function App:startSession()
 		else string.format("http://%s:%s", host, port)
 	local apiContext = ApiContext.new(baseUrl)
 
+	-- A live edit place is a throwaway copy of the filesystem, so it always
+	-- writes Studio edits back and lets the filesystem win conflicts, without
+	-- changing the settings a normal place uses.
+	local twoWaySync = if self:isLiveEditPlace() then true else Settings:get("twoWaySync")
+
 	local serveSession = ServeSession.new({
 		apiContext = apiContext,
-		twoWaySync = Settings:get("twoWaySync"),
+		twoWaySync = twoWaySync,
+		twoWaySyncAuthority = if self:isLiveEditPlace() then "Filesystem" else nil,
 	})
 
 	serveSession:setSyncResultCallback(function(status, result)
@@ -784,6 +836,13 @@ function App:startSession()
 			return "Accept"
 		end
 
+		-- A live edit place was built from the same tree the server sends, so
+		-- its initial patch only lines the two up.
+		if self:isLiveEditPlace() then
+			Log.trace("Accepting patch without confirmation because this is a live edit place")
+			return "Accept"
+		end
+
 		local confirmationBehavior = Settings:get("confirmationBehavior")
 		if confirmationBehavior == "Initial" then
 			-- Only confirm if we haven't synced this project yet this session
@@ -852,7 +911,7 @@ function App:startSession()
 		self:addNotification({
 			text = string.format(
 				"Please accept%sor abort the initializing sync session.",
-				Settings:get("twoWaySync") and ", reject, " or " "
+				twoWaySync and ", reject, " or " "
 			),
 			timeout = 7,
 		})
