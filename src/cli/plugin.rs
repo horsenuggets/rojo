@@ -171,6 +171,43 @@ mod test {
         let _ = initialize_plugin().unwrap();
     }
 
+    /// Studio only runs a local plugin's scripts when their RunContext is Plugin
+    /// or Legacy, so an entry script built as a Server script loads but never
+    /// runs.
+    #[test]
+    fn the_plugin_entry_script_runs_in_the_plugin_context() {
+        use rbx_dom_weak::{
+            types::{Enum, Variant},
+            ustr,
+        };
+
+        let session = initialize_plugin().unwrap();
+        let tree = session.tree();
+        let dom = tree.inner();
+        let root = dom.get_by_ref(tree.get_root_id()).unwrap();
+        let entry = root
+            .children()
+            .iter()
+            .map(|id| dom.get_by_ref(*id).unwrap())
+            .find(|instance| instance.name == "Plugin")
+            .expect("The plugin should have a \"Plugin\" entry script");
+
+        let plugin_context = *rbx_reflection_database::get()
+            .unwrap()
+            .enums
+            .get("RunContext")
+            .unwrap()
+            .items
+            .get("Plugin")
+            .unwrap();
+
+        assert_eq!(entry.class, "Script");
+        assert_eq!(
+            entry.properties.get(&ustr("RunContext")),
+            Some(&Variant::Enum(Enum::from_u32(plugin_context)))
+        );
+    }
+
     #[test]
     fn the_plugin_never_overwrites_upstream_rojo() {
         assert_eq!(PLUGIN_FILE_NAME, "Rojo+.rbxm");
