@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.3`
+
 * Added a `--path` flag to `rojo plugin install` and `rojo plugin uninstall` that targets
   a custom plugins folder instead of Roblox Studio's default. The folder must already
   exist, so a mistyped path fails instead of installing the plugin where Studio never
