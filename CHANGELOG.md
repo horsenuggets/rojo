@@ -38,9 +38,12 @@ Making a new release? Simply add the new header with the version and date undern
   descendants to one file, even when `instancesAsDirectories` is set, which keeps deep
   hierarchies from producing paths that are too long for Windows. Changing or removing a
   rule moves the affected Instances to their new layout on the next syncback, whether or
-  not they changed in the place.
-* Model files now read an adjacent `.meta.json` file, and syncback writes one to keep the
-  real name of a model's root when the file system can't hold it.
+  not they changed in the place. Instances defined by the project file keep their layout,
+  and syncback stops with an error when a rule would remove a path that `ignorePaths`
+  excludes or absorb a subtree that `ignoreTrees` excludes.
+* Model files now read an adjacent `.meta.json` or `.meta.jsonc` file, and syncback uses
+  it to keep the real name of a model's root when the file system can't hold it, leaving
+  the file's other fields as they are.
 
 ## `7.7.1-horse.1.5`
 
