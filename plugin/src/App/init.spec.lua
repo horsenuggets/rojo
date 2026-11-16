@@ -40,4 +40,26 @@ return function()
 			expect(App.isLiveEditEndpoint(marked, "http://localhost", "34872")).to.equal(false)
 		end
 	end)
+
+	-- Hosts are compared as the URLs a session connects to, so stripping a prefix
+	-- from a doubled scheme must not turn it into a different, real endpoint.
+	it("should not match a doubled scheme with the endpoint inside it", function()
+		local marked = {
+			liveEditConnection = {
+				host = "http://https://localhost",
+				port = "34901",
+			},
+		}
+		expect(App.isLiveEditEndpoint(marked, "https://localhost", "34901")).to.equal(false)
+		expect(App.isLiveEditEndpoint(marked, "http://https://localhost", "34901")).to.equal(true)
+
+		local secure = {
+			liveEditConnection = {
+				host = "https://localhost",
+				port = "34901",
+			},
+		}
+		expect(App.isLiveEditEndpoint(secure, "https://localhost", "34901")).to.equal(true)
+		expect(App.isLiveEditEndpoint(secure, "localhost", "34901")).to.equal(false)
+	end)
 end
