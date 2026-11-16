@@ -614,8 +614,13 @@ function App:readLiveEditMarker()
 	}
 end
 
-function App:isLiveEditPlace()
-	return self.liveEditConnection ~= nil
+--[[
+	Whether a session is the one this place was built for. A manual session to another
+	project must keep the user's settings and its confirmation.
+]]
+function App:isLiveEditEndpoint(host, port)
+	local liveEdit = self.liveEditConnection
+	return liveEdit ~= nil and host == liveEdit.host and tostring(port) == liveEdit.port
 end
 
 function App:isAutoConnectPlaytestServerAvailable()
@@ -691,12 +696,13 @@ function App:startSession()
 	-- A live edit place is a throwaway copy of the filesystem, so it always
 	-- writes Studio edits back and lets the filesystem win conflicts, without
 	-- changing the settings a normal place uses.
-	local twoWaySync = if self:isLiveEditPlace() then true else Settings:get("twoWaySync")
+	local liveEdit = self:isLiveEditEndpoint(host, port)
+	local twoWaySync = if liveEdit then true else Settings:get("twoWaySync")
 
 	local serveSession = ServeSession.new({
 		apiContext = apiContext,
 		twoWaySync = twoWaySync,
-		twoWaySyncAuthority = if self:isLiveEditPlace() then "Filesystem" else nil,
+		twoWaySyncAuthority = if liveEdit then "Filesystem" else nil,
 	})
 
 	serveSession:setSyncResultCallback(function(status, result)
@@ -838,7 +844,7 @@ function App:startSession()
 
 		-- A live edit place was built from the same tree the server sends, so
 		-- its initial patch only lines the two up.
-		if self:isLiveEditPlace() then
+		if liveEdit then
 			Log.trace("Accepting patch without confirmation because this is a live edit place")
 			return "Accept"
 		end
