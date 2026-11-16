@@ -49,6 +49,14 @@ local AppStatus = strict("AppStatus", {
 
 local e = Roact.createElement
 
+-- The URL a session connects to. A host keeps its own HTTP or HTTPS scheme,
+-- and a bare host is reached over HTTP.
+local function toBaseUrl(host, port)
+	return if string.find(host, "^https?://")
+		then string.format("%s:%s", host, port)
+		else string.format("http://%s:%s", host, port)
+end
+
 local App = Roact.Component:extend("App")
 
 function App:init()
@@ -409,9 +417,7 @@ end
 
 function App:findActiveServer()
 	local host, port = self:getHostAndPort()
-	local baseUrl = if string.find(host, "^https?://")
-		then string.format("%s:%s", host, port)
-		else string.format("http://%s:%s", host, port)
+	local baseUrl = toBaseUrl(host, port)
 
 	Log.trace("Checking for active sync server at {}", baseUrl)
 
@@ -620,7 +626,13 @@ end
 ]]
 function App:isLiveEditEndpoint(host, port)
 	local liveEdit = self.liveEditConnection
-	return liveEdit ~= nil and host == liveEdit.host and tostring(port) == liveEdit.port
+	if liveEdit == nil then
+		return false
+	end
+
+	-- Compared as the URLs a session would connect to, so a bare host and its
+	-- "http://" spelling match while HTTPS stays a different endpoint.
+	return toBaseUrl(host, port) == toBaseUrl(liveEdit.host, liveEdit.port)
 end
 
 function App:isAutoConnectPlaytestServerAvailable()
@@ -688,9 +700,7 @@ function App:startSession()
 
 	local host, port = self:getHostAndPort()
 
-	local baseUrl = if string.find(host, "^https?://")
-		then string.format("%s:%s", host, port)
-		else string.format("http://%s:%s", host, port)
+	local baseUrl = toBaseUrl(host, port)
 	local apiContext = ApiContext.new(baseUrl)
 
 	-- A live edit place is a throwaway copy of the filesystem, so it always
