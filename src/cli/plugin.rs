@@ -39,7 +39,7 @@ pub enum PluginSubcommand {
     /// Removes the plugin if it is installed.
     Uninstall {
         /// Remove the plugin from this plugins folder instead of Roblox
-        /// Studio's default.
+        /// Studio's default. The folder must already exist.
         #[clap(long)]
         path: Option<PathBuf>,
     },
@@ -91,15 +91,22 @@ fn locate_studio_plugins_folder() -> anyhow::Result<PathBuf> {
     Ok(RobloxStudio::locate()?.plugins_path().to_path_buf())
 }
 
-fn ensure_plugins_folder(folder: &PluginsFolder) -> anyhow::Result<()> {
-    if folder.path.is_dir() {
-        return Ok(());
-    }
-    if !folder.create_if_missing {
+/// Rejects a missing folder the user named explicitly, so a typo fails for
+/// both install and uninstall instead of silently doing nothing useful.
+fn check_explicit_folder(folder: &PluginsFolder) -> anyhow::Result<()> {
+    if !folder.create_if_missing && !folder.path.is_dir() {
         bail!(
             "The plugins folder \"{}\" does not exist.",
             folder.path.display()
         );
+    }
+    Ok(())
+}
+
+fn ensure_plugins_folder(folder: &PluginsFolder) -> anyhow::Result<()> {
+    check_explicit_folder(folder)?;
+    if folder.path.is_dir() {
+        return Ok(());
     }
     log::debug!("Creating Roblox Studio plugins folder");
     fs::create_dir(&folder.path)?;
@@ -141,6 +148,7 @@ fn install_plugin(path: Option<PathBuf>) -> anyhow::Result<()> {
 
 fn uninstall_plugin(path: Option<PathBuf>) -> anyhow::Result<()> {
     let folder = resolve_plugins_folder(path, locate_studio_plugins_folder)?;
+    check_explicit_folder(&folder)?;
 
     let plugin_path = plugin_file_path(&folder.path);
 
@@ -220,6 +228,26 @@ mod test {
         let folder = resolve_plugins_folder(None, || Ok(plugins.clone())).unwrap();
         ensure_plugins_folder(&folder).unwrap();
         assert!(plugins.is_dir());
+    }
+
+    #[test]
+    fn only_a_missing_explicit_folder_fails_the_check() {
+        let root = tempfile::tempdir().unwrap();
+        for create_if_missing in [false, true] {
+            for exists in [false, true] {
+                let path = root.path().join(format!("{create_if_missing}-{exists}"));
+                if exists {
+                    fs::create_dir(&path).unwrap();
+                }
+                let folder = PluginsFolder {
+                    path: path.clone(),
+                    create_if_missing,
+                };
+                let result = check_explicit_folder(&folder);
+                assert_eq!(result.is_err(), !create_if_missing && !exists);
+                assert_eq!(path.exists(), exists, "The check must never create folders");
+            }
+        }
     }
 
     #[test]
