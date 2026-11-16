@@ -620,7 +620,17 @@ end
 ]]
 function App:isLiveEditEndpoint(host, port)
 	local liveEdit = self.liveEditConnection
-	return liveEdit ~= nil and host == liveEdit.host and tostring(port) == liveEdit.port
+	if liveEdit == nil then
+		return false
+	end
+
+	-- A session adds "http://" to a bare host, so both spellings reach the same
+	-- server. HTTPS is a different endpoint and stays distinct.
+	local function withoutHttp(value)
+		return (string.gsub(value, "^http://", ""))
+	end
+
+	return withoutHttp(host) == withoutHttp(liveEdit.host) and tostring(port) == liveEdit.port
 end
 
 function App:isAutoConnectPlaytestServerAvailable()
