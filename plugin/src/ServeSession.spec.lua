@@ -304,4 +304,35 @@ return function()
 		Settings:set("twoWaySyncAuthority", original)
 		assert(success, err)
 	end)
+
+	-- A live edit session pins the authority, so a Studio edit still loses to
+	-- the filesystem even when the user's setting says otherwise.
+	it("should send and record a pinned authority instead of the setting", function()
+		local Settings = require(script.Parent.Settings)
+		local original = Settings:get("twoWaySyncAuthority")
+		local success, err = pcall(function()
+			Settings:set("twoWaySyncAuthority", "Studio")
+			local sent = {}
+			local session = setmetatable({
+				__twoWaySyncAuthority = "Filesystem",
+				__apiContext = {
+					write = function(_self, _patch, _cursor, authority)
+						table.insert(sent, authority)
+						return Promise.resolve(writeResult())
+					end,
+				},
+				__syncResults = {},
+			}, ServeSession)
+			Settings:set("twoWaySyncAuthority", "Studio")
+			session:__writePatch({ updated = {}, added = {}, removed = {} }):await()
+			Settings:set("twoWaySyncAuthority", "Filesystem")
+			session:__writePatch({ updated = {}, added = {}, removed = {} }):await()
+			expect(table.concat(sent, ",")).to.equal("Filesystem,Filesystem")
+			local results = session:getSyncResults()
+			expect(results[1].authority).to.equal("Filesystem")
+			expect(results[2].authority).to.equal("Filesystem")
+		end)
+		Settings:set("twoWaySyncAuthority", original)
+		assert(success, err)
+	end)
 end

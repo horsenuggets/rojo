@@ -5,6 +5,9 @@
 	> Internal attributes, prefixed with `RBX`, which syncback skips.
 	> Rojo's own reference links, `Rojo_Id` and `Rojo_Target_*`, which the server
 	  resolves into Ref properties instead of sending.
+	> Rojo+'s own connection markers, prefixed with `__RojoPlus_`, which a build
+	  bakes into a place and the filesystem never holds, so the first sync must
+	  leave them in place instead of deleting them.
 
 	These are left exactly as they are in Studio when diffing and applying.
 	Values with NaN or infinity, alone or inside a composite like a Vector3, are
@@ -14,7 +17,10 @@
 local unmanagedAttributes = {}
 
 function unmanagedAttributes.isUnmanaged(name)
-	return string.sub(name, 1, 3) == "RBX" or name == "Rojo_Id" or string.sub(name, 1, 12) == "Rojo_Target_"
+	return string.sub(name, 1, 3) == "RBX"
+		or name == "Rojo_Id"
+		or string.sub(name, 1, 12) == "Rojo_Target_"
+		or string.sub(name, 1, 11) == "__RojoPlus_"
 end
 
 -- Returns the attributes to give an instance: the managed values from

@@ -26,4 +26,7 @@ return strict("Config", {
 	defaultHost = "localhost",
 	defaultPort = "34872",
 	syncRemindersEnabled = false,
+	-- Set by a build tool before Studio opens the place, formatted as
+	-- `host:port`, so a throwaway live edit place reconnects without any UI.
+	liveEditAttribute = "__RojoPlus_LiveEditUrl",
 })

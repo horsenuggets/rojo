@@ -31,6 +31,20 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.5`
+
+* Connect the Rojo+ plugin automatically when a place carries a
+  `__RojoPlus_LiveEditUrl` attribute on `Workspace`, formatted as `host:port`. A live
+  edit place then connects, accepts its initial sync, and turns on two-way sync with
+  `Filesystem` authority for that session, without changing any setting. The initial
+  patch is accepted without confirmation because the place was built from the tree the
+  server sends, and a live edit marker takes priority over auto-reconnect.
+* Pin two-way sync authority per session, so a live edit place keeps resolving conflicts
+  in favor of the filesystem even when the user's setting says `Studio`.
+* Leave `__RojoPlus_*` attributes in Studio when diffing and applying, since a build
+  bakes them into a place and the filesystem never holds them. This also stops
+  `__RojoPlus_ConnectionUrl` from being written to disk by two-way sync.
+
 ## `7.7.1-horse.1.4`
 
 * Fixed the Rojo+ Studio plugin loading without running. Its entry script now builds with
