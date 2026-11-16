@@ -12,6 +12,7 @@ use rbx_dom_weak::{types::Ref, WeakDom};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    project::ProjectNode,
     snapshot::{InstigatingSource, RojoTree},
     snapshot_middleware::Middleware,
 };
@@ -52,10 +53,25 @@ pub struct ModelTreeRule {
 /// The `modelTrees` rules of a project, ready to match Instance paths.
 pub struct CompiledModelTreeRules {
     rules: Vec<(GlobMatcher, Middleware)>,
+    /// Paths of the Instances the project file defines. The project fixes
+    /// where and how each of them is stored, so rules never apply to them.
+    project_nodes: HashSet<String>,
 }
 
 impl CompiledModelTreeRules {
-    pub fn new(rules: &[ModelTreeRule]) -> anyhow::Result<Self> {
+    pub fn new(rules: &[ModelTreeRule], project_tree: &ProjectNode) -> anyhow::Result<Self> {
+        let mut project_nodes = HashSet::new();
+        if !rules.is_empty() {
+            let mut pending = vec![(project_tree, String::new())];
+            while let Some((node, path)) = pending.pop() {
+                for (name, child) in &node.children {
+                    let child_path = child_path(&path, name);
+                    project_nodes.insert(child_path.clone());
+                    pending.push((child, child_path));
+                }
+            }
+        }
+
         let rules = rules
             .iter()
             .map(|rule| {
@@ -72,7 +88,10 @@ impl CompiledModelTreeRules {
                 ))
             })
             .collect::<anyhow::Result<_>>()?;
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            project_nodes,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -80,8 +99,12 @@ impl CompiledModelTreeRules {
     }
 
     /// Returns the model middleware for the Instance at `inst_path`, taken
-    /// from the first rule that matches it.
+    /// from the first rule that matches it. Instances the project file defines
+    /// never match, but their descendants can.
     pub fn middleware_for(&self, inst_path: &str) -> Option<Middleware> {
+        if self.project_nodes.contains(inst_path) {
+            return None;
+        }
         self.rules
             .iter()
             .find(|(matcher, _)| matcher.is_match(inst_path))
@@ -239,7 +262,154 @@ mod test {
                 format: *format,
             })
             .collect();
-        CompiledModelTreeRules::new(&rules).unwrap()
+        CompiledModelTreeRules::new(&rules, &ProjectNode::default()).unwrap()
+    }
+
+    /// Runs a full syncback of `input` over a project on disk whose `src`
+    /// directory is the root Instance, then writes the result.
+    fn syncback(root: &Path, syncback_rules: &str, input: WeakDom) -> anyhow::Result<()> {
+        let project_path = root.join("default.project.json");
+        std::fs::write(
+            &project_path,
+            format!(
+                r#"{{"name":"Test","tree":{{"$path":"src"}},"syncbackRules":{syncback_rules}}}"#
+            ),
+        )?;
+        let vfs = memofs::Vfs::new_default()?;
+        vfs.set_watch_enabled(false);
+        let session = crate::serve_session::ServeSession::new(vfs, &project_path)?;
+        let snapshot = crate::syncback::syncback_loop(
+            session.vfs(),
+            &mut session.tree(),
+            input,
+            session.root_project(),
+        )?;
+        snapshot.write_to_vfs(root, session.vfs())?;
+        Ok(())
+    }
+
+    /// A root folder holding `FX`, which holds a `Keep` folder.
+    fn effects_dom() -> WeakDom {
+        WeakDom::new(
+            InstanceBuilder::new("Folder").with_child(
+                InstanceBuilder::new("Folder")
+                    .with_name("FX")
+                    .with_child(InstanceBuilder::new("Folder").with_name("Keep")),
+            ),
+        )
+    }
+
+    fn project_on_disk() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        (temp, root)
+    }
+
+    #[test]
+    fn conversions_never_remove_ignored_paths() {
+        let (_temp, root) = project_on_disk();
+        let keep = root.join("src/FX/Keep");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::write(keep.join("Notes.luau"), "return nil\n").unwrap();
+
+        let error = syncback(
+            &root,
+            r#"{
+                "instancesAsDirectories": true,
+                "ignorePaths": ["src/FX/Keep/**"],
+                "modelTrees": [{ "pattern": "FX" }]
+            }"#,
+            effects_dom(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ignorePaths"), "{error}");
+        assert!(keep.join("Notes.luau").is_file());
+        assert!(!root.join("src/FX.rbxm").exists());
+    }
+
+    #[test]
+    fn models_never_absorb_ignored_trees() {
+        let (_temp, root) = project_on_disk();
+
+        let error = syncback(
+            &root,
+            r#"{
+                "ignoreTrees": ["FX/Keep"],
+                "modelTrees": [{ "pattern": "FX" }]
+            }"#,
+            effects_dom(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ignoreTrees"), "{error}");
+        assert!(!root.join("src/FX.rbxm").exists());
+    }
+
+    #[test]
+    fn rewriting_a_model_keeps_its_other_metadata() {
+        let (_temp, root) = project_on_disk();
+        let rules = r#"{
+            "instancesAsDirectories": true,
+            "modelTrees": [{ "pattern": "*", "format": "rbxmx" }]
+        }"#;
+        let input = |child: Option<&str>| {
+            let mut model = InstanceBuilder::new("Folder").with_name("Model?");
+            if let Some(child) = child {
+                model = model.with_child(InstanceBuilder::new("Folder").with_name(child));
+            }
+            WeakDom::new(InstanceBuilder::new("Folder").with_child(model))
+        };
+        let json = root.join("src/Model_.meta.json");
+        let jsonc = root.join("src/Model_.meta.jsonc");
+
+        syncback(&root, rules, input(None)).unwrap();
+        assert!(root.join("src/Model_.rbxmx").is_file());
+        let written = std::fs::read_to_string(&json).unwrap();
+        assert!(written.contains(r#""name": "Model?""#), "{written}");
+
+        // The metadata moves to a JSONC file and gains a field of its own.
+        std::fs::remove_file(&json).unwrap();
+        std::fs::write(
+            &jsonc,
+            r#"{ "name": "Model?", "ignoreUnknownInstances": true }"#,
+        )
+        .unwrap();
+        syncback(&root, rules, input(Some("Added"))).unwrap();
+
+        let model = std::fs::read_to_string(root.join("src/Model_.rbxmx")).unwrap();
+        assert!(model.contains("Added"), "{model}");
+        let rewritten = std::fs::read_to_string(&jsonc).unwrap();
+        assert!(rewritten.contains(r#""name": "Model?""#), "{rewritten}");
+        assert!(rewritten.contains("ignoreUnknownInstances"), "{rewritten}");
+        assert!(!json.exists());
+    }
+
+    #[test]
+    fn project_nodes_never_match_but_their_descendants_do() {
+        let mut source = ProjectNode::default();
+        source
+            .children
+            .insert("Shared".to_owned(), ProjectNode::default());
+        let mut tree = ProjectNode::default();
+        tree.children.insert("src".to_owned(), source);
+        let rules = CompiledModelTreeRules::new(
+            &[ModelTreeRule {
+                pattern: "**".to_owned(),
+                format: None,
+            }],
+            &tree,
+        )
+        .unwrap();
+
+        assert_eq!(rules.middleware_for("src"), None);
+        assert_eq!(rules.middleware_for("src/Shared"), None);
+        assert_eq!(rules.middleware_for("src/Other"), Some(Middleware::Rbxm));
+        assert_eq!(
+            rules.middleware_for("src/Shared/Child"),
+            Some(Middleware::Rbxm)
+        );
     }
 
     fn on_disk(
@@ -363,7 +533,7 @@ mod test {
             pattern: "Maps/[".to_owned(),
             format: None,
         }];
-        assert!(CompiledModelTreeRules::new(&invalid).is_err());
+        assert!(CompiledModelTreeRules::new(&invalid, &ProjectNode::default()).is_err());
     }
 
     #[test]

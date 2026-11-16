@@ -15,6 +15,8 @@ use rbx_dom_weak::{
 
 use crate::{snapshot::InstanceWithMeta, snapshot_middleware::Middleware};
 
+use super::ModelTrees;
+
 pub fn name_for_inst<'old>(
     middleware: Middleware,
     new_inst: &Instance,
@@ -406,7 +408,14 @@ pub fn sibling_order_key(file_name: &str) -> (Cow<'_, str>, u64) {
 /// Assigns each child of `parent` a file stem whose generated output paths are
 /// safe and unique among its siblings, ignoring case. The first available stem
 /// is kept, and later collisions get `~2`, `~3`, and so on.
-pub fn unique_child_stems(dom: &WeakDom, parent: &Instance) -> HashMap<Ref, String> {
+///
+/// Children that `model_trees` stores as model files reserve the paths of
+/// those files, rather than the directories they would otherwise be.
+pub fn unique_child_stems(
+    dom: &WeakDom,
+    parent: &Instance,
+    model_trees: Option<&ModelTrees>,
+) -> HashMap<Ref, String> {
     let mut taken = HashSet::with_capacity(parent.children().len() * 2);
     let mut next_suffix = HashMap::new();
     let mut stems = HashMap::with_capacity(parent.children().len());
@@ -417,7 +426,9 @@ pub fn unique_child_stems(dom: &WeakDom, parent: &Instance) -> HashMap<Ref, Stri
             .expect("children should be in the DOM");
         let base = sanitize_stem(&child.name, &child.class);
         let base_key = base.to_lowercase();
-        let middleware = directory_middleware_for_instance(child);
+        let middleware = model_trees
+            .and_then(|trees| trees.middleware(*child_ref))
+            .unwrap_or_else(|| directory_middleware_for_instance(child));
         let mut counter = next_suffix.get(&base_key).copied().unwrap_or(1);
 
         loop {
@@ -451,6 +462,8 @@ mod test {
 
     use rbx_dom_weak::InstanceBuilder;
 
+    use crate::{project::ProjectNode, syncback::model_trees::CompiledModelTreeRules};
+
     fn stems_for(children: &[(&str, &str)]) -> Vec<String> {
         let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));
         let root = dom.root_ref();
@@ -458,10 +471,34 @@ mod test {
             .iter()
             .map(|(name, class)| dom.insert(root, InstanceBuilder::new(*class).with_name(*name)))
             .collect();
-        let stems = unique_child_stems(&dom, dom.root());
+        let stems = unique_child_stems(&dom, dom.root(), None);
         refs.iter()
             .map(|referent| stems[referent].clone())
             .collect()
+    }
+
+    #[test]
+    fn model_trees_reserve_their_file_paths() {
+        let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));
+        let root = dom.root_ref();
+        let model = dom.insert(root, InstanceBuilder::new("Folder").with_name("FX"));
+        let directory = dom.insert(root, InstanceBuilder::new("Folder").with_name("FX.rbxm"));
+        let rules = CompiledModelTreeRules::new(
+            &[serde_json::from_str(r#"{ "pattern": "FX" }"#).unwrap()],
+            &ProjectNode::default(),
+        )
+        .unwrap();
+        let trees = ModelTrees::find(&rules, &dom);
+
+        // Without the rule both are directories, and their names don't clash.
+        let plain = unique_child_stems(&dom, dom.root(), None);
+        assert_eq!(plain[&model], "FX");
+        assert_eq!(plain[&directory], "FX.rbxm");
+
+        // With it, `FX` is written to `FX.rbxm`, which the directory must avoid.
+        let stems = unique_child_stems(&dom, dom.root(), Some(&trees));
+        assert_eq!(stems[&model], "FX");
+        assert_eq!(stems[&directory], "FX.rbxm~2");
     }
 
     #[test]

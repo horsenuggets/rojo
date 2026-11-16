@@ -343,6 +343,7 @@ pub fn syncback_loop(
             .as_ref()
             .map(|rules| rules.model_trees.as_slice())
             .unwrap_or_default(),
+        &project.tree,
     )?;
     let mut relayout = if instances_as_directories(project) {
         inline::needs_relayout(
@@ -456,6 +457,23 @@ pub fn syncback_loop(
 
         let middleware = get_best_middleware(&snapshot);
 
+        // A model file holds its whole subtree, so it can't leave out a
+        // descendant the project asks syncback to ignore.
+        if snapshot.model_tree_middleware().is_some() {
+            let prefix = format!("{inst_path}/");
+            let ignored = project
+                .syncback_rules
+                .iter()
+                .flat_map(|rules| &rules.ignore_trees)
+                .find(|tree| tree.starts_with(&prefix));
+            if let Some(ignored) = ignored {
+                anyhow::bail!(
+                    "Cannot store {inst_path} as a model file because the project's \
+                     ignoreTrees rule excludes {ignored}"
+                );
+            }
+        }
+
         // Only a model owns its whole subtree. A directory may mix JSON and
         // binary descendants, so its early comparison must remain exact.
         let model_hasher: Option<fn(&Project, &WeakDom, Ref) -> _> = match middleware {
@@ -487,7 +505,12 @@ pub fn syncback_loop(
 
         let syncback = match middleware.syncback(&snapshot) {
             Ok(syncback) => syncback,
-            Err(err) if middleware == Middleware::Dir => {
+            // Writing the directory as a model file instead would remove the
+            // very paths an ignore conflict is reported to protect.
+            Err(err)
+                if middleware == Middleware::Dir
+                    && err.downcast_ref::<IgnoreConflict>().is_none() =>
+            {
                 let new_middleware = match env::var(DEBUG_MODEL_FORMAT_VAR) {
                     Ok(value) if value == "1" => Middleware::Rbxmx,
                     Ok(value) if value == "2" => Middleware::JsonModel,
@@ -562,7 +585,9 @@ pub fn syncback_loop(
                 // outlive it, since nothing else is written next to it.
                 if inst.metadata().middleware.is_some_and(is_model_file) {
                     for meta_path in inst.metadata().relevant_paths.iter().skip(1) {
-                        if meta_path.is_file() {
+                        if meta_path.is_file()
+                            && is_valid_path(&ignore_patterns, project_path, meta_path)
+                        {
                             fs_snapshot.remove_file(meta_path)
                         }
                     }
@@ -584,6 +609,13 @@ pub fn syncback_loop(
 
     Ok(fs_snapshot)
 }
+
+/// Reports that a layout the `modelTrees` rules ask for would remove or absorb
+/// something the project's ignore rules exclude. Syncback stops on it, where
+/// other directory errors make it write the directory as a model file.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct IgnoreConflict(pub String);
 
 pub struct SyncbackReturn<'sync> {
     pub fs_snapshot: FsSnapshot,

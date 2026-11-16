@@ -451,6 +451,46 @@ impl<'sync> SyncbackSnapshot<'sync> {
             || !(is_model_file(new_middleware) || is_model_file(old_middleware))
     }
 
+    /// Returns an error if replacing the files of `old` with another layout
+    /// would remove a path the project's `ignorePaths` rule excludes. Moving
+    /// between a model file and a directory removes everything the old layout
+    /// stored, which would take the excluded files with it.
+    pub fn validate_layout_change(&self, old: InstanceWithMeta<'sync>) -> anyhow::Result<()> {
+        let Some(rules) = &self.project().syncback_rules else {
+            return Ok(());
+        };
+        let globs = Some(rules.compile_globs()?);
+        let base = self.project().folder_location();
+        let mut pending = vec![old];
+        while let Some(instance) = pending.pop() {
+            pending.extend(
+                instance
+                    .children()
+                    .iter()
+                    .filter_map(|child| self.get_old_instance(*child)),
+            );
+            for path in &instance.metadata().relevant_paths {
+                if !super::is_valid_path(&globs, base, path) && self.vfs().metadata(path).is_ok() {
+                    return Err(super::IgnoreConflict(format!(
+                        "Cannot change how {} is stored because the project's ignorePaths \
+                         rule excludes {}",
+                        self.get_old_inst_path(old.id()),
+                        path.display()
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the Instances the `modelTrees` rules store as model files,
+    /// when this is a full syncback.
+    #[inline]
+    pub fn model_trees(&self) -> Option<&'sync ModelTrees> {
+        self.data.model_trees
+    }
+
     /// Returns whether an instance in the new tree holds `id` through its
     /// `Rojo_Id` attribute.
     #[inline]
