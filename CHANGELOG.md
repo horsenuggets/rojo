@@ -31,6 +31,11 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.4`
+
+* Fixed the Rojo+ Studio plugin loading without running. Its entry script now builds with
+  the Plugin `RunContext` instead of Server, which Studio never runs for local plugins.
+
 ## `7.7.1-horse.1.3`
 
 * Added a `--path` flag to `rojo plugin install` and `rojo plugin uninstall` that targets
