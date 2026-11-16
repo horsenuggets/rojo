@@ -435,4 +435,63 @@ return function()
 		expect(size(patch.added)).to.equal(1)
 		expect(patch.added["CHILD"]).to.equal(virtualInstances["CHILD"])
 	end)
+
+	-- A known root with `width` known children, each renamed on the virtual
+	-- side so the diff has an update to report for it.
+	local function renamedTree(width)
+		local knownInstances = InstanceMap.new()
+		local virtualInstances = {
+			ROOT = { ClassName = "Folder", Name = "Folder", Properties = {}, Children = {} },
+		}
+		local rootInstance = Instance.new("Folder")
+		knownInstances:insert("ROOT", rootInstance)
+		for index = 1, width do
+			local id = "CHILD_" .. index
+			virtualInstances[id] = { ClassName = "Folder", Name = "After" .. index, Properties = {}, Children = {} }
+			table.insert(virtualInstances.ROOT.Children, id)
+
+			local child = Instance.new("Folder")
+			child.Name = "Before" .. index
+			child.Parent = rootInstance
+			knownInstances:insert(id, child)
+		end
+		return knownInstances, virtualInstances, rootInstance
+	end
+
+	-- The caller yields from `step`, so a walk that skipped it for part of the
+	-- tree could still outlast Studio's script timeout.
+	it("should call step once for every diffed instance", function()
+		for _, width in { 0, 1, 9 } do
+			local knownInstances, virtualInstances, rootInstance = renamedTree(width)
+			local steps = 0
+			local ok, patch = diff(knownInstances, virtualInstances, "ROOT", function()
+				steps += 1
+			end)
+			assert(ok, tostring(patch))
+			expect(steps).to.equal(1 + width)
+			expect(#patch.updated).to.equal(width)
+			knownInstances:stop()
+			rootInstance:Destroy()
+		end
+	end)
+
+	it("should compute the same patch when step yields", function()
+		local knownInstances, virtualInstances, rootInstance = renamedTree(6)
+		local ok, plain = diff(knownInstances, virtualInstances, "ROOT")
+		assert(ok, tostring(plain))
+		local yieldedOk, yielded = diff(knownInstances, virtualInstances, "ROOT", function()
+			task.wait()
+		end)
+		assert(yieldedOk, tostring(yielded))
+
+		expect(#yielded.updated).to.equal(#plain.updated)
+		for index, update in plain.updated do
+			expect(yielded.updated[index].id).to.equal(update.id)
+			expect(yielded.updated[index].changedName).to.equal(update.changedName)
+		end
+		assert(isEmpty(yielded.added))
+		assert(isEmpty(yielded.removed))
+		knownInstances:stop()
+		rootInstance:Destroy()
+	end)
 end

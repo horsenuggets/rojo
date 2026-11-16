@@ -7,6 +7,7 @@ local Rojo = script:FindFirstAncestor("Rojo")
 local Plugin = Rojo.Plugin
 
 local Timer = require(Plugin.Timer)
+local yieldBudget = require(Plugin.yieldBudget)
 
 local applyPatch = require(script.applyPatch)
 local hydrate = require(script.hydrate)
@@ -33,9 +34,12 @@ function Reconciler:applyPatch(patch)
 	return unappliedPatch
 end
 
+-- Hydrating and diffing walk the whole place. On a large one that outlasts
+-- Studio's script timeout, which stops the sync without an error to report and
+-- leaves the session connecting forever, so both yield as they go.
 function Reconciler:hydrate(virtualInstances, rootId, rootInstance)
 	Timer.start("Reconciler:hydrate")
-	local result = hydrate(self.__instanceMap, virtualInstances, rootId, rootInstance)
+	local result = hydrate(self.__instanceMap, virtualInstances, rootId, rootInstance, yieldBudget())
 	Timer.stop()
 
 	return result
@@ -43,7 +47,7 @@ end
 
 function Reconciler:diff(virtualInstances, rootId)
 	Timer.start("Reconciler:diff")
-	local success, result = diff(self.__instanceMap, virtualInstances, rootId)
+	local success, result = diff(self.__instanceMap, virtualInstances, rootId, yieldBudget())
 	Timer.stop()
 
 	return success, result

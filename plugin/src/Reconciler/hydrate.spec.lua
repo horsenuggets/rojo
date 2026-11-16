@@ -262,4 +262,63 @@ return function()
 			expect(knownInstances.fromIds[id]).to.equal(expectedInstance)
 		end
 	end)
+
+	-- A tree of a root, `width` children, and one grandchild under each.
+	local function tree(width)
+		local virtualInstances = {
+			ROOT = { ClassName = "Folder", Name = "Root", Properties = {}, Children = {} },
+		}
+		local rootInstance = Instance.new("Folder")
+		for index = 1, width do
+			local childId = "CHILD_" .. index
+			local leafId = "LEAF_" .. index
+			virtualInstances[childId] =
+				{ ClassName = "Folder", Name = "Child" .. index, Properties = {}, Children = { leafId } }
+			virtualInstances[leafId] = { ClassName = "Folder", Name = "Leaf", Properties = {}, Children = {} }
+			table.insert(virtualInstances.ROOT.Children, childId)
+
+			local child = Instance.new("Folder")
+			child.Name = "Child" .. index
+			child.Parent = rootInstance
+			local leaf = Instance.new("Folder")
+			leaf.Name = "Leaf"
+			leaf.Parent = child
+		end
+		return virtualInstances, rootInstance
+	end
+
+	-- The caller yields from `step`, so a walk that skipped it for part of the
+	-- tree could still outlast Studio's script timeout.
+	it("should call step once for every hydrated instance", function()
+		for _, width in { 0, 1, 7 } do
+			local virtualInstances, rootInstance = tree(width)
+			local knownInstances = InstanceMap.new()
+			local steps = 0
+			hydrate(knownInstances, virtualInstances, "ROOT", rootInstance, function()
+				steps += 1
+			end)
+			expect(steps).to.equal(1 + width * 2)
+			expect(knownInstances:size()).to.equal(steps)
+			rootInstance:Destroy()
+		end
+	end)
+
+	it("should hydrate the same instances when step yields", function()
+		local virtualInstances, rootInstance = tree(5)
+		local plain = InstanceMap.new()
+		hydrate(plain, virtualInstances, "ROOT", rootInstance)
+
+		local yielding = InstanceMap.new()
+		hydrate(yielding, virtualInstances, "ROOT", rootInstance, function()
+			task.wait()
+		end)
+
+		expect(yielding:size()).to.equal(plain:size())
+		for id, instance in plain.fromIds do
+			expect(yielding.fromIds[id]).to.equal(instance)
+		end
+		plain:stop()
+		yielding:stop()
+		rootInstance:Destroy()
+	end)
 end

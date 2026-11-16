@@ -19,13 +19,14 @@ local services = require(script.Parent.services)
 -- group regardless of how large the group is.
 local MAX_CANDIDATES_TO_SCORE = 32
 
-local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootInstance)
+local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootInstance, step)
 	local virtualInstance = virtualInstances[rootId]
 
 	if virtualInstance == nil then
 		invariant("Cannot hydrate an instance not present in virtualInstances\nID: {}", rootId)
 	end
 
+	step()
 	instanceMap:insert(rootId, rootInstance)
 	stats.hydrated += 1
 
@@ -75,7 +76,7 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 			local service = services.getService(rootInstance, virtualChild.ClassName)
 			if service ~= nil and not visited[service] then
 				visited[service] = true
-				hydrateInner(stats, instanceMap, virtualInstances, childId, service)
+				hydrateInner(stats, instanceMap, virtualInstances, childId, service, step)
 				continue
 			end
 
@@ -170,11 +171,15 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 		end
 
 		visited[match] = true
-		hydrateInner(stats, instanceMap, virtualInstances, childId, match)
+		hydrateInner(stats, instanceMap, virtualInstances, childId, match, step)
 	end
 end
 
-local function hydrate(instanceMap, virtualInstances, rootId, rootInstance)
+local function noStep() end
+
+-- `step` is called once per instance, so a caller walking a large place can
+-- yield between instances. Without one, hydration never yields.
+local function hydrate(instanceMap, virtualInstances, rootId, rootInstance, step)
 	-- Tallies of the work hydration did, surfaced in a single debug log below so
 	-- the cost of property-based disambiguation is visible without per-node spam.
 	local stats = {
@@ -183,7 +188,7 @@ local function hydrate(instanceMap, virtualInstances, rootId, rootInstance)
 		candidatesScored = 0,
 	}
 
-	hydrateInner(stats, instanceMap, virtualInstances, rootId, rootInstance)
+	hydrateInner(stats, instanceMap, virtualInstances, rootId, rootInstance, step or noStep)
 
 	Log.debug(
 		"Hydrated {} instances ({} ambiguous name+class groups, {} candidates scored)",

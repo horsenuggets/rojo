@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Yield while hydrating and diffing during the initial sync, so connecting to a large
+  place no longer runs past Studio's script timeout. Studio stops a timed-out script
+  without an error the plugin can catch, which left the session stuck on "Connecting"
+  with nothing reported. A place with about 340,000 instances used to block Studio for
+  18 seconds in one stretch while connecting, and now stays responsive.
+
 ## `7.7.1-horse.1.5`
 
 * Connect the Rojo+ plugin automatically when a place carries a

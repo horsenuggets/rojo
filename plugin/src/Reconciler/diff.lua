@@ -26,7 +26,13 @@ local function shouldDeleteUnknownInstances(virtualInstance)
 	end
 end
 
-local function diff(instanceMap, virtualInstances, rootId)
+local function noStep() end
+
+-- `step` is called once per instance, so a caller walking a large place can
+-- yield between instances. Without one, diffing never yields.
+local function diff(instanceMap, virtualInstances, rootId, step)
+	step = step or noStep
+
 	local patch = {
 		removed = {},
 		added = {},
@@ -56,6 +62,7 @@ local function diff(instanceMap, virtualInstances, rootId)
 			return true
 		end
 		visited[id] = true
+		step()
 		local virtualInstance = virtualInstances[id]
 		local instance = instanceMap.fromIds[id]
 
