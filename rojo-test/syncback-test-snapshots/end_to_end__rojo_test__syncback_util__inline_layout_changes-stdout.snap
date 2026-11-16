@@ -3,7 +3,7 @@ source: tests/rojo_test/syncback_util.rs
 expression: "String::from_utf8_lossy(&output.stdout)"
 ---
 Writing src/Collapse/init.meta.json
-Writing src/Expand/Holder/Added.server.luau
+Writing src/Expand/Holder/Added.legacy.luau
 Writing src/Expand/Holder/Brick/init.meta.json
 Writing src/Collapse
 Writing src/Expand/Holder

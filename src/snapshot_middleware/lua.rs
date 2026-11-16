@@ -203,8 +203,25 @@ pub fn syncback_lua<'sync>(
     } else {
         anyhow::bail!("Scripts must have a `Source` property that is a String")
     };
+    snapshot.validate_script_destination(&snapshot.path)?;
     let mut fs_snapshot = FsSnapshot::new();
     fs_snapshot.add_file(&snapshot.path, contents);
+    if let Some(old_source) = snapshot
+        .old_inst()
+        .as_ref()
+        .and_then(crate::syncback::source_file)
+    {
+        if !snapshot.is_scoped()
+            && old_source != snapshot.path
+            && old_source.parent() == snapshot.path.parent()
+            && old_source
+                .extension()
+                .is_some_and(|extension| extension == "lua" || extension == "luau")
+        {
+            snapshot.validate_script_migration(&old_source, &snapshot.path)?;
+            fs_snapshot.remove_file(old_source);
+        }
+    }
 
     let meta = AdjacentMetadata::from_syncback_snapshot(snapshot, snapshot.path.clone())?;
     if let Some(mut meta) = meta {
@@ -237,7 +254,7 @@ pub fn syncback_lua_init<'sync>(
     snapshot: &SyncbackSnapshot<'sync>,
 ) -> anyhow::Result<SyncbackReturn<'sync>> {
     let new_inst = snapshot.new_inst();
-    let path = snapshot.path.join(match script_type {
+    let mut path = snapshot.path.join(match script_type {
         ScriptType::Server => "init.server.luau",
         ScriptType::Client => "init.client.luau",
         ScriptType::Module => "init.luau",
@@ -253,8 +270,37 @@ pub fn syncback_lua_init<'sync>(
         anyhow::bail!("Scripts must have a `Source` property that is a String")
     };
 
+    if let Some(old_source) = snapshot
+        .old_inst()
+        .as_ref()
+        .and_then(crate::syncback::source_file)
+    {
+        if old_source.parent() == Some(snapshot.path.as_path()) {
+            if let Some(extension) = old_source
+                .extension()
+                .filter(|extension| *extension == "lua" || *extension == "luau")
+            {
+                path.set_extension(extension);
+            }
+        }
+    }
+
+    // Scoped writes are retargeted to their tracked initializer by the caller.
+    if !snapshot.is_scoped() {
+        snapshot.validate_script_destination(&path)?;
+    }
     let mut dir_syncback = syncback_dir_no_meta(snapshot)?;
     dir_syncback.fs_snapshot.add_file(&path, contents);
+    if let Some(old_source) = snapshot
+        .old_inst()
+        .as_ref()
+        .and_then(crate::syncback::source_file)
+    {
+        if !snapshot.is_scoped() && old_source != path && old_source.parent() == path.parent() {
+            snapshot.validate_script_migration(&old_source, &path)?;
+            dir_syncback.fs_snapshot.remove_file(old_source);
+        }
+    }
 
     let meta = DirectoryMetadata::from_syncback_snapshot(snapshot, snapshot.path.clone())?;
     if let Some(mut meta) = meta {

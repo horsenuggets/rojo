@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    snapshot::{InstanceWithMeta, RojoTree},
+    snapshot::{InstanceContext, InstanceWithMeta, RojoTree},
     snapshot_middleware::{default_sync_rules, Middleware},
     Project,
 };
@@ -30,6 +30,8 @@ pub struct SyncbackData<'sync> {
     /// Whether this rewrites one instance's files for two-way sync, where the
     /// new tree only holds what that instance's own files store.
     pub(super) scoped: bool,
+    /// Effective destination context inherited by instances without tracked sources.
+    pub(super) context: Option<&'sync InstanceContext>,
     /// Instances in the new tree that are scripts or have script descendants,
     /// when they were computed ahead of time for the whole tree.
     pub(super) script_containers: Option<&'sync HashSet<Ref>>,
@@ -47,13 +49,22 @@ pub struct SyncbackSnapshot<'sync> {
 }
 
 impl<'sync> SyncbackSnapshot<'sync> {
+    fn context(&self) -> Option<&'sync InstanceContext> {
+        self.old_inst()
+            .map(|old| &old.metadata().context)
+            .or(self.data.context)
+    }
+
     /// Constructs a SyncbackSnapshot from the provided refs
     /// while inheriting this snapshot's path and data. This should be used for
     /// directories.
     #[inline]
     pub fn with_joined_path(&self, new_ref: Ref, old_ref: Option<Ref>) -> anyhow::Result<Self> {
         let mut snapshot = Self {
-            data: self.data,
+            data: SyncbackData {
+                context: self.context(),
+                ..self.data
+            },
             old: old_ref,
             new: new_ref,
             path: PathBuf::new(),
@@ -80,19 +91,27 @@ impl<'sync> SyncbackSnapshot<'sync> {
         stem: &str,
     ) -> Self {
         let mut snapshot = Self {
-            data: self.data,
+            data: SyncbackData {
+                context: self.context(),
+                ..self.data
+            },
             old: old_ref,
             new: new_ref,
             path: PathBuf::new(),
             middleware: None,
         };
-        let old_name = snapshot
+        let old_source = snapshot
             .old_inst()
             .and_then(|old| old.metadata().relevant_paths.first())
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str());
-        let name = match old_name {
-            Some(name) => name.to_owned(),
+            .and_then(|path| Some((path, path.file_name()?.to_str()?)));
+        let name = match old_source {
+            Some((source, name)) => super::file_names::canonical_script_source_name(
+                get_best_middleware(&snapshot),
+                source,
+                &snapshot.old_inst().unwrap().metadata().context.sync_rules,
+            )
+            .map(|name| name.into_owned())
+            .unwrap_or_else(|| name.to_owned()),
             None => file_name_for_stem(get_best_middleware(&snapshot), stem),
         };
         snapshot.path = base_path.join(name);
@@ -111,13 +130,11 @@ impl<'sync> SyncbackSnapshot<'sync> {
     /// also the stem of its adjacent `.meta.json` file.
     pub fn file_stem(&self) -> &str {
         let middleware = get_best_middleware(self);
-        for rule in self
-            .data
-            .project
-            .sync_rules
-            .iter()
-            .chain(default_sync_rules())
-        {
+        let rules = self
+            .context()
+            .map(|context| context.sync_rules.as_slice())
+            .unwrap_or(self.project().sync_rules.as_slice());
+        for rule in rules.iter().chain(default_sync_rules()) {
             if rule.middleware == middleware && rule.matches(&self.path) {
                 if let Ok(stem) = rule.file_name_for_path(&self.path) {
                     return stem;
@@ -141,7 +158,10 @@ impl<'sync> SyncbackSnapshot<'sync> {
         old_ref: Option<Ref>,
     ) -> anyhow::Result<Self> {
         let mut snapshot = Self {
-            data: self.data,
+            data: SyncbackData {
+                context: self.context(),
+                ..self.data
+            },
             old: old_ref,
             new: new_ref,
             path: PathBuf::new(),
@@ -159,7 +179,10 @@ impl<'sync> SyncbackSnapshot<'sync> {
     #[inline]
     pub fn with_new_path(&self, path: PathBuf, new_ref: Ref, old_ref: Option<Ref>) -> Self {
         Self {
-            data: self.data,
+            data: SyncbackData {
+                context: self.context(),
+                ..self.data
+            },
             old: old_ref,
             new: new_ref,
             path,
@@ -240,6 +263,129 @@ impl<'sync> SyncbackSnapshot<'sync> {
             .new_tree
             .get_by_ref(self.new)
             .expect("SyncbackSnapshot should not contain invalid referents")
+    }
+
+    /// Identifies a tracked file rename without treating fixed project paths as movable.
+    pub fn is_script_suffix_migration(&self, path: &Path) -> bool {
+        self.old_inst().is_some_and(|old| {
+            let Some(crate::snapshot::InstigatingSource::Path(source)) =
+                &old.metadata().instigating_source
+            else {
+                return false;
+            };
+            source != path
+                && source.parent() == path.parent()
+                && super::file_names::canonical_script_source_name(
+                    get_best_middleware(self),
+                    source,
+                    &old.metadata().context.sync_rules,
+                )
+                .is_some_and(|name| {
+                    path.file_name().and_then(|name| name.to_str()) == Some(name.as_ref())
+                })
+        })
+    }
+
+    /// A filtered rename must not remove its source without installing its replacement.
+    pub fn validate_script_migration(&self, old: &Path, new: &Path) -> anyhow::Result<()> {
+        let patterns = self
+            .project()
+            .syncback_rules
+            .as_ref()
+            .map(super::SyncbackRules::compile_globs)
+            .transpose()?;
+        for path in [old, new] {
+            anyhow::ensure!(
+                super::is_valid_path(&patterns, self.project().folder_location(), path),
+                "Cannot migrate a script source because an ignore pattern excludes {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_script_rule(&self, path: &Path) -> anyhow::Result<()> {
+        let middleware = get_best_middleware(self);
+        if middleware.is_dir() || self.middleware.is_some() {
+            return Ok(());
+        }
+        let context = self.context();
+        let rules = context
+            .map(|context| context.sync_rules.as_slice())
+            .unwrap_or(self.project().sync_rules.as_slice());
+        let emit_legacy = context
+            .map(|context| context.emit_legacy_scripts)
+            .or(self.project().emit_legacy_scripts)
+            .unwrap_or_else(|| crate::snapshot::InstanceContext::default().emit_legacy_scripts);
+        let rule = rules
+            .iter()
+            .chain(default_sync_rules())
+            .find(|rule| rule.matches(path))
+            .ok_or_else(|| {
+                anyhow::anyhow!("No sync rule matches script destination {}", path.display())
+            })?;
+        let reader = match rule.middleware {
+            Middleware::ServerScript if emit_legacy => Middleware::LegacyServerScript,
+            Middleware::ClientScript if emit_legacy => Middleware::LegacyClientScript,
+            other => other,
+        };
+        let suffix = super::file_names::script_kind_suffix(middleware);
+        let stem = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(|stem| suffix.and_then(|suffix| stem.strip_suffix(suffix)));
+        anyhow::ensure!(
+            suffix.is_some()
+                && super::file_names::script_kind_suffix(reader) == suffix
+                && rule.file_name_for_path(path).ok() == stem,
+            "Cannot write a script destination with an incompatible sync rule at {}",
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// Refuses to install a renamed source over a file the old tree does not own.
+    pub fn validate_script_destination(&self, path: &Path) -> anyhow::Result<()> {
+        if self
+            .old_inst()
+            .as_ref()
+            .and_then(super::source_file)
+            .is_some_and(|source| source == path)
+        {
+            return Ok(());
+        }
+        match self.vfs().metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.validate_script_rule(path)
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if self.middleware.is_some()
+            && self.old_inst().is_some_and(|old| {
+                old.metadata()
+                    .relevant_paths
+                    .iter()
+                    .any(|source| source == path)
+            })
+        {
+            return Ok(());
+        }
+        let owned = self.old_tree().descendants().any(|instance| {
+            self.get_old_instance(instance.referent())
+                .as_ref()
+                .and_then(super::source_file)
+                .is_some_and(|source| source == path)
+        });
+        anyhow::bail!(
+            "Cannot write script source because {} already exists at {}",
+            if owned {
+                "another managed source"
+            } else {
+                "an unmanaged file"
+            },
+            path.display()
+        )
     }
 
     /// Returns the root Project that was used to make this snapshot.

@@ -26,7 +26,7 @@ expression: contents
       <Item class="Script" referent="4">
         <Properties>
           <string name="Name">test</string>
-          <token name="RunContext">0</token>
+          <token name="RunContext">1</token>
           <string name="Source"></string>
         </Properties>
       </Item>

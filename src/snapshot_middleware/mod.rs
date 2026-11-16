@@ -362,12 +362,22 @@ impl Middleware {
             Self::Ignore => Ok(None),
 
             Self::Dir => snapshot_dir(context, vfs, path, name, entries),
-            Self::ServerScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::Server, entries)
-            }
-            Self::ClientScriptDir => {
-                snapshot_lua_init(context, vfs, path, name, ScriptType::Client, entries)
-            }
+            Self::ServerScriptDir => snapshot_lua_init(
+                context,
+                vfs,
+                path,
+                name,
+                ScriptType::RunContextServer,
+                entries,
+            ),
+            Self::ClientScriptDir => snapshot_lua_init(
+                context,
+                vfs,
+                path,
+                name,
+                ScriptType::RunContextClient,
+                entries,
+            ),
             Self::PluginScriptDir => {
                 snapshot_lua_init(context, vfs, path, name, ScriptType::Plugin, entries)
             }
@@ -407,9 +417,14 @@ impl Middleware {
             // Projects are only generated from files that already exist on the
             // file system, so we don't need to pass a file name.
             Middleware::Project => syncback_project(snapshot),
-            Middleware::ServerScript => syncback_lua(snapshot),
-            Middleware::ClientScript => syncback_lua(snapshot),
-            Middleware::ModuleScript => syncback_lua(snapshot),
+            Middleware::ServerScript
+            | Middleware::ClientScript
+            | Middleware::ModuleScript
+            | Middleware::PluginScript
+            | Middleware::LegacyServerScript
+            | Middleware::LegacyClientScript
+            | Middleware::RunContextServerScript
+            | Middleware::RunContextClientScript => syncback_lua(snapshot),
             Middleware::Rbxm => syncback_rbxm(snapshot),
             Middleware::Rbxmx => syncback_rbxmx(snapshot),
             Middleware::Toml => anyhow::bail!("cannot syncback Toml middleware"),
@@ -428,14 +443,6 @@ impl Middleware {
                 syncback_lua_init(ScriptType::LegacyClient, snapshot)
             }
             Middleware::CsvDir => syncback_csv_init(snapshot),
-
-            Middleware::PluginScript
-            | Middleware::LegacyServerScript
-            | Middleware::LegacyClientScript
-            | Middleware::RunContextServerScript
-            | Middleware::RunContextClientScript => {
-                anyhow::bail!("syncback is not implemented for {self:?} yet")
-            }
         }
     }
 
@@ -542,10 +549,14 @@ pub fn default_sync_rules() -> &'static [SyncRule] {
 
     DEFAULT_SYNC_RULES.get_or_init(|| {
         vec![
-            sync_rule!("*.server.lua", ServerScript, ".server.lua"),
-            sync_rule!("*.server.luau", ServerScript, ".server.luau"),
-            sync_rule!("*.client.lua", ClientScript, ".client.lua"),
-            sync_rule!("*.client.luau", ClientScript, ".client.luau"),
+            sync_rule!("*.server.lua", RunContextServerScript, ".server.lua"),
+            sync_rule!("*.server.luau", RunContextServerScript, ".server.luau"),
+            sync_rule!("*.client.lua", RunContextClientScript, ".client.lua"),
+            sync_rule!("*.client.luau", RunContextClientScript, ".client.luau"),
+            sync_rule!("*.legacy.lua", LegacyServerScript, ".legacy.lua"),
+            sync_rule!("*.legacy.luau", LegacyServerScript, ".legacy.luau"),
+            sync_rule!("*.local.lua", LegacyClientScript, ".local.lua"),
+            sync_rule!("*.local.luau", LegacyClientScript, ".local.luau"),
             sync_rule!("*.plugin.lua", PluginScript, ".plugin.lua"),
             sync_rule!("*.plugin.luau", PluginScript, ".plugin.luau"),
             sync_rule!("*.{lua,luau}", ModuleScript),
@@ -571,6 +582,71 @@ mod test {
 
     use memofs::{InMemoryFs, VfsSnapshot};
     use std::path::Path;
+
+    #[test]
+    fn canonical_script_suffixes_preserve_class_and_run_context() {
+        use rbx_dom_weak::types::{Enum, Variant};
+
+        let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+        for emit_legacy in [false, true] {
+            for extension in ["lua", "luau"] {
+                for (suffix, class, run_context) in [
+                    ("", "ModuleScript", None),
+                    (".local", "LocalScript", None),
+                    (".legacy", "Script", Some("Legacy")),
+                    (".server", "Script", Some("Server")),
+                    (".client", "Script", Some("Client")),
+                    (".plugin", "Script", Some("Plugin")),
+                ] {
+                    for has_children in [false, true] {
+                        let mut imfs = InMemoryFs::new();
+                        let file = format!("Code{suffix}.{extension}");
+                        let path = if has_children {
+                            imfs.load_snapshot(
+                                "/root/Code",
+                                VfsSnapshot::dir([
+                                    (
+                                        format!("init{suffix}.{extension}"),
+                                        VfsSnapshot::file("-- source"),
+                                    ),
+                                    ("Helper.luau".to_owned(), VfsSnapshot::file("return {}")),
+                                ]),
+                            )
+                            .unwrap();
+                            PathBuf::from("/root/Code")
+                        } else {
+                            let path = PathBuf::from("/root").join(file);
+                            imfs.load_snapshot(&path, VfsSnapshot::file("-- source"))
+                                .unwrap();
+                            path
+                        };
+                        let snapshot = snapshot_from_vfs(
+                            &InstanceContext::with_emit_legacy_scripts(Some(emit_legacy)),
+                            &Vfs::new(imfs),
+                            &path,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            snapshot.class_name,
+                            class,
+                            "{} with emitLegacyScripts={emit_legacy}",
+                            path.display()
+                        );
+                        assert_eq!(snapshot.children.len(), usize::from(has_children));
+                        let expected = run_context
+                            .map(|context| Variant::Enum(Enum::from_u32(contexts[context])));
+                        assert_eq!(
+                            snapshot.properties.get(&"RunContext".into()),
+                            expected.as_ref(),
+                            "{}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn reserved_cache_is_rejected_before_directory_or_file_dispatch() {
