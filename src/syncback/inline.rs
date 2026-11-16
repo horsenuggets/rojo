@@ -12,6 +12,8 @@ use crate::{
     snapshot_middleware::Middleware,
 };
 
+use super::ModelTrees;
+
 const SCRIPT_BASE_CLASS: &str = "LuaSourceContainer";
 
 /// Returns whether instances of `class` hold Luau source, including any class
@@ -72,7 +74,10 @@ pub fn script_containers(dom: &WeakDom) -> HashSet<Ref> {
 /// parent's `init.meta.json`, because that parent's subtree has no scripts.
 /// Syncback skips subtrees whose content is unchanged, so without this an
 /// existing project would never move into the inline layout.
-pub fn needs_relayout(tree: &RojoTree) -> HashSet<Ref> {
+///
+/// A directory that holds one of `model_trees` keeps a file for each child,
+/// since a model file can't be stored inline.
+pub fn needs_relayout(tree: &RojoTree, model_trees: &ModelTrees) -> HashSet<Ref> {
     let containers = script_containers(tree.inner());
     let mut relayout = HashSet::new();
     let mut pending = vec![tree.get_root_id()];
@@ -87,6 +92,7 @@ pub fn needs_relayout(tree: &RojoTree) -> HashSet<Ref> {
             instance.metadata().instigating_source,
             Some(InstigatingSource::Path(_))
         ) && !containers.contains(&parent)
+            && !model_trees.contains(parent)
             && tree.get_metadata(parent).is_some_and(|metadata| {
                 metadata.middleware == Some(Middleware::Dir)
                     && matches!(

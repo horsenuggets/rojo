@@ -266,6 +266,10 @@ fn should_inline(snapshot: &SyncbackSnapshot) -> bool {
     if !instances_as_directories(snapshot.project()) || snapshot.contains_script(snapshot.new) {
         return false;
     }
+    // A model file needs a path of its own, which an inline descendant lacks.
+    if snapshot.contains_model_tree(snapshot.new) {
+        return false;
+    }
     if let Some(old_inst) = snapshot.old_inst() {
         // Project-defined children are written by the project file.
         let has_project_children = old_inst.children().iter().any(|child| {
@@ -611,6 +615,13 @@ pub fn syncback_dir_no_meta<'sync>(
                     }
                     let key = old_name_paths.get(new_child.name.as_str())?;
                     old_child_map.remove(key)
+                })
+                .filter(|old_child| {
+                    let keeps = snapshot.keeps_model_layout(*new_child_ref, *old_child);
+                    if !keeps {
+                        removed_children.push(*old_child);
+                    }
+                    keeps
                 });
             children.push(match old_child {
                 Some(old_child) => {
@@ -703,6 +714,10 @@ fn children_by_name<'sync>(
                         "Skipping instance {} because it originates in a project file",
                         old_child.name()
                     );
+                    continue;
+                } else if !snapshot.keeps_model_layout(*new_child_ref, old_child) {
+                    children.push(snapshot.with_joined_path(*new_child_ref, None)?);
+                    removed_children.push(old_child);
                     continue;
                 }
                 // This child exists in both doms. Pass it on.

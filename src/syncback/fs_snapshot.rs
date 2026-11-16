@@ -129,6 +129,12 @@ impl FsSnapshot {
             lock.remove_dir_all(base_path.join(dir_path))?;
         }
         for path in &self.removed_files {
+            // An Instance that moves to a new layout is removed and written
+            // as new. If it lands on its old path after all, the file that was
+            // just written must survive.
+            if self.added_files.contains_key(path) {
+                continue;
+            }
             lock.remove_file(base_path.join(path))?;
         }
         drop(lock);

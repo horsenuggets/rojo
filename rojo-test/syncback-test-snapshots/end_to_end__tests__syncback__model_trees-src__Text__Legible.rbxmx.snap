@@ -1,0 +1,17 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Text/Legible.rbxmx
+---
+<roblox version="4">
+  <Item class="Model" referent="0">
+    <Properties>
+      <string name="Name">Legible</string>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Part" referent="1">
+      <Properties>
+        <string name="Name">Part</string>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
