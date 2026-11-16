@@ -507,6 +507,34 @@ impl AdjacentMetadata {
             && self.name.is_none()
     }
 
+    /// Returns what the metadata file at `path` should hold once its `name`
+    /// is replaced, keeping everything else in `existing`. Returns `None` when
+    /// nothing would be left to store, so the file shouldn't exist.
+    pub fn with_name(
+        existing: Option<&[u8]>,
+        path: &Path,
+        name: Option<String>,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut meta = match existing {
+            Some(contents) => Self::from_slice(contents, path.to_path_buf())?,
+            None => Self {
+                schema: None,
+                id: None,
+                ignore_unknown_instances: None,
+                name: None,
+                properties: IndexMap::new(),
+                attributes: IndexMap::new(),
+                path: path.to_path_buf(),
+            },
+        };
+        meta.name = name;
+        if meta.is_empty() && meta.id.is_none() && meta.schema.is_none() {
+            return Ok(None);
+        }
+        let contents = json::to_vec_pretty(&meta).context("could not serialize metadata")?;
+        Ok(Some(contents))
+    }
+
     // TODO: Add method to allow selectively applying parts of metadata and
     // throwing errors if invalid parts are specified.
 }
@@ -807,6 +835,55 @@ mod test {
     use rbx_dom_weak::ustr;
 
     use super::*;
+
+    #[test]
+    fn with_name_only_changes_the_name() {
+        let path = Path::new("/Model.meta.json");
+        let renamed = |existing: Option<&str>, name: Option<&str>| {
+            AdjacentMetadata::with_name(existing.map(str::as_bytes), path, name.map(str::to_owned))
+                .unwrap()
+                .map(|contents| String::from_utf8(contents).unwrap())
+        };
+
+        // Nothing to store means no file at all.
+        assert_eq!(renamed(None, None), None);
+        assert_eq!(renamed(Some(r#"{ "name": "Old" }"#), None), None);
+
+        let created = renamed(None, Some("New")).unwrap();
+        assert!(created.contains(r#""name": "New""#), "{created}");
+
+        // Every other field survives a new name and a removed one.
+        let existing = r#"{
+            "$schema": "schema.json",
+            "id": "model",
+            "ignoreUnknownInstances": true,
+            "name": "Old",
+            "properties": { "Archivable": false }
+        }"#;
+        for name in [Some("New"), None] {
+            let updated = renamed(Some(existing), name).unwrap();
+            for kept in [
+                "$schema",
+                r#""id": "model""#,
+                "ignoreUnknownInstances",
+                "Archivable",
+            ] {
+                assert!(updated.contains(kept), "{updated}");
+            }
+            assert!(!updated.contains("Old"), "{updated}");
+            assert_eq!(
+                updated.contains(r#""name": "New""#),
+                name.is_some(),
+                "{updated}"
+            );
+        }
+
+        // The pure helper gives the same answer every time.
+        assert_eq!(
+            renamed(Some(existing), Some("New")),
+            renamed(Some(existing), Some("New"))
+        );
+    }
 
     #[test]
     fn metadata_ids_defer_to_valid_attribute_ids() {

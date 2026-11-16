@@ -266,6 +266,10 @@ fn should_inline(snapshot: &SyncbackSnapshot) -> bool {
     if !instances_as_directories(snapshot.project()) || snapshot.contains_script(snapshot.new) {
         return false;
     }
+    // A model file needs a path of its own, which an inline descendant lacks.
+    if snapshot.contains_model_tree(snapshot.new) {
+        return false;
+    }
     if let Some(old_inst) = snapshot.old_inst() {
         // Project-defined children are written by the project file.
         let has_project_children = old_inst.children().iter().any(|child| {
@@ -337,7 +341,9 @@ fn inline_blocked_by_ignore_paths(snapshot: &SyncbackSnapshot) -> anyhow::Result
     let mut pending = vec![(snapshot.new, snapshot.path.clone())];
     while let Some((referent, directory)) = pending.pop() {
         let parent = dom.get_by_ref(referent).unwrap();
-        let stems = unique_child_stems(dom, parent);
+        // A directory with a model tree is never inlined, so none of these
+        // descendants is written as a model file.
+        let stems = unique_child_stems(dom, parent, None);
         for child_ref in parent.children() {
             let child = dom.get_by_ref(*child_ref).unwrap();
             let middleware = directory_middleware_for_instance(child);
@@ -545,7 +551,7 @@ pub fn syncback_dir_no_meta<'sync>(
         // Duplicate and unsafe names are given unique file names instead of
         // being rejected, so children are matched to the old tree by the file
         // name they would be written to rather than by their Instance name.
-        let stems = unique_child_stems(snapshot.new_tree(), new_inst);
+        let stems = unique_child_stems(snapshot.new_tree(), new_inst, snapshot.model_trees());
         let mut old_child_map = HashMap::new();
         let mut old_name_counts = HashMap::new();
         let mut old_name_paths = HashMap::new();
@@ -612,6 +618,14 @@ pub fn syncback_dir_no_meta<'sync>(
                     let key = old_name_paths.get(new_child.name.as_str())?;
                     old_child_map.remove(key)
                 });
+            let old_child = match old_child {
+                Some(old_child) if !snapshot.keeps_model_layout(*new_child_ref, old_child) => {
+                    snapshot.validate_layout_change(old_child)?;
+                    removed_children.push(old_child);
+                    None
+                }
+                other => other,
+            };
             children.push(match old_child {
                 Some(old_child) => {
                     snapshot.with_stem(&snapshot.path, *new_child_ref, Some(old_child.id()), stem)
@@ -703,6 +717,11 @@ fn children_by_name<'sync>(
                         "Skipping instance {} because it originates in a project file",
                         old_child.name()
                     );
+                    continue;
+                } else if !snapshot.keeps_model_layout(*new_child_ref, old_child) {
+                    snapshot.validate_layout_change(old_child)?;
+                    children.push(snapshot.with_joined_path(*new_child_ref, None)?);
+                    removed_children.push(old_child);
                     continue;
                 }
                 // This child exists in both doms. Pass it on.

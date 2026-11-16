@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    snapshot::{InstanceContext, InstanceWithMeta, RojoTree},
+    snapshot::{InstanceContext, InstanceWithMeta, InstigatingSource, RojoTree},
     snapshot_middleware::{default_sync_rules, Middleware},
     Project,
 };
@@ -17,8 +17,9 @@ use rbx_dom_weak::{
 
 use super::{
     file_names::{file_name_for_stem, stem_for_path},
-    get_best_middleware, name_for_inst,
+    get_best_middleware, is_model_file, name_for_inst,
     property_filter::filter_properties,
+    ModelTrees,
 };
 
 #[derive(Clone, Copy)]
@@ -35,6 +36,10 @@ pub struct SyncbackData<'sync> {
     /// Instances in the new tree that are scripts or have script descendants,
     /// when they were computed ahead of time for the whole tree.
     pub(super) script_containers: Option<&'sync HashSet<Ref>>,
+    /// Instances in the new tree that the `modelTrees` rules store as model
+    /// files. Scoped rewrites keep the layout already on disk, so they have
+    /// none.
+    pub(super) model_trees: Option<&'sync ModelTrees>,
     /// IDs that instances in the new tree hold through their `Rojo_Id`
     /// attribute, so no other instance may be written with one of them.
     pub(super) attribute_ids: &'sync HashSet<String>,
@@ -408,6 +413,82 @@ impl<'sync> SyncbackSnapshot<'sync> {
             Some(containers) => containers.contains(&new_ref),
             None => super::inline::contains_script(self.new_tree(), new_ref),
         }
+    }
+
+    /// Returns the model middleware a `modelTrees` rule assigns to this
+    /// snapshot's Instance. Sources named by a project node keep the path and
+    /// format the project gives them.
+    pub fn model_tree_middleware(&self) -> Option<Middleware> {
+        let middleware = self.data.model_trees?.middleware(self.new)?;
+        let from_project = self.old_inst().is_some_and(|old| {
+            matches!(
+                old.metadata().instigating_source,
+                Some(InstigatingSource::ProjectNode { .. })
+            )
+        });
+        (!from_project).then_some(middleware)
+    }
+
+    /// Returns whether the provided Instance in the new tree is stored as a
+    /// model file by a `modelTrees` rule, or has a descendant that is.
+    pub fn contains_model_tree(&self, new_ref: Ref) -> bool {
+        self.data
+            .model_trees
+            .is_some_and(|trees| trees.contains(new_ref))
+    }
+
+    /// Returns whether `new_ref` can be written over the files of `old`. A
+    /// model file and any other layout have different paths on disk, so when
+    /// only one side is a model file, or their formats differ, the old files
+    /// are removed and the Instance is written as if it were new.
+    pub fn keeps_model_layout(&self, new_ref: Ref, old: InstanceWithMeta<'sync>) -> bool {
+        let Some(old_middleware) = old.metadata().middleware else {
+            return true;
+        };
+        let paired = self.with_new_path(PathBuf::new(), new_ref, Some(old.id()));
+        let new_middleware = get_best_middleware(&paired);
+        new_middleware == old_middleware
+            || !(is_model_file(new_middleware) || is_model_file(old_middleware))
+    }
+
+    /// Returns an error if replacing the files of `old` with another layout
+    /// would remove a path the project's `ignorePaths` rule excludes. Moving
+    /// between a model file and a directory removes everything the old layout
+    /// stored, which would take the excluded files with it.
+    pub fn validate_layout_change(&self, old: InstanceWithMeta<'sync>) -> anyhow::Result<()> {
+        let Some(rules) = &self.project().syncback_rules else {
+            return Ok(());
+        };
+        let globs = Some(rules.compile_globs()?);
+        let base = self.project().folder_location();
+        let mut pending = vec![old];
+        while let Some(instance) = pending.pop() {
+            pending.extend(
+                instance
+                    .children()
+                    .iter()
+                    .filter_map(|child| self.get_old_instance(*child)),
+            );
+            for path in &instance.metadata().relevant_paths {
+                if !super::is_valid_path(&globs, base, path) && self.vfs().metadata(path).is_ok() {
+                    return Err(super::IgnoreConflict(format!(
+                        "Cannot change how {} is stored because the project's ignorePaths \
+                         rule excludes {}",
+                        self.get_old_inst_path(old.id()),
+                        path.display()
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the Instances the `modelTrees` rules store as model files,
+    /// when this is a full syncback.
+    #[inline]
+    pub fn model_trees(&self) -> Option<&'sync ModelTrees> {
+        self.data.model_trees
     }
 
     /// Returns whether an instance in the new tree holds `id` through its
