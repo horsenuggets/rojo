@@ -31,6 +31,10 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.6`
+
+* Fixed a live edit place falling back to the user's sync settings when its session
+  address and its `__RojoPlus_LiveEditUrl` marker differ only by an `http://` prefix.
 * Added `syncbackRules.modelTrees`, a list of rules that store whole subtrees in a single
   model file. Each rule has a `pattern` glob that is matched against the path of an
   Instance in the DataModel (like `Workspace/Maps/*/Effects`) and an optional `format` of
