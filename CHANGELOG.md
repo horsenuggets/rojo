@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.5`
+
 * Connect the Rojo+ plugin automatically when a place carries a
   `__RojoPlus_LiveEditUrl` attribute on `Workspace`, formatted as `host:port`. A live
   edit place then connects, accepts its initial sync, and turns on two-way sync with
