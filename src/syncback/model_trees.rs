@@ -397,6 +397,46 @@ mod test {
     }
 
     #[test]
+    fn a_displaced_directory_still_protects_its_ignored_files() {
+        let (_temp, root) = project_on_disk();
+        let part = r#"{ "className": "Part" }"#;
+        for holder in ["FX", "FX.rbxm"] {
+            let child = root.join("src").join(holder).join("Spark");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join("init.meta.json"), part).unwrap();
+        }
+        let notes = root.join("src/FX/notes.md");
+        std::fs::write(&notes, "Remember this.\n").unwrap();
+        let holder = |name: &str| {
+            InstanceBuilder::new("Folder")
+                .with_name(name)
+                .with_child(InstanceBuilder::new("Part").with_name("Spark"))
+        };
+
+        // The model file takes the name the other directory would use, which
+        // leaves that directory's own files unpaired and up for removal.
+        let error = syncback(
+            &root,
+            r#"{
+                "instancesAsDirectories": true,
+                "ignorePaths": ["**/*.md"],
+                "modelTrees": [{ "pattern": "FX" }]
+            }"#,
+            WeakDom::new(
+                InstanceBuilder::new("Folder")
+                    .with_child(holder("FX"))
+                    .with_child(holder("FX.rbxm")),
+            ),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("notes.md"), "{error}");
+        assert!(notes.is_file());
+        assert!(root.join("src/FX").is_dir());
+        assert!(root.join("src/FX.rbxm").is_dir());
+    }
+
+    #[test]
     fn nested_project_files_are_never_replaced() {
         let (_temp, root) = project_on_disk();
         let nested = root.join("src/Nested");
