@@ -1,14 +1,14 @@
 use std::path::Path;
 
 use anyhow::Context;
-use memofs::Vfs;
+use memofs::{IoResultExt, Vfs};
 
 use crate::{
     snapshot::{InstanceContext, InstanceMetadata, InstanceSnapshot},
     syncback::{FsSnapshot, SyncbackReturn, SyncbackSnapshot},
 };
 
-use super::{lua::metadata_exists, meta_file::AdjacentMetadata};
+use super::meta_file::AdjacentMetadata;
 
 #[profiling::function]
 pub fn snapshot_rbxm(
@@ -69,23 +69,41 @@ pub fn syncback_rbxm<'sync>(
 
 /// Keeps the adjacent metadata of a model file in step with its root's name.
 /// The root is named after the file when it is read, so a name the file system
-/// can't hold, or one shared with a sibling, is stored in the metadata.
+/// can't hold, or one shared with a sibling, is stored in the metadata. Anything
+/// else the metadata holds is left as it is.
 pub(super) fn syncback_model_name(
     snapshot: &SyncbackSnapshot,
     fs_snapshot: &mut FsSnapshot,
 ) -> anyhow::Result<()> {
-    let meta_path = snapshot
+    let directory = snapshot
         .path
         .parent()
-        .context("model files should have a parent directory")?
-        .join(format!("{}.meta.json", snapshot.file_stem()));
-    match snapshot.name_override() {
-        Some(name) => fs_snapshot.add_file(
-            meta_path,
-            crate::json::to_vec_pretty(&serde_json::json!({ "name": name }))
-                .context("could not serialize metadata")?,
+        .context("model files should have a parent directory")?;
+    let stem = snapshot.file_stem();
+    let json_path = directory.join(format!("{stem}.meta.json"));
+    let jsonc_path = directory.join(format!("{stem}.meta.jsonc"));
+    let json = snapshot.vfs().read(&json_path).with_not_found()?;
+    let jsonc = snapshot.vfs().read(&jsonc_path).with_not_found()?;
+
+    // Both files are applied when reading, so rewriting only one of them can't
+    // clear a name the other still sets.
+    let (meta_path, existing) = match (json, jsonc) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "Both {} and {} hold this model's metadata, so it can't be safely rewritten",
+            json_path.display(),
+            jsonc_path.display()
         ),
-        None if metadata_exists(snapshot.vfs(), &meta_path) => fs_snapshot.remove_file(meta_path),
+        (None, Some(existing)) => (jsonc_path, Some(existing)),
+        (existing, None) => (json_path, existing),
+    };
+    let existing = existing.as_deref().map(Vec::as_slice);
+    let updated = AdjacentMetadata::with_name(existing, &meta_path, snapshot.name_override())?;
+    match updated {
+        Some(contents) if existing != Some(contents.as_slice()) => {
+            fs_snapshot.add_file(meta_path, contents)
+        }
+        Some(_) => {}
+        None if existing.is_some() => fs_snapshot.remove_file(meta_path),
         None => {}
     }
     Ok(())
