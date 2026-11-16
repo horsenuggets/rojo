@@ -31,6 +31,10 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added a `--path` flag to `rojo plugin install` and `rojo plugin uninstall` that targets
+  a custom plugins folder instead of Roblox Studio's default. The folder must already
+  exist, so a mistyped path fails instead of installing the plugin where Studio never
+  loads it.
 * Choose syncback script suffixes from the instance class and `RunContext`. LocalScripts
   use `.local.luau`, legacy Scripts use `.legacy.luau`, and Scripts with Server or Client
   context use `.server.luau` or `.client.luau`. Recognize `.local` and `.legacy` script
