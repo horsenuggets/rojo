@@ -36,6 +36,19 @@ Making a new release? Simply add the new header with the version and date undern
   without an error the plugin can catch, which left the session stuck on "Connecting"
   with nothing reported. A place with about 340,000 instances used to block Studio for
   18 seconds in one stretch while connecting, and now stays responsive.
+* Added `syncbackRules.modelTrees`, a list of rules that store whole subtrees in a single
+  model file. Each rule has a `pattern` glob that is matched against the path of an
+  Instance in the DataModel (like `Workspace/Maps/*/Effects`) and an optional `format` of
+  `rbxm` (the default) or `rbxmx`. A matching Instance is written with all of its
+  descendants to one file, even when `instancesAsDirectories` is set, which keeps deep
+  hierarchies from producing paths that are too long for Windows. Changing or removing a
+  rule moves the affected Instances to their new layout on the next syncback, whether or
+  not they changed in the place. Instances defined by the project file keep their layout,
+  and syncback stops with an error when a rule would remove a path that `ignorePaths`
+  excludes or absorb a subtree that `ignoreTrees` excludes.
+* Model files now read an adjacent `.meta.json` or `.meta.jsonc` file, and syncback uses
+  it to keep the real name of a model's root when the file system can't hold it, leaving
+  the file's other fields as they are.
 
 ## `7.7.1-horse.1.5`
 

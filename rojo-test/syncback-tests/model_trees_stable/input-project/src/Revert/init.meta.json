@@ -1,0 +1,14 @@
+{
+    "children": [
+        {
+            "className": "Folder",
+            "name": "Old",
+            "children": [
+                {
+                    "className": "Part",
+                    "name": "Part"
+                }
+            ]
+        }
+    ]
+}

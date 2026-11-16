@@ -1,0 +1,16 @@
+---
+source: tests/rojo_test/syncback_util.rs
+expression: "String::from_utf8_lossy(&output.stdout)"
+---
+Writing src/Plain/Odd_Name.meta.json
+Writing src/Plain/Odd_Name.rbxm
+Writing src/Revert/init.meta.json
+Writing src/Scenes/Intro/FX.rbxm
+Writing src/Scenes/Outro/FX.rbxm
+Writing src/Text/Legible.rbxmx
+Writing src/Plain
+Writing src/Revert
+Writing src/Scenes/Outro
+Writing src/Text
+Removing src/Revert/Old.rbxm
+Removing src/Scenes/Intro/FX

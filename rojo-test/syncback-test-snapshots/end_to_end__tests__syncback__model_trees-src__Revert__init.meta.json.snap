@@ -1,0 +1,18 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Revert/init.meta.json
+---
+{
+    "children": [
+        {
+            "className": "Folder",
+            "name": "Old",
+            "children": [
+                {
+                    "className": "Part",
+                    "name": "Part"
+                }
+            ]
+        }
+    ]
+}
