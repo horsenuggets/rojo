@@ -31,6 +31,17 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added `syncbackRules.modelTrees`, a list of rules that store whole subtrees in a single
+  model file. Each rule has a `pattern` glob that is matched against the path of an
+  Instance in the DataModel (like `Workspace/Maps/*/Effects`) and an optional `format` of
+  `rbxm` (the default) or `rbxmx`. A matching Instance is written with all of its
+  descendants to one file, even when `instancesAsDirectories` is set, which keeps deep
+  hierarchies from producing paths that are too long for Windows. Changing or removing a
+  rule moves the affected Instances to their new layout on the next syncback, whether or
+  not they changed in the place.
+* Model files now read an adjacent `.meta.json` file, and syncback writes one to keep the
+  real name of a model's root when the file system can't hold it.
+
 ## `7.7.1-horse.1.5`
 
 * Connect the Rojo+ plugin automatically when a place carries a
