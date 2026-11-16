@@ -20,6 +20,7 @@ local ReconcilerServices = require(script.Parent.Reconciler.services)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local orderSwaps = require(script.Parent.orderSwaps)
+local yieldBudget = require(script.Parent.yieldBudget)
 
 local Status = strict("Session.Status", {
 	NotStarted = "NotStarted",
@@ -65,6 +66,9 @@ ServeSession.Status = Status
 -- notice when a patch is undone.
 ServeSession.PATCH_RECORDING_PREFIX = "Rojo+: Patch "
 
+-- Raised inside the initial sync when the session is stopped partway through.
+ServeSession.SYNC_CANCELLED = "Rojo+ sync was cancelled because the session stopped"
+
 function ServeSession.getWriteStatus(result)
 	assert(t.table(result))
 
@@ -94,11 +98,7 @@ function ServeSession.new(options)
 	-- Declare self ahead of time to capture it in a closure
 	local self
 	local function onInstanceChanged(instance, propertyName)
-		if not self.__twoWaySync then
-			return
-		end
-
-		self:__queueChange(instance, propertyName)
+		self:__onInstanceChanged(instance, propertyName)
 	end
 
 	local function onChangesFlushed(patch)
@@ -130,6 +130,9 @@ function ServeSession.new(options)
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
 		__changeBatcher = changeBatcher,
+		-- Studio edits seen before the initial sync knows the whole place. Nil
+		-- once they have been released.
+		__deferredChanges = {},
 		__statusChangedCallback = nil,
 		__connections = connections,
 		__syncResults = {},
@@ -157,6 +160,54 @@ end
 
 function ServeSession:getStatus()
 	return self.__status
+end
+
+--[[
+	The initial sync yields while it walks the place, so Studio edits can arrive
+	while only part of it is known. Sending one then would judge it against a
+	half-built instance map, where a move into a folder not reached yet looks
+	like a move to an unmanaged parent and gets undone. They are held instead.
+]]
+function ServeSession:__onInstanceChanged(instance, propertyName)
+	if not self.__twoWaySync then
+		return
+	end
+
+	local deferred = self.__deferredChanges
+	if deferred ~= nil then
+		table.insert(deferred, { instance = instance, propertyName = propertyName })
+		return
+	end
+
+	self:__queueChange(instance, propertyName)
+end
+
+-- Sends the held edits, in the order they happened, now that every instance
+-- they could refer to is known.
+function ServeSession:__releaseDeferredChanges()
+	local deferred = self.__deferredChanges
+	if deferred == nil then
+		return
+	end
+	self.__deferredChanges = nil
+
+	for _, change in deferred do
+		self:__queueChange(change.instance, change.propertyName)
+	end
+end
+
+--[[
+	Builds the function the initial sync calls as it walks the place. `budget`
+	yields when it is due and reports whether it did. A session stopped during
+	that yield has had its instance map cleared, so the walk must not touch it
+	again, and unwinding with an error is what stops it.
+]]
+function ServeSession:__syncStep(budget)
+	return function()
+		if budget() and self.__status == Status.Disconnected then
+			error(ServeSession.SYNC_CANCELLED, 0)
+		end
+	end
 end
 
 function ServeSession:__queueChange(instance, propertyName)
@@ -643,14 +694,19 @@ function ServeSession:__initialSync(serverInfo)
 		-- tracking them in the reconciler.
 		Log.trace("Matching existing Roblox instances to Rojo IDs")
 		self:setLoadingText("Hydrating instance map...")
-		self.__reconciler:hydrate(readResponseBody.instances, serverInfo.rootInstanceId, game)
+		-- Both walks cover the whole place, which on a large one outlasts
+		-- Studio's script timeout unless they yield along the way.
+		local step = self:__syncStep(yieldBudget())
+		self.__reconciler:hydrate(readResponseBody.instances, serverInfo.rootInstanceId, game, step)
 
 		-- Calculate the initial patch to apply to the DataModel to catch us
 		-- up to what Rojo thinks the place should look like.
 		Log.trace("Computing changes that plugin needs to make to catch up to server...")
 		self:setLoadingText("Finding differences between server and Studio...")
 		local success, catchUpPatch =
-			self.__reconciler:diff(readResponseBody.instances, serverInfo.rootInstanceId, game)
+			self.__reconciler:diff(readResponseBody.instances, serverInfo.rootInstanceId, step)
+
+		self:__releaseDeferredChanges()
 
 		if not success then
 			Log.error("Could not compute a diff to catch up to the Rojo server: {:#?}", catchUpPatch)

@@ -7,7 +7,6 @@ local Rojo = script:FindFirstAncestor("Rojo")
 local Plugin = Rojo.Plugin
 
 local Timer = require(Plugin.Timer)
-local yieldBudget = require(Plugin.yieldBudget)
 
 local applyPatch = require(script.applyPatch)
 local hydrate = require(script.hydrate)
@@ -34,22 +33,28 @@ function Reconciler:applyPatch(patch)
 	return unappliedPatch
 end
 
--- Hydrating and diffing walk the whole place. On a large one that outlasts
--- Studio's script timeout, which stops the sync without an error to report and
--- leaves the session connecting forever, so both yield as they go.
-function Reconciler:hydrate(virtualInstances, rootId, rootInstance)
+-- Hydrating and diffing walk the whole place, and call `step` as they go so
+-- the caller can yield or stop the walk by raising an error. The timer is
+-- stopped either way, so a cancelled walk doesn't leave it running.
+function Reconciler:hydrate(virtualInstances, rootId, rootInstance, step)
 	Timer.start("Reconciler:hydrate")
-	local result = hydrate(self.__instanceMap, virtualInstances, rootId, rootInstance, yieldBudget())
+	local ok, result = pcall(hydrate, self.__instanceMap, virtualInstances, rootId, rootInstance, step)
 	Timer.stop()
 
+	if not ok then
+		error(result, 0)
+	end
 	return result
 end
 
-function Reconciler:diff(virtualInstances, rootId)
+function Reconciler:diff(virtualInstances, rootId, step)
 	Timer.start("Reconciler:diff")
-	local success, result = diff(self.__instanceMap, virtualInstances, rootId, yieldBudget())
+	local ok, success, result = pcall(diff, self.__instanceMap, virtualInstances, rootId, step)
 	Timer.stop()
 
+	if not ok then
+		error(success, 0)
+	end
 	return success, result
 end
 
