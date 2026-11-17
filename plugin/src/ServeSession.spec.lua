@@ -239,6 +239,36 @@ return function()
 		expect(pending[1].status).to.equal("Pending")
 	end)
 
+	-- A later write waits for the one before it, whether that one succeeds or
+	-- fails, so an edit never reaches the server before the write that made
+	-- its instance.
+	it("should send writes one after another", function()
+		for _, firstFails in { false, true } do
+			local settle = {}
+			local started = {}
+			local session = setmetatable({
+				__apiContext = {
+					write = function(_self, patch)
+						table.insert(started, patch.name)
+						return Promise.new(function(resolve, reject)
+							settle[patch.name] = if firstFails and patch.name == "first" then reject else resolve
+						end)
+					end,
+				},
+				__syncResults = {},
+			}, ServeSession)
+			local first = session:__writePatch({ name = "first", updated = {}, added = {}, removed = {} })
+			local second = session:__writePatch({ name = "second", updated = {}, added = {}, removed = {} })
+			expect(table.concat(started, ",")).to.equal("first")
+
+			settle.first(writeResult())
+			first:await()
+			expect(table.concat(started, ",")).to.equal("first,second")
+			settle.second(writeResult())
+			second:await()
+		end
+	end)
+
 	it("should retain the first local change cursor until the batch is flushed", function()
 		local cursor = 0
 		local batcher = {
@@ -439,33 +469,50 @@ return function()
 
 	-- A deletion the server saved stops tracking the instance and everything
 	-- under it, so an undo sends it back as created. Others stay tracked.
+	-- An undo that came back before the response is created again. Walks
+	-- every combination of the deletion being saved and already undone.
 	it("should stop tracking only the deletions the server saved", function()
 		local InstanceMap = require(script.Parent.InstanceMap)
 		for _, saved in { false, true } do
-			local instanceMap = InstanceMap.new()
-			local deleted = Instance.new("Folder")
-			local child = Instance.new("Folder")
-			child.Parent = deleted
-			local kept = Instance.new("Folder")
-			instanceMap:insert("DELETED", deleted)
-			instanceMap:insert("CHILD", child)
-			instanceMap:insert("KEPT", kept)
-			local session = setmetatable({ __instanceMap = instanceMap }, ServeSession)
+			for _, undone in { false, true } do
+				local instanceMap = InstanceMap.new()
+				local deleted = Instance.new("Folder")
+				local child = Instance.new("Folder")
+				child.Parent = deleted
+				local kept = Instance.new("Folder")
+				instanceMap:insert("DELETED", deleted)
+				instanceMap:insert("CHILD", child)
+				instanceMap:insert("KEPT", kept)
+				if undone then
+					deleted.Parent = kept
+				end
+				local queued = {}
+				local session = setmetatable({
+					__instanceMap = instanceMap,
+					__markBatchStart = function() end,
+					__changeBatcher = {
+						addChild = function(_self, instance)
+							table.insert(queued, instance)
+						end,
+					},
+				}, ServeSession)
 
-			session:__untrackSavedRemovals({
-				accepted = {
-					removed_instances = if saved then { "DELETED" } else {},
-					added_instances = {},
-					updated_instances = {},
-				},
-			})
+				session:__untrackSavedRemovals({
+					accepted = {
+						removed_instances = if saved then { "DELETED" } else {},
+						added_instances = {},
+						updated_instances = {},
+					},
+				})
 
-			expect(instanceMap.fromIds.DELETED == nil).to.equal(saved)
-			expect(instanceMap.fromInstances[child] == nil).to.equal(saved)
-			expect(instanceMap.fromIds.KEPT).to.equal(kept)
-			instanceMap:stop()
-			deleted:Destroy()
-			kept:Destroy()
+				expect(instanceMap.fromIds.DELETED == nil).to.equal(saved)
+				expect(instanceMap.fromInstances[child] == nil).to.equal(saved)
+				expect(instanceMap.fromIds.KEPT).to.equal(kept)
+				expect(#queued).to.equal(if saved and undone then 1 else 0)
+				instanceMap:stop()
+				deleted:Destroy()
+				kept:Destroy()
+			end
 		end
 	end)
 

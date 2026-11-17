@@ -12,12 +12,49 @@
 
 	The new instances are inserted into the instance map before returning, so
 	changes in the same batch can refer to them.
+
+	A model only holds references between its own instances. References from
+	a new instance to anything else, like a part that's already known, are
+	returned as property changes to send after the addition, so the server can
+	link them or say why it can't.
 ]]
 
 local HttpService = game:GetService("HttpService")
 
 local Packages = script.Parent.Parent.Parent.Packages
 local Log = require(Packages.Log)
+local ReflectionDatabase = require(Packages.RbxDom.database)
+
+-- The serialized reference properties of each class, inherited ones included.
+local referenceProperties = {}
+
+local function referencePropertiesOf(className)
+	local cached = referenceProperties[className]
+	if cached ~= nil then
+		return cached
+	end
+	local names = {}
+	local current = className
+	while current ~= nil do
+		local class = ReflectionDatabase.Classes[current]
+		if class == nil then
+			break
+		end
+		for name, property in class.Properties do
+			local canonical = property.Kind.Canonical
+			if
+				property.DataType.Value == "Ref"
+				and canonical ~= nil
+				and canonical.Serialization ~= "DoesNotSerialize"
+			then
+				table.insert(names, name)
+			end
+		end
+		current = class.Superclass
+	end
+	referenceProperties[className] = names
+	return names
+end
 
 local function newId()
 	return string.lower((string.gsub(HttpService:GenerateGUID(false), "-", "")))
@@ -39,6 +76,7 @@ return function(instanceMap, candidates, serialize, makeId)
 	makeId = makeId or newId
 	local additions = {}
 	local inserts = {}
+	local references = {}
 
 	local function describe(instance)
 		local entry = {
@@ -117,8 +155,24 @@ return function(instanceMap, candidates, serialize, makeId)
 			model = result,
 			ids = ids,
 		}
+
+		local inModel = {}
+		for index = first, #inserts do
+			inModel[inserts[index][2]] = true
+		end
+		for index = first, #inserts do
+			local created = inserts[index][2]
+			for _, name in referencePropertiesOf(created.ClassName) do
+				local read, target = pcall(function()
+					return created[name]
+				end)
+				if read and target ~= nil and not inModel[target] then
+					table.insert(references, { created, name })
+				end
+			end
+		end
 	end
 
 	table.clear(candidates)
-	return additions
+	return additions, references
 end

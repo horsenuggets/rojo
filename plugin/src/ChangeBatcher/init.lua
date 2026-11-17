@@ -20,7 +20,13 @@ ChangeBatcher.__index = ChangeBatcher
 
 local BATCH_INTERVAL = 0.2
 
-function ChangeBatcher.new(instanceMap, onChangesFlushed)
+--[[
+	`onBatchTaken`, when given, is called as each batch is taken out, before
+	anything yields, and whatever it returns is passed to `onChangesFlushed`
+	with that batch. A session uses it to keep the message cursor each batch
+	started from, since later edits start a new batch while one is prepared.
+]]
+function ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken)
 	local self
 
 	local renderSteppedConnection = RunService.Heartbeat:Connect(function(dt)
@@ -32,6 +38,7 @@ function ChangeBatcher.new(instanceMap, onChangesFlushed)
 		__renderSteppedConnection = renderSteppedConnection,
 		__instanceMap = instanceMap,
 		__onChangesFlushed = onChangesFlushed,
+		__onBatchTaken = onBatchTaken,
 		__pendingPropertyChanges = {},
 		__pendingAdditions = {},
 		__serialize = serialize,
@@ -95,11 +102,18 @@ function ChangeBatcher:__flush()
 	local changes = self.__pendingPropertyChanges
 	self.__pendingAdditions = {}
 	self.__pendingPropertyChanges = {}
+	local context = if self.__onBatchTaken then self.__onBatchTaken() else nil
 
 	-- New instances are known before the other changes are encoded, so moving
 	-- an existing instance into one in the same batch is a move to a known parent.
 	local ok, patch = pcall(function()
-		local additions = createAdditions(self.__instanceMap, candidates, self.__serialize)
+		local additions, references = createAdditions(self.__instanceMap, candidates, self.__serialize)
+		-- References a new instance's model couldn't hold are sent as edits.
+		for _, reference in references do
+			local properties = changes[reference[1]] or {}
+			properties[reference[2]] = true
+			changes[reference[1]] = properties
+		end
 		local batch = createPatchSet(self.__instanceMap, changes)
 		batch.added = additions
 		return batch
@@ -114,7 +128,7 @@ function ChangeBatcher:__flush()
 		return nil
 	end
 
-	return self.__onChangesFlushed(patch)
+	return self.__onChangesFlushed(patch, context)
 end
 
 return ChangeBatcher

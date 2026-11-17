@@ -105,14 +105,20 @@ function ServeSession.new(options)
 		self:__onChildAdded(child)
 	end
 
-	local function onChangesFlushed(patch)
+	-- Each batch keeps the cursor it started from, taken before preparing it
+	-- yields, since an edit made meanwhile starts the next batch.
+	local function onBatchTaken()
 		local cursor = self.__pendingWriteCursor
 		self.__pendingWriteCursor = nil
+		return cursor
+	end
+
+	local function onChangesFlushed(patch, cursor)
 		return self:__writePatch(patch, cursor)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged, onChildAdded)
-	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed)
+	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken)
 	local reconciler = Reconciler.new(instanceMap)
 
 	local connections = {}
@@ -302,14 +308,25 @@ end
 	new instances to the server and must be sent as created.
 ]]
 function ServeSession:__untrackSavedRemovals(result)
+	local restored = {}
 	for _, id in result.accepted.removed_instances do
 		local instance = self.__instanceMap.fromIds[id]
 		if instance ~= nil then
 			for _, descendant in instance:GetDescendants() do
 				self.__instanceMap:removeInstance(descendant)
 			end
+			table.insert(restored, instance)
 		end
 		self.__instanceMap:removeId(id)
+	end
+	-- An undo before this response brought an instance back while it was
+	-- still tracked, so nothing queued it. It's created again now.
+	for _, instance in restored do
+		local parent = instance.Parent
+		if parent ~= nil and self.__instanceMap.fromInstances[parent] ~= nil then
+			self:__markBatchStart()
+			self.__changeBatcher:addChild(instance)
+		end
 	end
 end
 
@@ -340,8 +357,13 @@ function ServeSession:__writePatch(patch, messageCursor)
 		end
 	end
 
-	return self.__apiContext
-		:write(patch, messageCursor, authority)
+	-- Writes reach the server in the order they were made, so a later edit to
+	-- an instance never arrives before the write that created it.
+	local previous = self.__lastWrite or Promise.resolve()
+	local write = previous
+		:andThen(function()
+			return self.__apiContext:write(patch, messageCursor, authority)
+		end)
 		:andThen(function(result)
 			self:__untrackRejectedAdditions(patch, result)
 			self:__untrackSavedRemovals(result)
@@ -358,6 +380,8 @@ function ServeSession:__writePatch(patch, messageCursor)
 				},
 			})
 		end)
+	self.__lastWrite = write
+	return write
 end
 
 function ServeSession:getSyncResults()
