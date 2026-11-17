@@ -173,9 +173,19 @@ struct LiveProject {
     /// Whether the `modelTrees` rules changed before any write said which
     /// side wins, so the first write decides whether to apply them.
     relayout_pending: std::sync::atomic::AtomicBool,
-    /// While a relayout runs, every path it installs, so undoing it removes
-    /// exactly those, even when the tree never learned about them.
-    installed: Mutex<Option<Vec<PathBuf>>>,
+    /// While a relayout runs, what it wrote, so undoing it touches exactly
+    /// that, even when the tree never learned about it.
+    receipts: Mutex<Option<WriteReceipts>>,
+}
+
+/// What a relayout wrote.
+#[derive(Default)]
+struct WriteReceipts {
+    /// Every path it installed.
+    installed: Vec<PathBuf>,
+    /// Every existing file it rewrote, with what it wrote, or `None` if it
+    /// removed the file.
+    rewritten: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl From<Arc<Project>> for LiveProject {
@@ -184,7 +194,7 @@ impl From<Arc<Project>> for LiveProject {
             project: Mutex::new(project),
             authority: Mutex::new(None),
             relayout_pending: Default::default(),
-            installed: Mutex::new(None),
+            receipts: Mutex::new(None),
         }
     }
 }
@@ -512,9 +522,11 @@ impl JobThreadContext {
     /// the new ones can take their name. If writing fails, or the new files
     /// would lose anything, the old files and the tree are put back.
     fn relayout_instance(&self, tree: &mut RojoTree, id: Ref) -> anyhow::Result<()> {
-        *self.project.installed.lock().unwrap() = Some(Vec::new());
+        // Another server's startup recovery must not undo this one midway.
+        let _guard = crate::syncback::relocation::lock_relayouts(&self.vfs, &self.project())?;
+        *self.project.receipts.lock().unwrap() = Some(WriteReceipts::default());
         let result = self.relayout_recorded(tree, id);
-        *self.project.installed.lock().unwrap() = None;
+        *self.project.receipts.lock().unwrap() = None;
         result
     }
 
@@ -549,66 +561,47 @@ impl JobThreadContext {
                 },
                 &context,
             );
-            // The owner's file is rewritten last, so it changed only if the
-            // move went through. Only files that existed are put back, and only
-            // over what the move wrote, never over an editor's later save.
-            let owner_written = result.is_ok();
-            return self.finish_relayout(tree, id, parent, backup, result, || {
-                if !owner_written {
-                    return Ok(());
-                }
-                let mut lock = self.vfs.lock();
-                for (path, before) in &owner_files {
-                    let Some(before) = before else {
-                        continue;
-                    };
-                    let written = lock
-                        .read(path)
-                        .with_not_found()?
-                        .map(|bytes| (*bytes).clone());
-                    if written.as_ref() != Some(before) {
-                        lock.write_atomic(path, before, written.as_deref())?;
-                    }
-                }
-                Ok(())
-            });
+            return self.finish_relayout(tree, id, parent, backup, result, &owner_files, || Ok(()));
         }
 
         let path = match self.check_removal(tree, id, &context)? {
             Removal::Allowed(path) => path,
             Removal::Restore(_) => anyhow::bail!("its files changed on disk"),
         };
-        // Moving files another instance also comes from, like a folder two
-        // project nodes both map, would take them from that instance too.
-        anyhow::ensure!(
-            tree.get_ids_at_path(&path)
-                .iter()
-                .all(|holder| *holder == id),
-            "another instance comes from the same files"
-        );
         let mut entries = vec![path.clone()];
         entries.extend(own_sidecars(tree, id, &path));
-        // Files the project's syncback rules exclude are never rewritten, like
-        // a full syncback leaves them alone.
+        // Every file that moves is checked. Files another instance also comes
+        // from, like a folder two project nodes both map, would be taken from
+        // that instance too, and files the project's syncback rules exclude
+        // are never rewritten, like a full syncback leaves them alone.
+        let subtree: HashSet<Ref> = tree.descendants(id).map(|instance| instance.id()).collect();
         let project = self.project();
-        if let Some(rules) = &project.syncback_rules {
-            let globs = Some(rules.compile_globs()?);
-            let mut pending = entries.clone();
-            while let Some(entry) = pending.pop() {
-                anyhow::ensure!(
-                    crate::syncback::is_valid_path(&globs, project.folder_location(), &entry),
-                    "\"{}\" is excluded by the project's syncback rules",
-                    entry.display()
-                );
-                if self
-                    .vfs
-                    .metadata(&entry)
-                    .with_not_found()?
-                    .is_some_and(|m| m.is_dir())
-                {
-                    for child in self.vfs.read_dir(&entry)? {
-                        pending.push(child?.path().to_path_buf());
-                    }
+        let globs = match &project.syncback_rules {
+            Some(rules) => Some(rules.compile_globs()?),
+            None => None,
+        };
+        let mut pending = entries.clone();
+        while let Some(entry) = pending.pop() {
+            anyhow::ensure!(
+                tree.get_ids_at_path(&entry)
+                    .iter()
+                    .all(|holder| subtree.contains(holder)),
+                "another instance also comes from \"{}\"",
+                entry.display()
+            );
+            anyhow::ensure!(
+                crate::syncback::is_valid_path(&globs, project.folder_location(), &entry),
+                "\"{}\" is excluded by the project's syncback rules",
+                entry.display()
+            );
+            if self
+                .vfs
+                .metadata(&entry)
+                .with_not_found()?
+                .is_some_and(|metadata| metadata.is_dir())
+            {
+                for child in self.vfs.read_dir(&entry)? {
+                    pending.push(child?.path().to_path_buf());
                 }
             }
         }
@@ -634,11 +627,21 @@ impl JobThreadContext {
                 .map(|(index, entry)| (entry.clone(), index.to_string()))
                 .collect(),
         };
-        self.vfs.write(
-            aside.join(crate::syncback::relocation::RELAYOUT_MANIFEST_NAME),
-            serde_json::to_vec(&manifest)?,
+        // Published whole and flushed, with the folders that lead to it, before
+        // any source moves, so a power loss can't leave backups without it.
+        self.vfs.lock().write_atomic(
+            &aside.join(crate::syncback::relocation::RELAYOUT_MANIFEST_NAME),
+            &serde_json::to_vec(&manifest)?,
+            None,
         )?;
-        self.vfs.sync_path(&aside)?;
+        let mut flushed = Some(aside.as_path());
+        while let Some(folder) = flushed {
+            self.vfs.sync_path(folder)?;
+            if folder == project.folder_location() {
+                break;
+            }
+            flushed = folder.parent();
+        }
         let mut moved = Vec::new();
         let set_aside = (|| -> io::Result<()> {
             for (index, entry) in existing.iter().enumerate() {
@@ -671,7 +674,7 @@ impl JobThreadContext {
         }
         let result = self.place_subtree(tree, parent, model, &ids, &context, &[id]);
         let lossless = matches!(&result, Ok(errors) if errors.is_empty());
-        self.finish_relayout(tree, id, parent, backup, result, || {
+        self.finish_relayout(tree, id, parent, backup, result, &HashMap::new(), || {
             put_back(&moved);
             Ok(())
         })?;
@@ -681,9 +684,12 @@ impl JobThreadContext {
         Ok(())
     }
 
-    /// Keeps a relayout that saved everything. Otherwise deletes the new files,
-    /// calls `restore_files` to put the old ones back, and puts the subtree
-    /// back in the tree under its IDs.
+    /// Keeps a relayout that saved everything. Otherwise deletes the paths it
+    /// installed, puts each file it rewrote back to its contents in `before`,
+    /// calls `restore_files` to put set-aside files back, and puts the subtree
+    /// back in the tree under its IDs. A rewritten file is only put back while
+    /// it still holds what the relayout wrote, so an editor's save is kept.
+    #[allow(clippy::too_many_arguments)]
     fn finish_relayout(
         &self,
         tree: &mut RojoTree,
@@ -691,6 +697,7 @@ impl JobThreadContext {
         parent: Ref,
         backup: (InstanceSnapshot, SnapshotReferents),
         result: anyhow::Result<Vec<WriteError>>,
+        before: &ExpectedFiles,
         restore_files: impl FnOnce() -> io::Result<()>,
     ) -> anyhow::Result<()> {
         let error = match result {
@@ -705,22 +712,44 @@ impl JobThreadContext {
             ),
             Err(error) => error,
         };
-        // Exactly what was installed goes, which the tree may not know about
-        // yet if reading the new files back is what failed.
-        let installed = self
+        // Exactly what was written is undone, which the tree may not know
+        // about yet if reading the new files back is what failed.
+        let receipts = self
             .project
-            .installed
+            .receipts
             .lock()
             .unwrap()
-            .replace(Vec::new())
+            .replace(WriteReceipts::default())
             .unwrap_or_default();
         {
             let mut lock = self.vfs.lock();
-            for path in installed {
+            for path in receipts.installed {
                 match lock.metadata(&path).with_not_found()? {
                     Some(metadata) if metadata.is_dir() => lock.remove_dir_all(&path)?,
                     Some(_) => lock.remove_file(&path)?,
                     None => {}
+                }
+            }
+            for (path, written) in receipts.rewritten {
+                let Some(before) = before.get(&path) else {
+                    continue;
+                };
+                let current = lock
+                    .read(&path)
+                    .with_not_found()?
+                    .map(|bytes| (*bytes).clone());
+                if current != written {
+                    log::warn!(
+                        "Kept \"{}\", which changed after the relayout wrote it.",
+                        path.display()
+                    );
+                    continue;
+                }
+                match before {
+                    Some(before) => lock.write_atomic(&path, before, current.as_deref())?,
+                    None => {
+                        lock.remove_file(&path).with_not_found()?;
+                    }
                 }
             }
         }
@@ -1287,6 +1316,15 @@ impl JobThreadContext {
                 staged.write_model_file_to_vfs(base, &self.vfs, &expected, &source)?
             }
         }
+        // Recorded as soon as the file is written, since reading it back can
+        // still fail, and undoing a relayout needs exactly what was written.
+        if let Some(receipts) = self.project.receipts.lock().unwrap().as_mut() {
+            for (path, contents) in staged.file_changes() {
+                receipts
+                    .rewritten
+                    .push((base.join(path), contents.map(<[u8]>::to_vec)));
+            }
+        }
         let snapshot = match stored {
             StoredIn::Inline(_) => snapshot_shallow_from_vfs(&context, &self.vfs, &source)?,
             StoredIn::Model(_) => snapshot_from_vfs(&context, &self.vfs, &source)?,
@@ -1672,8 +1710,8 @@ impl JobThreadContext {
         // A failed relocation can leave a journal that still needs its staged
         // files, so those are left for startup recovery, which clears them.
         result?;
-        if let Some(installed) = self.project.installed.lock().unwrap().as_mut() {
-            installed.extend(destinations);
+        if let Some(receipts) = self.project.receipts.lock().unwrap().as_mut() {
+            receipts.installed.extend(destinations);
         }
         self.remove_stale_keep_files(directory);
         // Another server's startup recovery may have cleared it already, once
@@ -4553,24 +4591,57 @@ mod tests {
     /// folder two project nodes both map, and leaves them where they are.
     #[test]
     fn relayouts_refuse_files_another_instance_shares() {
-        let job = project_job(
-            "default.project.json",
-            r#"{"name":"Test","tree":{"$className":"Folder","First":{"$path":"src"},"Second":{"$path":"src"}}}"#,
-            vec![(
-                "src",
-                VfsSnapshot::dir([(
-                    "Mover",
-                    VfsSnapshot::dir([("Code.luau", VfsSnapshot::file("return 1"))]),
-                )]),
-            )],
+        // The folder itself, or only a file inside it.
+        for second in [r#"{"$path":"src"}"#, r#"{"$path":"src/Mover/Code.luau"}"#] {
+            let temp = tempfile::tempdir().unwrap();
+            // A server always serves from a canonical path.
+            let root = &temp.path().canonicalize().unwrap();
+            std::fs::create_dir_all(root.join("src/Mover")).unwrap();
+            std::fs::write(root.join("src/Mover/Code.luau"), "return 1").unwrap();
+            std::fs::write(
+                root.join("default.project.json"),
+                format!(
+                    r#"{{"name":"Test","tree":{{"$className":"Folder","First":{{"$path":"src"}},"Second":{second}}}}}"#
+                ),
+            )
+            .unwrap();
+            let job = disk_job(root);
+            let mover = find(&job, &["First", "Mover"]);
+            let mut tree = job.tree.lock().unwrap();
+            let error = job.relayout_instance(&mut tree, mover).unwrap_err();
+            assert!(error.to_string().contains("another instance"), "{error:#}");
+            drop(tree);
+            assert!(root.join("src/Mover/Code.luau").is_file(), "{second}");
+            assert!(
+                !crate::syncback::relocation::relayout_directory(&job.project())
+                    .read_dir()
+                    .is_ok_and(|mut entries| entries.next().is_some()),
+                "{second} set something aside"
+            );
+        }
+    }
+
+    /// A job serving the `default.project.json` in `root` on the real file
+    /// system, for tests that need its locks.
+    fn disk_job(root: &Path) -> JobThreadContext {
+        let vfs = Arc::new(Vfs::new(memofs::StdBackend::new().unwrap()));
+        vfs.set_watch_enabled(false);
+        let path = root.join("default.project.json");
+        let project = Project::load_exact(&vfs, &path, Some("Fallback")).unwrap();
+        let snapshot = snapshot_from_vfs(&Default::default(), &vfs, &path)
+            .unwrap()
+            .unwrap();
+        let tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Root")
+                .children(vec![snapshot]),
         );
-        let mover = find(&job, &["First", "Mover"]);
-        let mut tree = job.tree.lock().unwrap();
-        let error = job.relayout_instance(&mut tree, mover).unwrap_err();
-        assert!(error.to_string().contains("another instance"), "{error:#}");
-        drop(tree);
-        assert!(exists(&job, "/project/src/Mover/Code.luau"));
-        find(&job, &["Second", "Mover", "Code"]);
+        JobThreadContext {
+            tree: Arc::new(Mutex::new(tree)),
+            vfs,
+            message_queue: Arc::new(MessageQueue::new()),
+            project: Arc::new(project).into(),
+        }
     }
 
     /// A relayout refused because its folder's metadata changed on disk

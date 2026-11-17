@@ -386,6 +386,21 @@ impl FsSnapshot {
         list
     }
 
+    /// Returns each file this `FsSnapshot` writes, with its contents, or with
+    /// `None` for each file it removes.
+    pub fn file_changes(&self) -> Vec<(&Path, Option<&[u8]>)> {
+        let written = self
+            .added_files
+            .iter()
+            .map(|(path, contents)| (path.as_path(), Some(contents.as_slice())));
+        let removed = self
+            .removed_files
+            .iter()
+            .filter(|path| !self.added_files.contains_key(*path))
+            .map(|path| (path.as_path(), None));
+        written.chain(removed).collect()
+    }
+
     /// Returns a list of file paths that would be added by this `FsSnapshot`
     #[inline]
     pub fn added_files(&self) -> Vec<&Path> {

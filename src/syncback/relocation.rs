@@ -147,33 +147,64 @@ pub(crate) struct RelayoutManifest {
 
 pub(crate) const RELAYOUT_MANIFEST_NAME: &str = "manifest.json";
 
+// Relayouts in the same process, and their recovery, must not overlap.
+static RELAYOUT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Held for the whole of a relayout, and by recovery while it reads the
+/// folders relayouts leave, so neither sees the other halfway through, even
+/// across server processes.
+pub(crate) struct RelayoutGuard {
+    _file: memofs::VfsLockGuard,
+    _process: std::sync::MutexGuard<'static, ()>,
+}
+
+pub(crate) fn lock_relayouts(
+    vfs: &memofs::Vfs,
+    project: &crate::Project,
+) -> std::io::Result<RelayoutGuard> {
+    let process = RELAYOUT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = relayout_directory(project);
+    vfs.create_dir_all(&root)?;
+    let file = vfs.lock_exclusive(&root.with_extension("lock"))?;
+    Ok(RelayoutGuard {
+        _file: file,
+        _process: process,
+    })
+}
+
 /// Puts back the files of relayouts that were interrupted, before anything is
 /// read. A backup whose original path is taken again is kept, and so is a
-/// folder without a manifest, since neither can be put back safely.
+/// folder without a readable manifest, since neither can be put back safely.
 pub(crate) fn recover_relayouts(
     vfs: &memofs::Vfs,
     project: &crate::Project,
 ) -> std::io::Result<()> {
     use memofs::IoResultExt;
     let root = relayout_directory(project);
+    // Read-only serving must not create a lock when there's nothing to do.
+    if vfs.read_dir(&root).with_not_found()?.is_none() {
+        return Ok(());
+    }
+    let _guard = lock_relayouts(vfs, project)?;
     let Some(folders) = vfs.read_dir(&root).with_not_found()? else {
         return Ok(());
     };
     let folders = folders.collect::<std::io::Result<Vec<_>>>()?;
     for folder in folders {
         let folder = folder.path().to_path_buf();
-        let Some(manifest) = vfs
+        let manifest = vfs
             .read(folder.join(RELAYOUT_MANIFEST_NAME))
             .with_not_found()?
-        else {
+            .and_then(|manifest| serde_json::from_slice::<RelayoutManifest>(&manifest).ok());
+        let Some(manifest) = manifest else {
             log::warn!(
-                "Kept \"{}\", which an interrupted relayout left without a manifest.",
+                "Kept \"{}\", which an interrupted relayout left without a readable manifest.",
                 folder.display()
             );
             continue;
         };
-        let manifest: RelayoutManifest =
-            serde_json::from_slice(&manifest).map_err(std::io::Error::other)?;
         let mut restored_all = true;
         for (original, backup) in manifest.entries {
             let backup = folder.join(backup);
