@@ -750,13 +750,19 @@ impl JobThreadContext {
                 .parent();
         }
         let destination_context = destination_parent.metadata().context.clone();
+        // The root of a project, like the DataModel a place project describes,
+        // records the project file as its source. It is a directory through its
+        // tree's `$path`, never a script to promote.
+        let destination_is_project_root =
+            destination_parent.metadata().middleware == Some(Middleware::Project);
         let promotion = if parent != instance.parent() {
             match destination_parent.metadata().instigating_source.as_ref() {
                 Some(InstigatingSource::Path(path))
-                    if !destination_parent
-                        .metadata()
-                        .middleware
-                        .is_some_and(|value| value.is_dir()) =>
+                    if !destination_is_project_root
+                        && !destination_parent
+                            .metadata()
+                            .middleware
+                            .is_some_and(|value| value.is_dir()) =>
                 {
                     let middleware = destination_parent
                         .metadata()
@@ -864,6 +870,15 @@ impl JobThreadContext {
                 {
                     path.clone()
                 }
+                Some(InstigatingSource::Path(project_file)) if destination_is_project_root => {
+                    let project = Project::load_exact(&self.vfs, project_file, None)?;
+                    let mapping = project
+                        .tree
+                        .path
+                        .as_ref()
+                        .context("The project-defined destination has no directory $path")?;
+                    project.folder_location().join(mapping.path())
+                }
                 Some(InstigatingSource::ProjectNode { node, .. }) => node
                     .path
                     .as_ref()
@@ -889,10 +904,14 @@ impl JobThreadContext {
                 destination_snapshot.metadata.middleware != Some(Middleware::Project),
                 "The destination directory now defines its own project"
             );
-            if matches!(
-                destination_parent.metadata().instigating_source,
-                Some(InstigatingSource::Path(_))
-            ) {
+            // A project root reads as a plain directory through its `$path`, like
+            // any other project node, so only file-backed destinations compare.
+            if !destination_is_project_root
+                && matches!(
+                    destination_parent.metadata().instigating_source,
+                    Some(InstigatingSource::Path(_))
+                )
+            {
                 ensure!(
                     destination_snapshot.metadata.middleware
                         == destination_parent.metadata().middleware,

@@ -1,0 +1,7 @@
+{
+  "name": "place_root",
+  "tree": {
+    "$className": "DataModel",
+    "$path": "src"
+  }
+}

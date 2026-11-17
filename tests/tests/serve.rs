@@ -218,6 +218,59 @@ fn assert_numeric_api_writes_converge(cases: &[(f64, f64)]) {
     });
 }
 
+// The DataModel of a place project records the project file as its source, so
+// moving a folder to the root used to be refused as a script promotion.
+#[test]
+fn studio_move_to_the_datamodel_root_writes_into_its_path() {
+    use librojo::web_api::WriteResponse;
+    use std::collections::HashMap;
+
+    run_serve_test("place_root", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let root = info.root_instance_id;
+        let read = session.get_api_read(root).unwrap();
+        let mover = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "Mover")
+            .expect("The fixture must contain Mover")
+            .id;
+
+        let request = WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(read.message_cursor),
+            authority: WriteAuthority::Studio,
+            removed: Vec::new(),
+            added: HashMap::new(),
+            updated: vec![InstanceUpdate {
+                id: mover,
+                changed_parent: Some(root),
+                changed_name: None,
+                changed_class_name: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::default(),
+            }],
+        };
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://localhost:{}/api/write", session.port()))
+            .header("content-type", "application/msgpack")
+            .body(serialize_msgpack(&request).unwrap())
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let response: WriteResponse = deserialize_msgpack(&response).unwrap();
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+
+        assert!(!session.path().join("src/ReplicatedStorage/Mover").exists());
+        assert!(session.path().join("src/Mover").is_dir());
+        let moved = session.get_api_read(root).unwrap();
+        assert_eq!(moved.instances[&mover].parent, root);
+    });
+}
+
 #[test]
 fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {
     use librojo::web_api::{
