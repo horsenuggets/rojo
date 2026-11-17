@@ -36,15 +36,16 @@ use crate::{
     Project,
 };
 
-pub use addition::syncback_new_subtree;
+pub use addition::{drop_duplicate_ids, syncback_new_subtree};
 pub use file_names::{
     directory_middleware_for_instance, extension_for_middleware, name_for_inst, sibling_order_key,
     unique_child_stems, validate_file_name,
 };
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
+pub(crate) use inline::is_script_class;
 pub use model_trees::{is_model_file, is_project_owned, ModelTreeRule, ModelTrees};
-pub(crate) use property_filter::{can_write_property, is_unset_binary_string};
+pub(crate) use property_filter::{can_write_property, is_unset_value};
 pub use property_filter::{
     filter_json_properties_preallocated, filter_properties, filter_properties_preallocated,
 };
@@ -72,6 +73,46 @@ pub fn syncback_instance(
     id: Ref,
     new_tree: WeakDom,
 ) -> anyhow::Result<FsSnapshot> {
+    syncback_scoped(vfs, old_tree, project, id, new_tree, false)
+}
+
+/// Serializes a model file from `new_tree`, which must hold the model's whole
+/// subtree, since the file stores every descendant.
+pub fn syncback_model_file(
+    vfs: &Vfs,
+    old_tree: &RojoTree,
+    project: &Project,
+    id: Ref,
+    new_tree: WeakDom,
+) -> anyhow::Result<FsSnapshot> {
+    syncback_scoped(vfs, old_tree, project, id, new_tree, true)
+}
+
+/// Links the references between instances in `dom` through `Rojo_Id` and
+/// `Rojo_Target_*` attributes, like a full syncback does, unless the project
+/// opts out. Instances keep the IDs they already carry. References to
+/// instances outside `dom` can't be linked and become nil.
+pub(crate) fn link_scoped_referents(project: &Project, dom: &mut WeakDom) -> anyhow::Result<()> {
+    let ignore_referents = project
+        .syncback_rules
+        .as_ref()
+        .and_then(|rules| rules.ignore_referents)
+        .unwrap_or_default();
+    if ignore_referents {
+        return Ok(());
+    }
+    let links = collect_referents(dom);
+    link_referents(links, dom, &HashMap::new())
+}
+
+fn syncback_scoped(
+    vfs: &Vfs,
+    old_tree: &RojoTree,
+    project: &Project,
+    id: Ref,
+    mut new_tree: WeakDom,
+    whole_model: bool,
+) -> anyhow::Result<FsSnapshot> {
     let old_inst = old_tree
         .get_instance(id)
         .context("Cannot sync an unknown instance")?;
@@ -85,11 +126,20 @@ pub fn syncback_instance(
         .metadata()
         .middleware
         .context("The instance has no known filesystem middleware")?;
-    if matches!(
+    let is_model = matches!(
         middleware,
         Middleware::Rbxm | Middleware::Rbxmx | Middleware::JsonModel
-    ) {
-        anyhow::bail!("Model-file updates require subtree serialization");
+    );
+    if is_model != whole_model {
+        anyhow::bail!(if is_model {
+            "Model-file updates require subtree serialization"
+        } else {
+            "Only model files are serialized with their whole subtree"
+        });
+    }
+    // Binary models hold references natively. Other formats need attributes.
+    if !matches!(middleware, Middleware::Rbxm | Middleware::Rbxmx) {
+        link_scoped_referents(project, &mut new_tree)?;
     }
     if let (Some(script), Some(source)) = (
         script_middleware_for_syncback(new_tree.root(), Some(old_inst), project),

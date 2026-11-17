@@ -8,7 +8,16 @@ use rbx_dom_weak::{
     ustr, Instance, InstanceBuilder, Ustr, UstrMap, WeakDom,
 };
 
-use crate::{multimap::MultiMap, RojoRef};
+use crate::{multimap::MultiMap, RojoRef, REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX};
+
+/// Reads an attribute that holds an ID, which files store as a string.
+fn attribute_string(value: &Variant) -> Option<String> {
+    match value {
+        Variant::String(value) => Some(value.clone()),
+        Variant::BinaryString(value) => std::str::from_utf8(value.as_ref()).ok().map(str::to_owned),
+        _ => None,
+    }
+}
 
 use super::{InstanceMetadata, InstanceSnapshot};
 
@@ -109,20 +118,83 @@ impl RojoTree {
     }
 
     pub fn insert_instance(&mut self, parent_ref: Ref, snapshot: InstanceSnapshot) -> Ref {
-        self.insert_instance_inner(parent_ref, snapshot, None)
+        self.insert_instance_inner(parent_ref, snapshot, None, &mut Vec::new())
     }
 
     /// Inserts `snapshot` like [`Self::insert_instance`], but gives its instances
     /// the referents in `referents`, which is shaped like the snapshot. An
     /// instance without one, or beyond the shape, gets a new referent. The
     /// referents must not be in the tree already.
+    ///
+    /// Each inserted instance is recorded in `inserted` as its snapshot's
+    /// `snapshot_id` and the referent it got. Pass the list to
+    /// [`Self::resolve_snapshot_refs`] once everything is inserted.
     pub fn insert_instance_with_referents(
         &mut self,
         parent_ref: Ref,
         snapshot: InstanceSnapshot,
         referents: &SnapshotReferents,
+        inserted: &mut Vec<(Ref, Ref)>,
     ) -> Ref {
-        self.insert_instance_inner(parent_ref, snapshot, Some(referents))
+        self.insert_instance_inner(parent_ref, snapshot, Some(referents), inserted)
+    }
+
+    /// Resolves the references of the instances in `inserted`, a list of
+    /// snapshot ids and referents, the way applying a patch does. A file's
+    /// references hold snapshot ids, which now point at the instances they
+    /// became, or are `Rojo_Target_*` attributes naming a `Rojo_Id`.
+    pub fn resolve_snapshot_refs(&mut self, inserted: &[(Ref, Ref)]) {
+        let resolved: HashMap<Ref, Ref> = inserted
+            .iter()
+            .copied()
+            .filter(|(snapshot_id, _)| snapshot_id.is_some())
+            .collect();
+        for &(_, referent) in inserted {
+            let Some(instance) = self.inner.get_by_ref_mut(referent) else {
+                continue;
+            };
+            for value in instance.properties.values_mut() {
+                if let Variant::Ref(target) = value {
+                    if let Some(&referent) = resolved.get(target) {
+                        *target = referent;
+                    }
+                }
+            }
+        }
+
+        // Every ID is registered before any target is looked up, since a
+        // target can come later in the list than what points at it.
+        let mut targets = Vec::new();
+        for &(_, referent) in inserted {
+            let Some(Variant::Attributes(attributes)) = self
+                .inner
+                .get_by_ref(referent)
+                .and_then(|instance| instance.properties.get(&ustr("Attributes")))
+            else {
+                continue;
+            };
+            let specified = attributes
+                .get(REF_ID_ATTRIBUTE_NAME)
+                .and_then(attribute_string);
+            for (name, value) in attributes.iter() {
+                if let (Some(property), Some(target)) = (
+                    name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX),
+                    attribute_string(value),
+                ) {
+                    targets.push((referent, ustr(property), RojoRef::new(target)));
+                }
+            }
+            if let Some(specified) = specified {
+                self.set_specified_id(referent, RojoRef::new(specified));
+            }
+        }
+        for (referent, property, target) in targets {
+            if let Some(target) = self.get_specified_id(&target) {
+                if let Some(instance) = self.inner.get_by_ref_mut(referent) {
+                    instance.properties.insert(property, Variant::Ref(target));
+                }
+            }
+        }
     }
 
     fn insert_instance_inner(
@@ -130,7 +202,9 @@ impl RojoTree {
         parent_ref: Ref,
         snapshot: InstanceSnapshot,
         referents: Option<&SnapshotReferents>,
+        inserted: &mut Vec<(Ref, Ref)>,
     ) -> Ref {
+        let snapshot_id = snapshot.snapshot_id;
         // !!!!!!!!!! UGLY HACK !!!!!!!!!!
         // ! If you are going to change this, go change it in patch_compute/compute_property_patches too
         //
@@ -165,10 +239,11 @@ impl RojoTree {
 
         let referent = self.inner.insert(parent_ref, builder);
         self.insert_metadata(referent, snapshot.metadata);
+        inserted.push((snapshot_id, referent));
 
         for (index, child) in snapshot.children.into_iter().enumerate() {
             let child_referents = referents.and_then(|referents| referents.children.get(index));
-            self.insert_instance_inner(referent, child, child_referents);
+            self.insert_instance_inner(referent, child, child_referents, inserted);
         }
 
         referent
@@ -268,9 +343,9 @@ impl RojoTree {
         self.metadata_map.get(&id)
     }
 
-    /// Returns whether any instance holds the given RojoRef.
-    pub fn is_specified_id_used(&self, specified: &RojoRef) -> bool {
-        !self.specified_id_to_refs.get(specified).is_empty()
+    /// Returns every instance that holds the given RojoRef.
+    pub fn specified_id_holders(&self, specified: &RojoRef) -> &[Ref] {
+        self.specified_id_to_refs.get(specified)
     }
 
     /// Get the backing Ref of the given RojoRef. If the RojoRef maps to exactly
@@ -458,7 +533,10 @@ mod test {
         snapshot::{InstanceMetadata, InstanceSnapshot},
         RojoRef,
     };
-    use rbx_dom_weak::types::Ref;
+    use rbx_dom_weak::{
+        types::{Attributes, Ref, Variant},
+        ustr, UstrMap,
+    };
 
     use super::{RojoTree, SnapshotReferents};
 
@@ -485,7 +563,7 @@ mod test {
         };
 
         assert_eq!(
-            tree.insert_instance_with_referents(root, snapshot, &referents),
+            tree.insert_instance_with_referents(root, snapshot, &referents, &mut Vec::new()),
             parent
         );
         let children = tree.get_instance(parent).unwrap().children().to_vec();
@@ -498,17 +576,115 @@ mod test {
         assert_eq!(tree.get_instance(children[2]).unwrap().name(), "Beyond");
     }
 
+    /// A file that can't hold references links them through attributes, and a
+    /// target can be inserted after what points at it.
     #[test]
-    fn reports_whether_a_specified_id_is_used() {
+    fn resolves_attribute_references_between_inserted_snapshots() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let attributes = |entries: &[(&str, &str)]| {
+            let mut attributes = Attributes::new();
+            for (name, value) in entries {
+                attributes.insert(name.to_string(), Variant::String(value.to_string()));
+            }
+            UstrMap::from_iter([(ustr("Attributes"), Variant::Attributes(attributes))])
+        };
+        let snapshot = InstanceSnapshot::new().name("Model").children(vec![
+            InstanceSnapshot::new()
+                .name("Weld")
+                .properties(attributes(&[("Rojo_Target_Part0", "part")])),
+            InstanceSnapshot::new()
+                .name("Part")
+                .properties(attributes(&[("Rojo_Id", "part")])),
+        ]);
+
+        let mut inserted = Vec::new();
+        let model = tree.insert_instance_with_referents(
+            root,
+            snapshot,
+            &SnapshotReferents::default(),
+            &mut inserted,
+        );
+        tree.resolve_snapshot_refs(&inserted);
+
+        let children = tree.get_instance(model).unwrap().children().to_vec();
+        let part = children[1];
+        assert_eq!(
+            tree.get_instance(children[0])
+                .unwrap()
+                .properties()
+                .get(&ustr("Part0")),
+            Some(&Variant::Ref(part))
+        );
+        assert_eq!(
+            tree.get_specified_id(&RojoRef::new("part".into())),
+            Some(part)
+        );
+        assert_eq!(
+            tree.get_metadata(part).unwrap().specified_id,
+            Some(RojoRef::new("part".into()))
+        );
+    }
+
+    #[test]
+    fn resolves_references_between_inserted_snapshots() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let outside = tree.insert_instance(root, InstanceSnapshot::new().name("Outside"));
+        let target_snapshot = Ref::new();
+        let weld = |name: &str| {
+            InstanceSnapshot::new()
+                .name(name)
+                .properties(UstrMap::from_iter([
+                    (ustr("Part0"), Variant::Ref(target_snapshot)),
+                    (ustr("Part1"), Variant::Ref(outside)),
+                ]))
+        };
+        let snapshot = InstanceSnapshot::new().name("Model").children(vec![
+            weld("Before"),
+            InstanceSnapshot::new()
+                .name("Target")
+                .snapshot_id(target_snapshot),
+            weld("After"),
+        ]);
+        let target = Ref::new();
+        let referents = SnapshotReferents {
+            id: None,
+            children: vec![
+                SnapshotReferents::default(),
+                SnapshotReferents {
+                    id: Some(target),
+                    children: Vec::new(),
+                },
+            ],
+        };
+
+        let mut inserted = Vec::new();
+        let model = tree.insert_instance_with_referents(root, snapshot, &referents, &mut inserted);
+        tree.resolve_snapshot_refs(&inserted);
+
+        for &child in tree.get_instance(model).unwrap().children() {
+            let properties = tree.get_instance(child).unwrap().properties();
+            if let Some(part0) = properties.get(&ustr("Part0")) {
+                assert_eq!(part0, &Variant::Ref(target));
+                assert_eq!(properties.get(&ustr("Part1")), Some(&Variant::Ref(outside)));
+            }
+        }
+    }
+
+    #[test]
+    fn reports_which_instances_hold_a_specified_id() {
         let mut tree = RojoTree::new(InstanceSnapshot::new());
         let root = tree.get_root_id();
         let id = RojoRef::new("taken".into());
-        assert!(!tree.is_specified_id_used(&id));
+        assert!(tree.specified_id_holders(&id).is_empty());
         let mut metadata = InstanceMetadata::new();
         metadata.specified_id = Some(id.clone());
-        tree.insert_instance(root, InstanceSnapshot::new().metadata(metadata));
-        assert!(tree.is_specified_id_used(&id));
-        assert!(!tree.is_specified_id_used(&RojoRef::new("free".into())));
+        let holder = tree.insert_instance(root, InstanceSnapshot::new().metadata(metadata));
+        assert_eq!(tree.specified_id_holders(&id), [holder]);
+        assert!(tree
+            .specified_id_holders(&RojoRef::new("free".into()))
+            .is_empty());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     file_names::{directory_middleware_for_instance, free_child_stem},
-    inline,
+    inline, link_scoped_referents,
     model_trees::{CompiledModelTreeRules, ModelTrees},
     ref_properties::attribute_ids,
     syncback_snapshot, FsSnapshot, SyncbackData, SyncbackSnapshot,
@@ -76,7 +76,7 @@ pub fn syncback_new_subtree(
         destination = new_tree.insert(destination, InstanceBuilder::new(class).with_name(name));
     }
     model.transfer(subtree, &mut new_tree, destination);
-    drop_duplicate_ids(&mut new_tree, subtree, old_tree);
+    link_scoped_referents(project, &mut new_tree)?;
 
     let parent_instance = old_tree.get_instance(parent).unwrap();
     let rules = CompiledModelTreeRules::new(
@@ -162,14 +162,24 @@ pub fn syncback_new_subtree(
     })
 }
 
-/// Removes the `Rojo_Id` attribute from new instances whose ID another
+/// Removes the `Rojo_Id` attribute from instances in `model` whose ID another
 /// instance already holds. Duplicating an instance in Studio copies the
 /// attribute, and two instances with one ID would break every reference to it.
-fn drop_duplicate_ids(dom: &mut WeakDom, subtree: Ref, old_tree: &RojoTree) {
+/// The `moving` subtrees are what `model` holds, so their IDs aren't taken.
+pub fn drop_duplicate_ids(model: &mut WeakDom, old_tree: &RojoTree, moving: &[Ref]) {
+    let is_moving = |mut id: Ref| {
+        while let Some(instance) = old_tree.get_instance(id) {
+            if moving.contains(&id) {
+                return true;
+            }
+            id = instance.parent();
+        }
+        false
+    };
     let mut seen = HashSet::new();
-    let mut pending = vec![subtree];
+    let mut pending = model.root().children().to_vec();
     while let Some(referent) = pending.pop() {
-        let instance = dom.get_by_ref_mut(referent).unwrap();
+        let instance = model.get_by_ref_mut(referent).unwrap();
         pending.extend(instance.children().iter().copied());
         let Some(Variant::Attributes(attributes)) =
             instance.properties.get_mut(&ustr("Attributes"))
@@ -179,7 +189,10 @@ fn drop_duplicate_ids(dom: &mut WeakDom, subtree: Ref, old_tree: &RojoTree) {
         let Some(Variant::String(id)) = attributes.get(REF_ID_ATTRIBUTE_NAME) else {
             continue;
         };
-        let taken = old_tree.is_specified_id_used(&RojoRef::new(id.clone()));
+        let taken = old_tree
+            .specified_id_holders(&RojoRef::new(id.clone()))
+            .iter()
+            .any(|holder| !is_moving(*holder));
         if taken || !seen.insert(id.clone()) {
             attributes.remove(REF_ID_ATTRIBUTE_NAME);
         }

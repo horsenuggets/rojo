@@ -4,7 +4,7 @@ use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
 use rbx_dom_weak::{
     types::{Ref, Variant},
-    ustr, HashMapExt as _, InstanceBuilder, UstrMap, WeakDom,
+    ustr, HashMapExt as _, InstanceBuilder, Ustr, UstrMap, WeakDom,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -24,9 +24,9 @@ use crate::{
         snapshot_from_vfs, snapshot_project_node, snapshot_shallow_from_vfs, Middleware,
     },
     syncback::{
-        can_write_property, decide_property_write, get_property_filter, same_value, source_file,
-        syncback_instance, syncback_new_subtree, validate_write_targets, FsSnapshot,
-        PropertyWriteDecision,
+        can_write_property, decide_property_write, drop_duplicate_ids, get_property_filter,
+        same_value, source_file, syncback_instance, syncback_model_file, syncback_new_subtree,
+        validate_write_targets, FsSnapshot, PropertyWriteDecision,
     },
     web::interface::{AddedIds, InstanceAddition, WriteAuthority, WriteError, WriteResult},
 };
@@ -314,12 +314,8 @@ impl JobThreadContext {
             // Created subtrees go first, so the rest of the batch can move
             // existing instances into them.
             for (&id, addition) in additions {
-                match self.persist_addition(&mut tree, id, addition, &mut messages) {
-                    Ok(unstored) => errors.extend(unstored.into_iter().map(|id| WriteError {
-                        id,
-                        property: None,
-                        message: "This instance could not be stored on disk".into(),
-                    })),
+                match self.persist_addition(&mut tree, id, addition, &context, &mut messages) {
+                    Ok(unsaved) => errors.extend(unsaved),
                     Err(err) => errors.push(WriteError {
                         id,
                         property: None,
@@ -397,6 +393,40 @@ impl JobThreadContext {
                         property: None,
                         message: "Cannot remove an ancestor while a retained descendant's move is unapplied".into(),
                     });
+                    continue;
+                }
+                // An instance inside a model file is removed by rewriting the
+                // model without it.
+                if let Some(StoredIn::Model(model)) = stored_in(&tree, id) {
+                    let stored = StoredIn::Model(model);
+                    let result = (|| -> anyhow::Result<()> {
+                        let mut copy = StoredCopy::new(&tree, stored);
+                        let removed = copy
+                            .copy_of(id)
+                            .context("The instance isn't stored in this model")?;
+                        copy.delete(removed);
+                        let written = self.write_stored(&tree, stored, copy)?;
+                        errors.extend(Self::apply_stored(&mut tree, written, &[]));
+                        Ok(())
+                    })();
+                    if let Err(err) = result {
+                        errors.push(WriteError {
+                            id,
+                            property: None,
+                            message: format!("{err:#}"),
+                        });
+                        if let Some(instance) = tree.get_instance(id) {
+                            deletion_conflicts.push(PatchAdd {
+                                parent_id: instance.parent(),
+                                instance: snapshot_from_tree(&tree, id),
+                            });
+                            messages.push(AppliedPatchSet {
+                                removed: vec![id],
+                                added: vec![id],
+                                updated: Vec::new(),
+                            });
+                        }
+                    }
                     continue;
                 }
                 if let Some(owner) = inline_owner(&tree, id) {
@@ -522,15 +552,16 @@ impl JobThreadContext {
 
     /// Writes a subtree created in Studio as new files and adds it to the tree
     /// under the ids Studio gave it, so announcing it to Studio doesn't create a
-    /// second copy. Returns the ids of created instances that weren't stored,
-    /// which Studio must stop tracking.
+    /// second copy. Returns errors for what wasn't saved. Studio stops
+    /// tracking a created instance with an error that names no property.
     fn persist_addition(
         &self,
         tree: &mut RojoTree,
         root_id: Ref,
         addition: &InstanceAddition,
+        context: &WriteContext,
         messages: &mut Vec<AppliedPatchSet>,
-    ) -> anyhow::Result<Vec<Ref>> {
+    ) -> anyhow::Result<Vec<WriteError>> {
         anyhow::ensure!(
             addition.ids.id == root_id,
             "The created subtree's root id doesn't match its key"
@@ -545,14 +576,314 @@ impl JobThreadContext {
                     .all(|id| id.is_some() && tree.get_instance(*id).is_none()),
             "Studio's ids for the created instances are not new and unique"
         );
-        let parent = tree
-            .get_instance(addition.parent)
-            .context("The parent is no longer known")?;
-        let parent_context = parent.metadata().context.clone();
-        let directory = self.children_directory(tree, addition.parent)?;
-
+        anyhow::ensure!(
+            tree.get_instance(addition.parent).is_some(),
+            "The parent is no longer known"
+        );
         let model = rbx_binary::from_reader(addition.model.as_slice())
             .context("Could not read the created instances")?;
+        let unsaved =
+            self.place_subtree(tree, addition.parent, model, &addition.ids, context, &[])?;
+        if tree.get_instance(root_id).is_some() {
+            messages.push(AppliedPatchSet {
+                added: vec![root_id],
+                ..AppliedPatchSet::new()
+            });
+        }
+        Ok(unsaved)
+    }
+
+    /// Rewrites the file `stored` names from `copy`, then reads it back. The
+    /// tree isn't changed, so nothing is lost if a later step fails. Pass the
+    /// result to [`Self::apply_stored`].
+    fn write_stored(
+        &self,
+        tree: &RojoTree,
+        stored: StoredIn,
+        copy: StoredCopy,
+    ) -> anyhow::Result<WrittenStored> {
+        anyhow::ensure!(
+            self.stored_matches_disk(tree, stored)?,
+            "The file changed on disk; the change was not saved"
+        );
+        self.write_stored_unchecked(tree, stored, copy)
+    }
+
+    /// Like [`Self::write_stored`], for a caller that already checked the file
+    /// against the tree before changing the tree.
+    fn write_stored_unchecked(
+        &self,
+        tree: &RojoTree,
+        stored: StoredIn,
+        copy: StoredCopy,
+    ) -> anyhow::Result<WrittenStored> {
+        let owner = stored.owner();
+        let instance = tree
+            .get_instance(owner)
+            .context("The file's owner is no longer known")?;
+        let Some(InstigatingSource::Path(source)) = instance.metadata().instigating_source.as_ref()
+        else {
+            anyhow::bail!("The file's owner has no filesystem source");
+        };
+        let source = source.clone();
+        let context = instance.metadata().context.clone();
+        let expected =
+            FsSnapshot::capture_file_contents(&instance.metadata().relevant_paths, &self.vfs)?;
+        let ids = copy.added_ids(copy.dom.root_ref());
+        let outside = outside_refs(&copy.dom, &copy.ids);
+        let staged = match stored {
+            StoredIn::Inline(_) => {
+                syncback_instance(&self.vfs, tree, &self.project, owner, copy.dom)?
+            }
+            StoredIn::Model(_) => {
+                syncback_model_file(&self.vfs, tree, &self.project, owner, copy.dom)?
+            }
+        };
+        validate_write_targets(&self.project, &staged)?;
+        staged.write_single_file_to_vfs(self.project.folder_location(), &self.vfs, &expected)?;
+        let snapshot = match stored {
+            StoredIn::Inline(_) => snapshot_shallow_from_vfs(&context, &self.vfs, &source)?,
+            StoredIn::Model(_) => snapshot_from_vfs(&context, &self.vfs, &source)?,
+        }
+        .context("The rewritten file is no longer visible")?;
+        Ok(WrittenStored {
+            stored,
+            snapshot,
+            ids,
+            outside,
+        })
+    }
+
+    /// Returns whether the file `stored` names still holds what the tree has.
+    fn stored_matches_disk(&self, tree: &RojoTree, stored: StoredIn) -> anyhow::Result<bool> {
+        let owner = stored.owner();
+        let instance = tree.get_instance(owner).unwrap();
+        let Some(InstigatingSource::Path(source)) = instance.metadata().instigating_source.as_ref()
+        else {
+            return Ok(false);
+        };
+        let context = &instance.metadata().context;
+        let patch = match stored {
+            StoredIn::Inline(_) => compute_shallow_patch_set(
+                snapshot_shallow_from_vfs(context, &self.vfs, source)?,
+                tree,
+                owner,
+            ),
+            StoredIn::Model(_) => {
+                compute_patch_set(snapshot_from_vfs(context, &self.vfs, source)?, tree, owner)
+            }
+        };
+        Ok(patch == PatchSet::new())
+    }
+
+    /// Replaces the instances a rewritten file stores with what was read back,
+    /// under the ids the copy recorded. `moving` subtrees are removed first,
+    /// since their ids now belong to this file. Returns errors for what the
+    /// file couldn't keep.
+    fn apply_stored(
+        tree: &mut RojoTree,
+        written: WrittenStored,
+        moving: &[Ref],
+    ) -> Vec<WriteError> {
+        let owner = written.stored.owner();
+        for &id in moving {
+            if tree.get_instance(id).is_some() {
+                tree.remove(id);
+            }
+        }
+        let stored: Vec<Ref> = tree
+            .get_instance(owner)
+            .unwrap()
+            .children()
+            .iter()
+            .copied()
+            .filter(|&child| stored_in(tree, child) == Some(written.stored))
+            .collect();
+        for child in stored {
+            tree.remove(child);
+        }
+        let (referents, unstored) = pair_added_ids(&written.snapshot, &written.ids);
+        let mut snapshot = written.snapshot;
+        if let Some(mut instance) = tree.get_instance_mut(owner) {
+            let inner = instance.inner_mut();
+            inner.name = snapshot.name.to_string();
+            // Kept like insert_instance keeps it, since it's the server's own.
+            let pivot = inner.properties.get(&ustr("NeedsPivotMigration")).cloned();
+            inner.properties = std::mem::take(&mut snapshot.properties);
+            if let Some(pivot) = pivot {
+                inner
+                    .properties
+                    .entry(ustr("NeedsPivotMigration"))
+                    .or_insert(pivot);
+            }
+        }
+        // The owner's own references, like a model's PrimaryPart, can point at
+        // what it stores too.
+        let mut inserted = vec![(snapshot.snapshot_id, owner)];
+        let children = std::mem::take(&mut snapshot.children);
+        for (child, child_referents) in children.into_iter().zip(referents.children.iter()) {
+            tree.insert_instance_with_referents(owner, child, child_referents, &mut inserted);
+        }
+        tree.resolve_snapshot_refs(&inserted);
+        unsaved_errors(unstored, written.outside)
+    }
+
+    /// Edits or moves instances whose file is shared: those stored inline in a
+    /// directory's metadata, and those inside a model file. Each affected file
+    /// is rewritten whole. A move between two files writes the destination
+    /// first, so a failure can duplicate the instance but never lose it.
+    fn persist_stored_move(
+        &self,
+        tree: &mut RojoTree,
+        update: &PatchUpdate,
+        context: &WriteContext,
+    ) -> anyhow::Result<Vec<WriteError>> {
+        let id = update.id;
+        let parent = update
+            .changed_parent
+            .context("A move needs a destination")?;
+        let instance = tree
+            .get_instance(id)
+            .context("The moved instance is no longer known")?;
+        let mut ancestor = parent;
+        while ancestor.is_some() {
+            anyhow::ensure!(ancestor != id, "Reparenting would create a cycle");
+            ancestor = tree
+                .get_instance(ancestor)
+                .context("Unknown ancestor")?
+                .parent();
+        }
+        let name = update
+            .changed_name
+            .clone()
+            .unwrap_or_else(|| instance.name().to_owned());
+        let source = stored_in(tree, id);
+        let destination = children_stored_in(tree, parent);
+        let moving = [id];
+
+        // The moved subtree as a model, with the ids it keeps.
+        let (model, ids) = subtree_model(tree, id, &name);
+
+        match (source, destination) {
+            (Some(from), Some(to)) if from == to => {
+                let mut copy = StoredCopy::new(tree, from);
+                let moved = copy
+                    .copy_of(id)
+                    .context("The moved instance isn't stored here")?;
+                let target = copy
+                    .copy_of(parent)
+                    .context("The destination isn't stored here")?;
+                copy.dom.transfer_within(moved, target);
+                copy.dom.get_by_ref_mut(moved).unwrap().name = name;
+                let written = self.write_stored(tree, from, copy)?;
+                Ok(Self::apply_stored(tree, written, &[]))
+            }
+            (_, Some(to)) => {
+                // The source's copy is taken before anything changes, without
+                // the moved subtree.
+                let source_copy = source.map(|from| {
+                    let mut copy = StoredCopy::new(tree, from);
+                    if let Some(moved) = copy.copy_of(id) {
+                        copy.dom.destroy(moved);
+                    }
+                    (from, copy)
+                });
+                let mut copy = StoredCopy::new(tree, to);
+                copy.add(parent, model, &ids)?;
+                let written = self.write_stored(tree, to, copy)?;
+                let mut errors = Vec::new();
+                match source_copy {
+                    Some((from, copy)) => {
+                        let removed = self.write_stored(tree, from, copy)?;
+                        errors = Self::apply_stored(tree, removed, &moving);
+                    }
+                    None => {
+                        if self.remove_instance(tree, id, context)?.is_some() {
+                            anyhow::bail!("The moved instance changed on disk");
+                        }
+                    }
+                }
+                errors.extend(Self::apply_stored(tree, written, &moving));
+                Ok(errors)
+            }
+            (Some(from), None) => {
+                // Checked first, since placing the subtree takes it out of the
+                // tree while the source file still holds it.
+                anyhow::ensure!(
+                    self.stored_matches_disk(tree, from)?,
+                    "The file changed on disk; the change was not saved"
+                );
+                let mut copy = StoredCopy::new(tree, from);
+                if let Some(moved) = copy.copy_of(id) {
+                    copy.dom.destroy(moved);
+                }
+                let mut errors = self.place_subtree(tree, parent, model, &ids, context, &moving)?;
+                let removed = self.write_stored_unchecked(tree, from, copy)?;
+                errors.extend(Self::apply_stored(tree, removed, &[]));
+                Ok(errors)
+            }
+            (None, None) => anyhow::bail!("Neither side of this move is stored in a shared file"),
+        }
+    }
+
+    /// Writes a subtree as new files under `parent` and adds it to the tree
+    /// under the ids in `ids`. A script parent is promoted to a directory
+    /// first, and a parent whose children share its file has that file
+    /// rewritten instead. `moving` subtrees are removed from the tree once the
+    /// files are in place, since they're what's being written. Returns errors
+    /// for what the files couldn't keep.
+    fn place_subtree(
+        &self,
+        tree: &mut RojoTree,
+        parent: Ref,
+        mut model: WeakDom,
+        ids: &AddedIds,
+        context: &WriteContext,
+        moving: &[Ref],
+    ) -> anyhow::Result<Vec<WriteError>> {
+        drop_duplicate_ids(&mut model, tree, moving);
+        if let Some(stored) = children_stored_in(tree, parent) {
+            let mut copy = StoredCopy::new(tree, stored);
+            copy.add(parent, model, ids)?;
+            let written = self.write_stored(tree, stored, copy)?;
+            return Ok(Self::apply_stored(tree, written, moving));
+        }
+
+        let parent_instance = tree
+            .get_instance(parent)
+            .context("The parent is no longer known")?;
+        let is_script_file = parent_instance
+            .metadata()
+            .middleware
+            .is_some_and(|middleware| !middleware.is_dir() && middleware != Middleware::Project)
+            && crate::syncback::is_script_class(parent_instance.class_name().as_str());
+        if is_script_file {
+            // Written next to the script, then moved in, which promotes the
+            // script to a directory the way a move into it would.
+            let holder = parent_instance.parent();
+            let errors = self.place_subtree(tree, holder, model, ids, context, moving)?;
+            let move_in = PatchUpdate {
+                changed_parent: Some(parent),
+                ..empty_update(ids.id)
+            };
+            let mut messages = Vec::new();
+            match self.relocate_instance(tree, &move_in, &mut messages, context) {
+                Ok(RelocationOutcome::Moved) => return Ok(errors),
+                Ok(RelocationOutcome::Restore(_)) => {
+                    let _ = self.remove_instance(tree, ids.id, context);
+                    tree.remove(ids.id);
+                    anyhow::bail!("The script changed on disk; the instance was not added");
+                }
+                Err(err) => {
+                    let _ = self.remove_instance(tree, ids.id, context);
+                    tree.remove(ids.id);
+                    return Err(err.context("Could not add the instance under the script"));
+                }
+            }
+        }
+
+        let parent_context = parent_instance.metadata().context.clone();
+        let directory = self.children_directory(tree, parent)?;
         let existing: HashSet<String> = self
             .vfs
             .read_dir(&directory)?
@@ -565,11 +896,12 @@ impl JobThreadContext {
                     .map(str::to_lowercase)
             })
             .collect();
+        let outside = outside_refs(&model, &model_copies(&model, ids));
         let new = syncback_new_subtree(
             &self.vfs,
             tree,
             &self.project,
-            addition.parent,
+            parent,
             &directory,
             &existing,
             model,
@@ -578,14 +910,17 @@ impl JobThreadContext {
         self.install_new_files(&directory, new.fs_snapshot)?;
 
         let snapshot = snapshot_from_vfs(&parent_context, &self.vfs, &new.root_path)?
-            .context("The created instance is not visible on disk")?;
-        let (referents, unstored) = pair_added_ids(&snapshot, &addition.ids);
-        let root = tree.insert_instance_with_referents(addition.parent, snapshot, &referents);
-        messages.push(AppliedPatchSet {
-            added: vec![root],
-            ..AppliedPatchSet::new()
-        });
-        Ok(unstored)
+            .context("The new instance is not visible on disk")?;
+        for &id in moving {
+            if tree.get_instance(id).is_some() {
+                tree.remove(id);
+            }
+        }
+        let (referents, unstored) = pair_added_ids(&snapshot, ids);
+        let mut inserted = Vec::new();
+        tree.insert_instance_with_referents(parent, snapshot, &referents, &mut inserted);
+        tree.resolve_snapshot_refs(&inserted);
+        Ok(unsaved_errors(unstored, outside))
     }
 
     /// Returns the directory that holds `id`'s children on disk.
@@ -1453,9 +1788,24 @@ impl JobThreadContext {
         context: &WriteContext,
         attempt: u32,
     ) {
+        // A move that touches a file shared with other instances rewrites
+        // those files instead of moving files of its own.
+        let stored_move = tree.get_instance(update.id).is_some_and(|instance| {
+            update.changed_parent.is_some_and(|parent| {
+                parent != instance.parent()
+                    && (stored_in(tree, update.id).is_some()
+                        || children_stored_in(tree, parent).is_some())
+            })
+        });
+        if stored_move {
+            self.persist_stored_update(tree, update, outcome, context);
+            return;
+        }
         let structural = tree.get_instance(update.id).is_some_and(|instance| {
-            update.changed_parent.is_some()
-                || (inline_owner(tree, update.id).is_none()
+            update
+                .changed_parent
+                .is_some_and(|parent| parent != instance.parent())
+                || (stored_in(tree, update.id).is_none()
                     && update
                         .changed_name
                         .as_deref()
@@ -1468,6 +1818,238 @@ impl JobThreadContext {
         self.persist_property_update(tree, update, outcome, context, attempt);
     }
 
+    /// Persists a move that touches a shared file, then any other edits in the
+    /// same update.
+    fn persist_stored_update(
+        &self,
+        tree: &mut RojoTree,
+        update: &PatchUpdate,
+        outcome: &mut WriteOutcome,
+        context: &WriteContext,
+    ) {
+        let id = update.id;
+        let restore = |tree: &RojoTree, outcome: &mut WriteOutcome| {
+            if let Some(instance) = tree.get_instance(id) {
+                outcome.conflicts.updated_instances.push(PatchUpdate {
+                    changed_parent: Some(instance.parent()),
+                    changed_name: update
+                        .changed_name
+                        .as_ref()
+                        .map(|_| instance.name().to_owned()),
+                    ..empty_update(id)
+                });
+            }
+        };
+        let destination = update
+            .changed_parent
+            .and_then(|parent| children_stored_in(tree, parent));
+        let mut files: Vec<StoredIn> = stored_in(tree, id).into_iter().chain(destination).collect();
+        files.dedup();
+        for stored in files {
+            match self.catch_up_stored(tree, stored, context, outcome.messages) {
+                Ok(true) => {}
+                Ok(false) => {
+                    restore(tree, outcome);
+                    return;
+                }
+                Err(error) => {
+                    outcome.errors.push(WriteError {
+                        id,
+                        property: Some("Parent".into()),
+                        message: format!("Could not read a shared file: {error:#}"),
+                    });
+                    restore(tree, outcome);
+                    return;
+                }
+            }
+        }
+        if tree.get_instance(id).is_none() {
+            if context.authority == WriteAuthority::Studio {
+                outcome.errors.push(removed_on_disk(id));
+            }
+            return;
+        }
+        match self.persist_stored_move(tree, update, context) {
+            Ok(unsaved) => {
+                let instance = tree.get_instance(id);
+                outcome.accepted.updated_instances.push(PatchUpdate {
+                    changed_parent: instance.map(|instance| instance.parent()),
+                    changed_name: update.changed_name.clone(),
+                    ..empty_update(id)
+                });
+                outcome.errors.extend(unsaved);
+                let remaining = PatchUpdate {
+                    changed_parent: None,
+                    changed_name: None,
+                    ..update.clone()
+                };
+                if !remaining.changed_properties.is_empty() && tree.get_instance(id).is_some() {
+                    self.persist_property_update(tree, &remaining, outcome, context, 1);
+                }
+            }
+            Err(error) => {
+                outcome.errors.push(WriteError {
+                    id,
+                    property: Some("Parent".into()),
+                    message: format!("{error:#}"),
+                });
+                restore(tree, outcome);
+            }
+        }
+    }
+
+    /// Persists an edit to a model file or an instance inside one by
+    /// rewriting the model file.
+    fn persist_model_edit(
+        &self,
+        tree: &mut RojoTree,
+        model: Ref,
+        update: &PatchUpdate,
+        outcome: &mut WriteOutcome,
+        context: &WriteContext,
+    ) {
+        let id = update.id;
+        let stored = StoredIn::Model(model);
+        let restore = |tree: &RojoTree, outcome: &mut WriteOutcome| {
+            if let Some(instance) = tree.get_instance(id) {
+                outcome.conflicts.updated_instances.push(PatchUpdate {
+                    changed_name: update
+                        .changed_name
+                        .as_ref()
+                        .map(|_| instance.name().to_owned()),
+                    changed_properties: update
+                        .changed_properties
+                        .keys()
+                        .map(|key| (*key, instance.properties().get(key).cloned()))
+                        .collect(),
+                    ..empty_update(id)
+                });
+            }
+        };
+
+        // Like any other write, a disk change wins under Filesystem authority,
+        // and is caught up with first under Studio authority.
+        match self.catch_up_stored(tree, stored, context, outcome.messages) {
+            Ok(true) => {}
+            Ok(false) => {
+                restore(tree, outcome);
+                return;
+            }
+            Err(error) => {
+                outcome.errors.push(WriteError {
+                    id,
+                    property: None,
+                    message: format!("Could not read the model file: {error:#}"),
+                });
+                return;
+            }
+        }
+        if tree.get_instance(id).is_none() {
+            if context.authority == WriteAuthority::Studio {
+                outcome.errors.push(removed_on_disk(id));
+            }
+            return;
+        }
+
+        let result = (|| -> anyhow::Result<Vec<WriteError>> {
+            anyhow::ensure!(
+                update.changed_class_name.is_none() && update.changed_metadata.is_none(),
+                "Changing the class or metadata is not supported by two-way sync"
+            );
+            let mut copy = StoredCopy::new(tree, stored);
+            let target = copy
+                .copy_of(id)
+                .context("The instance isn't stored in this model")?;
+            // A reference to an instance in the model points at its copy.
+            let values: Vec<_> = update
+                .changed_properties
+                .iter()
+                .map(|(key, value)| {
+                    let value = match value {
+                        Some(Variant::Ref(referent)) => {
+                            Some(Variant::Ref(copy.copy_of(*referent).unwrap_or(*referent)))
+                        }
+                        other => other.clone(),
+                    };
+                    (*key, value)
+                })
+                .collect();
+            let instance = copy.dom.get_by_ref_mut(target).unwrap();
+            if let Some(name) = &update.changed_name {
+                instance.name = name.clone();
+            }
+            for (key, value) in values {
+                match value {
+                    Some(value) => instance.properties.insert(key, value),
+                    None => instance.properties.remove(&key),
+                };
+            }
+            let written = self.write_stored(tree, stored, copy)?;
+            Ok(Self::apply_stored(tree, written, &[]))
+        })();
+        match result {
+            Ok(unsaved) => {
+                outcome.accepted.updated_instances.push(update.clone());
+                outcome.errors.extend(unsaved);
+            }
+            Err(error) => {
+                outcome.errors.push(WriteError {
+                    id,
+                    property: None,
+                    message: format!("{error:#}"),
+                });
+                restore(tree, outcome);
+            }
+        }
+    }
+
+    /// Brings the tree in line with a shared file that changed on disk, and
+    /// tells Studio. Returns whether the write should go ahead: always when
+    /// the file hadn't changed, and only under Studio authority when it had.
+    fn catch_up_stored(
+        &self,
+        tree: &mut RojoTree,
+        stored: StoredIn,
+        context: &WriteContext,
+        messages: &mut Vec<AppliedPatchSet>,
+    ) -> anyhow::Result<bool> {
+        if !context.stale && self.stored_matches_disk(tree, stored)? {
+            return Ok(true);
+        }
+        let owner = stored.owner();
+        let instance = tree.get_instance(owner).unwrap();
+        let Some(InstigatingSource::Path(source)) = instance.metadata().instigating_source.as_ref()
+        else {
+            anyhow::bail!("The file's owner has no filesystem source");
+        };
+        let context_for_read = instance.metadata().context.clone();
+        let source = source.clone();
+        let disk_patch = match stored {
+            StoredIn::Inline(_) => compute_shallow_patch_set(
+                snapshot_shallow_from_vfs(&context_for_read, &self.vfs, &source)?,
+                tree,
+                owner,
+            ),
+            StoredIn::Model(_) => compute_patch_set(
+                snapshot_from_vfs(&context_for_read, &self.vfs, &source)?,
+                tree,
+                owner,
+            ),
+        };
+        if disk_patch == PatchSet::new() {
+            return Ok(true);
+        }
+        if context.authority == WriteAuthority::Filesystem {
+            let applied = apply_patch_set(tree, disk_patch);
+            if !applied.is_empty() {
+                messages.push(applied);
+            }
+            return Ok(false);
+        }
+        catch_up(tree, disk_patch, context.batch, messages);
+        Ok(true)
+    }
+
     fn persist_property_update(
         &self,
         tree: &mut RojoTree,
@@ -1476,6 +2058,21 @@ impl JobThreadContext {
         context: &WriteContext,
         attempt: u32,
     ) {
+        // Model files store their whole subtree, so their edits rewrite it.
+        let model = match stored_in(tree, update.id) {
+            Some(StoredIn::Model(model)) => Some(model),
+            _ if tree
+                .get_metadata(update.id)
+                .is_some_and(|metadata| is_model_middleware(metadata.middleware)) =>
+            {
+                Some(update.id)
+            }
+            _ => None,
+        };
+        if let Some(model) = model {
+            self.persist_model_edit(tree, model, update, outcome, context);
+            return;
+        }
         let WriteOutcome {
             accepted,
             conflicts,
@@ -1975,6 +2572,123 @@ enum RelocationOutcome {
     Restore(Box<Option<InstanceSnapshot>>),
 }
 
+/// A shared file that was rewritten, as it was read back, with the ids its
+/// instances are meant to keep.
+struct WrittenStored {
+    stored: StoredIn,
+    snapshot: InstanceSnapshot,
+    ids: AddedIds,
+    outside: Vec<(Ref, Ustr)>,
+}
+
+/// Copies an instance and its descendants out of the tree, named `name`, as a
+/// model with one top-level instance, along with the ids they keep.
+fn subtree_model(tree: &RojoTree, id: Ref, name: &str) -> (WeakDom, AddedIds) {
+    fn copy(
+        tree: &RojoTree,
+        id: Ref,
+        dom: &mut WeakDom,
+        parent: Ref,
+        name: Option<&str>,
+    ) -> AddedIds {
+        let instance = tree.get_instance(id).unwrap();
+        let name = name.unwrap_or(instance.name());
+        let copied = dom.insert(
+            parent,
+            InstanceBuilder::new(instance.class_name())
+                .with_name(name)
+                .with_properties(instance.properties().clone()),
+        );
+        AddedIds {
+            id,
+            name: name.to_owned(),
+            class_name: instance.class_name(),
+            children: instance
+                .children()
+                .iter()
+                .map(|child| copy(tree, *child, dom, copied, None))
+                .collect(),
+        }
+    }
+    let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));
+    let root = dom.root_ref();
+    let ids = copy(tree, id, &mut dom, root, Some(name));
+    let copies = model_copies(&dom, &ids);
+    retarget_refs(&mut dom, &copies);
+    (dom, ids)
+}
+
+/// Maps the instances of a model with one top-level instance to the ids in
+/// `ids`, which is shaped like it.
+fn model_copies(model: &WeakDom, ids: &AddedIds) -> HashMap<Ref, Ref> {
+    let mut copies = HashMap::new();
+    let mut pending: Vec<_> = model.root().children().iter().copied().zip([ids]).collect();
+    while let Some((copied, entry)) = pending.pop() {
+        copies.insert(copied, entry.id);
+        let children = model.get_by_ref(copied).unwrap().children().to_vec();
+        pending.extend(children.into_iter().zip(entry.children.iter()));
+    }
+    copies
+}
+
+/// Returns the references a file can't hold, since they point at instances
+/// outside `dom`, as the tree instance and property that hold each one.
+/// `copies` maps each copy in `dom` to the tree instance it stands for.
+fn outside_refs(dom: &WeakDom, copies: &HashMap<Ref, Ref>) -> Vec<(Ref, Ustr)> {
+    let mut outside = Vec::new();
+    for (&copy, &original) in copies {
+        let Some(instance) = dom.get_by_ref(copy) else {
+            continue;
+        };
+        for (name, value) in &instance.properties {
+            if let Variant::Ref(target) = value {
+                if target.is_some() && dom.get_by_ref(*target).is_none() {
+                    outside.push((original, *name));
+                }
+            }
+        }
+    }
+    outside
+}
+
+/// The errors for what a write couldn't keep: instances that didn't survive
+/// the round trip through their files, and references that leave them.
+fn unsaved_errors(unstored: Vec<Ref>, outside: Vec<(Ref, Ustr)>) -> Vec<WriteError> {
+    let instances = unstored.into_iter().map(|id| WriteError {
+        id,
+        property: None,
+        message: "This instance could not be stored on disk".into(),
+    });
+    let references = outside.into_iter().map(|(id, property)| WriteError {
+        id,
+        property: Some(property.to_string()),
+        message: "This reference points outside its file, so it was not saved".into(),
+    });
+    instances.chain(references).collect()
+}
+
+/// Points `Ref` properties at the copies in `dom` of the tree instances they
+/// named, where `copies` maps each copy to the tree instance it came from.
+/// References to instances outside the copy are left as they are.
+fn retarget_refs(dom: &mut WeakDom, copies: &HashMap<Ref, Ref>) {
+    let to_copy: HashMap<Ref, Ref> = copies
+        .iter()
+        .map(|(copy, original)| (*original, *copy))
+        .collect();
+    for &copy in copies.keys() {
+        let Some(instance) = dom.get_by_ref_mut(copy) else {
+            continue;
+        };
+        for value in instance.properties.values_mut() {
+            if let Variant::Ref(target) = value {
+                if let Some(copied) = to_copy.get(target) {
+                    *target = *copied;
+                }
+            }
+        }
+    }
+}
+
 /// Returns the directory a project node's `$path` names, resolved against the
 /// folder of the project file that declares it, or `None` without a `$path`.
 fn project_node_directory(
@@ -2187,6 +2901,205 @@ enum InlineEdit<'a> {
         properties: &'a UstrMap<Variant>,
     },
     Remove(Ref),
+}
+
+/// The single file that stores an instance which has no file of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredIn {
+    /// The `init.meta.json` of this directory, among its inline children.
+    Inline(Ref),
+    /// This model file, which stores its whole subtree.
+    Model(Ref),
+}
+
+impl StoredIn {
+    fn owner(self) -> Ref {
+        match self {
+            StoredIn::Inline(owner) | StoredIn::Model(owner) => owner,
+        }
+    }
+}
+
+fn is_model_middleware(middleware: Option<Middleware>) -> bool {
+    matches!(
+        middleware,
+        Some(Middleware::Rbxm | Middleware::Rbxmx | Middleware::JsonModel)
+    )
+}
+
+/// Returns the file that stores `id`'s children, when they can't have files of
+/// their own: an instance stored inline keeps its children in the same
+/// `init.meta.json`, and a model file or anything inside one keeps them in the
+/// model. Returns `None` when children get files of their own.
+fn children_stored_in(tree: &RojoTree, id: Ref) -> Option<StoredIn> {
+    let metadata = tree.get_metadata(id)?;
+    if is_model_middleware(metadata.middleware) {
+        return Some(StoredIn::Model(id));
+    }
+    if metadata.instigating_source.is_some() {
+        return None;
+    }
+    let mut current = tree.get_instance(id)?.parent();
+    while let Some(ancestor) = tree.get_instance(current) {
+        let metadata = ancestor.metadata();
+        match metadata.instigating_source {
+            Some(InstigatingSource::Path(_)) if is_model_middleware(metadata.middleware) => {
+                return Some(StoredIn::Model(current));
+            }
+            Some(InstigatingSource::Path(_)) if metadata.middleware == Some(Middleware::Dir) => {
+                return Some(StoredIn::Inline(current));
+            }
+            Some(_) => return None,
+            None => current = ancestor.parent(),
+        }
+    }
+    None
+}
+
+/// Returns the file that stores `id` itself, when it has no file of its own:
+/// the nearest ancestor with a source, if that's a directory or a model file.
+fn stored_in(tree: &RojoTree, id: Ref) -> Option<StoredIn> {
+    if tree.get_metadata(id)?.instigating_source.is_some() {
+        return None;
+    }
+    let mut current = tree.get_instance(id)?.parent();
+    while let Some(ancestor) = tree.get_instance(current) {
+        let metadata = ancestor.metadata();
+        match metadata.instigating_source {
+            Some(InstigatingSource::Path(_)) if is_model_middleware(metadata.middleware) => {
+                return Some(StoredIn::Model(current));
+            }
+            Some(InstigatingSource::Path(_)) if metadata.middleware == Some(Middleware::Dir) => {
+                return Some(StoredIn::Inline(current));
+            }
+            Some(_) => return None,
+            None => current = ancestor.parent(),
+        }
+    }
+    None
+}
+
+/// A copy of the instances one file stores, with the tree id each copy came
+/// from, so the file can be rewritten whole after an edit.
+struct StoredCopy {
+    dom: WeakDom,
+    /// Which tree instance each copy came from, or which id a new one takes.
+    ids: HashMap<Ref, Ref>,
+}
+
+impl StoredCopy {
+    /// Copies what `stored` holds: an inline owner with the instances its
+    /// metadata stores, or a model file with its whole subtree.
+    fn new(tree: &RojoTree, stored: StoredIn) -> Self {
+        let owner = stored.owner();
+        let builder = |id: Ref| {
+            let instance = tree.get_instance(id).unwrap();
+            InstanceBuilder::new(instance.class_name())
+                .with_name(instance.name())
+                .with_properties(instance.properties().clone())
+        };
+        let mut dom = WeakDom::new(builder(owner));
+        let mut ids = HashMap::from([(dom.root_ref(), owner)]);
+        let mut pending = vec![(owner, dom.root_ref())];
+        while let Some((source, destination)) = pending.pop() {
+            for &child in tree.get_instance(source).unwrap().children() {
+                if source == owner && stored_in(tree, child) != Some(stored) {
+                    continue;
+                }
+                let copy = dom.insert(destination, builder(child));
+                ids.insert(copy, child);
+                pending.push((child, copy));
+            }
+        }
+        retarget_refs(&mut dom, &ids);
+        StoredCopy { dom, ids }
+    }
+
+    /// Deletes a copy and its descendants. References to them become nil, the
+    /// way they would for an instance that no longer exists.
+    fn delete(&mut self, copy: Ref) {
+        let deleted: HashSet<Ref> = self
+            .dom
+            .descendants_of(copy)
+            .map(|instance| instance.referent())
+            .collect();
+        self.dom.destroy(copy);
+        for &remaining in self.ids.keys() {
+            let Some(instance) = self.dom.get_by_ref_mut(remaining) else {
+                continue;
+            };
+            for value in instance.properties.values_mut() {
+                if let Variant::Ref(target) = value {
+                    if deleted.contains(target) {
+                        *target = Ref::none();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the copy of a tree instance.
+    fn copy_of(&self, id: Ref) -> Option<Ref> {
+        self.ids
+            .iter()
+            .find_map(|(copy, original)| (*original == id).then_some(*copy))
+    }
+
+    /// Moves `model`'s top-level instance under `parent`'s copy, recording the
+    /// ids `added` gives it.
+    fn add(&mut self, parent: Ref, mut model: WeakDom, added: &AddedIds) -> anyhow::Result<()> {
+        let destination = self
+            .copy_of(parent)
+            .context("The parent isn't stored in this file")?;
+        let top = match model.root().children() {
+            [top] => *top,
+            other => anyhow::bail!(
+                "A created subtree must have exactly one root, not {}",
+                other.len()
+            ),
+        };
+        let mut pending = vec![(top, added)];
+        while let Some((instance, ids)) = pending.pop() {
+            self.ids.insert(instance, ids.id);
+            let children = model.get_by_ref(instance).unwrap().children().to_vec();
+            let mut remaining: Vec<Option<&AddedIds>> = ids.children.iter().map(Some).collect();
+            for child in children {
+                let child_instance = model.get_by_ref(child).unwrap();
+                let found = remaining.iter_mut().find(|candidate| {
+                    candidate.is_some_and(|candidate| {
+                        candidate.name == child_instance.name
+                            && candidate.class_name == child_instance.class
+                    })
+                });
+                if let Some(child_ids) = found.and_then(Option::take) {
+                    pending.push((child, child_ids));
+                }
+            }
+        }
+        // Copy referents survive a transfer, so the recorded ids stay valid.
+        model.transfer(top, &mut self.dom, destination);
+        // A moved instance can point at one the file already holds, and the
+        // reverse, so both now point at copies.
+        retarget_refs(&mut self.dom, &self.ids);
+        Ok(())
+    }
+
+    /// Returns the ids this copy will hold once written, shaped like the copy
+    /// below `root`. Copies without an id are left out with their descendants.
+    fn added_ids(&self, root: Ref) -> AddedIds {
+        let instance = self.dom.get_by_ref(root).unwrap();
+        AddedIds {
+            id: self.ids.get(&root).copied().unwrap_or_else(Ref::none),
+            name: instance.name.clone(),
+            class_name: instance.class,
+            children: instance
+                .children()
+                .iter()
+                .filter(|child| self.ids.contains_key(child))
+                .map(|child| self.added_ids(*child))
+                .collect(),
+        }
+    }
 }
 
 /// Returns the directory whose `init.meta.json` stores this instance, if it is

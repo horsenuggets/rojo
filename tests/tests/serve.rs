@@ -468,6 +468,288 @@ fn studio_move_to_the_datamodel_root_writes_into_its_path() {
     });
 }
 
+/// The `shared_files` fixture, read from a running server, with what the
+/// tests below look up in it.
+struct SharedFiles {
+    info: librojo::web_api::ServerInfoResponse,
+    cursor: u32,
+    ids: std::collections::HashMap<String, Ref>,
+}
+
+impl SharedFiles {
+    fn read(session: &crate::rojo_test::serve_util::TestServeSession) -> Self {
+        let info = session.get_api_rojo().unwrap();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let ids = read
+            .instances
+            .values()
+            .map(|instance| (instance.name.to_string(), instance.id))
+            .collect();
+        SharedFiles {
+            cursor: read.message_cursor,
+            info,
+            ids,
+        }
+    }
+
+    fn id(&self, name: &str) -> Ref {
+        self.ids[name]
+    }
+
+    fn write(
+        &self,
+        session: &crate::rojo_test::serve_util::TestServeSession,
+        removed: Vec<Ref>,
+        updated: Vec<InstanceUpdate>,
+    ) -> librojo::web_api::WriteResponse {
+        post_write(
+            session,
+            &WriteRequest {
+                session_id: self.info.session_id,
+                message_cursor: Some(self.cursor),
+                authority: WriteAuthority::Filesystem,
+                removed,
+                added: Default::default(),
+                updated,
+            },
+        )
+    }
+}
+
+fn shared_update(id: Ref) -> InstanceUpdate {
+    InstanceUpdate {
+        id,
+        changed_parent: None,
+        changed_name: None,
+        changed_class_name: None,
+        changed_metadata: None,
+        changed_properties: UstrMap::default(),
+    }
+}
+
+/// Waits for the watcher to report a write, then returns every message the
+/// server sent after `cursor`.
+fn settled_messages(
+    session: &crate::rojo_test::serve_util::TestServeSession,
+    cursor: u32,
+) -> Vec<librojo::web_api::SubscribeMessage<'static>> {
+    thread::sleep(Duration::from_millis(1500));
+    // The socket waits for a message, so it's only asked when there is one.
+    let root = session.get_api_rojo().unwrap().root_instance_id;
+    if session.get_api_read(root).unwrap().message_cursor == cursor {
+        return Vec::new();
+    }
+    let packet = session
+        .get_api_socket_packet(SocketPacketType::Messages, cursor)
+        .unwrap();
+    let SocketPacketBody::Messages(packet) = packet.body;
+    packet.messages
+}
+
+fn read_ref(
+    session: &crate::rojo_test::serve_util::TestServeSession,
+    id: Ref,
+    property: &str,
+) -> Option<Ref> {
+    let info = session.get_api_rojo().unwrap();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    match read.instances[&id]
+        .properties
+        .get(&ustr(property))
+        .map(|value| value.as_ref())
+    {
+        Some(Variant::Ref(referent)) if referent.is_some() => Some(*referent),
+        _ => None,
+    }
+}
+
+// An edit inside a binary model rewrites the file, but every instance in it is
+// still the one Studio has. Replacing them would make Studio rebuild the model,
+// and a re-read of the file must not report its references as changes.
+#[test]
+fn studio_edits_inside_binary_models_keep_every_instance() {
+    run_serve_test("shared_files", |session, _| {
+        let fixture = SharedFiles::read(&session);
+        let response = fixture.write(
+            &session,
+            Vec::new(),
+            vec![InstanceUpdate {
+                changed_name: Some("Renamed".into()),
+                ..shared_update(fixture.id("A"))
+            }],
+        );
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(response.conflicts.updated_instances.is_empty());
+
+        for message in settled_messages(&session, fixture.cursor) {
+            assert!(message.removed.is_empty(), "{:?}", message.removed);
+            assert!(message.added.is_empty(), "{:?}", message.added.keys());
+            for update in &message.updated {
+                assert!(
+                    update.changed_properties.is_empty(),
+                    "re-reading the model reported {:?}",
+                    update.changed_properties.keys()
+                );
+            }
+        }
+        let weld = fixture.id("Weld");
+        assert_eq!(read_ref(&session, weld, "Part0"), Some(fixture.id("A")));
+        assert_eq!(read_ref(&session, weld, "Part1"), Some(fixture.id("B")));
+    });
+}
+
+// A move between two model files rewrites both, and the moved instances keep
+// their ids.
+#[test]
+fn studio_moves_between_model_files_keep_their_ids() {
+    run_serve_test("shared_files", |session, _| {
+        let fixture = SharedFiles::read(&session);
+        let inner = fixture.id("Inner");
+        let response = fixture.write(
+            &session,
+            Vec::new(),
+            vec![InstanceUpdate {
+                changed_parent: Some(fixture.id("BinModel")),
+                ..shared_update(inner)
+            }],
+        );
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+
+        let json = fs::read_to_string(
+            session
+                .path()
+                .join("src/ReplicatedStorage/JsonModel.model.json"),
+        )
+        .unwrap();
+        assert!(!json.contains("Inner"), "{json}");
+        settled_messages(&session, fixture.cursor);
+        let read = session.get_api_read(fixture.info.root_instance_id).unwrap();
+        assert_eq!(read.instances[&inner].parent, fixture.id("BinModel"));
+        assert_eq!(read.instances[&fixture.id("Value")].parent, inner);
+    });
+}
+
+// A file can only hold references between its own instances. Moving what a
+// reference points at out of its file is saved, and the reference that was
+// lost is reported.
+#[test]
+fn studio_references_leaving_their_file_are_reported() {
+    run_serve_test("shared_files", |session, _| {
+        let fixture = SharedFiles::read(&session);
+        let pointer = fixture.id("Pointer");
+        assert_eq!(
+            read_ref(&session, pointer, "Value"),
+            Some(fixture.id("Base"))
+        );
+        let response = fixture.write(
+            &session,
+            Vec::new(),
+            vec![InstanceUpdate {
+                changed_parent: Some(fixture.id("ReplicatedStorage")),
+                ..shared_update(fixture.id("Base"))
+            }],
+        );
+        assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+        assert_eq!(response.errors[0].id, pointer);
+        assert_eq!(response.errors[0].property.as_deref(), Some("Value"));
+        assert!(session.path().join("src/ReplicatedStorage/Base").is_dir());
+    });
+}
+
+// Deleting what a reference points at leaves it nil, like in Studio, and
+// isn't an error.
+#[test]
+fn studio_deletions_inside_model_files_clear_references() {
+    run_serve_test("shared_files", |session, _| {
+        let fixture = SharedFiles::read(&session);
+        let response = fixture.write(&session, vec![fixture.id("A")], Vec::new());
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        settled_messages(&session, fixture.cursor);
+        let weld = fixture.id("Weld");
+        assert_eq!(read_ref(&session, weld, "Part0"), None);
+        assert_eq!(read_ref(&session, weld, "Part1"), Some(fixture.id("B")));
+    });
+}
+
+// A created subtree written as JSON links its references through attributes,
+// so they survive the round trip through its files.
+#[test]
+fn studio_created_subtrees_keep_their_references() {
+    use librojo::web_api::{AddedIds, InstanceAddition};
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use std::collections::HashMap;
+
+    run_serve_test("shared_files", |session, _| {
+        let fixture = SharedFiles::read(&session);
+        let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));
+        let root = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Folder").with_name("Linked"),
+        );
+        let target = dom.insert(root, InstanceBuilder::new("Part").with_name("Target"));
+        dom.insert(
+            root,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("Link")
+                .with_property("Value", Variant::Ref(target)),
+        );
+        let mut model = Vec::new();
+        rbx_binary::to_writer(&mut model, &dom, &[root]).unwrap();
+        let child = |name: &str, class: &str| AddedIds {
+            id: Ref::new(),
+            name: name.into(),
+            class_name: ustr(class),
+            children: Vec::new(),
+        };
+        let ids = AddedIds {
+            id: Ref::new(),
+            name: "Linked".into(),
+            class_name: ustr("Folder"),
+            children: vec![child("Target", "Part"), child("Link", "ObjectValue")],
+        };
+        let (target_id, link_id) = (ids.children[0].id, ids.children[1].id);
+        let response = post_write(
+            &session,
+            &WriteRequest {
+                session_id: fixture.info.session_id,
+                message_cursor: Some(fixture.cursor),
+                authority: WriteAuthority::Filesystem,
+                removed: Vec::new(),
+                added: HashMap::from([(
+                    ids.id,
+                    InstanceAddition {
+                        parent: fixture.id("ReplicatedStorage"),
+                        model,
+                        ids,
+                    },
+                )]),
+                updated: Vec::new(),
+            },
+        );
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+
+        let linked = session.path().join("src/ReplicatedStorage/Linked");
+        let mut written = String::new();
+        let mut pending = vec![linked];
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else {
+                written += &fs::read_to_string(&path).unwrap();
+            }
+        }
+        assert!(written.contains("Rojo_Target_Value"), "{written}");
+        assert!(written.contains("Rojo_Id"), "{written}");
+        assert_eq!(read_ref(&session, link_id, "Value"), Some(target_id));
+        settled_messages(&session, fixture.cursor);
+        assert_eq!(read_ref(&session, link_id, "Value"), Some(target_id));
+    });
+}
+
 #[test]
 fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {
     use librojo::web_api::{
