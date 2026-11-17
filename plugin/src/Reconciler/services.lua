@@ -21,15 +21,30 @@ local function isDataModel(instance)
 	return success and result
 end
 
+-- Returns whether scripts can make instances of `className`. A class missing
+-- from the reflection database counts as not creatable, since Studio keeps
+-- internal objects of unlisted classes under the DataModel.
+function services.isCreatable(className)
+	return ReflectionDatabase.Classes[className] ~= nil
+		and not hasTag(className, "NotCreatable")
+		and not hasTag(className, "Service")
+end
+local isCreatable = services.isCreatable
+
 -- Returns whether the engine owns `instance`, so Rojo must never remove it even
--- when the project doesn't describe it. Everything directly under a DataModel
--- is engine-owned, and so are instances of classes that can't be created, since
--- the engine makes those itself (like TouchInterest) and syncback only writes
--- them when the place actually contains them.
+-- when the project doesn't describe it. Instances of classes that can't be
+-- created are engine-owned, since the engine makes those itself (like
+-- TouchInterest) and syncback only writes them when the place contains them.
+-- Directly under a DataModel, that covers services and Studio's internal
+-- objects. A creatable instance there, like a Folder a project puts at the
+-- root, belongs to the place and is removed like any other.
 function services.isEngineOwned(instance)
 	local success, result = pcall(function()
 		local parent = instance.Parent
-		return (parent ~= nil and isDataModel(parent)) or hasTag(instance.ClassName, "NotCreatable")
+		if parent ~= nil and isDataModel(parent) then
+			return not isCreatable(instance.ClassName)
+		end
+		return hasTag(instance.ClassName, "NotCreatable")
 	end)
 	return success and result
 end
