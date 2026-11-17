@@ -195,8 +195,30 @@ pub fn needs_relayout(
     as_directories: bool,
 ) -> HashSet<Ref> {
     let mut relayout = HashSet::new();
+    for stale in stale_layouts(rules, tree, as_directories) {
+        // Every ancestor's subtree includes the misplaced instance.
+        let mut current = tree.get_instance(stale).unwrap().parent();
+        while relayout.insert(current) {
+            match tree.get_instance(current) {
+                Some(ancestor) if ancestor.parent().is_some() => current = ancestor.parent(),
+                _ => break,
+            }
+        }
+    }
+    relayout
+}
+
+/// Returns the instances whose own layout on disk the `modelTrees` rules no
+/// longer ask for, as described for [`needs_relayout`]. None of them is inside
+/// another, since a model file's descendants have no layout of their own.
+pub fn stale_layouts(
+    rules: &CompiledModelTreeRules,
+    tree: &RojoTree,
+    as_directories: bool,
+) -> Vec<Ref> {
+    let mut stale_instances = Vec::new();
     if rules.is_empty() && !as_directories {
-        return relayout;
+        return stale_instances;
     }
     let dom = tree.inner();
     let mut pending = vec![(tree.get_root_id(), String::new())];
@@ -221,16 +243,7 @@ pub fn needs_relayout(
                 (None, None) => false,
             };
             if stale {
-                // Every ancestor's subtree includes the misplaced instance.
-                let mut current = referent;
-                while relayout.insert(current) {
-                    match tree.get_instance(current) {
-                        Some(ancestor) if ancestor.parent().is_some() => {
-                            current = ancestor.parent()
-                        }
-                        _ => break,
-                    }
-                }
+                stale_instances.push(*child_ref);
             }
             // A model file holds its descendants, which have no layout of
             // their own to check.
@@ -240,7 +253,7 @@ pub fn needs_relayout(
             }
         }
     }
-    relayout
+    stale_instances
 }
 
 fn child_path(parent_path: &str, name: &str) -> String {

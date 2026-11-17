@@ -26,8 +26,9 @@ use crate::{
     },
     syncback::{
         can_write_property, decide_property_write, drop_duplicate_ids, drop_ignored_properties,
-        get_property_filter, same_value, source_file, syncback_instance, syncback_model_file,
-        syncback_new_subtree, validate_write_targets, FsSnapshot, PropertyWriteDecision,
+        get_property_filter, same_value, source_file, stale_layouts, syncback_instance,
+        syncback_model_file, syncback_new_subtree, validate_write_targets, CompiledModelTreeRules,
+        FsSnapshot, PropertyWriteDecision,
     },
     web::interface::{AddedIds, InstanceAddition, WriteAuthority, WriteError, WriteResult},
     REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX,
@@ -91,7 +92,7 @@ impl ChangeProcessor {
             tree,
             vfs,
             message_queue,
-            project,
+            project: project.into(),
         };
 
         let job_thread = jod_thread::Builder::new()
@@ -157,11 +158,38 @@ struct JobThreadContext {
     /// into this message queue to inform any connected clients.
     message_queue: Arc<MessageQueue<AppliedPatchSet>>,
 
-    /// The project's serialization and filtering rules.
-    project: Arc<Project>,
+    /// The project's serialization and filtering rules, read again whenever
+    /// the project file changes.
+    project: LiveProject,
+}
+
+/// The project as it is now, and what two-way sync knows about how to apply a
+/// change to its rules.
+struct LiveProject {
+    project: Mutex<Arc<Project>>,
+    /// The authority of the latest write, which is the only time Studio says
+    /// which side wins. `None` until the first write.
+    authority: Mutex<Option<WriteAuthority>>,
+    /// Whether the `modelTrees` rules changed before any write said which
+    /// side wins, so the first write decides whether to apply them.
+    relayout_pending: std::sync::atomic::AtomicBool,
+}
+
+impl From<Arc<Project>> for LiveProject {
+    fn from(project: Arc<Project>) -> Self {
+        Self {
+            project: Mutex::new(project),
+            authority: Mutex::new(None),
+            relayout_pending: Default::default(),
+        }
+    }
 }
 
 impl JobThreadContext {
+    fn project(&self) -> Arc<Project> {
+        Arc::clone(&self.project.project.lock().unwrap())
+    }
+
     /// Computes and applies patches to the DOM for a given file path.
     ///
     /// This function finds the nearest ancestor to the given path that has associated instances
@@ -193,6 +221,16 @@ impl JobThreadContext {
                 None => break Vec::new(),
             }
         };
+
+        // Something new in a folder only adds that one entry, so only it is
+        // read, instead of the folder's whole subtree.
+        if let [id] = affected_ids[..] {
+            if current_path != path.as_path() {
+                if let Some(applied) = self.add_new_entry(&mut tree, id, current_path, &path) {
+                    return applied;
+                }
+            }
+        }
 
         for id in affected_ids {
             // A change to one of an instance's own files, like a directory's
@@ -228,6 +266,27 @@ impl JobThreadContext {
             return;
         }
 
+        // A `.gitkeep` is never an instance, so its own events change nothing.
+        // Anything else that appears makes the `.gitkeep`s above it unneeded.
+        match &event {
+            VfsEvent::Create(path) | VfsEvent::Write(path) | VfsEvent::Remove(path)
+                if is_keep_file(path) =>
+            {
+                return;
+            }
+            VfsEvent::Create(path) => {
+                if let Some(directory) = path.parent() {
+                    self.remove_stale_keep_files(directory);
+                }
+            }
+            _ => {}
+        }
+
+        let project_file_changed = matches!(
+            &event,
+            VfsEvent::Create(path) | VfsEvent::Write(path) if self.is_project_file(path)
+        );
+
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
         let applied_patches = match event {
@@ -254,6 +313,415 @@ impl JobThreadContext {
         // Notify anyone listening to the message queue about the changes we
         // just made.
         self.message_queue.push_messages(&applied_patches);
+
+        if project_file_changed {
+            self.reload_project();
+        }
+    }
+
+    /// Handles a change to `path`, which no instance comes from yet, under the
+    /// folder `directory` that `parent` comes from, by reading only the entry
+    /// of `directory` that holds `path` and adding it. Returns `None` when the
+    /// entry could change the folder itself, like an `init` file, which needs
+    /// the folder read again.
+    fn add_new_entry(
+        &self,
+        tree: &mut RojoTree,
+        parent: Ref,
+        directory: &Path,
+        path: &Path,
+    ) -> Option<Vec<AppliedPatchSet>> {
+        let metadata = tree.get_metadata(parent)?;
+        let is_folder = matches!(
+            &metadata.instigating_source,
+            Some(InstigatingSource::Path(source)) if source == directory
+        ) && metadata
+            .middleware
+            .is_some_and(|middleware| middleware.is_dir());
+        if !is_folder {
+            return None;
+        }
+        let name = path.strip_prefix(directory).ok()?.components().next()?;
+        let entry = directory.join(name);
+        let name = name.as_os_str().to_str()?;
+        let changes_folder = name.starts_with("init.")
+            || name.ends_with(".meta.json")
+            || name.ends_with(".meta.jsonc")
+            || name.ends_with(".project.json");
+        if changes_folder || !tree.get_ids_at_path(&entry).is_empty() {
+            return None;
+        }
+
+        let mut context = metadata.context.clone();
+        if crate::snapshot::is_path_ignored(&context.path_ignore_rules, &entry) {
+            return Some(Vec::new());
+        }
+        // Children are read with their folder on the stack, like a full read
+        // of the folder does, so a link back to it is still caught.
+        let canonical = canonicalize_or_original(&self.vfs, directory.to_path_buf());
+        Arc::make_mut(
+            context
+                .active_directories
+                .get_or_insert_with(Default::default),
+        )
+        .push(canonical);
+        let snapshot = match snapshot_from_vfs(&context, &self.vfs, &entry) {
+            Ok(Some(snapshot)) => snapshot,
+            // Gone again, or not something Rojo reads.
+            Ok(None) => return Some(Vec::new()),
+            Err(error) => {
+                log::error!("Snapshot error: {error:?}");
+                return Some(Vec::new());
+            }
+        };
+        let applied = apply_patch_set(
+            tree,
+            PatchSet {
+                added_instances: vec![PatchAdd {
+                    parent_id: parent,
+                    instance: snapshot,
+                }],
+                ..PatchSet::new()
+            },
+        );
+        Some(vec![applied])
+    }
+
+    /// Whether `path` is the project file this server serves.
+    fn is_project_file(&self, path: &Path) -> bool {
+        let project_file = self.project().file_location.clone();
+        canonicalize_or_original(&self.vfs, path.to_path_buf())
+            == canonicalize_or_original(&self.vfs, project_file)
+    }
+
+    /// Reads the project file again, so two-way sync writes with its current
+    /// rules. When the syncback rules changed, instances whose layout is stale
+    /// move to the one the rules ask for if Studio is authoritative. Any rule
+    /// counts, since lifting an exclusion can let a refused relayout go ahead.
+    /// Under Filesystem authority the files on disk decide, so layouts stay as
+    /// they are. Before any write says which side wins, the first one decides.
+    fn reload_project(&self) {
+        let current = self.project();
+        let reloaded = match Project::load_exact(&self.vfs, &current.file_location, None) {
+            Ok(project) => project,
+            Err(error) => {
+                log::warn!(
+                    "The project file could not be read again, so its old rules are kept ({error:#})."
+                );
+                return;
+            }
+        };
+        if current.syncback_rules == reloaded.syncback_rules {
+            *self.project.project.lock().unwrap() = Arc::new(reloaded);
+            return;
+        }
+        *self.project.project.lock().unwrap() = Arc::new(reloaded);
+        let authority = *self.project.authority.lock().unwrap();
+        match authority {
+            Some(WriteAuthority::Studio) => self.relayout(),
+            Some(WriteAuthority::Filesystem) => log::debug!(
+                "The syncback rules changed, but the filesystem is authoritative, so layouts on disk stay as they are."
+            ),
+            None => self
+                .project
+                .relayout_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// Remembers which side a write says wins, and applies `modelTrees` rules
+    /// that changed before any write said so if it's Studio.
+    fn note_authority(&self, authority: WriteAuthority) {
+        *self.project.authority.lock().unwrap() = Some(authority);
+        let pending = self
+            .project
+            .relayout_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if pending && authority == WriteAuthority::Studio {
+            self.relayout();
+        }
+    }
+
+    /// Moves every instance whose layout the `modelTrees` rules no longer ask
+    /// for to the one they do, keeping its ID, so Studio sees no change.
+    fn relayout(&self) {
+        let project = self.project();
+        let rules = match CompiledModelTreeRules::new(
+            project
+                .syncback_rules
+                .as_ref()
+                .map(|rules| rules.model_trees.as_slice())
+                .unwrap_or_default(),
+            &project.tree,
+        ) {
+            Ok(rules) => rules,
+            Err(error) => {
+                log::warn!("The modelTrees rules are invalid ({error:#}).");
+                return;
+            }
+        };
+        let mut tree = self.tree.lock().unwrap();
+        // A model file can't sit in a folder's metadata, so an instance stored
+        // there moves with its outermost ancestor in the same file, which is
+        // written out as files of its own with every rule applied.
+        let mut targets: Vec<Ref> = Vec::new();
+        for mut id in stale_layouts(
+            &rules,
+            &tree,
+            crate::syncback::instances_as_directories(&project),
+        ) {
+            while let Some(parent) = tree.get_instance(id).map(|instance| instance.parent()) {
+                if children_stored_in(&tree, parent).is_none() {
+                    break;
+                }
+                id = parent;
+            }
+            if !targets.contains(&id) {
+                targets.push(id);
+            }
+        }
+        let mut moved = 0;
+        for id in targets {
+            let Some(instance) = tree.get_instance(id) else {
+                continue;
+            };
+            let name = instance.name().to_owned();
+            match self.relayout_instance(&mut tree, id) {
+                Ok(()) => moved += 1,
+                Err(error) => {
+                    log::warn!("Could not move \"{name}\" to its new layout ({error:#}).")
+                }
+            }
+        }
+        if moved > 0 {
+            log::info!(
+                "Moved {moved} {} to the layout the modelTrees rules ask for.",
+                if moved == 1 { "instance" } else { "instances" }
+            );
+        }
+    }
+
+    /// Rewrites one instance and its descendants in the layout the project's
+    /// rules give it, under the same IDs. Its old files are set aside first, so
+    /// the new ones can take their name. If writing fails, or the new files
+    /// would lose anything, the old files and the tree are put back.
+    fn relayout_instance(&self, tree: &mut RojoTree, id: Ref) -> anyhow::Result<()> {
+        let instance = tree.get_instance(id).context("The instance is gone")?;
+        let parent = instance.parent();
+        anyhow::ensure!(
+            children_stored_in(tree, parent).is_none(),
+            "its parent keeps its children in a shared file, which can't hold a model file"
+        );
+        let context = WriteContext {
+            stale: false,
+            authority: WriteAuthority::Studio,
+            batch: &[],
+        };
+        let backup = backup_subtree(tree, id);
+
+        // An instance in its folder's metadata moves out of it like any move.
+        if let Some(stored) = stored_in(tree, id) {
+            let owner = tree
+                .get_instance(stored.owner())
+                .context("The file's owner is gone")?;
+            let owner_files =
+                FsSnapshot::capture_file_contents(&owner.metadata().relevant_paths, &self.vfs)?;
+            let result = self.persist_stored_move(
+                tree,
+                &PatchUpdate {
+                    changed_parent: Some(parent),
+                    ..empty_update(id)
+                },
+                &context,
+            );
+            return self.finish_relayout(tree, id, parent, backup, result, || {
+                for (path, contents) in &owner_files {
+                    match contents {
+                        Some(contents) => self.vfs.write(path, contents)?,
+                        None => {
+                            self.vfs.remove_file(path).with_not_found()?;
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        let path = match self.check_removal(tree, id, &context)? {
+            Removal::Allowed(path) => path,
+            Removal::Restore(_) => anyhow::bail!("its files changed on disk"),
+        };
+        let mut entries = vec![path.clone()];
+        entries.extend(own_sidecars(tree, id, &path));
+        // Files the project's syncback rules exclude are never rewritten, like
+        // a full syncback leaves them alone.
+        let project = self.project();
+        if let Some(rules) = &project.syncback_rules {
+            let globs = Some(rules.compile_globs()?);
+            let mut pending = entries.clone();
+            while let Some(entry) = pending.pop() {
+                anyhow::ensure!(
+                    crate::syncback::is_valid_path(&globs, project.folder_location(), &entry),
+                    "\"{}\" is excluded by the project's syncback rules",
+                    entry.display()
+                );
+                if self
+                    .vfs
+                    .metadata(&entry)
+                    .with_not_found()?
+                    .is_some_and(|m| m.is_dir())
+                {
+                    for child in self.vfs.read_dir(&entry)? {
+                        pending.push(child?.path().to_path_buf());
+                    }
+                }
+            }
+        }
+        let name = instance.name().to_owned();
+        let (model, ids) = subtree_model(tree, id, &name);
+
+        // Kept apart from the staging that recovery clears, so files set aside
+        // by an interrupted relayout are never lost.
+        let aside = self
+            .project()
+            .folder_location()
+            .join(".rojo")
+            .join("relayout")
+            .join(uuid::Uuid::new_v4().to_string());
+        self.vfs.create_dir_all(&aside)?;
+        let mut moved = Vec::new();
+        let set_aside = (|| -> io::Result<()> {
+            for (index, entry) in entries.iter().enumerate() {
+                if self.vfs.metadata(entry).with_not_found()?.is_none() {
+                    continue;
+                }
+                let destination = aside.join(index.to_string());
+                let expected = self.vfs.snapshot_tree(entry)?;
+                self.vfs.move_no_replace(entry, &destination, &expected)?;
+                moved.push((entry.clone(), destination));
+            }
+            Ok(())
+        })();
+        let put_back = |moved: &[(PathBuf, PathBuf)]| {
+            for (original, destination) in moved {
+                let restored = self.vfs.snapshot_tree(destination).and_then(|expected| {
+                    self.vfs.move_no_replace(destination, original, &expected)
+                });
+                if let Err(error) = restored {
+                    log::error!(
+                        "Could not put \"{}\" back from \"{}\" ({error}).",
+                        original.display(),
+                        destination.display()
+                    );
+                    return;
+                }
+            }
+            let _ = self.vfs.remove_dir_all(&aside);
+        };
+        if let Err(error) = set_aside {
+            put_back(&moved);
+            return Err(error.into());
+        }
+        let result = self.place_subtree(tree, parent, model, &ids, &context, &[id]);
+        let lossless = matches!(&result, Ok(errors) if errors.is_empty());
+        self.finish_relayout(tree, id, parent, backup, result, || {
+            put_back(&moved);
+            Ok(())
+        })?;
+        if lossless {
+            self.vfs.remove_dir_all(&aside)?;
+        }
+        Ok(())
+    }
+
+    /// Keeps a relayout that saved everything. Otherwise deletes the new files,
+    /// calls `restore_files` to put the old ones back, and puts the subtree
+    /// back in the tree under its IDs.
+    fn finish_relayout(
+        &self,
+        tree: &mut RojoTree,
+        id: Ref,
+        parent: Ref,
+        backup: (InstanceSnapshot, SnapshotReferents),
+        result: anyhow::Result<Vec<WriteError>>,
+        restore_files: impl FnOnce() -> io::Result<()>,
+    ) -> anyhow::Result<()> {
+        let error = match result {
+            Ok(errors) if errors.is_empty() => return Ok(()),
+            Ok(errors) => anyhow::anyhow!(
+                "the new layout couldn't keep everything ({})",
+                errors
+                    .iter()
+                    .map(|error| error.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Err(error) => error,
+        };
+        if let Some(InstigatingSource::Path(written)) = tree
+            .get_metadata(id)
+            .and_then(|metadata| metadata.instigating_source.clone())
+        {
+            let sidecars = own_sidecars(tree, id, &written);
+            let mut lock = self.vfs.lock();
+            match lock.metadata(&written).with_not_found()? {
+                Some(metadata) if metadata.is_dir() => lock.remove_dir_all(&written)?,
+                Some(_) => lock.remove_file(&written)?,
+                None => {}
+            }
+            for sidecar in sidecars {
+                lock.remove_file(&sidecar).with_not_found()?;
+            }
+        }
+        if tree.get_instance(id).is_some() {
+            tree.remove(id);
+        }
+        restore_files()?;
+        let (snapshot, referents) = backup;
+        tree.insert_instance_with_referents(parent, snapshot, &referents, &mut Vec::new());
+        Err(error)
+    }
+
+    /// Deletes the empty `.gitkeep`s syncback left in `directory`, which just
+    /// gained contents, and in the directories holding it, which aren't empty
+    /// either. Only directories inside the project folder are looked at, one
+    /// check each, and a `.gitkeep` with contents was written by someone else
+    /// and is kept.
+    fn remove_stale_keep_files(&self, directory: &Path) {
+        let root =
+            canonicalize_or_original(&self.vfs, self.project().folder_location().to_path_buf());
+        let start = canonicalize_or_original(&self.vfs, directory.to_path_buf());
+        let mut directory = Some(start.as_path());
+        while let Some(current) = directory {
+            if !current.starts_with(&root) {
+                break;
+            }
+            let keep = current.join(EMPTY_DIR_KEEP_NAME);
+            match self.vfs.read(&keep).with_not_found() {
+                Ok(Some(contents)) if contents.is_empty() => {
+                    if let Err(error) = self.vfs.remove_file(&keep).with_not_found() {
+                        log::warn!("Could not remove \"{}\" ({error}).", keep.display());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("Could not read \"{}\" ({error}).", keep.display()),
+            }
+            directory = current.parent();
+        }
+    }
+
+    /// Keeps a directory in version control once a deletion from Studio left
+    /// it empty, the way syncback keeps an empty directory.
+    fn keep_if_empty(&self, directory: &Path) {
+        let Ok(Some(mut entries)) = self.vfs.read_dir(directory).with_not_found() else {
+            return;
+        };
+        if entries.next().is_none() {
+            let keep = directory.join(EMPTY_DIR_KEEP_NAME);
+            if let Err(error) = self.vfs.write(&keep, []) {
+                log::warn!("Could not write \"{}\" ({error}).", keep.display());
+            }
+        }
     }
 
     /// Returns whether an event is about a path inside the project's `.rojo`
@@ -264,7 +732,8 @@ impl JobThreadContext {
         else {
             return false;
         };
-        let folder = self.project.folder_location();
+        let project = self.project();
+        let folder = project.folder_location();
         let canonical = self.vfs.canonicalize(folder).ok();
         [Some(folder.to_path_buf()), canonical]
             .into_iter()
@@ -298,6 +767,7 @@ impl JobThreadContext {
         message_cursor: Option<u32>,
         authority: WriteAuthority,
     ) -> WriteResult {
+        self.note_authority(authority);
         // A request is based on the last revision applied before its local batch began.
         // The current server DOM is not a baseline when a watcher has advanced it.
         let context = WriteContext {
@@ -526,6 +996,20 @@ impl JobThreadContext {
                     }
                     continue;
                 }
+                // Only a folder whose children have files of their own can be
+                // left empty, so only those get a `.gitkeep` back.
+                let holder = tree
+                    .get_instance(id)
+                    .and_then(|instance| tree.get_metadata(instance.parent()))
+                    .filter(|parent| {
+                        parent
+                            .middleware
+                            .is_some_and(|middleware| middleware.is_dir())
+                    })
+                    .and_then(|parent| match &parent.instigating_source {
+                        Some(InstigatingSource::Path(path)) => Some(path.clone()),
+                        _ => None,
+                    });
                 match self.remove_instance(&tree, id, &context) {
                     Ok(Some(snapshot)) => {
                         if let Some(instance) = tree.get_instance(id) {
@@ -544,7 +1028,12 @@ impl JobThreadContext {
                             });
                         }
                     }
-                    Ok(None) => accepted.removed_instances.push(id),
+                    Ok(None) => {
+                        accepted.removed_instances.push(id);
+                        if let Some(holder) = holder {
+                            self.keep_if_empty(&holder);
+                        }
+                    }
                     Err(err) => {
                         errors.push(WriteError {
                             id,
@@ -666,7 +1155,7 @@ impl JobThreadContext {
             .context("Could not read the created instances")?;
         // Moved instances keep what their files hold, but new ones leave out
         // what the project's syncback rules ignore.
-        drop_ignored_properties(&self.project, &mut model);
+        drop_ignored_properties(&self.project(), &mut model);
         let unsaved =
             self.place_subtree(tree, addition.parent, model, &addition.ids, context, &[])?;
         if tree.get_instance(root_id).is_some() {
@@ -731,14 +1220,15 @@ impl JobThreadContext {
         let outside = outside_refs(&copy.dom, &copy.ids);
         let staged = match stored {
             StoredIn::Inline(_) => {
-                syncback_instance(&self.vfs, tree, &self.project, owner, copy.dom)?
+                syncback_instance(&self.vfs, tree, &self.project(), owner, copy.dom)?
             }
             StoredIn::Model(_) => {
-                syncback_model_file(&self.vfs, tree, &self.project, owner, copy.dom)?
+                syncback_model_file(&self.vfs, tree, &self.project(), owner, copy.dom)?
             }
         };
-        validate_write_targets(&self.project, &staged)?;
-        let base = self.project.folder_location();
+        validate_write_targets(&self.project(), &staged)?;
+        let project = self.project();
+        let base = project.folder_location();
         match stored {
             StoredIn::Inline(_) => staged.write_single_file_to_vfs(base, &self.vfs, &expected)?,
             // A model file's adjacent metadata can change along with it.
@@ -1034,13 +1524,13 @@ impl JobThreadContext {
         let new = syncback_new_subtree(
             &self.vfs,
             tree,
-            &self.project,
+            &self.project(),
             parent,
             &directory,
             &existing,
             model,
         )?;
-        validate_write_targets(&self.project, &new.fs_snapshot)?;
+        validate_write_targets(&self.project(), &new.fs_snapshot)?;
         self.install_new_files(&directory, new.fs_snapshot)?;
 
         let snapshot = snapshot_from_vfs(&parent_context, &self.vfs, &new.root_path)?
@@ -1101,11 +1591,11 @@ impl JobThreadContext {
             relocation_transaction::Relocation,
         };
 
-        let cache = cache_directory(&self.project);
+        let cache = cache_directory(&self.project());
         self.vfs.create_dir_all(&cache)?;
         self.vfs.sync_path(&cache)?;
         self.vfs.sync_path(cache.parent().unwrap())?;
-        let staging = staging_directory(&self.project).join(uuid::Uuid::new_v4().to_string());
+        let staging = staging_directory(&self.project()).join(uuid::Uuid::new_v4().to_string());
         let files = files.rebase(directory, &staging)?;
         let journal = cache.join(uuid::Uuid::new_v4().to_string());
         let result = execute_staged_relocation(&self.vfs, &journal, || {
@@ -1129,6 +1619,7 @@ impl JobThreadContext {
         // A failed relocation can leave a journal that still needs its staged
         // files, so those are left for startup recovery, which clears them.
         result?;
+        self.remove_stale_keep_files(directory);
         // Another server's startup recovery may have cleared it already, once
         // the lock was released.
         self.vfs.remove_dir_all(&staging).with_not_found()?;
@@ -1147,34 +1638,7 @@ impl JobThreadContext {
             Removal::Allowed(path) => path,
             Removal::Restore(snapshot) => return Ok(*snapshot),
         };
-        // A file's adjacent metadata goes with it, or an instance written at
-        // the same name later would pick up its properties and ID. Files that
-        // share a stem, like `Code.luau` and `Code.txt`, share it too, so it
-        // stays while another instance still reads it.
-        let sidecars: Vec<PathBuf> = tree
-            .get_metadata(id)
-            .map(|metadata| {
-                metadata
-                    .relevant_paths
-                    .iter()
-                    .filter(|sidecar| {
-                        *sidecar != &path
-                            && sidecar.parent() == path.parent()
-                            && sidecar
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .is_some_and(|name| {
-                                    name.ends_with(".meta.json") || name.ends_with(".meta.jsonc")
-                                })
-                            && tree
-                                .get_ids_at_path(sidecar)
-                                .iter()
-                                .all(|holder| *holder == id)
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let sidecars = own_sidecars(tree, id, &path);
         let mut lock = self.vfs.lock();
         match lock.metadata(&path).with_not_found()? {
             Some(metadata) if metadata.is_file() => {
@@ -1234,7 +1698,7 @@ impl JobThreadContext {
                     // Syncback keeps an empty directory with an empty `.gitkeep`
                     // that no instance lists, so it goes with the directory. One
                     // with contents was written by someone else and is kept.
-                    let keep = entry.path().file_name() == Some(".gitkeep".as_ref())
+                    let keep = is_keep_file(entry.path())
                         && self
                             .vfs
                             .read(entry.path())
@@ -1304,8 +1768,8 @@ impl JobThreadContext {
                 }
             }
             let new_tree = inline_subtree(tree, owner, &InlineEdit::Remove(id));
-            let staged = syncback_instance(&self.vfs, tree, &self.project, owner, new_tree)?;
-            validate_write_targets(&self.project, &staged)?;
+            let staged = syncback_instance(&self.vfs, tree, &self.project(), owner, new_tree)?;
+            validate_write_targets(&self.project(), &staged)?;
             let latest = self.snapshot_owner(tree, owner)?;
             if snapshots_differ(snapshot, latest.as_ref()) {
                 if authority == WriteAuthority::Filesystem {
@@ -1314,7 +1778,7 @@ impl JobThreadContext {
                 continue;
             }
             match staged.write_single_file_to_vfs(
-                self.project.folder_location(),
+                self.project().folder_location(),
                 &self.vfs,
                 &expected,
             ) {
@@ -1552,7 +2016,7 @@ impl JobThreadContext {
                         let mut targets = FsSnapshot::new();
                         targets.remove_file(source);
                         targets.add_file(target, Vec::new());
-                        validate_write_targets(&self.project, &targets)?;
+                        validate_write_targets(&self.project(), &targets)?;
                     }
                     // A project alias can refer to a file without owning its primary
                     // metadata index, so also inspect explicit project mappings.
@@ -1717,7 +2181,7 @@ impl JobThreadContext {
                     ),
                     "Directories containing project-defined sources cannot be relocated"
                 );
-                if let Some(rules) = &self.project.syncback_rules {
+                if let Some(rules) = &self.project().syncback_rules {
                     let old_path = tree.inner().full_path_of(instance.id(), "/");
                     let suffix = old_path.strip_prefix(&old_instance_path).unwrap();
                     let new_path = format!("{new_instance_path}{suffix}");
@@ -1769,7 +2233,7 @@ impl JobThreadContext {
                             let mut targets = FsSnapshot::new();
                             targets.remove_file(path);
                             targets.add_file(&target, Vec::new());
-                            validate_write_targets(&self.project, &targets)?;
+                            validate_write_targets(&self.project(), &targets)?;
                         }
                     }
                 }
@@ -1831,7 +2295,7 @@ impl JobThreadContext {
             let mut targets = FsSnapshot::new();
             targets.remove_file(&source);
             targets.add_file(&destination, Vec::new());
-            validate_write_targets(&self.project, &targets)?;
+            validate_write_targets(&self.project(), &targets)?;
             if let Some(expected) = self.vfs.snapshot_tree(&source).with_not_found()? {
                 moves.push(Relocation {
                     source,
@@ -1849,7 +2313,7 @@ impl JobThreadContext {
             !snapshots_differ(snapshot, latest.as_ref()),
             "The source changed while planning its relocation"
         );
-        let cache = cache_directory(&self.project);
+        let cache = cache_directory(&self.project());
         ensure!(
             !cache.starts_with(&source)
                 && promotion.as_ref().is_none_or(|promotion| {
@@ -1861,7 +2325,7 @@ impl JobThreadContext {
         self.vfs.create_dir_all(&cache)?;
         self.vfs.sync_path(&cache)?;
         self.vfs.sync_path(cache.parent().unwrap())?;
-        self.vfs.sync_path(self.project.folder_location())?;
+        self.vfs.sync_path(self.project().folder_location())?;
         let journal = cache.join(uuid::Uuid::new_v4().to_string());
         let rollback = moves
             .iter()
@@ -2165,11 +2629,11 @@ impl JobThreadContext {
         // Studio gets their saved values back. The rest are still saved.
         let class = instance.class_name();
         let filter_tree = WeakDom::new(InstanceBuilder::new(class));
-        let ignored = get_property_filter(&self.project, filter_tree.root()).unwrap_or_default();
+        let ignored = get_property_filter(&self.project(), filter_tree.root()).unwrap_or_default();
         let mut refused = UstrMap::new();
         let mut allowed = update.clone();
         allowed.changed_properties.retain(|key, _| {
-            let message = if !can_write_property(&self.project, class.as_str(), key.as_str()) {
+            let message = if !can_write_property(&self.project(), class.as_str(), key.as_str()) {
                 "This property is excluded by reflection serialization rules"
             } else if ignored.contains(key) {
                 "This property is excluded by the project's syncback rules"
@@ -2551,7 +3015,7 @@ impl JobThreadContext {
                 }
                 PropertyWriteDecision::Persist => {
                     if !can_write_property(
-                        &self.project,
+                        &self.project(),
                         instance.class_name().as_str(),
                         key.as_str(),
                     ) {
@@ -2582,7 +3046,7 @@ impl JobThreadContext {
             }
         }
         let filter_tree = WeakDom::new(InstanceBuilder::new(instance.class_name()));
-        if let Some(ignored) = get_property_filter(&self.project, filter_tree.root()) {
+        if let Some(ignored) = get_property_filter(&self.project(), filter_tree.root()) {
             accepted_properties.retain(|key, _| {
                 if ignored.contains(key) {
                     errors.push(WriteError {
@@ -2654,22 +3118,22 @@ impl JobThreadContext {
                     .with_properties(properties),
             )
         };
-        let mut staged = match syncback_instance(&self.vfs, tree, &self.project, owner_id, new_tree)
-        {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                errors.push(WriteError {
-                    id,
-                    property: None,
-                    message: format!("Failed to serialize changes: {err:#}"),
-                });
-                conflicts.updated_instances.retain(|patch| patch.id != id);
-                conflicts
-                    .updated_instances
-                    .extend(disk_restoration(tree, owner_id, update, snapshot).updated_instances);
-                return;
-            }
-        };
+        let mut staged =
+            match syncback_instance(&self.vfs, tree, &self.project(), owner_id, new_tree) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    errors.push(WriteError {
+                        id,
+                        property: None,
+                        message: format!("Failed to serialize changes: {err:#}"),
+                    });
+                    conflicts.updated_instances.retain(|patch| patch.id != id);
+                    conflicts.updated_instances.extend(
+                        disk_restoration(tree, owner_id, update, snapshot).updated_instances,
+                    );
+                    return;
+                }
+            };
         let source = source_file(&owner);
         if !accepted_properties.contains_key(&ustr("Source")) {
             // A directory script's source lives in its initializer, not at the
@@ -2686,7 +3150,7 @@ impl JobThreadContext {
             // metadata out keeps its formatting and the write to one file.
             staged.retain_added_files(|candidate| candidate == source);
         }
-        if let Err(err) = validate_write_targets(&self.project, &staged) {
+        if let Err(err) = validate_write_targets(&self.project(), &staged) {
             errors.push(WriteError {
                 id,
                 property: None,
@@ -2700,7 +3164,7 @@ impl JobThreadContext {
         }
         // Every accepted value differs from the disk, so a write that changes no
         // file means the edit can't be represented and must not report Saved.
-        if !staged.changes_files(self.project.folder_location(), &expected) {
+        if !staged.changes_files(self.project().folder_location(), &expected) {
             errors.push(WriteError {
                 id,
                 property: None,
@@ -2728,7 +3192,7 @@ impl JobThreadContext {
         // read or in the write's own byte check. Studio authority treats both as
         // the same race, while the filesystem keeps a failed write a failure.
         let written = (!snapshots_differ(snapshot, latest.as_ref())).then(|| {
-            staged.write_single_file_to_vfs(self.project.folder_location(), &self.vfs, &expected)
+            staged.write_single_file_to_vfs(self.project().folder_location(), &self.vfs, &expected)
         });
         match written {
             Some(Ok(())) => {
@@ -3726,6 +4190,43 @@ fn filesystem_restoration(
     patch
 }
 
+/// Returns the adjacent metadata of the file at `path`, which `id` comes from,
+/// that goes with the file when it's deleted or moved. Without it, an instance
+/// written at the same name later would pick up its properties and ID. Files
+/// that share a stem, like `Code.luau` and `Code.txt`, share it too, so it
+/// stays while another instance still reads it.
+fn own_sidecars(tree: &RojoTree, id: Ref, path: &Path) -> Vec<PathBuf> {
+    let Some(metadata) = tree.get_metadata(id) else {
+        return Vec::new();
+    };
+    metadata
+        .relevant_paths
+        .iter()
+        .filter(|sidecar| {
+            sidecar.as_path() != path
+                && sidecar.parent() == path.parent()
+                && sidecar
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.ends_with(".meta.json") || name.ends_with(".meta.jsonc")
+                    })
+                && tree
+                    .get_ids_at_path(sidecar)
+                    .iter()
+                    .all(|holder| *holder == id)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The file syncback writes to keep an empty directory in version control.
+const EMPTY_DIR_KEEP_NAME: &str = ".gitkeep";
+
+fn is_keep_file(path: &Path) -> bool {
+    path.file_name() == Some(EMPTY_DIR_KEEP_NAME.as_ref())
+}
+
 fn canonicalize_or_original(vfs: &Vfs, path: PathBuf) -> PathBuf {
     match vfs.canonicalize(&path) {
         Ok(canonical) => canonical,
@@ -3985,7 +4486,7 @@ mod tests {
                 tree: Arc::new(Mutex::new(tree)),
                 vfs,
                 message_queue: Arc::new(MessageQueue::new()),
-                project: Arc::new(project),
+                project: Arc::new(project).into(),
             },
             id,
         )
@@ -4020,7 +4521,7 @@ mod tests {
                 tree: Arc::new(Mutex::new(tree)),
                 vfs,
                 message_queue: Arc::new(MessageQueue::new()),
-                project: Arc::new(project),
+                project: Arc::new(project).into(),
             },
             id,
         )
@@ -4586,7 +5087,7 @@ mod tests {
         {
             let mut tree = job.tree.lock().unwrap();
             let mut metadata = tree.get_metadata(right).unwrap().clone();
-            let mut node = job.project.tree.clone();
+            let mut node = job.project().tree.clone();
             node.path = Some(crate::project::PathNode::Required(
                 "/project/src/Right".into(),
             ));
@@ -4953,7 +5454,7 @@ mod tests {
                 let mut metadata = tree.get_metadata(script).unwrap().clone();
                 match failure {
                     "project" => {
-                        let mut node = job.project.tree.clone();
+                        let mut node = job.project().tree.clone();
                         node.path = Some(crate::project::PathNode::Required(
                             "/project/src/Left/Code.server.lua".into(),
                         ));
@@ -5232,7 +5733,7 @@ mod tests {
             tree: Arc::new(Mutex::new(tree)),
             vfs: Arc::clone(&vfs),
             message_queue: Arc::new(MessageQueue::new()),
-            project: Arc::new(project),
+            project: Arc::new(project).into(),
         };
 
         let (accepted, conflicts, errors) = job.handle_tree_event(PatchSet {
@@ -5313,7 +5814,7 @@ mod tests {
             tree: Arc::new(Mutex::new(tree)),
             vfs: Arc::clone(&vfs),
             message_queue: Arc::new(MessageQueue::new()),
-            project: Arc::new(project),
+            project: Arc::new(project).into(),
         };
 
         vfs.write("/project/Zone/Child/init.meta.json", "{ not json")
@@ -5397,7 +5898,7 @@ mod tests {
             tree: Arc::new(Mutex::new(tree)),
             vfs: Arc::clone(&vfs),
             message_queue: Arc::new(MessageQueue::new()),
-            project: Arc::new(project),
+            project: Arc::new(project).into(),
         };
 
         let (accepted, conflicts, errors) = job.handle_tree_event(PatchSet {
@@ -5524,7 +6025,9 @@ mod tests {
     #[test]
     fn serialization_failure_restores_requested_studio_values() {
         let (mut job, id) = part_job();
-        Arc::get_mut(&mut job.project).unwrap().syncback_rules =
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules =
             Some(serde_json::from_value(serde_json::json!({"ignorePaths":["Part/**"]})).unwrap());
         let before = job.vfs.read("/project/Part/init.meta.json").unwrap();
         let (accepted, conflicts, errors) = job.handle_tree_event(transparency_update(id, 0.75));
@@ -5609,7 +6112,9 @@ mod tests {
         use rbx_reflection::{PropertyKind, PropertySerialization, Scriptability};
 
         let (mut job, id) = part_job();
-        Arc::get_mut(&mut job.project).unwrap().syncback_rules =
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules =
             Some(serde_json::from_value(serde_json::json!({"syncUnscriptable":false})).unwrap());
         let database = rbx_reflection_database::get().unwrap();
         let mut class_name = "Part";
@@ -5717,7 +6222,9 @@ mod tests {
     #[test]
     fn pending_disk_discrepancy_restores_before_attempting_serialization() {
         let (mut job, id) = part_job();
-        Arc::get_mut(&mut job.project).unwrap().syncback_rules =
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules =
             Some(serde_json::from_value(serde_json::json!({"ignorePaths":["Part/**"]})).unwrap());
         job.vfs
             .write(
@@ -5792,7 +6299,9 @@ mod tests {
     #[test]
     fn scoped_write_respects_full_ignored_tree_path() {
         let (mut job, id) = part_job();
-        Arc::get_mut(&mut job.project).unwrap().syncback_rules =
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules =
             Some(serde_json::from_value(serde_json::json!({"ignoreTrees":["Part"]})).unwrap());
         let before = job.vfs.read("/project/Part/init.meta.json").unwrap();
         let (accepted, _, errors) = job.handle_tree_event(transparency_update(id, 0.75));
@@ -5809,7 +6318,9 @@ mod tests {
     #[test]
     fn scoped_write_rejects_an_ignored_metadata_target() {
         let (mut job, id) = part_job();
-        Arc::get_mut(&mut job.project).unwrap().syncback_rules = Some(
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules = Some(
             serde_json::from_value(serde_json::json!({"ignorePaths":["Part/init.meta.json"]}))
                 .unwrap(),
         );
@@ -5933,7 +6444,7 @@ mod tests {
                 tree: Arc::new(Mutex::new(tree)),
                 vfs,
                 message_queue: Arc::new(MessageQueue::new()),
-                project: Arc::new(project),
+                project: Arc::new(project).into(),
             },
             id,
         )
@@ -6574,6 +7085,168 @@ mod tests {
         }
     }
 
+    fn exists(job: &JobThreadContext, path: &str) -> bool {
+        job.vfs.metadata(path).with_not_found().unwrap().is_some()
+    }
+
+    /// A `.gitkeep` is only needed while its directory is empty. Anything new
+    /// below it, however deep, makes every empty one on the way up go, and a
+    /// `.gitkeep` with contents or outside the project is left alone. Walks
+    /// every combination of how deep the new file is and what the outer
+    /// `.gitkeep` holds.
+    #[test]
+    fn new_contents_remove_the_gitkeeps_above_them() {
+        for deep in [false, true] {
+            for outer in ["", "notes"] {
+                let (job, _) = script_job(
+                    vec![(
+                        "src",
+                        VfsSnapshot::dir([(
+                            "Outer",
+                            VfsSnapshot::dir([
+                                (".gitkeep", VfsSnapshot::file(outer)),
+                                (
+                                    "Inner",
+                                    VfsSnapshot::dir([(".gitkeep", VfsSnapshot::file(""))]),
+                                ),
+                            ]),
+                        )]),
+                    )],
+                    "/project/src",
+                );
+                job.vfs
+                    .write("/outside.gitkeep-holder/.gitkeep", "")
+                    .unwrap();
+                let created = if deep {
+                    "/project/src/Outer/Inner/New.luau"
+                } else {
+                    "/project/src/Outer/New.luau"
+                };
+                job.vfs.write(created, "return 1").unwrap();
+                job.handle_vfs_event(VfsEvent::Create(created.into()));
+
+                let case = format!("deep {deep} outer {outer:?}");
+                assert_eq!(
+                    exists(&job, "/project/src/Outer/Inner/.gitkeep"),
+                    !deep,
+                    "{case}"
+                );
+                assert_eq!(
+                    exists(&job, "/project/src/Outer/.gitkeep"),
+                    !outer.is_empty(),
+                    "{case}"
+                );
+                assert!(exists(&job, "/outside.gitkeep-holder/.gitkeep"), "{case}");
+                // The new file is still read as usual.
+                let path: &[&str] = if deep {
+                    &["Outer", "Inner", "New"]
+                } else {
+                    &["Outer", "New"]
+                };
+                find(&job, path);
+            }
+        }
+    }
+
+    /// Something new in a folder is read on its own, whether it's a file, a
+    /// folder that already has contents, or only reported through a file deep
+    /// inside it. Files Rojo doesn't read add nothing, and an `init` file still
+    /// changes what its folder is.
+    #[test]
+    fn new_entries_are_added_without_rereading_their_folder() {
+        let (job, _) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([(
+                    "Holder",
+                    VfsSnapshot::dir([("Existing.luau", VfsSnapshot::file("return 0"))]),
+                )]),
+            )],
+            "/project/src",
+        );
+        let existing = find(&job, &["Holder", "Existing"]);
+        job.vfs
+            .write("/project/src/Holder/Existing.luau", "return 'unseen'")
+            .unwrap();
+
+        job.vfs
+            .write("/project/src/Holder/File.luau", "return 1")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Create("/project/src/Holder/File.luau".into()));
+        job.vfs
+            .create_dir_all("/project/src/Holder/Deep/Inner")
+            .unwrap();
+        job.vfs
+            .write("/project/src/Holder/Deep/Inner/Leaf.luau", "return 2")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Create(
+            "/project/src/Holder/Deep/Inner/Leaf.luau".into(),
+        ));
+        job.vfs
+            .write("/project/src/Holder/.DS_Store", "junk")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Create("/project/src/Holder/.DS_Store".into()));
+
+        find(&job, &["Holder", "File"]);
+        find(&job, &["Holder", "Deep", "Inner", "Leaf"]);
+        let holder = find(&job, &["Holder"]);
+        {
+            let tree = job.tree.lock().unwrap();
+            // Only the new entries were read, so the unannounced edit wasn't.
+            assert_eq!(
+                tree.get_instance(existing)
+                    .unwrap()
+                    .properties()
+                    .get(&ustr("Source")),
+                Some(&Variant::String("return 0".into()))
+            );
+            let holder = tree.get_instance(holder).unwrap();
+            assert_eq!(holder.children().len(), 3);
+            assert_eq!(holder.class_name(), "Folder");
+        }
+
+        job.vfs
+            .write("/project/src/Holder/init.luau", "return 'module'")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Create("/project/src/Holder/init.luau".into()));
+        let holder = find(&job, &["Holder"]);
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(
+            tree.get_instance(holder).unwrap().class_name(),
+            "ModuleScript"
+        );
+    }
+
+    /// Deleting the last child of a folder from Studio keeps the folder in
+    /// version control, while deleting one of several doesn't.
+    #[test]
+    fn deleting_the_last_child_keeps_its_folder() {
+        for siblings in [false, true] {
+            let mut entries = vec![("Only.luau", VfsSnapshot::file("return 1"))];
+            if siblings {
+                entries.push(("Other.luau", VfsSnapshot::file("return 2")));
+            }
+            let (job, _) = script_job(
+                vec![(
+                    "src",
+                    VfsSnapshot::dir([("Holder", VfsSnapshot::dir(entries))]),
+                )],
+                "/project/src",
+            );
+            let only = find(&job, &["Holder", "Only"]);
+            let (accepted, _, errors) = studio_write(
+                &job,
+                PatchSet {
+                    removed_instances: vec![only],
+                    ..PatchSet::new()
+                },
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(accepted.removed_instances, vec![only]);
+            assert_eq!(exists(&job, "/project/src/Holder/.gitkeep"), !siblings);
+        }
+    }
+
     /// Syncback keeps empty directories with a `.gitkeep`, which no instance
     /// lists, so it must not stop the directory from being deleted.
     #[test]
@@ -7124,7 +7797,7 @@ mod tests {
             tree: Arc::clone(&tree),
             vfs: Arc::clone(&vfs),
             message_queue: Arc::new(MessageQueue::new()),
-            project: Arc::new(project),
+            project: Arc::new(project).into(),
         };
         let id = tree.lock().unwrap().root().children()[0];
         let (accepted, conflicts, errors) = job.handle_tree_event(transparency_update(id, 0.7));
@@ -7235,7 +7908,9 @@ mod tests {
             id,
             metadata.middleware(crate::snapshot_middleware::Middleware::Dir),
         );
-        Arc::get_mut(&mut job.project).unwrap().syncback_rules = Some(
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules = Some(
             serde_json::from_value(serde_json::json!({
                 "ignoreProperties": { "Part": ["CanCollide"] }
             }))
@@ -7304,7 +7979,7 @@ mod tests {
             tree: Arc::clone(&tree),
             vfs: Arc::clone(&vfs),
             message_queue: Arc::new(MessageQueue::new()),
-            project: Arc::new(project),
+            project: Arc::new(project).into(),
         };
         let id = tree.lock().unwrap().get_root_id();
         let (accepted, conflicts, errors) = job.handle_tree_event(PatchSet {
@@ -7351,7 +8026,7 @@ mod tests {
             tree: Arc::new(Mutex::new(RojoTree::new(InstanceSnapshot::new()))),
             vfs: Arc::new(vfs),
             message_queue: Arc::new(MessageQueue::new()),
-            project: Arc::new(project),
+            project: Arc::new(project).into(),
         };
         let file = temp.path().join("deleted.luau");
         std::fs::write(&file, "return nil").unwrap();
