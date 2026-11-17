@@ -83,29 +83,40 @@ return function(instanceMap, candidates, serialize, makeId)
 			continue
 		end
 
-		local success, result = pcall(function()
-			local copy = instance:Clone()
-			prune(instance, copy)
-			local model = serialize(copy)
-			copy:Destroy()
-			return model
+		-- The copy and the ids are taken together, before serializing yields, so
+		-- they describe the same subtree. Tracking starts right away, so edits
+		-- made while serializing are queued like any other.
+		local copied, copy = pcall(function()
+			local clone = instance:Clone()
+			prune(instance, clone)
+			return clone
 		end)
+		if not copied then
+			Log.warn("Could not send {} to the file system. {}", instance:GetFullName(), copy)
+			continue
+		end
+		local first = #inserts + 1
+		local ids = describe(instance)
+		for index = first, #inserts do
+			local entry = inserts[index]
+			instanceMap:insert(entry[1], entry[2])
+		end
+
+		local success, result = pcall(serialize, copy)
+		copy:Destroy()
 		if not success then
 			Log.warn("Could not send {} to the file system. {}", instance:GetFullName(), result)
+			for index = first, #inserts do
+				instanceMap:removeId(inserts[index][1])
+			end
 			continue
 		end
 
-		local first = #inserts + 1
-		local ids = describe(instance)
 		additions[ids.id] = {
 			parent = parentId,
 			model = result,
 			ids = ids,
 		}
-		for index = first, #inserts do
-			local entry = inserts[index]
-			instanceMap:insert(entry[1], entry[2])
-		end
 	end
 
 	table.clear(candidates)

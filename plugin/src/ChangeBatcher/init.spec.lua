@@ -135,5 +135,44 @@ return function()
 
 			expect(changeBatcher:__flush()).to.equal(nil)
 		end)
+
+		-- Serializing a new instance yields. A flush due meanwhile does nothing,
+		-- changes made meanwhile wait for the next batch, and a batch whose
+		-- session stopped meanwhile is never sent.
+		it("should run one flush at a time and drop a batch stopped while it was prepared", function()
+			for _, stopWhileSerializing in { false, true } do
+				local instanceMap = InstanceMap.new()
+				local root = Instance.new("Folder")
+				instanceMap:insert("ROOT", root)
+				local sent = {}
+				local changeBatcher = ChangeBatcher.new(instanceMap, function(patch)
+					table.insert(sent, patch)
+					return patch
+				end)
+				local later = Instance.new("Folder")
+				later.Parent = root
+				local nestedResult = "not run"
+				changeBatcher.__serialize = function()
+					changeBatcher:addChild(later)
+					nestedResult = changeBatcher:__flush()
+					if stopWhileSerializing then
+						changeBatcher:stop()
+					end
+					return "MODEL"
+				end
+				local created = Instance.new("Folder")
+				created.Parent = root
+				changeBatcher:addChild(created)
+
+				changeBatcher:__flush()
+
+				expect(nestedResult).to.equal(nil)
+				expect(#sent).to.equal(if stopWhileSerializing then 0 else 1)
+				expect(changeBatcher.__pendingAdditions[later]).to.equal(if stopWhileSerializing then nil else true)
+				changeBatcher:stop()
+				instanceMap:stop()
+				root:Destroy()
+			end
+		end)
 	end)
 end

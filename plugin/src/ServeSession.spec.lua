@@ -401,7 +401,7 @@ return function()
 	it("should stop tracking only the additions the server rejected", function()
 		local InstanceMap = require(script.Parent.InstanceMap)
 		local PatchSet = require(script.Parent.PatchSet)
-		for _, outcome in { "rejectFirst", "rejectChild", "transportFailure", "accepted" } do
+		for _, outcome in { "rejectFirst", "rejectChild", "transportFailure", "propertyError", "accepted" } do
 			local instanceMap = InstanceMap.new()
 			for _, id in { "A", "A_CHILD", "B" } do
 				instanceMap:insert(id, Instance.new("Folder"))
@@ -418,6 +418,7 @@ return function()
 					errors = if outcome == "rejectFirst"
 						then { { id = "A" } }
 						elseif outcome == "rejectChild" then { { id = "A_CHILD" } }
+						elseif outcome == "propertyError" then { { id = "A", property = "Value" } }
 						else {},
 				}
 			session:__untrackRejectedAdditions(patch, result)
@@ -426,6 +427,7 @@ return function()
 				rejectFirst = { A = true, A_CHILD = true },
 				rejectChild = { A_CHILD = true },
 				transportFailure = { A = true, A_CHILD = true, B = true },
+				propertyError = {},
 				accepted = {},
 			})[outcome]
 			for _, id in { "A", "A_CHILD", "B" } do

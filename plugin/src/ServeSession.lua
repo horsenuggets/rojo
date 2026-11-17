@@ -257,6 +257,11 @@ function ServeSession:__untrackRejectedAdditions(patch, result)
 		end
 	else
 		for _, err in result.errors or {} do
+			-- An error about one property of a saved instance, like a reference
+			-- that couldn't be stored, leaves the instance saved and tracked.
+			if err.property ~= nil then
+				continue
+			end
 			local addition = patch.added[err.id]
 			if addition ~= nil then
 				for _, id in collectAddedIds(addition.ids, {}) do

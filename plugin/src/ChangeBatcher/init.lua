@@ -44,6 +44,7 @@ function ChangeBatcher:stop()
 	self.__renderSteppedConnection:Disconnect()
 	self.__pendingPropertyChanges = {}
 	self.__pendingAdditions = {}
+	self.__stopped = true
 end
 
 function ChangeBatcher:isEmpty()
@@ -80,17 +81,36 @@ function ChangeBatcher:__cycle(dt)
 end
 
 function ChangeBatcher:__flush()
-	if self:isEmpty() then
+	-- Serializing new instances yields, so a flush can still be running when
+	-- the next one is due. Only one runs at a time, which keeps writes in order
+	-- and stops two flushes from sending the same instances.
+	if self.__flushing or self:isEmpty() then
 		return nil
 	end
+	self.__flushing = true
+
+	-- This batch is taken out first, so changes made while it's prepared go to
+	-- the next one.
+	local candidates = self.__pendingAdditions
+	local changes = self.__pendingPropertyChanges
+	self.__pendingAdditions = {}
+	self.__pendingPropertyChanges = {}
 
 	-- New instances are known before the other changes are encoded, so moving
 	-- an existing instance into one in the same batch is a move to a known parent.
-	local additions = createAdditions(self.__instanceMap, self.__pendingAdditions, self.__serialize)
-	local patch = createPatchSet(self.__instanceMap, self.__pendingPropertyChanges)
-	patch.added = additions
+	local ok, patch = pcall(function()
+		local additions = createAdditions(self.__instanceMap, candidates, self.__serialize)
+		local batch = createPatchSet(self.__instanceMap, changes)
+		batch.added = additions
+		return batch
+	end)
+	self.__flushing = false
+	if not ok then
+		error(patch, 0)
+	end
 
-	if PatchSet.isEmpty(patch) then
+	-- A session stopped while this batch was prepared sends nothing.
+	if self.__stopped or PatchSet.isEmpty(patch) then
 		return nil
 	end
 

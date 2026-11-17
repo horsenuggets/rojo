@@ -149,6 +149,37 @@ return function()
 		root:Destroy()
 	end)
 
+	-- Serializing yields. Whatever happens to the subtree meanwhile, the ids
+	-- describe what was serialized, and the new instances are already tracked.
+	it("should describe the serialized subtree even if it changes while serializing", function()
+		for _, change in { "rename", "add", "remove" } do
+			local root = Instance.new("Folder")
+			local instanceMap = InstanceMap.new()
+			instanceMap:insert("ROOT", root)
+			local created = folder("Created", root)
+			local child = folder("Child", created)
+			local trackedWhileSerializing = false
+			local additions = createAdditions(instanceMap, { [created] = true }, function(copy)
+				trackedWhileSerializing = instanceMap.fromInstances[child] ~= nil
+				if change == "rename" then
+					child.Name = "Renamed"
+				elseif change == "add" then
+					folder("Late", created)
+				else
+					child.Parent = nil
+				end
+				return describeTree(copy)
+			end)
+			local _, addition = next(additions)
+			expect(addition.model).to.equal("(Created (Child))")
+			expect(#addition.ids.children).to.equal(1)
+			expect(addition.ids.children[1].name).to.equal("Child")
+			expect(trackedWhileSerializing).to.equal(true)
+			instanceMap:stop()
+			root:Destroy()
+		end
+	end)
+
 	it("should empty the candidate set", function()
 		local root, instanceMap, _, _ = harness()
 		local candidates = { [folder("Created", root)] = true }
