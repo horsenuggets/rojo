@@ -12,6 +12,14 @@ use crate::{multimap::MultiMap, RojoRef};
 
 use super::{InstanceMetadata, InstanceSnapshot};
 
+/// The referents to give a snapshot's instances, shaped like the snapshot. See
+/// [`RojoTree::insert_instance_with_referents`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SnapshotReferents {
+    pub id: Option<Ref>,
+    pub children: Vec<SnapshotReferents>,
+}
+
 /// An expanded variant of rbx_dom_weak's `WeakDom` that tracks additional
 /// metadata per instance that's Rojo-specific.
 ///
@@ -101,6 +109,28 @@ impl RojoTree {
     }
 
     pub fn insert_instance(&mut self, parent_ref: Ref, snapshot: InstanceSnapshot) -> Ref {
+        self.insert_instance_inner(parent_ref, snapshot, None)
+    }
+
+    /// Inserts `snapshot` like [`Self::insert_instance`], but gives its instances
+    /// the referents in `referents`, which is shaped like the snapshot. An
+    /// instance without one, or beyond the shape, gets a new referent. The
+    /// referents must not be in the tree already.
+    pub fn insert_instance_with_referents(
+        &mut self,
+        parent_ref: Ref,
+        snapshot: InstanceSnapshot,
+        referents: &SnapshotReferents,
+    ) -> Ref {
+        self.insert_instance_inner(parent_ref, snapshot, Some(referents))
+    }
+
+    fn insert_instance_inner(
+        &mut self,
+        parent_ref: Ref,
+        snapshot: InstanceSnapshot,
+        referents: Option<&SnapshotReferents>,
+    ) -> Ref {
         // !!!!!!!!!! UGLY HACK !!!!!!!!!!
         // ! If you are going to change this, go change it in patch_compute/compute_property_patches too
         //
@@ -124,17 +154,21 @@ impl RojoTree {
             _ => Vec::new(),
         };
 
-        let builder = InstanceBuilder::empty()
+        let mut builder = InstanceBuilder::empty()
             .with_class(snapshot.class_name)
             .with_name(snapshot.name.into_owned())
             .with_properties(hack_needs_pivot_migration)
             .with_properties(snapshot.properties);
+        if let Some(chosen) = referents.and_then(|referents| referents.id) {
+            builder = builder.with_referent(chosen);
+        }
 
         let referent = self.inner.insert(parent_ref, builder);
         self.insert_metadata(referent, snapshot.metadata);
 
-        for child in snapshot.children {
-            self.insert_instance(referent, child);
+        for (index, child) in snapshot.children.into_iter().enumerate() {
+            let child_referents = referents.and_then(|referents| referents.children.get(index));
+            self.insert_instance_inner(referent, child, child_referents);
         }
 
         referent
@@ -232,6 +266,11 @@ impl RojoTree {
 
     pub fn get_metadata(&self, id: Ref) -> Option<&InstanceMetadata> {
         self.metadata_map.get(&id)
+    }
+
+    /// Returns whether any instance holds the given RojoRef.
+    pub fn is_specified_id_used(&self, specified: &RojoRef) -> bool {
+        !self.specified_id_to_refs.get(specified).is_empty()
     }
 
     /// Get the backing Ref of the given RojoRef. If the RojoRef maps to exactly
@@ -419,8 +458,58 @@ mod test {
         snapshot::{InstanceMetadata, InstanceSnapshot},
         RojoRef,
     };
+    use rbx_dom_weak::types::Ref;
 
-    use super::RojoTree;
+    use super::{RojoTree, SnapshotReferents};
+
+    #[test]
+    fn inserts_with_chosen_referents_and_fills_the_rest() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let snapshot = InstanceSnapshot::new().name("Parent").children(vec![
+            InstanceSnapshot::new().name("Chosen"),
+            InstanceSnapshot::new().name("Unchosen"),
+            InstanceSnapshot::new().name("Beyond"),
+        ]);
+        let parent = Ref::new();
+        let chosen = Ref::new();
+        let referents = SnapshotReferents {
+            id: Some(parent),
+            children: vec![
+                SnapshotReferents {
+                    id: Some(chosen),
+                    children: Vec::new(),
+                },
+                SnapshotReferents::default(),
+            ],
+        };
+
+        assert_eq!(
+            tree.insert_instance_with_referents(root, snapshot, &referents),
+            parent
+        );
+        let children = tree.get_instance(parent).unwrap().children().to_vec();
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0], chosen);
+        assert_eq!(tree.get_instance(chosen).unwrap().name(), "Chosen");
+        for child in &children[1..] {
+            assert!(child.is_some() && *child != parent && *child != chosen);
+        }
+        assert_eq!(tree.get_instance(children[2]).unwrap().name(), "Beyond");
+    }
+
+    #[test]
+    fn reports_whether_a_specified_id_is_used() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new());
+        let root = tree.get_root_id();
+        let id = RojoRef::new("taken".into());
+        assert!(!tree.is_specified_id_used(&id));
+        let mut metadata = InstanceMetadata::new();
+        metadata.specified_id = Some(id.clone());
+        tree.insert_instance(root, InstanceSnapshot::new().metadata(metadata));
+        assert!(tree.is_specified_id_used(&id));
+        assert!(!tree.is_specified_id_used(&RojoRef::new("free".into())));
+    }
 
     #[test]
     fn checked_reparent_rejects_invalid_moves_and_keeps_same_parent_order() {

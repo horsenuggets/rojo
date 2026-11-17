@@ -107,6 +107,30 @@ impl FsSnapshot {
         self.removed_dirs.insert(path.as_ref().to_path_buf());
     }
 
+    /// Moves every added path from inside `from` to the same place inside `to`,
+    /// so new files can be staged somewhere else before they're installed.
+    /// Fails if the snapshot removes anything or adds a path outside `from`.
+    pub fn rebase(self, from: &Path, to: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.removed_files.is_empty() && self.removed_dirs.is_empty(),
+            "Only new files can be staged"
+        );
+        let move_path = |path: PathBuf| -> anyhow::Result<PathBuf> {
+            let suffix = path
+                .strip_prefix(from)
+                .map_err(|_| anyhow::anyhow!("{} is outside {}", path.display(), from.display()))?;
+            Ok(to.join(suffix))
+        };
+        let mut rebased = Self::new();
+        for path in self.added_dirs {
+            rebased.added_dirs.insert(move_path(path)?);
+        }
+        for (path, contents) in self.added_files {
+            rebased.added_files.insert(move_path(path)?, contents);
+        }
+        Ok(rebased)
+    }
+
     /// Writes the `FsSnapshot` to the provided VFS, using the provided `base`
     /// as a root for the other paths in the `FsSnapshot`.
     ///
@@ -341,6 +365,27 @@ impl FsSnapshot {
 mod tests {
     use super::*;
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn rebase_moves_added_paths_and_rejects_anything_else() {
+        let from = Path::new("/project/src");
+        let to = Path::new("/project/.rojo/stage");
+        let snapshot = FsSnapshot::new()
+            .with_added_dir(from.join("Folder"))
+            .with_added_file(from.join("Folder/init.meta.json"), b"{}".to_vec());
+        let rebased = snapshot.rebase(from, to).unwrap();
+        assert_eq!(rebased.added_dirs(), vec![to.join("Folder").as_path()]);
+        assert_eq!(
+            rebased.added_files.get(&to.join("Folder/init.meta.json")),
+            Some(&b"{}".to_vec())
+        );
+
+        let outside = FsSnapshot::new().with_added_file("/elsewhere/file.luau", Vec::new());
+        assert!(outside.rebase(from, to).is_err());
+        let mut removal = FsSnapshot::new();
+        removal.remove_file(from.join("old.luau"));
+        assert!(removal.rebase(from, to).is_err());
+    }
 
     #[test]
     fn filtered_merge_rejects_duplicate_destinations_before_mutating() {
