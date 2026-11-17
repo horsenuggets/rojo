@@ -218,6 +218,203 @@ fn assert_numeric_api_writes_converge(cases: &[(f64, f64)]) {
     });
 }
 
+/// Builds what Studio sends for a created subtree: the model and the ids it
+/// picked, shaped like the subtree. `children` lists (name, class) pairs under
+/// a Folder named `name`, and every ModuleScript gets source.
+fn created_subtree(name: &str, children: &[(&str, &str)]) -> (Vec<u8>, librojo::web_api::AddedIds) {
+    use librojo::web_api::AddedIds;
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+    let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));
+    let root = dom.insert(
+        dom.root_ref(),
+        InstanceBuilder::new("Folder").with_name(name),
+    );
+    let mut ids = AddedIds {
+        id: Ref::new(),
+        name: name.into(),
+        class_name: ustr("Folder"),
+        children: Vec::new(),
+    };
+    for (child, class) in children {
+        let mut builder = InstanceBuilder::new(*class).with_name(*child);
+        if *class == "ModuleScript" {
+            builder =
+                builder.with_property("Source", Variant::String(format!("return \"{child}\"\n")));
+        }
+        dom.insert(root, builder);
+        ids.children.push(AddedIds {
+            id: Ref::new(),
+            name: (*child).into(),
+            class_name: ustr(class),
+            children: Vec::new(),
+        });
+    }
+    let mut model = Vec::new();
+    rbx_binary::to_writer(&mut model, &dom, &[root]).unwrap();
+    (model, ids)
+}
+
+fn post_write(
+    session: &crate::rojo_test::serve_util::TestServeSession,
+    request: &WriteRequest,
+) -> librojo::web_api::WriteResponse {
+    let response = reqwest::blocking::Client::new()
+        .post(format!("http://localhost:{}/api/write", session.port()))
+        .header("content-type", "application/msgpack")
+        .body(serialize_msgpack(request).unwrap())
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .unwrap();
+    deserialize_msgpack(&response).unwrap()
+}
+
+// A subtree created in Studio is written as new files and keeps the ids
+// Studio picked, so the server's announcement of it isn't a second copy, and
+// the watcher seeing the new files changes nothing.
+#[test]
+fn studio_created_subtrees_are_written_as_directories_and_keep_their_ids() {
+    assert_created_subtrees_are_written("place_root", |directory| {
+        assert!(
+            directory.is_dir(),
+            "{} was not created",
+            directory.display()
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("Code.luau")).unwrap(),
+            "return \"Code\"\n"
+        );
+        assert!(directory.join("Same").is_dir());
+        assert!(directory.join("Same~2").is_dir());
+    });
+}
+
+// Without instancesAsDirectories, a folder with same-named children can't be
+// a directory, so it's written as a model file, like a full syncback would.
+#[test]
+fn studio_created_subtrees_fall_back_to_models_and_keep_their_ids() {
+    assert_created_subtrees_are_written("place_root_models", |directory| {
+        assert!(!directory.exists());
+        assert!(directory.with_extension("rbxm").is_file());
+    });
+}
+
+fn assert_created_subtrees_are_written(fixture: &str, check_layout: impl Fn(&std::path::Path)) {
+    use librojo::web_api::InstanceAddition;
+    use std::collections::{HashMap, HashSet};
+
+    run_serve_test(fixture, |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let root = info.root_instance_id;
+        let read = session.get_api_read(root).unwrap();
+        let storage = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "ReplicatedStorage")
+            .unwrap()
+            .id;
+        let cursor = read.message_cursor;
+
+        let mut added = HashMap::new();
+        let mut expected_ids = HashSet::new();
+        for (parent, name) in [(storage, "Created"), (root, "AtRoot")] {
+            let (model, ids) = created_subtree(
+                name,
+                &[
+                    ("Code", "ModuleScript"),
+                    ("Same", "Folder"),
+                    ("Same", "Folder"),
+                ],
+            );
+            expected_ids.insert(ids.id);
+            expected_ids.extend(ids.children.iter().map(|child| child.id));
+            added.insert(ids.id, InstanceAddition { parent, model, ids });
+        }
+        let response = post_write(
+            &session,
+            &WriteRequest {
+                session_id: info.session_id,
+                message_cursor: Some(cursor),
+                authority: WriteAuthority::Filesystem,
+                removed: Vec::new(),
+                added,
+                updated: Vec::new(),
+            },
+        );
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+
+        let src = session.path().join("src");
+        for directory in [src.join("ReplicatedStorage/Created"), src.join("AtRoot")] {
+            check_layout(&directory);
+        }
+
+        // Let the watcher report the new files, then make sure every instance
+        // is still the one Studio named, exactly once.
+        thread::sleep(Duration::from_millis(1500));
+        let read = session.get_api_read(root).unwrap();
+        for id in &expected_ids {
+            assert!(read.instances.contains_key(id), "lost the id {id:?}");
+        }
+        let created = read
+            .instances
+            .values()
+            .filter(|instance| instance.name == "Created" || instance.name == "AtRoot")
+            .count();
+        assert_eq!(created, 2);
+        let packet = session
+            .get_api_socket_packet(SocketPacketType::Messages, cursor)
+            .unwrap();
+        let SocketPacketBody::Messages(packet) = packet.body;
+        for message in &packet.messages {
+            for id in message.added.keys() {
+                assert!(
+                    expected_ids.contains(id),
+                    "announced an unexpected instance {id:?}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn studio_created_subtrees_reject_ids_that_are_not_new() {
+    use librojo::web_api::InstanceAddition;
+    use std::collections::HashMap;
+
+    run_serve_test("place_root", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let root = info.root_instance_id;
+        let read = session.get_api_read(root).unwrap();
+        let (model, mut ids) = created_subtree("Reused", &[("Child", "Folder")]);
+        // Studio reusing an id the server already has must not be accepted.
+        ids.children[0].id = root;
+        let response = post_write(
+            &session,
+            &WriteRequest {
+                session_id: info.session_id,
+                message_cursor: Some(read.message_cursor),
+                authority: WriteAuthority::Filesystem,
+                removed: Vec::new(),
+                added: HashMap::from([(
+                    ids.id,
+                    InstanceAddition {
+                        parent: root,
+                        model,
+                        ids: ids.clone(),
+                    },
+                )]),
+                updated: Vec::new(),
+            },
+        );
+        assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+        assert_eq!(response.errors[0].id, ids.id);
+        assert!(!session.path().join("src/Reused").exists());
+    });
+}
+
 // The DataModel of a place project records the project file as its source, so
 // moving a folder to the root used to be refused as a script promotion.
 #[test]

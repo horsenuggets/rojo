@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
@@ -5,9 +6,9 @@ use rbx_dom_weak::{
     types::{Ref, Variant},
     ustr, HashMapExt as _, InstanceBuilder, UstrMap, WeakDom,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
@@ -17,16 +18,17 @@ use crate::{
     snapshot::{
         apply_patch_set, compute_patch_set, compute_saved_patch_set, compute_shallow_patch_set,
         AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, InstigatingSource, PatchAdd,
-        PatchSet, PatchUpdate, RojoTree,
+        PatchSet, PatchUpdate, RojoTree, SnapshotReferents,
     },
     snapshot_middleware::{
         snapshot_from_vfs, snapshot_project_node, snapshot_shallow_from_vfs, Middleware,
     },
     syncback::{
         can_write_property, decide_property_write, get_property_filter, same_value, source_file,
-        syncback_instance, validate_write_targets, FsSnapshot, PropertyWriteDecision,
+        syncback_instance, syncback_new_subtree, validate_write_targets, FsSnapshot,
+        PropertyWriteDecision,
     },
-    web::interface::{WriteAuthority, WriteError, WriteResult},
+    web::interface::{AddedIds, InstanceAddition, WriteAuthority, WriteError, WriteResult},
 };
 
 /// How many times a Studio-authoritative write is retried when its file keeps
@@ -38,6 +40,8 @@ pub(crate) struct TreeMutation {
     pub message_cursor: Option<u32>,
     pub authority: WriteAuthority,
     pub patch_set: PatchSet,
+    /// Subtrees created in Studio, keyed by the id of each root.
+    pub additions: HashMap<Ref, InstanceAddition>,
     pub result_sender: Sender<WriteResult>,
 }
 
@@ -104,8 +108,9 @@ impl ChangeProcessor {
                         },
                         recv(tree_mutation_receiver) -> mutation => {
                             let mutation = mutation?;
-                            let result = task.handle_tree_event_at_cursor(
+                            let result = task.handle_write(
                                 mutation.patch_set,
+                                &mutation.additions,
                                 mutation.message_cursor,
                                 mutation.authority,
                             );
@@ -215,6 +220,12 @@ impl JobThreadContext {
             .commit_event(&event)
             .expect("Error applying VFS change");
 
+        // The project's state directory holds journals and staged files, which
+        // come and go during a write and are never part of the tree.
+        if self.is_in_state_directory(&event) {
+            return;
+        }
+
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
         let applied_patches = match event {
@@ -243,6 +254,22 @@ impl JobThreadContext {
         self.message_queue.push_messages(&applied_patches);
     }
 
+    /// Returns whether an event is about a path inside the project's `.rojo`
+    /// state directory. Watchers report canonical paths, so both spellings of
+    /// the project folder are checked.
+    fn is_in_state_directory(&self, event: &VfsEvent) -> bool {
+        let (VfsEvent::Create(path) | VfsEvent::Write(path) | VfsEvent::Remove(path)) = event
+        else {
+            return false;
+        };
+        let folder = self.project.folder_location();
+        let canonical = self.vfs.canonicalize(folder).ok();
+        [Some(folder.to_path_buf()), canonical]
+            .into_iter()
+            .flatten()
+            .any(|folder| path.starts_with(folder.join(".rojo")))
+    }
+
     #[cfg(test)]
     fn handle_tree_event(&self, patch_set: PatchSet) -> WriteResult {
         self.handle_tree_event_at_cursor(
@@ -252,9 +279,20 @@ impl JobThreadContext {
         )
     }
 
+    #[cfg(test)]
     fn handle_tree_event_at_cursor(
         &self,
         patch_set: PatchSet,
+        message_cursor: Option<u32>,
+        authority: WriteAuthority,
+    ) -> WriteResult {
+        self.handle_write(patch_set, &HashMap::new(), message_cursor, authority)
+    }
+
+    fn handle_write(
+        &self,
+        patch_set: PatchSet,
+        additions: &HashMap<Ref, InstanceAddition>,
         message_cursor: Option<u32>,
         authority: WriteAuthority,
     ) -> WriteResult {
@@ -273,6 +311,22 @@ impl JobThreadContext {
         let mut deletion_conflicts = Vec::new();
         {
             let mut tree = self.tree.lock().unwrap();
+            // Created subtrees go first, so the rest of the batch can move
+            // existing instances into them.
+            for (&id, addition) in additions {
+                match self.persist_addition(&mut tree, id, addition, &mut messages) {
+                    Ok(unstored) => errors.extend(unstored.into_iter().map(|id| WriteError {
+                        id,
+                        property: None,
+                        message: "This instance could not be stored on disk".into(),
+                    })),
+                    Err(err) => errors.push(WriteError {
+                        id,
+                        property: None,
+                        message: format!("Could not create this instance on disk: {err:#}"),
+                    }),
+                }
+            }
             let order = crate::syncback::relocation::relocation_order(
                 &tree,
                 &patch_set.updated_instances,
@@ -464,6 +518,150 @@ impl JobThreadContext {
         conflicts.added_instances.extend(deletion_conflicts);
         self.message_queue.push_messages(&messages);
         (accepted, conflicts, errors)
+    }
+
+    /// Writes a subtree created in Studio as new files and adds it to the tree
+    /// under the ids Studio gave it, so announcing it to Studio doesn't create a
+    /// second copy. Returns the ids of created instances that weren't stored,
+    /// which Studio must stop tracking.
+    fn persist_addition(
+        &self,
+        tree: &mut RojoTree,
+        root_id: Ref,
+        addition: &InstanceAddition,
+        messages: &mut Vec<AppliedPatchSet>,
+    ) -> anyhow::Result<Vec<Ref>> {
+        anyhow::ensure!(
+            addition.ids.id == root_id,
+            "The created subtree's root id doesn't match its key"
+        );
+        let mut ids = Vec::new();
+        collect_added_ids(&addition.ids, &mut ids);
+        let unique: HashSet<_> = ids.iter().collect();
+        anyhow::ensure!(
+            unique.len() == ids.len()
+                && ids
+                    .iter()
+                    .all(|id| id.is_some() && tree.get_instance(*id).is_none()),
+            "Studio's ids for the created instances are not new and unique"
+        );
+        let parent = tree
+            .get_instance(addition.parent)
+            .context("The parent is no longer known")?;
+        let parent_context = parent.metadata().context.clone();
+        let directory = self.children_directory(tree, addition.parent)?;
+
+        let model = rbx_binary::from_reader(addition.model.as_slice())
+            .context("Could not read the created instances")?;
+        let existing: HashSet<String> = self
+            .vfs
+            .read_dir(&directory)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_lowercase)
+            })
+            .collect();
+        let new = syncback_new_subtree(
+            &self.vfs,
+            tree,
+            &self.project,
+            addition.parent,
+            &directory,
+            &existing,
+            model,
+        )?;
+        validate_write_targets(&self.project, &new.fs_snapshot)?;
+        self.install_new_files(&directory, new.fs_snapshot)?;
+
+        let snapshot = snapshot_from_vfs(&parent_context, &self.vfs, &new.root_path)?
+            .context("The created instance is not visible on disk")?;
+        let (referents, unstored) = pair_added_ids(&snapshot, &addition.ids);
+        let root = tree.insert_instance_with_referents(addition.parent, snapshot, &referents);
+        messages.push(AppliedPatchSet {
+            added: vec![root],
+            ..AppliedPatchSet::new()
+        });
+        Ok(unstored)
+    }
+
+    /// Returns the directory that holds `id`'s children on disk.
+    fn children_directory(&self, tree: &RojoTree, id: Ref) -> anyhow::Result<PathBuf> {
+        let instance = tree
+            .get_instance(id)
+            .context("The instance is no longer known")?;
+        let metadata = instance.metadata();
+        let directory = match metadata.instigating_source.as_ref() {
+            Some(InstigatingSource::Path(path))
+                if metadata
+                    .middleware
+                    .is_some_and(|middleware| middleware.is_dir()) =>
+            {
+                path.clone()
+            }
+            // A project's root records the project file as its source.
+            Some(InstigatingSource::Path(project_file))
+                if metadata.middleware == Some(Middleware::Project) =>
+            {
+                let project = Project::load_exact(&self.vfs, project_file, None)?;
+                project_node_directory(project_file, &project.tree)
+                    .context("The project's root has no directory $path")?
+            }
+            Some(InstigatingSource::ProjectNode { path, node, .. }) => {
+                project_node_directory(path, node)
+                    .context("The project-defined parent has no directory $path")?
+            }
+            _ => anyhow::bail!("New instances can only be created inside a directory yet"),
+        };
+        anyhow::ensure!(
+            self.vfs.metadata(&directory)?.is_dir(),
+            "The parent's $path is not an existing directory"
+        );
+        Ok(directory)
+    }
+
+    /// Writes new files into a staging directory, then moves them into
+    /// `directory` through a recoverable transaction that never replaces an
+    /// existing path. A crash leaves either all of them or none of them.
+    fn install_new_files(&self, directory: &Path, files: FsSnapshot) -> anyhow::Result<()> {
+        use crate::syncback::{
+            relocation::{cache_directory, execute_relocation},
+            relocation_transaction::Relocation,
+        };
+
+        let cache = cache_directory(&self.project);
+        self.vfs.create_dir_all(&cache)?;
+        self.vfs.sync_path(&cache)?;
+        self.vfs.sync_path(cache.parent().unwrap())?;
+        let staging = cache.join(format!("{}.new", uuid::Uuid::new_v4()));
+        self.vfs.create_dir_all(&staging)?;
+        let result = (|| -> anyhow::Result<()> {
+            files
+                .rebase(directory, &staging)?
+                .write_to_vfs("", &self.vfs)?;
+            let mut moves = Vec::new();
+            for entry in self.vfs.read_dir(&staging)? {
+                let source = entry?.path().to_path_buf();
+                let name = source.file_name().context("A staged path has no name")?;
+                let expected = self.vfs.snapshot_tree(&source)?;
+                moves.push(Relocation {
+                    destination: directory.join(name),
+                    source,
+                    expected,
+                });
+            }
+            let journal = cache.join(uuid::Uuid::new_v4().to_string());
+            execute_relocation(&self.vfs, &journal, moves, Vec::new())?;
+            Ok(())
+        })();
+        // Whatever wasn't installed stays out of the project.
+        let cleanup = self.vfs.remove_dir_all(&staging);
+        result?;
+        cleanup?;
+        Ok(())
     }
 
     fn remove_instance(
@@ -1777,6 +1975,66 @@ enum RelocationOutcome {
     Restore(Box<Option<InstanceSnapshot>>),
 }
 
+/// Returns the directory a project node's `$path` names, resolved against the
+/// folder of the project file that declares it, or `None` without a `$path`.
+fn project_node_directory(
+    project_file: &Path,
+    node: &crate::project::ProjectNode,
+) -> Option<PathBuf> {
+    let mapping = node.path.as_ref()?;
+    let folder = project_file.parent().unwrap_or(Path::new(""));
+    Some(folder.join(mapping.path()))
+}
+
+/// Collects every id in a created subtree, root first.
+fn collect_added_ids(ids: &AddedIds, out: &mut Vec<Ref>) {
+    out.push(ids.id);
+    for child in &ids.children {
+        collect_added_ids(child, out);
+    }
+}
+
+/// Pairs the ids Studio gave a created subtree with the instances read back
+/// from disk. The roots always pair. Below them, children pair by name and
+/// class, and same-named siblings pair in order. Returns the referents to
+/// insert the snapshot with, and the ids of Studio's instances that have no
+/// counterpart on disk, with all of their descendants.
+fn pair_added_ids(snapshot: &InstanceSnapshot, ids: &AddedIds) -> (SnapshotReferents, Vec<Ref>) {
+    let mut unpaired = Vec::new();
+    let referents = pair_added_ids_inner(snapshot, ids, &mut unpaired);
+    (referents, unpaired)
+}
+
+fn pair_added_ids_inner(
+    snapshot: &InstanceSnapshot,
+    ids: &AddedIds,
+    unpaired: &mut Vec<Ref>,
+) -> SnapshotReferents {
+    let mut remaining: Vec<Option<&AddedIds>> = ids.children.iter().map(Some).collect();
+    let children = snapshot
+        .children
+        .iter()
+        .map(|child| {
+            let found = remaining.iter_mut().find(|candidate| {
+                candidate.is_some_and(|candidate| {
+                    candidate.name == child.name && candidate.class_name == child.class_name
+                })
+            });
+            match found.and_then(Option::take) {
+                Some(child_ids) => pair_added_ids_inner(child, child_ids, unpaired),
+                None => SnapshotReferents::default(),
+            }
+        })
+        .collect();
+    for leftover in remaining.into_iter().flatten() {
+        collect_added_ids(leftover, unpaired);
+    }
+    SnapshotReferents {
+        id: Some(ids.id),
+        children,
+    }
+}
+
 fn empty_update(id: Ref) -> PatchUpdate {
     PatchUpdate {
         id,
@@ -2257,6 +2515,100 @@ mod tests {
         ustr,
     };
     use std::path::Path;
+
+    fn added(name: &str, class: &str, children: Vec<AddedIds>) -> AddedIds {
+        AddedIds {
+            id: Ref::new(),
+            name: name.into(),
+            class_name: ustr(class),
+            children,
+        }
+    }
+
+    fn snapshot(
+        name: &'static str,
+        class: &str,
+        children: Vec<InstanceSnapshot>,
+    ) -> InstanceSnapshot {
+        InstanceSnapshot::new()
+            .name(name)
+            .class_name(class)
+            .children(children)
+    }
+
+    // Every Studio id pairs with the disk instance of the same name and class,
+    // same-named siblings pair in order, and an id with no counterpart on disk
+    // is reported along with its descendants.
+    #[test]
+    fn pairs_created_ids_with_the_instances_read_back() {
+        let first = added("Same", "Folder", Vec::new());
+        let second = added("Same", "Folder", Vec::new());
+        let script = added("Code", "ModuleScript", Vec::new());
+        let dropped_child = added("Inner", "Folder", Vec::new());
+        let dropped = added("Ignored", "Folder", vec![dropped_child.clone()]);
+        let root = added(
+            "Root",
+            "Folder",
+            vec![
+                first.clone(),
+                script.clone(),
+                dropped.clone(),
+                second.clone(),
+            ],
+        );
+        let disk = snapshot(
+            "Root",
+            "Folder",
+            vec![
+                snapshot("Code", "ModuleScript", Vec::new()),
+                snapshot("Same", "Folder", Vec::new()),
+                snapshot("Same", "Folder", Vec::new()),
+                snapshot("OnlyOnDisk", "Folder", Vec::new()),
+            ],
+        );
+
+        let (referents, unpaired) = pair_added_ids(&disk, &root);
+        assert_eq!(referents.id, Some(root.id));
+        let ids: Vec<_> = referents.children.iter().map(|child| child.id).collect();
+        assert_eq!(
+            ids,
+            [Some(script.id), Some(first.id), Some(second.id), None]
+        );
+        assert_eq!(unpaired, [dropped.id, dropped_child.id]);
+
+        // Pairing is pure.
+        assert_eq!(pair_added_ids(&disk, &root), (referents, unpaired));
+    }
+
+    #[test]
+    fn a_class_mismatch_does_not_pair() {
+        let child = added("Value", "StringValue", Vec::new());
+        let root = added("Root", "Folder", vec![child.clone()]);
+        let disk = snapshot(
+            "Root",
+            "Folder",
+            vec![snapshot("Value", "Folder", Vec::new())],
+        );
+        let (referents, unpaired) = pair_added_ids(&disk, &root);
+        assert_eq!(referents.children[0].id, None);
+        assert_eq!(unpaired, [child.id]);
+    }
+
+    #[test]
+    fn resolves_a_project_node_path_against_its_project_file() {
+        let node: crate::project::ProjectNode =
+            serde_json::from_str(r#"{"$path": "src/shared"}"#).unwrap();
+        assert_eq!(
+            project_node_directory(Path::new("/project/default.project.json"), &node),
+            Some(PathBuf::from("/project/src/shared"))
+        );
+        let pathless: crate::project::ProjectNode =
+            serde_json::from_str(r#"{"$className": "Folder"}"#).unwrap();
+        assert_eq!(
+            project_node_directory(Path::new("/project/default.project.json"), &pathless),
+            None
+        );
+    }
 
     fn part_job() -> (JobThreadContext, Ref) {
         let mut imfs = InMemoryFs::new();

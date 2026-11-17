@@ -3,5 +3,8 @@
   "tree": {
     "$className": "DataModel",
     "$path": "src"
+  },
+  "syncbackRules": {
+    "instancesAsDirectories": true
   }
 }

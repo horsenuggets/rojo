@@ -32,8 +32,9 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// cursors to write requests and accepted, conflicted, and failed results to write
 /// responses, which older peers neither send nor understand. Version 7 made write
 /// requests carry the plugin's chosen `WriteAuthority`. Version 8 adds identity-preserving
-/// instance reparenting through `changedParent` updates.
-pub const PROTOCOL_VERSION: u64 = 8;
+/// instance reparenting through `changedParent` updates. Version 9 makes `added` carry
+/// Studio-created subtrees as `InstanceAddition`s.
+pub const PROTOCOL_VERSION: u64 = 9;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
@@ -363,9 +364,38 @@ pub struct WriteRequest {
     pub authority: WriteAuthority,
     pub removed: Vec<Ref>,
 
+    /// Subtrees created in Studio, keyed by the id Studio gave each root.
     #[serde(default)]
-    pub added: HashMap<Ref, ()>,
+    pub added: HashMap<Ref, InstanceAddition>,
     pub updated: Vec<InstanceUpdate>,
+}
+
+/// A subtree created in Studio. Studio picks every id itself and starts
+/// tracking the instances under them before sending, so the server's
+/// announcement of the same instances is recognized instead of duplicated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceAddition {
+    /// The managed instance the subtree was created under.
+    pub parent: Ref,
+    /// The subtree serialized by Studio as a binary model with one root.
+    #[serde(with = "serde_bytes")]
+    pub model: Vec<u8>,
+    /// The ids Studio assigned, shaped like the subtree.
+    pub ids: AddedIds,
+}
+
+/// The id Studio assigned to one instance of an added subtree. A model doesn't
+/// keep Studio's ids, so the name and class let the server pair each id with
+/// its instance. Same-named siblings pair in their order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddedIds {
+    pub id: Ref,
+    pub name: String,
+    pub class_name: Ustr,
+    #[serde(default)]
+    pub children: Vec<AddedIds>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -647,7 +677,7 @@ mod tests {
 
     #[test]
     fn structural_protocol_round_trips_json_and_messagepack() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
         let id = Ref::new();
         let parent = Ref::new();
         let update = InstanceUpdate {
