@@ -1,4 +1,7 @@
-use rbx_dom_weak::{types::Variant, Instance, Ustr, UstrMap};
+use rbx_dom_weak::{
+    types::{ContentType, Variant},
+    Instance, Ustr, UstrMap,
+};
 use rbx_reflection::{PropertyKind, PropertySerialization, Scriptability};
 
 use crate::{resolution::normalize_json_variant, variant_eq::variant_eq, Project};
@@ -89,13 +92,13 @@ fn filter_properties_impl<'inst>(
                 if !variant_eq(comparable, default) {
                     allocation.push((*name, value));
                 }
-            } else if !is_unset_binary_string(value) {
+            } else if !is_unset_value(value) {
                 allocation.push((*name, value));
             }
         }
     } else {
         for (name, value) in &inst.properties {
-            if predicate(name, value) || is_unset_binary_string(value) {
+            if predicate(name, value) || is_unset_value(value) {
                 continue;
             }
             allocation.push((*name, value));
@@ -103,13 +106,18 @@ fn filter_properties_impl<'inst>(
     }
 }
 
-/// Returns whether `value` is an empty `BinaryString`, which Roblox writes for
-/// binary properties that hold nothing. Newer Studio versions serialize such
-/// properties (like `Instance.SerializedOverrides`) on every instance before
-/// the reflection database records a default for them, so without this check
-/// syncback would write an empty value into the metadata of every instance.
-pub(crate) fn is_unset_binary_string(value: &Variant) -> bool {
-    matches!(value, Variant::BinaryString(bytes) if AsRef::<[u8]>::as_ref(bytes).is_empty())
+/// Returns whether `value` holds nothing: an empty `BinaryString` or an unset
+/// `Content`. Newer Studio versions serialize such properties (like
+/// `Instance.SerializedOverrides` and `Folder.ExplorerIconContent`) on every
+/// instance before the reflection database records a default for them, so
+/// without this check syncback would write an empty value into the metadata
+/// of every instance.
+pub(crate) fn is_unset_value(value: &Variant) -> bool {
+    match value {
+        Variant::BinaryString(bytes) => AsRef::<[u8]>::as_ref(bytes).is_empty(),
+        Variant::Content(content) => matches!(content.value(), ContentType::None),
+        _ => false,
+    }
 }
 
 pub(crate) fn can_write_property(project: &Project, class_name: &str, prop_name: &str) -> bool {
@@ -176,7 +184,7 @@ mod test {
     use super::*;
     use memofs::Vfs;
     use rbx_dom_weak::{
-        types::{BinaryString, CFrame, Matrix3, Vector2, Vector3},
+        types::{BinaryString, CFrame, Content, Matrix3, Vector2, Vector3},
         ustr, InstanceBuilder, WeakDom,
     };
 
@@ -227,6 +235,27 @@ mod test {
                     !bytes.is_empty(),
                     "{class} with {} bytes",
                     bytes.len()
+                );
+            }
+        }
+    }
+
+    /// Walks every combination of a class with and without reflection data and
+    /// a content property with and without a value.
+    #[test]
+    fn content_without_defaults_is_kept_only_when_set() {
+        let (_temp, project) = load_project();
+        let name = ustr("ExplorerIconContent");
+        for class in ["Folder", "NotARealClass"] {
+            for (content, kept) in [
+                (Content::none(), false),
+                (Content::from_uri("rbxassetid://1"), true),
+            ] {
+                let dom = WeakDom::new(InstanceBuilder::new(class).with_property(name, content));
+                assert_eq!(
+                    filter_properties(&project, dom.root()).contains_key(&name),
+                    kept,
+                    "{class} keeping {kept}"
                 );
             }
         }
