@@ -45,6 +45,31 @@ return function()
 		root:Destroy()
 	end)
 
+	-- Metadata has nothing to apply in Studio. Leaving it unapplied would make
+	-- the sync fallback replace the instance, alone or alongside a rename.
+	it("should apply metadata changes without touching the instance", function()
+		for _, renamed in { false, true } do
+			local instanceMap = InstanceMap.new()
+			local instance = Instance.new("Part")
+			instance.Name = "Moved"
+			instance.Parent = container
+			instanceMap:insert("MOVED", instance)
+			local patch = PatchSet.newEmpty()
+			table.insert(patch.updated, {
+				id = "MOVED",
+				changedName = if renamed then "Renamed" else nil,
+				changedMetadata = { ignoreUnknownInstances = false },
+				changedProperties = {},
+			})
+			local unapplied = applyPatch(instanceMap, patch)
+			assert(PatchSet.isEmpty(unapplied), "expected the whole patch to apply")
+			expect(instanceMap.fromIds.MOVED).to.equal(instance)
+			expect(instance.Name).to.equal(if renamed then "Renamed" else "Moved")
+			instanceMap:stop()
+			instance:Destroy()
+		end
+	end)
+
 	it("should restore remove-and-add subtrees whether their old IDs are still mapped or absent", function()
 		for _, mapped in { false, true } do
 			local instanceMap = InstanceMap.new()

@@ -226,13 +226,10 @@ local function applyPatch(instanceMap, patch)
 			end
 		end
 
-		if update.changedMetadata ~= nil then
-			-- TODO: Support changing metadata. This will become necessary when
-			-- Rojo persistently tracks metadata for each instance in order to
-			-- remove extra instances.
-			unappliedUpdate.changedMetadata = update.changedMetadata
-			partiallyApplied = true
-		end
+		-- Metadata lives on the server, which every diff reads it from, so a
+		-- change to it has nothing to apply in Studio. Reporting it as unapplied
+		-- would make the sync fallback replace the instance, breaking every
+		-- reference to it.
 
 		if update.changedProperties ~= nil then
 			for propertyName, propertyValue in pairs(update.changedProperties) do

@@ -291,6 +291,23 @@ function ServeSession:__syncStep(budget)
 	end
 end
 
+--[[
+	Stops tracking instances whose deletion the server saved, with their
+	descendants. Their files are gone, so if an undo brings them back, they are
+	new instances to the server and must be sent as created.
+]]
+function ServeSession:__untrackSavedRemovals(result)
+	for _, id in result.accepted.removed_instances do
+		local instance = self.__instanceMap.fromIds[id]
+		if instance ~= nil then
+			for _, descendant in instance:GetDescendants() do
+				self.__instanceMap:removeInstance(descendant)
+			end
+		end
+		self.__instanceMap:removeId(id)
+	end
+end
+
 function ServeSession:__queueChange(instance, propertyName)
 	self:__markBatchStart()
 	self.__changeBatcher:add(instance, propertyName)
@@ -322,6 +339,7 @@ function ServeSession:__writePatch(patch, messageCursor)
 		:write(patch, messageCursor, authority)
 		:andThen(function(result)
 			self:__untrackRejectedAdditions(patch, result)
+			self:__untrackSavedRemovals(result)
 			finish(ServeSession.getWriteStatus(result), result)
 			return result
 		end)

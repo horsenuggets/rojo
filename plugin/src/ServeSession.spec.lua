@@ -5,6 +5,11 @@ return function()
 	local function writeResult(errors, conflicts)
 		return {
 			errors = errors or {},
+			accepted = {
+				removed_instances = {},
+				added_instances = {},
+				updated_instances = {},
+			},
 			conflicts = conflicts or {
 				removed_instances = {},
 				added_instances = {},
@@ -221,6 +226,7 @@ return function()
 
 		resolveWrite({
 			errors = {},
+			accepted = { removed_instances = {}, added_instances = {}, updated_instances = {} },
 			conflicts = { removed_instances = {}, added_instances = {}, updated_instances = {} },
 		})
 		write:await()
@@ -426,6 +432,38 @@ return function()
 				expect(instanceMap.fromIds[id] == nil).to.equal(expectedGone[id] == true)
 			end
 			instanceMap:stop()
+		end
+	end)
+
+	-- A deletion the server saved stops tracking the instance and everything
+	-- under it, so an undo sends it back as created. Others stay tracked.
+	it("should stop tracking only the deletions the server saved", function()
+		local InstanceMap = require(script.Parent.InstanceMap)
+		for _, saved in { false, true } do
+			local instanceMap = InstanceMap.new()
+			local deleted = Instance.new("Folder")
+			local child = Instance.new("Folder")
+			child.Parent = deleted
+			local kept = Instance.new("Folder")
+			instanceMap:insert("DELETED", deleted)
+			instanceMap:insert("CHILD", child)
+			instanceMap:insert("KEPT", kept)
+			local session = setmetatable({ __instanceMap = instanceMap }, ServeSession)
+
+			session:__untrackSavedRemovals({
+				accepted = {
+					removed_instances = if saved then { "DELETED" } else {},
+					added_instances = {},
+					updated_instances = {},
+				},
+			})
+
+			expect(instanceMap.fromIds.DELETED == nil).to.equal(saved)
+			expect(instanceMap.fromInstances[child] == nil).to.equal(saved)
+			expect(instanceMap.fromIds.KEPT).to.equal(kept)
+			instanceMap:stop()
+			deleted:Destroy()
+			kept:Destroy()
 		end
 	end)
 
