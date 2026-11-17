@@ -26,7 +26,14 @@ local function shouldDeleteUnknownInstances(virtualInstance)
 	end
 end
 
-local function diff(instanceMap, virtualInstances, rootId)
+local function noStep() end
+
+-- `step` is called for every instance the walk touches, whether it is diffed,
+-- added, or unknown, so a caller walking a large place can yield along the
+-- way. Without one, diffing never yields.
+local function diff(instanceMap, virtualInstances, rootId, step)
+	step = step or noStep
+
 	local patch = {
 		removed = {},
 		added = {},
@@ -38,6 +45,7 @@ local function diff(instanceMap, virtualInstances, rootId)
 
 	-- Existing identities inside added subtrees are moves, not new instances.
 	local function markIdAdded(id)
+		step()
 		if instanceMap.fromIds[id] ~= nil then
 			diffInternal(id)
 			return
@@ -56,6 +64,7 @@ local function diff(instanceMap, virtualInstances, rootId)
 			return true
 		end
 		visited[id] = true
+		step()
 		local virtualInstance = virtualInstances[id]
 		local instance = instanceMap.fromIds[id]
 
@@ -166,6 +175,9 @@ local function diff(instanceMap, virtualInstances, rootId)
 		-- corresponding virtual instance should be removed. Any instance that
 		-- does have a corresponding virtual instance is recursively diffed.
 		for _, childInstance in ipairs(instance:GetChildren()) do
+			-- Unknown children are only recorded here and never recursed into,
+			-- so a wide folder of them needs its own chances to yield.
+			step()
 			local childId = instanceMap.fromInstances[childInstance]
 
 			if childId == nil then
