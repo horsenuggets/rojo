@@ -1148,7 +1148,9 @@ impl JobThreadContext {
             Removal::Restore(snapshot) => return Ok(*snapshot),
         };
         // A file's adjacent metadata goes with it, or an instance written at
-        // the same name later would pick up its properties and ID.
+        // the same name later would pick up its properties and ID. Files that
+        // share a stem, like `Code.luau` and `Code.txt`, share it too, so it
+        // stays while another instance still reads it.
         let sidecars: Vec<PathBuf> = tree
             .get_metadata(id)
             .map(|metadata| {
@@ -1164,6 +1166,10 @@ impl JobThreadContext {
                                 .is_some_and(|name| {
                                     name.ends_with(".meta.json") || name.ends_with(".meta.jsonc")
                                 })
+                            && tree
+                                .get_ids_at_path(sidecar)
+                                .iter()
+                                .all(|holder| *holder == id)
                     })
                     .cloned()
                     .collect()
@@ -6516,6 +6522,55 @@ mod tests {
                     "{path} was left behind"
                 );
             }
+        }
+    }
+
+    /// Files that share a stem share their adjacent metadata, so deleting one
+    /// of them leaves it for the other.
+    #[test]
+    fn deletions_keep_metadata_another_file_reads() {
+        let (job, src) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([
+                    ("Code.luau", VfsSnapshot::file("return 1")),
+                    ("Code.txt", VfsSnapshot::file("text")),
+                    (
+                        "Code.meta.json",
+                        VfsSnapshot::file(r#"{"attributes":{"Kind":"shared"}}"#),
+                    ),
+                ]),
+            )],
+            "/project/src",
+        );
+        let script = {
+            let tree = job.tree.lock().unwrap();
+            let children = tree.get_instance(src).unwrap().children().to_vec();
+            children
+                .into_iter()
+                .find(|child| tree.get_instance(*child).unwrap().class_name() == "ModuleScript")
+                .unwrap()
+        };
+        let (accepted, _, errors) = studio_write(
+            &job,
+            PatchSet {
+                removed_instances: vec![script],
+                ..PatchSet::new()
+            },
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(accepted.removed_instances, vec![script]);
+        assert!(job
+            .vfs
+            .metadata("/project/src/Code.luau")
+            .with_not_found()
+            .unwrap()
+            .is_none());
+        for kept in ["/project/src/Code.txt", "/project/src/Code.meta.json"] {
+            assert!(
+                job.vfs.metadata(kept).with_not_found().unwrap().is_some(),
+                "{kept}"
+            );
         }
     }
 
