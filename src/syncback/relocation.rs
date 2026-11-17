@@ -130,6 +130,109 @@ pub(crate) fn cache_directory(project: &crate::Project) -> PathBuf {
     project.folder_location().join(".rojo").join("relocations")
 }
 
+/// Where a relayout sets an instance's old files aside while it writes the new
+/// layout. Startup recovery puts back whatever an interrupted one left here.
+pub(crate) fn relayout_directory(project: &crate::Project) -> PathBuf {
+    project.folder_location().join(".rojo").join("relayout")
+}
+
+/// What a relayout set aside, written before anything moves, so recovery can
+/// put each file back where it came from.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RelayoutManifest {
+    /// Each original path, with the name its backup has in the same folder as
+    /// this manifest.
+    pub entries: Vec<(PathBuf, String)>,
+}
+
+pub(crate) const RELAYOUT_MANIFEST_NAME: &str = "manifest.json";
+
+// Relayouts in the same process, and their recovery, must not overlap.
+static RELAYOUT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Held for the whole of a relayout, and by recovery while it reads the
+/// folders relayouts leave, so neither sees the other halfway through, even
+/// across server processes.
+pub(crate) struct RelayoutGuard {
+    _file: memofs::VfsLockGuard,
+    _process: std::sync::MutexGuard<'static, ()>,
+}
+
+pub(crate) fn lock_relayouts(
+    vfs: &memofs::Vfs,
+    project: &crate::Project,
+) -> std::io::Result<RelayoutGuard> {
+    let process = RELAYOUT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = relayout_directory(project);
+    vfs.create_dir_all(&root)?;
+    let file = vfs.lock_exclusive(&root.with_extension("lock"))?;
+    Ok(RelayoutGuard {
+        _file: file,
+        _process: process,
+    })
+}
+
+/// Puts back the files of relayouts that were interrupted, before anything is
+/// read. A backup whose original path is taken again is kept, and so is a
+/// folder without a readable manifest, since neither can be put back safely.
+pub(crate) fn recover_relayouts(
+    vfs: &memofs::Vfs,
+    project: &crate::Project,
+) -> std::io::Result<()> {
+    use memofs::IoResultExt;
+    let root = relayout_directory(project);
+    // Read-only serving must not create a lock when there's nothing to do.
+    if vfs.read_dir(&root).with_not_found()?.is_none() {
+        return Ok(());
+    }
+    let _guard = lock_relayouts(vfs, project)?;
+    let Some(folders) = vfs.read_dir(&root).with_not_found()? else {
+        return Ok(());
+    };
+    let folders = folders.collect::<std::io::Result<Vec<_>>>()?;
+    for folder in folders {
+        let folder = folder.path().to_path_buf();
+        let manifest = vfs
+            .read(folder.join(RELAYOUT_MANIFEST_NAME))
+            .with_not_found()?
+            .and_then(|manifest| serde_json::from_slice::<RelayoutManifest>(&manifest).ok());
+        let Some(manifest) = manifest else {
+            log::warn!(
+                "Kept \"{}\", which an interrupted relayout left without a readable manifest.",
+                folder.display()
+            );
+            continue;
+        };
+        let mut restored_all = true;
+        for (original, backup) in manifest.entries {
+            let backup = folder.join(backup);
+            if vfs.metadata(&backup).with_not_found()?.is_none() {
+                continue;
+            }
+            if vfs.metadata(&original).with_not_found()?.is_some() {
+                log::warn!(
+                    "Kept \"{}\", since \"{}\" exists again.",
+                    backup.display(),
+                    original.display()
+                );
+                restored_all = false;
+                continue;
+            }
+            let expected = vfs.snapshot_tree(&backup)?;
+            vfs.move_no_replace(&backup, &original, &expected)?;
+        }
+        if restored_all {
+            vfs.remove_dir_all(&folder)?;
+            log::warn!(
+                "Undid a relayout that was interrupted. If it had written the new layout already, the folder may hold the instance twice."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Where new files are written before a relocation moves them into the
 /// project. It's kept apart from the journals, which recovery reads.
 pub(crate) fn staging_directory(project: &crate::Project) -> PathBuf {
@@ -725,6 +828,61 @@ mod tests {
 
     /// Files staged by a write that never finished are cleared at startup, and
     /// recovery never mistakes them for a journal.
+    /// Files an interrupted relayout set aside go back where they came from,
+    /// whether they were a file or a folder. A backup whose original path is
+    /// taken again is kept, and so is a folder without a manifest.
+    #[test]
+    fn recovery_puts_back_what_a_relayout_set_aside() {
+        for taken in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let project_path = temp.path().join("default.project.json");
+            std::fs::write(
+                &project_path,
+                r#"{"name":"Test","tree":{"$className":"Folder","$path":"src"}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(temp.path().join("src")).unwrap();
+            let vfs = memofs::Vfs::new(memofs::StdBackend::new().unwrap());
+            vfs.set_watch_enabled(false);
+            let project = crate::Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+
+            let aside = relayout_directory(&project).join(uuid::Uuid::new_v4().to_string());
+            std::fs::create_dir_all(aside.join("0")).unwrap();
+            std::fs::write(aside.join("0/init.luau"), "return 'folder'").unwrap();
+            std::fs::write(aside.join("1"), "{}").unwrap();
+            let folder = temp.path().join("src/Mover");
+            let sidecar = temp.path().join("src/Mover.meta.json");
+            let manifest = RelayoutManifest {
+                entries: vec![(folder.clone(), "0".into()), (sidecar.clone(), "1".into())],
+            };
+            std::fs::write(
+                aside.join(RELAYOUT_MANIFEST_NAME),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            if taken {
+                std::fs::write(&sidecar, "taken").unwrap();
+            }
+            let orphan = relayout_directory(&project).join("orphan");
+            std::fs::create_dir_all(&orphan).unwrap();
+
+            recover_relayouts(&vfs, &project).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(folder.join("init.luau")).unwrap(),
+                "return 'folder'"
+            );
+            if taken {
+                assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "taken");
+                assert!(aside.join("1").exists());
+            } else {
+                assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "{}");
+                assert!(!aside.exists());
+            }
+            assert!(orphan.exists());
+        }
+    }
+
     #[test]
     fn recovery_clears_leftover_staging() {
         for with_journal_cache in [false, true] {

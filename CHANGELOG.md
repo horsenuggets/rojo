@@ -31,6 +31,27 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.8`
+
+* Changing `syncbackRules.modelTrees` or `instancesAsDirectories` while serving now moves
+  matching instances between model files and directories right away when Studio is
+  authoritative, keeping their IDs so Studio sees no change. Instances stored in a
+  folder's metadata move out with their outermost ancestor there. A relayout that would
+  rewrite a file `ignorePaths` excludes is refused, and one that would lose an instance
+  is undone, until a later rule change lets it through. Files another instance also
+  comes from are never moved. An interrupted relayout is undone the next time the server
+  starts, from a manifest it writes before moving anything. Under Filesystem authority,
+  layouts on disk never change. Before any write says which side wins, the first one
+  decides. Other project file changes, like `ignoreProperties`, now apply to two-way sync
+  writes without restarting the server.
+* Something new in a folder on disk is now read on its own instead of with the folder's
+  whole subtree, which took over half a second in a folder of about 4,500 files and now
+  takes about 0.1 milliseconds. Editor swap files and `.DS_Store` no longer trigger a
+  full read either.
+* A syncback `.gitkeep` is now removed once its folder gets other contents, from Studio
+  or from disk, and a folder that a deletion from Studio leaves empty gets one back. A
+  `.gitkeep` with contents is never touched.
+
 ## `7.7.1-horse.1.7`
 
 * Two-way sync now saves instances created in Studio. A new subtree is written as the
