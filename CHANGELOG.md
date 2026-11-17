@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.7`
+
 * Two-way sync now saves instances created in Studio. A new subtree is written as the
   files a syncback would write for it, keeping the IDs Studio gave it, so the server's
   announcement of it never creates a second copy. This needs protocol version 9, so the
