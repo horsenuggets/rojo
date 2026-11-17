@@ -507,10 +507,13 @@ impl AdjacentMetadata {
             && self.name.is_none()
     }
 
-    /// Returns what the metadata file at `path` should hold once its `name`
-    /// is replaced, keeping everything else in `existing`. Returns `None` when
-    /// nothing would be left to store, so the file shouldn't exist.
-    pub fn with_name(
+    /// Returns what the metadata file at `path` should hold next to a model
+    /// file whose root is named `name`. The model file stores the root's
+    /// properties and attributes itself, so any that `existing` sets are
+    /// dropped, or they would override the synced values when read back. The
+    /// other fields are kept. Returns `None` when nothing would be left to
+    /// store, so the file shouldn't exist.
+    pub fn for_model_root(
         existing: Option<&[u8]>,
         path: &Path,
         name: Option<String>,
@@ -528,6 +531,8 @@ impl AdjacentMetadata {
             },
         };
         meta.name = name;
+        meta.properties.clear();
+        meta.attributes.clear();
         if meta.is_empty() && meta.id.is_none() && meta.schema.is_none() {
             return Ok(None);
         }
@@ -837,12 +842,16 @@ mod test {
     use super::*;
 
     #[test]
-    fn with_name_only_changes_the_name() {
+    fn model_root_metadata_keeps_only_what_the_model_cannot_hold() {
         let path = Path::new("/Model.meta.json");
         let renamed = |existing: Option<&str>, name: Option<&str>| {
-            AdjacentMetadata::with_name(existing.map(str::as_bytes), path, name.map(str::to_owned))
-                .unwrap()
-                .map(|contents| String::from_utf8(contents).unwrap())
+            AdjacentMetadata::for_model_root(
+                existing.map(str::as_bytes),
+                path,
+                name.map(str::to_owned),
+            )
+            .unwrap()
+            .map(|contents| String::from_utf8(contents).unwrap())
         };
 
         // Nothing to store means no file at all.
@@ -852,25 +861,32 @@ mod test {
         let created = renamed(None, Some("New")).unwrap();
         assert!(created.contains(r#""name": "New""#), "{created}");
 
+        // Values the model file stores are all that a sidecar loses.
+        assert_eq!(
+            renamed(
+                Some(r#"{ "properties": { "Archivable": false }, "attributes": { "A": 1 } }"#),
+                None
+            ),
+            None
+        );
+
         // Every other field survives a new name and a removed one.
         let existing = r#"{
             "$schema": "schema.json",
             "id": "model",
             "ignoreUnknownInstances": true,
             "name": "Old",
-            "properties": { "Archivable": false }
+            "properties": { "Archivable": false },
+            "attributes": { "Amount": 1 }
         }"#;
         for name in [Some("New"), None] {
             let updated = renamed(Some(existing), name).unwrap();
-            for kept in [
-                "$schema",
-                r#""id": "model""#,
-                "ignoreUnknownInstances",
-                "Archivable",
-            ] {
+            for kept in ["$schema", r#""id": "model""#, "ignoreUnknownInstances"] {
                 assert!(updated.contains(kept), "{updated}");
             }
-            assert!(!updated.contains("Old"), "{updated}");
+            for dropped in ["Old", "Archivable", "Amount"] {
+                assert!(!updated.contains(dropped), "{updated}");
+            }
             assert_eq!(
                 updated.contains(r#""name": "New""#),
                 name.is_some(),
