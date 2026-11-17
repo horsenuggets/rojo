@@ -67,6 +67,14 @@ syncback_tests! {
     inline_script_free => ["src/Props/init.meta.json", "src/Mixed/Data/init.meta.json", "src/Mixed/Module.luau", "src/Mixed/Scripts/Marker/init.meta.json", "src/InPointer/init.meta.json"],
     // Ensures that all of the JSON middlewares are handled as expected
     json_middlewares => ["src/dir_with_meta/init.meta.json", "src/model_json.model.json", "src/project_json.project.json"],
+    // Ensures that `modelTrees` rules write matching subtrees as model files
+    // in the format they ask for, replace the directories they used to be
+    // even when nothing changed, keep unsafe names in adjacent metadata, and
+    // that a model file no rule matches goes back to the directory layout
+    model_trees => ["src/Plain/Odd_Name.meta.json", "src/Plain/Odd_Name.rbxm", "src/Revert/init.meta.json", "src/Scenes/Intro/FX.rbxm", "src/Scenes/Outro/FX.rbxm", "src/Text/Legible.rbxmx"],
+    // Ensures that a project already laid out by its `modelTrees` rules is
+    // left untouched
+    model_trees_stable => [],
     // Ensures projects that refer to other projects work as expected
     nested_projects => ["nested.project.json", "string_value.txt"],
     // Non-finite number attributes are kept in their tagged form by every JSON writer.

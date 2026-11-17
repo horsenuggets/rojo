@@ -122,13 +122,26 @@ impl FsSnapshot {
                 Err(err) => return Err(err),
             };
         }
+        // A directory can be replaced by a file with the same name, like a
+        // folder named `FX.rbxm` next to an `FX` that becomes a model file.
+        // It has to go before the file can be written in its place.
+        let replaced = |dir_path: &PathBuf| self.added_files.contains_key(dir_path);
+        for dir_path in self.removed_dirs.iter().filter(|path| replaced(path)) {
+            lock.remove_dir_all(base_path.join(dir_path))?;
+        }
         for (path, contents) in &self.added_files {
             lock.write(base_path.join(path), contents)?;
         }
-        for dir_path in &self.removed_dirs {
+        for dir_path in self.removed_dirs.iter().filter(|path| !replaced(path)) {
             lock.remove_dir_all(base_path.join(dir_path))?;
         }
         for path in &self.removed_files {
+            // An Instance that moves to a new layout is removed and written
+            // as new. If it lands on its old path after all, the file that was
+            // just written must survive.
+            if self.added_files.contains_key(path) {
+                continue;
+            }
             lock.remove_file(base_path.join(path))?;
         }
         drop(lock);

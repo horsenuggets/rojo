@@ -3,6 +3,7 @@ pub mod from_studio;
 mod fs_snapshot;
 mod hash;
 mod inline;
+mod model_trees;
 pub(crate) mod promotion;
 mod property_filter;
 mod ref_properties;
@@ -40,6 +41,7 @@ pub use file_names::{
 };
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
+pub use model_trees::{is_model_file, is_project_owned, ModelTreeRule, ModelTrees};
 pub(crate) use property_filter::{can_write_property, is_unset_binary_string};
 pub use property_filter::{
     filter_json_properties_preallocated, filter_properties, filter_properties_preallocated,
@@ -116,6 +118,7 @@ pub fn syncback_instance(
             scoped: true,
             context: None,
             script_containers: None,
+            model_trees: None,
             attribute_ids: &attribute_ids,
         },
         old: Some(id),
@@ -334,11 +337,27 @@ pub fn syncback_loop(
 
     let project_path = project.folder_location();
 
+    let model_tree_rules = model_trees::CompiledModelTreeRules::new(
+        project
+            .syncback_rules
+            .as_ref()
+            .map(|rules| rules.model_trees.as_slice())
+            .unwrap_or_default(),
+        &project.tree,
+    )?;
     let mut relayout = if instances_as_directories(project) {
-        inline::needs_relayout(old_tree)
+        inline::needs_relayout(
+            old_tree,
+            &ModelTrees::find(&model_tree_rules, old_tree.inner()),
+        )
     } else {
         HashSet::new()
     };
+    relayout.extend(model_trees::needs_relayout(
+        &model_tree_rules,
+        old_tree,
+        instances_as_directories(project),
+    ));
     for instance in old_tree.inner().descendants() {
         let old = old_tree.get_instance(instance.referent()).unwrap();
         if !matches!(
@@ -372,6 +391,7 @@ pub fn syncback_loop(
             }
         }
     }
+    let model_trees = ModelTrees::find(&model_tree_rules, &new_tree);
     let script_containers = inline::script_containers(&new_tree);
     let attribute_ids = attribute_ids(&new_tree);
     let syncback_data = SyncbackData {
@@ -382,6 +402,7 @@ pub fn syncback_loop(
         scoped: false,
         context: None,
         script_containers: Some(&script_containers),
+        model_trees: Some(&model_trees),
         attribute_ids: &attribute_ids,
     };
 
@@ -436,6 +457,23 @@ pub fn syncback_loop(
 
         let middleware = get_best_middleware(&snapshot);
 
+        // A model file holds its whole subtree, so it can't leave out a
+        // descendant the project asks syncback to ignore.
+        if snapshot.model_tree_middleware().is_some() {
+            let prefix = format!("{inst_path}/");
+            let ignored = project
+                .syncback_rules
+                .iter()
+                .flat_map(|rules| &rules.ignore_trees)
+                .find(|tree| tree.starts_with(&prefix));
+            if let Some(ignored) = ignored {
+                anyhow::bail!(
+                    "Cannot store {inst_path} as a model file because the project's \
+                     ignoreTrees rule excludes {ignored}"
+                );
+            }
+        }
+
         // Only a model owns its whole subtree. A directory may mix JSON and
         // binary descendants, so its early comparison must remain exact.
         let model_hasher: Option<fn(&Project, &WeakDom, Ref) -> _> = match middleware {
@@ -467,7 +505,12 @@ pub fn syncback_loop(
 
         let syncback = match middleware.syncback(&snapshot) {
             Ok(syncback) => syncback,
-            Err(err) if middleware == Middleware::Dir => {
+            // Writing the directory as a model file instead would remove the
+            // very paths an ignore conflict is reported to protect.
+            Err(err)
+                if middleware == Middleware::Dir
+                    && err.downcast_ref::<IgnoreConflict>().is_none() =>
+            {
                 let new_middleware = match env::var(DEBUG_MODEL_FORMAT_VAR) {
                     Ok(value) if value == "1" => Middleware::Rbxmx,
                     Ok(value) if value == "2" => Middleware::JsonModel,
@@ -483,7 +526,11 @@ pub fn syncback_loop(
                     "{file_name}.{}",
                     extension_for_middleware(new_middleware)
                 ));
-                let new_snapshot = snapshot.with_new_path(path, snapshot.new, snapshot.old);
+                // The model file is named by its own middleware, not by the
+                // directory that could not be written.
+                let new_snapshot = snapshot
+                    .with_new_path(path, snapshot.new, snapshot.old)
+                    .middleware(new_middleware);
                 log::warn!(
                     "Could not syncback {inst_path} as a Directory because: {err}.\n\
                     It will instead be synced back as a {new_middleware:?}."
@@ -534,6 +581,17 @@ pub fn syncback_loop(
                 } else {
                     fs_snapshot.remove_file(path)
                 }
+                // The metadata that names a model file's root would otherwise
+                // outlive it, since nothing else is written next to it.
+                if inst.metadata().middleware.is_some_and(is_model_file) {
+                    for meta_path in inst.metadata().relevant_paths.iter().skip(1) {
+                        if meta_path.is_file()
+                            && is_valid_path(&ignore_patterns, project_path, meta_path)
+                        {
+                            fs_snapshot.remove_file(meta_path)
+                        }
+                    }
+                }
             }
         }
 
@@ -551,6 +609,13 @@ pub fn syncback_loop(
 
     Ok(fs_snapshot)
 }
+
+/// Reports that a layout the `modelTrees` rules ask for would remove or absorb
+/// something the project's ignore rules exclude. Syncback stops on it, where
+/// other directory errors make it write the directory as a model file.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct IgnoreConflict(pub String);
 
 pub struct SyncbackReturn<'sync> {
     pub fs_snapshot: FsSnapshot,
@@ -620,6 +685,8 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
 
     if let Some(override_middleware) = snapshot.middleware {
         return override_middleware;
+    } else if let Some(model) = snapshot.model_tree_middleware() {
+        return model;
     } else if let Some(script) =
         script_middleware_for_syncback(inst, snapshot.old_inst(), snapshot.project()).filter(|_| {
             old_middleware.is_none_or(|old| file_names::script_kind_suffix(old).is_some())
@@ -706,6 +773,14 @@ pub struct SyncbackRules {
     /// their real names are stored in their metadata. Defaults to `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     instances_as_directories: Option<bool>,
+    /// A list of rules that store whole subtrees in a single model file. Each
+    /// has a `pattern` glob that is matched against the path of an Instance in
+    /// the DataModel, and an optional `format` of `rbxm` (the default) or
+    /// `rbxmx`. A matching Instance is written with all of its descendants to
+    /// one file, even when `instancesAsDirectories` is set. The first rule
+    /// that matches an Instance decides its format.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) model_trees: Vec<ModelTreeRule>,
 }
 
 impl SyncbackRules {
@@ -1383,6 +1458,7 @@ mod test {
             ignore_referents: None,
             create_ignore_dir_paths,
             instances_as_directories: None,
+            model_trees: Vec::new(),
         }
     }
 

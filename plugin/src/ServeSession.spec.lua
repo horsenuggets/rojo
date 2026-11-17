@@ -335,4 +335,148 @@ return function()
 		Settings:set("twoWaySyncAuthority", original)
 		assert(success, err)
 	end)
+
+	-- A session that records what reaches the change batcher.
+	local function changeSession(twoWaySync, deferring)
+		local queued = {}
+		local session = setmetatable({
+			__twoWaySync = twoWaySync,
+			__deferredChanges = if deferring then {} else nil,
+			__changeBatcher = {
+				__pendingPropertyChanges = {},
+				add = function(_self, instance, propertyName)
+					table.insert(queued, instance.Name .. "." .. propertyName)
+				end,
+			},
+			__apiContext = {
+				getMessageCursor = function()
+					return 1
+				end,
+			},
+		}, ServeSession)
+		return session, queued
+	end
+
+	-- Every combination of two-way sync and the initial sync still running.
+	-- An edit is dropped without two-way sync, held while the place is only
+	-- partly known, and queued otherwise.
+	it("should drop, hold, or queue a Studio edit", function()
+		local instance = Instance.new("Folder")
+		instance.Name = "Edited"
+		for _, twoWaySync in { false, true } do
+			for _, deferring in { false, true } do
+				local session, queued = changeSession(twoWaySync, deferring)
+				session:__onInstanceChanged(instance, "Name")
+
+				local held = if session.__deferredChanges then #session.__deferredChanges else 0
+				expect(#queued).to.equal(if twoWaySync and not deferring then 1 else 0)
+				expect(held).to.equal(if twoWaySync and deferring then 1 else 0)
+			end
+		end
+		instance:Destroy()
+	end)
+
+	it("should release held edits in order and queue later ones directly", function()
+		local first = Instance.new("Folder")
+		first.Name = "First"
+		local second = Instance.new("Folder")
+		second.Name = "Second"
+		local session, queued = changeSession(true, true)
+
+		session:__onInstanceChanged(first, "Parent")
+		session:__onInstanceChanged(second, "Name")
+		session:__onInstanceChanged(first, "Name")
+		expect(#queued).to.equal(0)
+
+		session:__releaseDeferredChanges()
+		expect(table.concat(queued, ",")).to.equal("First.Parent,Second.Name,First.Name")
+		expect(session.__deferredChanges).to.equal(nil)
+
+		session:__onInstanceChanged(second, "Parent")
+		expect(queued[4]).to.equal("Second.Parent")
+
+		-- Releasing again must not replay anything.
+		session:__releaseDeferredChanges()
+		expect(#queued).to.equal(4)
+		first:Destroy()
+		second:Destroy()
+	end)
+
+	-- Every combination of the budget having yielded and the session having
+	-- stopped. The walk only has to stop when both are true, since a session
+	-- can't be stopped without a yield to stop it in.
+	it("should cancel the initial sync only after a yield in a stopped session", function()
+		for _, yielded in { false, true } do
+			for _, status in { "Connecting", "Connected", "Disconnected" } do
+				local session = setmetatable({ __status = status }, ServeSession)
+				local step = session:__syncStep(function()
+					return yielded
+				end)
+				local ok, err = pcall(step)
+				local shouldCancel = yielded and status == "Disconnected"
+				expect(ok).to.equal(not shouldCancel)
+				if shouldCancel then
+					expect(err).to.equal(ServeSession.SYNC_CANCELLED)
+				end
+			end
+		end
+	end)
+
+	-- Stopping the session while hydration is suspended must end the sync
+	-- there: no diff, no confirmation, no patch, and no held edits sent.
+	it("should abandon the initial sync when the session stops mid-walk", function()
+		local reached = {}
+		local queued = {}
+		local session
+		session = setmetatable({
+			__status = "Connecting",
+			__twoWaySync = true,
+			__deferredChanges = { { instance = Instance.new("Folder"), propertyName = "Name" } },
+			__updateLoadingText = function() end,
+			__syncStep = function(self)
+				-- Stands in for a budget that yields on the first step.
+				return ServeSession.__syncStep(self, function()
+					return true
+				end)
+			end,
+			__userConfirmCallback = function()
+				table.insert(reached, "confirm")
+				return "Accept"
+			end,
+			__changeBatcher = {
+				__pendingPropertyChanges = {},
+				add = function()
+					table.insert(queued, "edit")
+				end,
+			},
+			__reconciler = {
+				hydrate = function(_self, _instances, _rootId, _root, step)
+					table.insert(reached, "hydrate")
+					session.__status = "Disconnected"
+					step()
+					table.insert(reached, "hydrate finished")
+				end,
+				diff = function()
+					table.insert(reached, "diff")
+					return true, { removed = {}, added = {}, updated = {} }
+				end,
+			},
+			__apiContext = {
+				read = function()
+					return Promise.resolve({ messageCursor = 1, instances = {} })
+				end,
+				setMessageCursor = function() end,
+				getMessageCursor = function()
+					return 1
+				end,
+			},
+		}, ServeSession)
+
+		local ok, err = session:__initialSync({ rootInstanceId = "ROOT" }):await()
+		expect(ok).to.equal(false)
+		expect(string.find(tostring(err), ServeSession.SYNC_CANCELLED, 1, true) ~= nil).to.equal(true)
+		expect(table.concat(reached, ",")).to.equal("hydrate")
+		expect(#queued).to.equal(0)
+		session.__deferredChanges[1].instance:Destroy()
+	end)
 end

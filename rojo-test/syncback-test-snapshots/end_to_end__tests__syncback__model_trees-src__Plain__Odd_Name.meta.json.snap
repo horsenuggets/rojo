@@ -1,0 +1,7 @@
+---
+source: tests/tests/syncback.rs
+expression: src/Plain/Odd_Name.meta.json
+---
+{
+    "name": "Odd?Name"
+}

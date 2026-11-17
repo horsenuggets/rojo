@@ -1,0 +1,39 @@
+---
+source: tests/rojo_test/syncback_util.rs
+expression: src/Scenes/Outro/FX.rbxm
+---
+num_types: 2
+num_instances: 2
+chunks:
+  - Inst:
+      type_id: 1
+      type_name: Folder
+      object_format: 0
+      referents:
+        - 1
+  - Inst:
+      type_id: 0
+      type_name: Part
+      object_format: 0
+      referents:
+        - 0
+  - Prop:
+      type_id: 1
+      prop_name: Name
+      prop_type: String
+      values:
+        - FX
+  - Prop:
+      type_id: 0
+      prop_name: Name
+      prop_type: String
+      values:
+        - Beam
+  - Prnt:
+      version: 0
+      links:
+        - - 0
+          - 1
+        - - 1
+          - -1
+  - End

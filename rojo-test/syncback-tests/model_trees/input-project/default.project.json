@@ -1,0 +1,24 @@
+{
+  "name": "model_trees",
+  "tree": {
+    "$className": "Folder",
+    "src": {
+      "$path": "src"
+    }
+  },
+  "syncbackRules": {
+    "instancesAsDirectories": true,
+    "modelTrees": [
+      {
+        "pattern": "src/Scenes/*/FX"
+      },
+      {
+        "pattern": "src/Text/*",
+        "format": "rbxmx"
+      },
+      {
+        "pattern": "src/Plain/*"
+      }
+    ]
+  }
+}

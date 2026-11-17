@@ -1,0 +1,59 @@
+---
+source: tests/rojo_test/syncback_util.rs
+expression: src/Scenes/Intro/FX.rbxm
+---
+num_types: 3
+num_instances: 3
+chunks:
+  - Inst:
+      type_id: 2
+      type_name: Folder
+      object_format: 0
+      referents:
+        - 2
+  - Inst:
+      type_id: 0
+      type_name: ModuleScript
+      object_format: 0
+      referents:
+        - 0
+  - Inst:
+      type_id: 1
+      type_name: Part
+      object_format: 0
+      referents:
+        - 1
+  - Prop:
+      type_id: 2
+      prop_name: Name
+      prop_type: String
+      values:
+        - FX
+  - Prop:
+      type_id: 0
+      prop_name: Name
+      prop_type: String
+      values:
+        - Emit
+  - Prop:
+      type_id: 0
+      prop_name: Source
+      prop_type: String
+      values:
+        - "return \"emit\"\n"
+  - Prop:
+      type_id: 1
+      prop_name: Name
+      prop_type: String
+      values:
+        - Spark
+  - Prnt:
+      version: 0
+      links:
+        - - 0
+          - 2
+        - - 1
+          - 2
+        - - 2
+          - -1
+  - End
