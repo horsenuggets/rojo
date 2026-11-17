@@ -216,10 +216,12 @@ local function diff(instanceMap, virtualInstances, rootId, step)
 			local childInstance = instanceMap.fromIds[childId]
 
 			if childInstance == nil then
-				-- Children of a DataModel are services. Hydration already resolved
-				-- every one a plugin can reach, and the rest can't be created.
-				if instance:IsA("DataModel") then
-					Log.debug("Skipping unreachable service {}", virtualInstances[childId].ClassName)
+				-- Hydration already resolved every service a plugin can reach, and
+				-- the rest can't be created. A creatable instance a project puts at
+				-- the root, like a Folder, is added like any other.
+				local className = virtualInstances[childId].ClassName
+				if instance:IsA("DataModel") and not services.isCreatable(className) then
+					Log.debug("Skipping unreachable service {}", className)
 					continue
 				end
 

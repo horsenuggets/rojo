@@ -10,7 +10,7 @@ local Log = require(Packages.Log)
 local InstanceMap = {}
 InstanceMap.__index = InstanceMap
 
-function InstanceMap.new(onInstanceChanged)
+function InstanceMap.new(onInstanceChanged, onChildAdded)
 	local self = {
 		-- A map from IDs to instances.
 		fromIds = {},
@@ -35,6 +35,10 @@ function InstanceMap.new(onInstanceChanged)
 		-- Callback that's invoked whenever an instance is changed and it was
 		-- not paused.
 		onInstanceChanged = onInstanceChanged,
+
+		-- Callback that's invoked with each instance that gains a known parent
+		-- while it isn't known itself, which is how Studio-made instances appear.
+		onChildAdded = onChildAdded,
 	}
 
 	return setmetatable(self, InstanceMap)
@@ -213,6 +217,13 @@ function InstanceMap:__connectSignals(instance)
 		}
 	end
 
+	table.insert(
+		self.instancesToSignal[instance],
+		instance.ChildAdded:Connect(function(child)
+			self:__maybeFireChildAdded(instance, child)
+		end)
+	)
+
 	-- AncestryChanged is deliberately not watched. Changes to an instance's own Parent
 	-- already arrive through the signals above, while AncestryChanged also fires on every
 	-- descendant when an ancestor moves. Those descendants still have their parent, so
@@ -248,6 +259,23 @@ function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
 	end
 
 	self.onInstanceChanged(instance, propertyName)
+end
+
+--[[
+	Reports a child that isn't known yet. Instances Rojo+ creates itself also
+	pass through here, between being parented and being inserted, so whoever
+	handles this must check again later whether the child is still unknown.
+]]
+function InstanceMap:__maybeFireChildAdded(parent, child)
+	if self.onChildAdded == nil or self.fromInstances[child] ~= nil then
+		return
+	end
+
+	if self.pausedUpdateInstances[parent] or self:__isGameRunning() then
+		return
+	end
+
+	self.onChildAdded(child)
 end
 
 -- Kept separate so tests, which the test place runs in a running game, can still exercise

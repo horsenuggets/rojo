@@ -213,8 +213,13 @@ pub fn syncback_dir<'sync>(
         }
 
         // Metadata that used to hold inline children is rewritten even when it
-        // ends up empty, or the removed children would load again from it.
-        if !meta.is_empty() || (inline && was_inline) {
+        // ends up empty, or the removed children would load again from it. So
+        // is any metadata file that already exists, or the values it held, like
+        // the last attribute removed from a folder, would load again. Emptying
+        // it in place also keeps the edit to one file, which two-way sync needs.
+        // A file whose inline children are moving out is removed below instead.
+        let leaving_inline = !inline && was_inline;
+        if !meta.is_empty() || (inline && was_inline) || (!leaving_inline && is_file(&meta_path)?) {
             let contents = crate::json::to_vec_pretty(&meta)
                 .context("could not serialize new init.meta.json")?;
             if snapshot.vfs().read(&meta_path).with_not_found()?.as_deref() != Some(&contents) {

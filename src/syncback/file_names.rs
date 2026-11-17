@@ -372,13 +372,43 @@ fn sanitize_stem(name: &str, class: &str) -> String {
     stem
 }
 
+/// Returns the stem a new child of a directory is written with. None of the
+/// entries it would occupy may already be in the directory, compared without
+/// case, where `existing` holds the lowercased names of those entries. Taken
+/// stems get `~2`, `~3`, and so on, like [`unique_child_stems`].
+pub fn free_child_stem(
+    child: &Instance,
+    middleware: Middleware,
+    existing: &HashSet<String>,
+) -> String {
+    let base = sanitize_stem(&child.name, &child.class);
+    let mut counter = 1;
+    loop {
+        let stem = if counter == 1 {
+            base.clone()
+        } else {
+            format!("{base}~{counter}")
+        };
+        let free = output_paths(middleware, &stem).iter().all(|path| {
+            let entry = path.split('/').next().unwrap_or(path);
+            !existing.contains(&entry.to_lowercase())
+        });
+        if free {
+            return stem;
+        }
+        counter += 1;
+    }
+}
+
 /// Returns every path a child can occupy, including its adjacent metadata.
 fn output_paths(middleware: Middleware, stem: &str) -> Vec<String> {
     let mut paths = vec![file_name_for_stem(middleware, stem)];
     if middleware.is_dir() {
         paths.push(format!("{stem}/init.meta.json"));
     } else {
+        // Both sidecars are applied when the file is read.
         paths.push(format!("{stem}.meta.json"));
+        paths.push(format!("{stem}.meta.jsonc"));
     }
     paths
 }
@@ -463,6 +493,37 @@ mod test {
     use rbx_dom_weak::InstanceBuilder;
 
     use crate::{project::ProjectNode, syncback::model_trees::CompiledModelTreeRules};
+
+    fn free_stem(name: &str, class: &str, existing: &[&str]) -> String {
+        let dom = WeakDom::new(InstanceBuilder::new(class).with_name(name));
+        let existing = existing.iter().map(|name| name.to_lowercase()).collect();
+        free_child_stem(
+            dom.root(),
+            directory_middleware_for_instance(dom.root()),
+            &existing,
+        )
+    }
+
+    #[test]
+    fn free_child_stem_avoids_every_existing_entry_without_case() {
+        assert_eq!(free_stem("Folder", "Folder", &[]), "Folder");
+        assert_eq!(free_stem("Folder", "Folder", &["folder"]), "Folder~2");
+        assert_eq!(
+            free_stem("Folder", "Folder", &["FOLDER", "Folder~2"]),
+            "Folder~3"
+        );
+        // A script's metadata sidecars count too, in either format.
+        for sidecar in ["Mod.meta.json", "Mod.meta.jsonc"] {
+            assert_eq!(free_stem("Mod", "ModuleScript", &[sidecar]), "Mod~2");
+        }
+        assert_eq!(free_stem("Mod", "ModuleScript", &["Mod"]), "Mod");
+        // Names that aren't safe file names are sanitized first.
+        assert_eq!(
+            free_stem("a/b", "Folder", &[]),
+            free_stem("a/b", "Folder", &[])
+        );
+        assert!(!free_stem("a/b", "Folder", &[]).contains('/'));
+    }
 
     fn stems_for(children: &[(&str, &str)]) -> Vec<String> {
         let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));

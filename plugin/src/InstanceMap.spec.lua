@@ -210,4 +210,57 @@ return function()
 			tree.Container:Destroy()
 		end
 	end)
+
+	-- Every combination of the child being known, the parent being paused, and
+	-- the game running. Only an unknown child of an active parent is reported.
+	it("should report only unknown children added to a known parent", function()
+		for _, known in { false, true } do
+			for _, paused in { false, true } do
+				for _, gameRunning in { false, true } do
+					const added = {}
+					const instanceMap = InstanceMap.new(nil, function(child)
+						table.insert(added, child)
+					end)
+					instanceMap.__isGameRunning = function()
+						return gameRunning
+					end
+					const parent = Instance.new("Folder")
+					instanceMap:insert("PARENT", parent)
+					if paused then
+						instanceMap:pauseInstance(parent)
+					end
+					const child = Instance.new("Folder")
+					if known then
+						instanceMap:insert("CHILD", child)
+					end
+
+					child.Parent = parent
+					settle()
+
+					const expected = not known and not paused and not gameRunning
+					expect(#added).to.equal(if expected then 1 else 0)
+					instanceMap:stop()
+					parent:Destroy()
+				end
+			end
+		end
+	end)
+
+	it("should not report children of an untracked parent", function()
+		const added = {}
+		const instanceMap = InstanceMap.new(nil, function(child)
+			table.insert(added, child)
+		end)
+		instanceMap.__isGameRunning = function()
+			return false
+		end
+		const parent = Instance.new("Folder")
+		instanceMap:insert("PARENT", parent)
+		instanceMap:removeId("PARENT")
+		Instance.new("Folder").Parent = parent
+		settle()
+		expect(#added).to.equal(0)
+		instanceMap:stop()
+		parent:Destroy()
+	end)
 end

@@ -1,3 +1,4 @@
+mod addition;
 mod file_names;
 pub mod from_studio;
 mod fs_snapshot;
@@ -32,17 +33,19 @@ use crate::{
     snapshot::{InstanceWithMeta, RojoTree},
     snapshot_middleware::{dir_init_files, Middleware},
     syncback::ref_properties::{attribute_ids, collect_referents, ids_on_disk, link_referents},
-    Project,
+    Project, REF_POINTER_ATTRIBUTE_PREFIX,
 };
 
+pub use addition::{drop_duplicate_ids, drop_ignored_properties, syncback_new_subtree};
 pub use file_names::{
     directory_middleware_for_instance, extension_for_middleware, name_for_inst, sibling_order_key,
     unique_child_stems, validate_file_name,
 };
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
+pub(crate) use inline::is_script_class;
 pub use model_trees::{is_model_file, is_project_owned, ModelTreeRule, ModelTrees};
-pub(crate) use property_filter::{can_write_property, is_unset_binary_string};
+pub(crate) use property_filter::{can_write_property, is_unset_value};
 pub use property_filter::{
     filter_json_properties_preallocated, filter_properties, filter_properties_preallocated,
 };
@@ -70,6 +73,87 @@ pub fn syncback_instance(
     id: Ref,
     new_tree: WeakDom,
 ) -> anyhow::Result<FsSnapshot> {
+    syncback_scoped(vfs, old_tree, project, id, new_tree, false)
+}
+
+/// Serializes a model file from `new_tree`, which must hold the model's whole
+/// subtree, since the file stores every descendant.
+pub fn syncback_model_file(
+    vfs: &Vfs,
+    old_tree: &RojoTree,
+    project: &Project,
+    id: Ref,
+    new_tree: WeakDom,
+) -> anyhow::Result<FsSnapshot> {
+    syncback_scoped(vfs, old_tree, project, id, new_tree, true)
+}
+
+/// Links the references between instances in `dom` through `Rojo_Id` and
+/// `Rojo_Target_*` attributes, like a full syncback does, unless the project
+/// opts out. Instances keep the IDs they already carry. References to
+/// instances outside `dom` can't be linked and become nil.
+pub(crate) fn link_scoped_referents(project: &Project, dom: &mut WeakDom) -> anyhow::Result<()> {
+    let ignore_referents = project
+        .syncback_rules
+        .as_ref()
+        .and_then(|rules| rules.ignore_referents)
+        .unwrap_or_default();
+    if ignore_referents {
+        return Ok(());
+    }
+    // Linking rewrites every `Rojo_Target_*` attribute of an instance that
+    // points inside `dom`. One whose property was cleared must go, and one
+    // that points outside `dom`, held by the attribute alone, must stay.
+    let mut kept = Vec::new();
+    let mut cleared = Vec::new();
+    for referent in descendants(dom, dom.root_ref()) {
+        let instance = dom.get_by_ref(referent).unwrap();
+        let Some(Variant::Attributes(attributes)) = instance.properties.get(&ustr("Attributes"))
+        else {
+            continue;
+        };
+        for (name, value) in attributes.iter() {
+            let Some(property) = name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) else {
+                continue;
+            };
+            match instance.properties.get(&ustr(property)) {
+                Some(Variant::Ref(target)) if target.is_none() => {
+                    cleared.push((referent, name.clone()))
+                }
+                Some(Variant::Ref(target)) if dom.get_by_ref(*target).is_some() => {}
+                _ => kept.push((referent, name.clone(), value.clone())),
+            }
+        }
+    }
+    for (referent, name) in cleared {
+        if let Some(Variant::Attributes(attributes)) = dom
+            .get_by_ref_mut(referent)
+            .and_then(|instance| instance.properties.get_mut(&ustr("Attributes")))
+        {
+            attributes.remove(name.as_str());
+        }
+    }
+    let links = collect_referents(dom);
+    link_referents(links, dom, &HashMap::new())?;
+    for (referent, name, value) in kept {
+        if let Some(Variant::Attributes(attributes)) = dom
+            .get_by_ref_mut(referent)
+            .and_then(|instance| instance.properties.get_mut(&ustr("Attributes")))
+        {
+            attributes.insert(name, value);
+        }
+    }
+    Ok(())
+}
+
+fn syncback_scoped(
+    vfs: &Vfs,
+    old_tree: &RojoTree,
+    project: &Project,
+    id: Ref,
+    mut new_tree: WeakDom,
+    whole_model: bool,
+) -> anyhow::Result<FsSnapshot> {
     let old_inst = old_tree
         .get_instance(id)
         .context("Cannot sync an unknown instance")?;
@@ -83,11 +167,20 @@ pub fn syncback_instance(
         .metadata()
         .middleware
         .context("The instance has no known filesystem middleware")?;
-    if matches!(
+    let is_model = matches!(
         middleware,
         Middleware::Rbxm | Middleware::Rbxmx | Middleware::JsonModel
-    ) {
-        anyhow::bail!("Model-file updates require subtree serialization");
+    );
+    if is_model != whole_model {
+        anyhow::bail!(if is_model {
+            "Model-file updates require subtree serialization"
+        } else {
+            "Only model files are serialized with their whole subtree"
+        });
+    }
+    // Binary models hold references natively. Other formats need attributes.
+    if !matches!(middleware, Middleware::Rbxm | Middleware::Rbxmx) {
+        link_scoped_referents(project, &mut new_tree)?;
     }
     if let (Some(script), Some(source)) = (
         script_middleware_for_syncback(new_tree.root(), Some(old_inst), project),
@@ -335,8 +428,6 @@ pub fn syncback_loop(
     log::debug!("Hashing file DOM");
     let new_hashes = hash_tree(project, &new_tree, new_tree.root_ref());
 
-    let project_path = project.folder_location();
-
     let model_tree_rules = model_trees::CompiledModelTreeRules::new(
         project
             .syncback_rules
@@ -417,7 +508,7 @@ pub fn syncback_loop(
     let mut fs_snapshot = FsSnapshot::new();
     let mut file_owners = HashMap::new();
 
-    'syncback: while let Some(snapshot) = snapshots.pop() {
+    while let Some(snapshot) = snapshots.pop() {
         let inst_path = snapshot.get_new_inst_path(snapshot.new);
         // We can quickly check that two subtrees are identical and if they are,
         // skip reconciling them.
@@ -437,20 +528,51 @@ pub fn syncback_loop(
             }
         }
 
+        if let Some((children, _)) = syncback_snapshot(
+            snapshot,
+            &ignore_patterns,
+            project,
+            &relayout,
+            &mut fs_snapshot,
+            &mut file_owners,
+        )? {
+            snapshots.extend(children);
+        }
+    }
+
+    Ok(fs_snapshot)
+}
+
+/// Serializes one instance into `fs_snapshot` and returns the snapshots for its
+/// children, along with the path the instance was written to. Returns `None`
+/// when the project's rules leave the instance out, or a model file already
+/// holds exactly this subtree. Instances in `relayout` are always rewritten.
+fn syncback_snapshot<'sync>(
+    snapshot: SyncbackSnapshot<'sync>,
+    ignore_patterns: &Option<Vec<IgnorableGlob>>,
+    project: &Project,
+    relayout: &HashSet<Ref>,
+    fs_snapshot: &mut FsSnapshot,
+    file_owners: &mut HashMap<PathBuf, Ref>,
+) -> anyhow::Result<Option<(Vec<SyncbackSnapshot<'sync>>, PathBuf)>> {
+    let inst_path = snapshot.get_new_inst_path(snapshot.new);
+    let project_path = project.folder_location();
+    let mut written_path = snapshot.path.clone();
+    {
         if snapshot.is_script_suffix_migration(&snapshot.path) {
             let old_source = snapshot.old_inst().as_ref().and_then(source_file).unwrap();
             snapshot.validate_script_migration(&old_source, &snapshot.path)?;
         }
-        if !is_valid_path(&ignore_patterns, project_path, &snapshot.path) {
+        if !is_valid_path(ignore_patterns, project_path, &snapshot.path) {
             log::debug!("Skipping {inst_path} because its path matches ignore pattern");
-            continue;
+            return Ok(None);
         }
         if let Some(syncback_rules) = &project.syncback_rules {
             // Ignore trees;
             for ignored in &syncback_rules.ignore_trees {
                 if inst_path.starts_with(ignored.as_str()) {
                     log::debug!("Tree {inst_path} is blocked by project");
-                    continue 'syncback;
+                    return Ok(None);
                 }
             }
         }
@@ -488,7 +610,7 @@ pub fn syncback_loop(
             let old = hash_model(project, snapshot.old_tree(), old_ref);
             let new = hash_model(project, snapshot.new_tree(), snapshot.new);
             if old.get(&old_ref) == new.get(&snapshot.new) {
-                continue;
+                return Ok(None);
             }
         }
 
@@ -500,7 +622,7 @@ pub fn syncback_loop(
 
         if matches!(middleware, Middleware::Json | Middleware::Toml) {
             log::warn!("Cannot syncback {middleware:?} at {inst_path}, skipping");
-            continue;
+            return Ok(None);
         }
 
         let syncback = match middleware.syncback(&snapshot) {
@@ -535,6 +657,7 @@ pub fn syncback_loop(
                     "Could not syncback {inst_path} as a Directory because: {err}.\n\
                     It will instead be synced back as a {new_middleware:?}."
                 );
+                written_path = new_snapshot.path.clone();
                 let new_syncback_result = new_middleware
                     .syncback(&new_snapshot)
                     .with_context(|| format!("Failed to syncback {inst_path}"));
@@ -561,7 +684,7 @@ pub fn syncback_loop(
                 };
                 let path = source.path();
                 let inst_path = snapshot.get_old_inst_path(inst.id());
-                if !is_valid_path(&ignore_patterns, project_path, path) {
+                if !is_valid_path(ignore_patterns, project_path, path) {
                     log::debug!(
                         "Skipping removing {} because its matches an ignore pattern",
                         path.display()
@@ -586,7 +709,7 @@ pub fn syncback_loop(
                 if inst.metadata().middleware.is_some_and(is_model_file) {
                     for meta_path in inst.metadata().relevant_paths.iter().skip(1) {
                         if meta_path.is_file()
-                            && is_valid_path(&ignore_patterns, project_path, meta_path)
+                            && is_valid_path(ignore_patterns, project_path, meta_path)
                         {
                             fs_snapshot.remove_file(meta_path)
                         }
@@ -599,15 +722,13 @@ pub fn syncback_loop(
 
         fs_snapshot.merge_with_filter(
             syncback.fs_snapshot,
-            |path| is_valid_path(&ignore_patterns, project_path, path),
+            |path| is_valid_path(ignore_patterns, project_path, path),
             snapshot.new,
-            &mut file_owners,
+            file_owners,
         )?;
 
-        snapshots.extend(syncback.children);
+        Ok(Some((syncback.children, written_path)))
     }
-
-    Ok(fs_snapshot)
 }
 
 /// Reports that a layout the `modelTrees` rules ask for would remove or absorb

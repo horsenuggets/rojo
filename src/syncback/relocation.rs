@@ -130,6 +130,26 @@ pub(crate) fn cache_directory(project: &crate::Project) -> PathBuf {
     project.folder_location().join(".rojo").join("relocations")
 }
 
+/// Where new files are written before a relocation moves them into the
+/// project. It's kept apart from the journals, which recovery reads.
+pub(crate) fn staging_directory(project: &crate::Project) -> PathBuf {
+    project.folder_location().join(".rojo").join("staging")
+}
+
+/// Like [`execute_relocation`], with the moves made by `stage` while the
+/// relocation lock is held, so recovery never sees a staging directory that's
+/// still being written.
+pub(crate) fn execute_staged_relocation(
+    vfs: &memofs::Vfs,
+    journal: &Path,
+    stage: impl FnOnce() -> std::io::Result<Vec<super::relocation_transaction::Relocation>>,
+) -> std::io::Result<()> {
+    execute_transaction(vfs, journal, || {
+        let moves = stage()?;
+        super::relocation_transaction::execute(vfs, journal, moves, Vec::new())
+    })
+}
+
 /// Retire terminal intents before subsequent moves can make their old parents vanish.
 /// An unresolved intent is deliberately retained for startup recovery.
 pub(crate) fn execute_relocation(
@@ -209,23 +229,37 @@ pub(crate) fn recover_relocations(
     use memofs::IoResultExt;
     let _guard = RELOCATION_LOCK.lock().unwrap();
     let cache = cache_directory(project);
-    let Some(mut entries) = vfs.read_dir(&cache).with_not_found()? else {
-        return Ok(());
+    let staging = staging_directory(project);
+    let has_entries = |directory: &Path| -> std::io::Result<bool> {
+        match vfs.read_dir(directory).with_not_found()? {
+            Some(mut entries) => entries.next().transpose().map(|entry| entry.is_some()),
+            None => Ok(false),
+        }
     };
     // Read-only serving must not create a lock or require a writable cache when
     // there is nothing to recover. This observation is not used for recovery.
-    match entries.next() {
-        None => return Ok(()),
-        Some(entry) => {
-            entry?;
-        }
+    if !has_entries(&cache)? && !has_entries(&staging)? {
+        return Ok(());
     }
     let _filesystem_guard = vfs.lock_exclusive(&relocation_lock_path(&cache)?)?;
+    // Journals can still name staged files, so staging is only cleared once
+    // they're recovered. Staging happens under this lock, so nothing is
+    // being written there now.
+    recover_journals(vfs, &cache)?;
+    if vfs.read_dir(&staging).with_not_found()?.is_some() {
+        vfs.remove_dir_all(&staging)?;
+    }
+    Ok(())
+}
+
+fn recover_journals(vfs: &memofs::Vfs, cache: &Path) -> std::io::Result<()> {
+    use memofs::IoResultExt;
     // Re-enumerate only after acquiring exclusion. An executing process may have
     // completed and retired every entry observed before we waited for its lock.
-    let Some(entries) = vfs.read_dir(&cache).with_not_found()? else {
+    let Some(entries) = vfs.read_dir(cache).with_not_found()? else {
         return Ok(());
     };
+    let cache = cache.to_path_buf();
     let entries = entries.collect::<std::io::Result<Vec<_>>>()?;
     // StdBackend rejects linked cache roots when flushing, before recovery can
     // mutate a journal reached through a different coordinator's lock domain.
@@ -687,6 +721,34 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    /// Files staged by a write that never finished are cleared at startup, and
+    /// recovery never mistakes them for a journal.
+    #[test]
+    fn recovery_clears_leftover_staging() {
+        for with_journal_cache in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let project_path = temp.path().join("default.project.json");
+            std::fs::write(
+                &project_path,
+                r#"{"name":"Test","tree":{"$className":"Folder"}}"#,
+            )
+            .unwrap();
+            let vfs = memofs::Vfs::new(memofs::StdBackend::new().unwrap());
+            vfs.set_watch_enabled(false);
+            let project = crate::Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+            if with_journal_cache {
+                std::fs::create_dir_all(cache_directory(&project)).unwrap();
+            }
+            let staged = staging_directory(&project).join(uuid::Uuid::new_v4().to_string());
+            std::fs::create_dir_all(staged.join("New")).unwrap();
+            std::fs::write(staged.join("New/init.meta.json"), "{}").unwrap();
+
+            recover_relocations(&vfs, &project).unwrap();
+
+            assert!(!staging_directory(&project).exists());
+        }
     }
 
     #[test]

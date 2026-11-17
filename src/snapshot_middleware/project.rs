@@ -23,7 +23,7 @@ use crate::{
     },
     snapshot_middleware::Middleware,
     syncback::{
-        filter_properties, get_property_filter, instances_as_directories, is_unset_binary_string,
+        filter_properties, get_property_filter, instances_as_directories, is_unset_value,
         FsSnapshot, SyncbackReturn, SyncbackSnapshot,
     },
     variant_eq::variant_eq,
@@ -685,10 +685,10 @@ fn should_remove_stale_property(
 
 /// Returns whether a property missing from the filtered properties was reset,
 /// rather than missing for an unknown reason. Besides properties with a known
-/// default, an empty `BinaryString` is filtered out as unset, so an existing
-/// nonempty entry must be cleared or the next build would restore the old bytes.
+/// default, an empty `BinaryString` or unset `Content` is filtered out as unset,
+/// so an existing entry must be cleared or the next build would restore it.
 fn reset_is_known(has_default: bool, current: Option<&Variant>) -> bool {
-    has_default || current.is_some_and(is_unset_binary_string)
+    has_default || current.is_some_and(is_unset_value)
 }
 
 fn project_node_property_syncback_path(

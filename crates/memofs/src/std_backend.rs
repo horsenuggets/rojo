@@ -1,13 +1,26 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Mutex};
 use std::thread;
-use std::time::Duration;
-use std::{collections::HashSet, io};
+use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 
 use crossbeam_channel::Receiver;
-use notify::{watcher, DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{raw_watcher, RawEvent, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::watch_batch::{exists_exactly, WatchBatch};
 use crate::{DirEntry, IoResultExt, Metadata, ReadDir, VfsBackend, VfsEvent};
+
+/// A batch settles once events stop arriving for this long, which gathers the
+/// separate events of one save or move.
+const BATCH_QUIET: Duration = Duration::from_millis(50);
+
+/// A steady stream of events still settles this often, so a long build that
+/// keeps writing files can't hold every change back until it finishes.
+const BATCH_LIMIT: Duration = Duration::from_millis(500);
 
 /// `VfsBackend` that uses `std::fs` and the `notify` crate.
 pub struct StdBackend {
@@ -19,31 +32,40 @@ pub struct StdBackend {
 impl StdBackend {
     pub fn new() -> io::Result<StdBackend> {
         let (notify_tx, notify_rx) = mpsc::channel();
-        let watcher = watcher(notify_tx, Duration::from_millis(50)).map_err(io::Error::other)?;
+        // The raw watcher, because notify's debouncer trusts the event kinds,
+        // which macOS reports wrongly. See `watch_batch`.
+        let watcher = raw_watcher(notify_tx).map_err(io::Error::other)?;
 
         let (tx, rx) = crossbeam_channel::unbounded();
 
         thread::spawn(move || {
-            for event in notify_rx {
-                match event {
-                    DebouncedEvent::Create(path) => {
-                        tx.send(VfsEvent::Create(path))?;
+            while let Ok(first) = notify_rx.recv() {
+                let mut batch = WatchBatch::default();
+                record(&mut batch, first);
+
+                let started = Instant::now();
+                let mut disconnected = false;
+                while started.elapsed() < BATCH_LIMIT {
+                    match notify_rx.recv_timeout(BATCH_QUIET) {
+                        Ok(event) => record(&mut batch, event),
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
                     }
-                    DebouncedEvent::Write(path) => {
-                        tx.send(VfsEvent::Write(path))?;
+                }
+
+                let mut entries = HashMap::new();
+                for event in batch.settle(|path| exists_exactly(path, &mut entries)) {
+                    if tx.send(event).is_err() {
+                        return;
                     }
-                    DebouncedEvent::Remove(path) => {
-                        tx.send(VfsEvent::Remove(path))?;
-                    }
-                    DebouncedEvent::Rename(from, to) => {
-                        tx.send(VfsEvent::Remove(from))?;
-                        tx.send(VfsEvent::Create(to))?;
-                    }
-                    _ => {}
+                }
+                if disconnected {
+                    return;
                 }
             }
-
-            Result::<(), crossbeam_channel::SendError<VfsEvent>>::Ok(())
         });
 
         Ok(Self {
@@ -340,6 +362,15 @@ impl VfsBackend for StdBackend {
     }
 }
 
+/// Adds a raw event to the batch. Events without a path, like the rescan
+/// request FSEvents sends after dropping events, were ignored by the debouncer
+/// this replaces too.
+fn record(batch: &mut WatchBatch, event: RawEvent) {
+    if let (Some(path), Ok(op)) = (event.path, event.op) {
+        batch.record(path, op);
+    }
+}
+
 fn validate_lock_file(file: &std::fs::File, path: &Path) -> io::Result<()> {
     let opened = file.metadata()?;
     let named = std::fs::symlink_metadata(path)?;
@@ -366,6 +397,95 @@ fn validate_lock_file(file: &std::fs::File, path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Collects watcher events until `done` is satisfied or the time runs out.
+    fn collect_until(
+        receiver: &Receiver<VfsEvent>,
+        done: impl Fn(&[VfsEvent]) -> bool,
+    ) -> Vec<VfsEvent> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        while !done(&events) && Instant::now() < deadline {
+            if let Ok(event) = receiver.recv_timeout(Duration::from_millis(100)) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    // Moving a folder soon after creating it is what lost the old path on
+    // macOS. Both sides of the move must be reported on every platform.
+    #[test]
+    fn reports_both_sides_of_moving_a_new_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(root.path()).unwrap();
+        std::fs::create_dir(root.join("Inner")).unwrap();
+
+        let mut backend = StdBackend::new().unwrap();
+        let receiver = backend.event_receiver();
+        backend.watch(&root).unwrap();
+        // Let the watcher start before the changes it should see.
+        thread::sleep(Duration::from_millis(500));
+
+        let from = root.join("Folder");
+        let to = root.join("Inner").join("Folder");
+        std::fs::create_dir(&from).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        std::fs::rename(&from, &to).unwrap();
+
+        let removed = |events: &[VfsEvent]| {
+            events
+                .iter()
+                .any(|event| matches!(event, VfsEvent::Remove(path) if path == &from))
+        };
+        let created = |events: &[VfsEvent]| {
+            events
+                .iter()
+                .any(|event| matches!(event, VfsEvent::Create(path) if path == &to))
+        };
+        let events = collect_until(&receiver, |events| removed(events) && created(events));
+        assert!(
+            removed(&events),
+            "no removal of the old path in {:?}",
+            events
+        );
+        assert!(
+            created(&events),
+            "no creation of the new path in {:?}",
+            events
+        );
+    }
+
+    // On a case-insensitive filesystem the old name still resolves, so only an
+    // exact name check sees that it is gone.
+    #[test]
+    fn reports_a_case_only_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(root.path()).unwrap();
+
+        let from = root.join("folder");
+        let to = root.join("FOLDER");
+        std::fs::create_dir(&from).unwrap();
+
+        let mut backend = StdBackend::new().unwrap();
+        let receiver = backend.event_receiver();
+        backend.watch(&root).unwrap();
+        thread::sleep(Duration::from_millis(500));
+
+        std::fs::rename(&from, &to).unwrap();
+
+        let removed = |events: &[VfsEvent]| {
+            events
+                .iter()
+                .any(|event| matches!(event, VfsEvent::Remove(path) if path == &from))
+        };
+        let events = collect_until(&receiver, removed);
+        assert!(
+            removed(&events),
+            "no removal of the old name in {:?}",
+            events
+        );
+    }
 
     #[test]
     fn lock_subprocess_helper() {

@@ -6,7 +6,7 @@ expectedPlaceIds: ~
 gameId: ~
 placeId: ~
 projectName: ref_properties_remove
-protocolVersion: 8
+protocolVersion: 9
 rootInstanceId: id-2
 serverVersion: "[server-version]"
 sessionId: id-1

@@ -101,14 +101,24 @@ function ServeSession.new(options)
 		self:__onInstanceChanged(instance, propertyName)
 	end
 
-	local function onChangesFlushed(patch)
+	local function onChildAdded(child)
+		self:__onChildAdded(child)
+	end
+
+	-- Each batch keeps the cursor it started from, taken before preparing it
+	-- yields, since an edit made meanwhile starts the next batch.
+	local function onBatchTaken()
 		local cursor = self.__pendingWriteCursor
 		self.__pendingWriteCursor = nil
+		return cursor
+	end
+
+	local function onChangesFlushed(patch, cursor)
 		return self:__writePatch(patch, cursor)
 	end
 
-	local instanceMap = InstanceMap.new(onInstanceChanged)
-	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed)
+	local instanceMap = InstanceMap.new(onInstanceChanged, onChildAdded)
+	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken)
 	local reconciler = Reconciler.new(instanceMap)
 
 	local connections = {}
@@ -182,6 +192,23 @@ function ServeSession:__onInstanceChanged(instance, propertyName)
 	self:__queueChange(instance, propertyName)
 end
 
+-- An instance appeared under a known parent, which is how instances made in
+-- Studio show up. Like edits, they are held during the initial sync.
+function ServeSession:__onChildAdded(child)
+	if not self.__twoWaySync then
+		return
+	end
+
+	local deferred = self.__deferredChanges
+	if deferred ~= nil then
+		table.insert(deferred, { child = child })
+		return
+	end
+
+	self:__markBatchStart()
+	self.__changeBatcher:addChild(child)
+end
+
 -- Sends the held edits, in the order they happened, now that every instance
 -- they could refer to is known.
 function ServeSession:__releaseDeferredChanges()
@@ -192,7 +219,72 @@ function ServeSession:__releaseDeferredChanges()
 	self.__deferredChanges = nil
 
 	for _, change in deferred do
-		self:__queueChange(change.instance, change.propertyName)
+		if change.child ~= nil then
+			self:__markBatchStart()
+			self.__changeBatcher:addChild(change.child)
+		else
+			self:__queueChange(change.instance, change.propertyName)
+		end
+	end
+end
+
+-- Retain the revision preceding the first local change, even if a websocket
+-- update arrives before this batch is sent.
+function ServeSession:__markBatchStart()
+	if self.__changeBatcher:isEmpty() then
+		self.__pendingWriteCursor = self.__apiContext:getMessageCursor()
+	end
+end
+
+-- Collects every id an addition gave out, root first.
+local function collectAddedIds(entry, out)
+	table.insert(out, entry.id)
+	for _, child in entry.children do
+		collectAddedIds(child, out)
+	end
+	return out
+end
+
+--[[
+	Stops tracking instances Studio created that the server didn't store. They
+	stay in Studio, but nothing refers to ids the server never took.
+]]
+function ServeSession:__untrackRejectedAdditions(patch, result)
+	if next(patch.added) == nil then
+		return
+	end
+
+	local rejected = {}
+	if result == nil then
+		for _, addition in patch.added do
+			for _, id in collectAddedIds(addition.ids, {}) do
+				rejected[id] = true
+			end
+		end
+	else
+		for _, err in result.errors or {} do
+			-- An error about one property of a saved instance, like a reference
+			-- that couldn't be stored, leaves the instance saved and tracked.
+			if err.property ~= nil then
+				continue
+			end
+			local addition = patch.added[err.id]
+			if addition ~= nil then
+				for _, id in collectAddedIds(addition.ids, {}) do
+					rejected[id] = true
+				end
+			else
+				rejected[err.id] = true
+			end
+		end
+	end
+
+	for _, addition in patch.added do
+		for _, id in collectAddedIds(addition.ids, {}) do
+			if rejected[id] then
+				self.__instanceMap:removeId(id)
+			end
+		end
 	end
 end
 
@@ -210,12 +302,77 @@ function ServeSession:__syncStep(budget)
 	end
 end
 
-function ServeSession:__queueChange(instance, propertyName)
-	-- Retain the revision preceding the first local change, even if a websocket
-	-- update arrives before this batch is sent.
-	if next(self.__changeBatcher.__pendingPropertyChanges) == nil then
-		self.__pendingWriteCursor = self.__apiContext:getMessageCursor()
+--[[
+	Stops tracking instances whose deletion the server saved, with their
+	descendants. Their files are gone, so if an undo brings them back, they are
+	new instances to the server and must be sent as created.
+]]
+function ServeSession:__untrackSavedRemovals(result)
+	local restored = {}
+	for _, id in result.accepted.removed_instances do
+		local instance = self.__instanceMap.fromIds[id]
+		if instance ~= nil then
+			for _, descendant in instance:GetDescendants() do
+				self.__instanceMap:removeInstance(descendant)
+			end
+			table.insert(restored, instance)
+		end
+		self.__instanceMap:removeId(id)
 	end
+	-- An undo before this response brought an instance back while it was
+	-- still tracked, so nothing queued it. It's created again now.
+	for _, instance in restored do
+		local parent = instance.Parent
+		if parent ~= nil and self.__instanceMap.fromInstances[parent] ~= nil then
+			self:__markBatchStart()
+			self.__changeBatcher:addChild(instance)
+		end
+	end
+end
+
+--[[
+	The server announces a deletion this session saved, and the announcement
+	can arrive before the write's response. If an undo brought the instance
+	back meanwhile, removing it again would undo the undo, so it's left out of
+	the patch, stops being tracked, and is created again.
+]]
+function ServeSession:__keepUndoneDeletions(patch)
+	local pending = self.__pendingDeletions
+	if pending == nil or #patch.removed == 0 then
+		return
+	end
+	local removed = {}
+	local undone = {}
+	for _, id in patch.removed do
+		local instance = pending[id]
+		if instance ~= nil and instance.Parent ~= nil then
+			table.insert(undone, instance)
+			pending[id] = nil
+		else
+			table.insert(removed, id)
+		end
+	end
+	if #undone == 0 then
+		return
+	end
+	patch.removed = removed
+	for _, instance in undone do
+		for _, descendant in instance:GetDescendants() do
+			self.__instanceMap:removeInstance(descendant)
+		end
+		self.__instanceMap:removeInstance(instance)
+	end
+	for _, instance in undone do
+		local parent = instance.Parent
+		if parent ~= nil and self.__instanceMap.fromInstances[parent] ~= nil then
+			self:__markBatchStart()
+			self.__changeBatcher:addChild(instance)
+		end
+	end
+end
+
+function ServeSession:__queueChange(instance, propertyName)
+	self:__markBatchStart()
 	self.__changeBatcher:add(instance, propertyName)
 end
 
@@ -241,13 +398,41 @@ function ServeSession:__writePatch(patch, messageCursor)
 		end
 	end
 
-	return self.__apiContext
-		:write(patch, messageCursor, authority)
+	-- The instances this write deletes are remembered until it's answered, so
+	-- an announcement of the deletion can tell whether an undo came first.
+	self.__pendingDeletions = self.__pendingDeletions or {}
+	for _, id in patch.removed do
+		if self.__instanceMap ~= nil and self.__instanceMap.fromIds[id] ~= nil then
+			self.__pendingDeletions[id] = self.__instanceMap.fromIds[id]
+		end
+	end
+	local function forgetDeletions()
+		for _, id in patch.removed do
+			self.__pendingDeletions[id] = nil
+		end
+	end
+
+	-- Writes reach the server in the order they were made, so a later edit to
+	-- an instance never arrives before the write that created it. A write
+	-- still waiting when the session stops is never sent.
+	local previous = self.__lastWrite or Promise.resolve()
+	local write = previous
+		:andThen(function()
+			if self.__status == Status.Disconnected then
+				return Promise.reject("The session stopped before this write was sent")
+			end
+			return self.__apiContext:write(patch, messageCursor, authority)
+		end)
 		:andThen(function(result)
+			forgetDeletions()
+			self:__untrackRejectedAdditions(patch, result)
+			self:__untrackSavedRemovals(result)
 			finish(ServeSession.getWriteStatus(result), result)
 			return result
 		end)
 		:catch(function(err)
+			forgetDeletions()
+			self:__untrackRejectedAdditions(patch, nil)
 			finish("Failed", {
 				errors = {
 					{
@@ -256,6 +441,8 @@ function ServeSession:__writePatch(patch, messageCursor)
 				},
 			})
 		end)
+	self.__lastWrite = write
+	return write
 end
 
 function ServeSession:getSyncResults()
@@ -596,6 +783,7 @@ function ServeSession:__replaceInstances(idList)
 end
 
 function ServeSession:__applyPatch(patch)
+	self:__keepUndoneDeletions(patch)
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording =
 		ChangeHistoryService:TryBeginRecording(ServeSession.PATCH_RECORDING_PREFIX .. patchTimestamp)
