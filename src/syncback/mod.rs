@@ -1,3 +1,4 @@
+mod addition;
 mod file_names;
 pub mod from_studio;
 mod fs_snapshot;
@@ -35,6 +36,7 @@ use crate::{
     Project,
 };
 
+pub use addition::syncback_new_subtree;
 pub use file_names::{
     directory_middleware_for_instance, extension_for_middleware, name_for_inst, sibling_order_key,
     unique_child_stems, validate_file_name,
@@ -335,8 +337,6 @@ pub fn syncback_loop(
     log::debug!("Hashing file DOM");
     let new_hashes = hash_tree(project, &new_tree, new_tree.root_ref());
 
-    let project_path = project.folder_location();
-
     let model_tree_rules = model_trees::CompiledModelTreeRules::new(
         project
             .syncback_rules
@@ -417,7 +417,7 @@ pub fn syncback_loop(
     let mut fs_snapshot = FsSnapshot::new();
     let mut file_owners = HashMap::new();
 
-    'syncback: while let Some(snapshot) = snapshots.pop() {
+    while let Some(snapshot) = snapshots.pop() {
         let inst_path = snapshot.get_new_inst_path(snapshot.new);
         // We can quickly check that two subtrees are identical and if they are,
         // skip reconciling them.
@@ -437,20 +437,51 @@ pub fn syncback_loop(
             }
         }
 
+        if let Some((children, _)) = syncback_snapshot(
+            snapshot,
+            &ignore_patterns,
+            project,
+            &relayout,
+            &mut fs_snapshot,
+            &mut file_owners,
+        )? {
+            snapshots.extend(children);
+        }
+    }
+
+    Ok(fs_snapshot)
+}
+
+/// Serializes one instance into `fs_snapshot` and returns the snapshots for its
+/// children, along with the path the instance was written to. Returns `None`
+/// when the project's rules leave the instance out, or a model file already
+/// holds exactly this subtree. Instances in `relayout` are always rewritten.
+fn syncback_snapshot<'sync>(
+    snapshot: SyncbackSnapshot<'sync>,
+    ignore_patterns: &Option<Vec<IgnorableGlob>>,
+    project: &Project,
+    relayout: &HashSet<Ref>,
+    fs_snapshot: &mut FsSnapshot,
+    file_owners: &mut HashMap<PathBuf, Ref>,
+) -> anyhow::Result<Option<(Vec<SyncbackSnapshot<'sync>>, PathBuf)>> {
+    let inst_path = snapshot.get_new_inst_path(snapshot.new);
+    let project_path = project.folder_location();
+    let mut written_path = snapshot.path.clone();
+    {
         if snapshot.is_script_suffix_migration(&snapshot.path) {
             let old_source = snapshot.old_inst().as_ref().and_then(source_file).unwrap();
             snapshot.validate_script_migration(&old_source, &snapshot.path)?;
         }
-        if !is_valid_path(&ignore_patterns, project_path, &snapshot.path) {
+        if !is_valid_path(ignore_patterns, project_path, &snapshot.path) {
             log::debug!("Skipping {inst_path} because its path matches ignore pattern");
-            continue;
+            return Ok(None);
         }
         if let Some(syncback_rules) = &project.syncback_rules {
             // Ignore trees;
             for ignored in &syncback_rules.ignore_trees {
                 if inst_path.starts_with(ignored.as_str()) {
                     log::debug!("Tree {inst_path} is blocked by project");
-                    continue 'syncback;
+                    return Ok(None);
                 }
             }
         }
@@ -488,7 +519,7 @@ pub fn syncback_loop(
             let old = hash_model(project, snapshot.old_tree(), old_ref);
             let new = hash_model(project, snapshot.new_tree(), snapshot.new);
             if old.get(&old_ref) == new.get(&snapshot.new) {
-                continue;
+                return Ok(None);
             }
         }
 
@@ -500,7 +531,7 @@ pub fn syncback_loop(
 
         if matches!(middleware, Middleware::Json | Middleware::Toml) {
             log::warn!("Cannot syncback {middleware:?} at {inst_path}, skipping");
-            continue;
+            return Ok(None);
         }
 
         let syncback = match middleware.syncback(&snapshot) {
@@ -535,6 +566,7 @@ pub fn syncback_loop(
                     "Could not syncback {inst_path} as a Directory because: {err}.\n\
                     It will instead be synced back as a {new_middleware:?}."
                 );
+                written_path = new_snapshot.path.clone();
                 let new_syncback_result = new_middleware
                     .syncback(&new_snapshot)
                     .with_context(|| format!("Failed to syncback {inst_path}"));
@@ -561,7 +593,7 @@ pub fn syncback_loop(
                 };
                 let path = source.path();
                 let inst_path = snapshot.get_old_inst_path(inst.id());
-                if !is_valid_path(&ignore_patterns, project_path, path) {
+                if !is_valid_path(ignore_patterns, project_path, path) {
                     log::debug!(
                         "Skipping removing {} because its matches an ignore pattern",
                         path.display()
@@ -586,7 +618,7 @@ pub fn syncback_loop(
                 if inst.metadata().middleware.is_some_and(is_model_file) {
                     for meta_path in inst.metadata().relevant_paths.iter().skip(1) {
                         if meta_path.is_file()
-                            && is_valid_path(&ignore_patterns, project_path, meta_path)
+                            && is_valid_path(ignore_patterns, project_path, meta_path)
                         {
                             fs_snapshot.remove_file(meta_path)
                         }
@@ -599,15 +631,13 @@ pub fn syncback_loop(
 
         fs_snapshot.merge_with_filter(
             syncback.fs_snapshot,
-            |path| is_valid_path(&ignore_patterns, project_path, path),
+            |path| is_valid_path(ignore_patterns, project_path, path),
             snapshot.new,
-            &mut file_owners,
+            file_owners,
         )?;
 
-        snapshots.extend(syncback.children);
+        Ok(Some((syncback.children, written_path)))
     }
-
-    Ok(fs_snapshot)
 }
 
 /// Reports that a layout the `modelTrees` rules ask for would remove or absorb
