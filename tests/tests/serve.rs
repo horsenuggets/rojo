@@ -379,6 +379,135 @@ fn assert_created_subtrees_are_written(fixture: &str, check_layout: impl Fn(&std
     });
 }
 
+/// Waits up to a few seconds for `check` to hold.
+fn eventually(mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    check()
+}
+
+/// An empty write, which only tells the server which side wins.
+fn announce_authority(
+    session: &crate::rojo_test::serve_util::TestServeSession,
+    authority: WriteAuthority,
+) {
+    let info = session.get_api_rojo().unwrap();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let response = post_write(
+        session,
+        &WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(read.message_cursor),
+            authority,
+            removed: Vec::new(),
+            added: Default::default(),
+            updated: Vec::new(),
+        },
+    );
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+}
+
+fn set_model_trees(session: &crate::rojo_test::serve_util::TestServeSession, rules: &str) {
+    fs::write(
+        session.path().join("default.project.json"),
+        format!(
+            r#"{{"name":"place_root","tree":{{"$className":"DataModel","$path":"src"}},"syncbackRules":{{"instancesAsDirectories":true,"modelTrees":{rules}}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+// Changing the modelTrees rules while serving moves matching instances to
+// their new layout when Studio is authoritative, and back when the rule goes,
+// keeping their IDs. Under Filesystem authority, layouts never change. Before
+// any write says which side wins, the first one decides.
+#[test]
+fn model_tree_rule_changes_relayout_only_under_studio_authority() {
+    for case in ["studio", "filesystem", "studio_later"] {
+        run_serve_test("place_root", |session, _| {
+            let storage = session.path().join("src/ReplicatedStorage");
+            let info = session.get_api_rojo().unwrap();
+            let mover = session
+                .get_api_read(info.root_instance_id)
+                .unwrap()
+                .instances
+                .values()
+                .find(|instance| instance.name == "Mover")
+                .unwrap()
+                .id;
+            fs::write(storage.join("Mover/Kid.luau"), "return 'kid'").unwrap();
+            let mut kid = Ref::none();
+            assert!(eventually(|| {
+                let read = session.get_api_read(info.root_instance_id).unwrap();
+                match read.instances.values().find(|i| i.name == "Kid") {
+                    Some(instance) => {
+                        kid = instance.id;
+                        true
+                    }
+                    None => false,
+                }
+            }));
+            let both_kept = || {
+                let read = session.get_api_read(info.root_instance_id).unwrap();
+                read.instances.contains_key(&mover)
+                    && read.instances.get(&kid).is_some_and(|i| i.parent == mover)
+                    && read
+                        .instances
+                        .values()
+                        .filter(|i| i.name == "Mover")
+                        .count()
+                        == 1
+                    && read.instances.values().filter(|i| i.name == "Kid").count() == 1
+            };
+            match case {
+                "studio" => announce_authority(&session, WriteAuthority::Studio),
+                "filesystem" => announce_authority(&session, WriteAuthority::Filesystem),
+                _ => {}
+            }
+
+            set_model_trees(&session, r#"[{"pattern":"ReplicatedStorage/Mover"}]"#);
+            if case == "studio_later" {
+                thread::sleep(Duration::from_millis(1000));
+                assert!(storage.join("Mover").is_dir(), "moved before any write");
+                announce_authority(&session, WriteAuthority::Studio);
+            }
+
+            if case == "filesystem" {
+                thread::sleep(Duration::from_millis(1500));
+                assert!(storage.join("Mover").is_dir(), "{case}");
+                assert!(!storage.join("Mover.rbxm").exists(), "{case}");
+                return;
+            }
+            assert!(
+                eventually(|| storage.join("Mover.rbxm").is_file()),
+                "{case} never wrote the model"
+            );
+            assert!(!storage.join("Mover").exists(), "{case}");
+            thread::sleep(Duration::from_millis(1000));
+            assert!(both_kept(), "{case} lost an ID in the model");
+
+            // Without a rule, instancesAsDirectories turns it back.
+            set_model_trees(&session, "[]");
+            assert!(
+                eventually(|| storage.join("Mover").is_dir()),
+                "{case} never went back"
+            );
+            assert!(!storage.join("Mover.rbxm").exists(), "{case}");
+            assert_eq!(
+                fs::read_to_string(storage.join("Mover/Kid.luau")).unwrap(),
+                "return 'kid'"
+            );
+            thread::sleep(Duration::from_millis(1000));
+            assert!(both_kept(), "{case} lost an ID in the directories");
+        });
+    }
+}
+
 // A folder syncback kept with a `.gitkeep` doesn't need it once something is
 // created in it from Studio.
 #[test]

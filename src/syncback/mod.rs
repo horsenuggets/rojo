@@ -45,6 +45,7 @@ pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
 pub(crate) use inline::is_script_class;
 pub use model_trees::{is_model_file, is_project_owned, ModelTreeRule, ModelTrees};
+pub(crate) use model_trees::{stale_layouts, CompiledModelTreeRules};
 pub(crate) use property_filter::{can_write_property, is_unset_value};
 pub use property_filter::{
     filter_json_properties_preallocated, filter_properties, filter_properties_preallocated,
