@@ -31,6 +31,30 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Two-way sync now saves instances created in Studio. A new subtree is written as the
+  files a syncback would write for it, keeping the IDs Studio gave it, so the server's
+  announcement of it never creates a second copy. This needs protocol version 9, so the
+  server and plugin must be updated together.
+* Two-way sync now saves edits, moves, and deletions of instances that share a file with
+  others, like children stored in a directory's `init.meta.json` and everything inside a
+  `.rbxm`, `.rbxmx`, or `.model.json` file. Instances created under or moved into a
+  script promote it to a directory. Moves between files keep instance IDs, and references
+  between instances in JSON files are linked through `Rojo_Id` and `Rojo_Target_*`
+  attributes. A reference that would point outside its file is reported instead of being
+  dropped silently.
+* Fixed moving an instance to the root of a place project, deleting a folder's last
+  attribute, and creatable instances at the DataModel root being treated as services.
+* Fixed the macOS watcher missing deletions and case-only renames, which could leave a
+  moved folder in both places.
+* Fixed deleting a parent and its descendant in one batch, which could crash the server,
+  and deleting a folder that syncback had kept with a `.gitkeep`.
+* Fixed undoing a saved deletion in Studio, which now saves the instances again.
+* Fixed Studio replacing an instance when its server metadata changed, which broke
+  references to it.
+* Fixed rereading a model file reporting its references and pivots as changes, which made
+  Studio rebuild the whole model after each edit.
+* Syncback no longer writes unset `Content` properties like `ExplorerIconContent`.
+
 ## `7.7.1-horse.1.6`
 
 * Yield while hydrating and diffing during the initial sync, so connecting to a large
