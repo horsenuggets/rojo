@@ -42,14 +42,23 @@ Making a new release? Simply add the new header with the version and date undern
   `.rbxm`, `.rbxmx`, or `.model.json` file. Instances created under or moved into a
   script promote it to a directory. Moves between files keep instance IDs, and references
   between instances in JSON files are linked through `Rojo_Id` and `Rojo_Target_*`
-  attributes. A reference that would point outside its file is reported instead of being
-  dropped silently.
+  attributes. A reference to an instance in another file is linked through that
+  instance's `Rojo_Id`, including references set on new instances and on children in a
+  directory's metadata, and one whose target has no ID is reported instead of being
+  dropped silently. Shared-file writes follow the same Filesystem and Studio authority
+  rules as other writes, check the files they rewrite against what was read, honor
+  `ignoreProperties`, and keep a model root's metadata ID.
+* Studio sends its writes in order and keeps a batch's starting point while new
+  instances are serialized, so a later edit never reaches the server first or overwrites
+  a change it didn't see.
 * Fixed moving an instance to the root of a place project, deleting a folder's last
   attribute, and creatable instances at the DataModel root being treated as services.
 * Fixed the macOS watcher missing deletions and case-only renames, which could leave a
   moved folder in both places.
 * Fixed deleting a parent and its descendant in one batch, which could crash the server,
-  and deleting a folder that syncback had kept with a `.gitkeep`.
+  and deleting a folder that syncback had kept with a `.gitkeep`. Deleting a file now
+  also deletes its adjacent `.meta.json` or `.meta.jsonc`, and a new file never takes the
+  name of an existing one.
 * Fixed undoing a saved deletion in Studio, which now saves the instances again.
 * Fixed Studio replacing an instance when its server metadata changed, which broke
   references to it.
