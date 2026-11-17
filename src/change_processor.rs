@@ -788,13 +788,25 @@ impl JobThreadContext {
                     }
                     (from, copy)
                 });
+                // Both sides are checked before the destination is written, so
+                // a refused move never leaves a copy behind.
+                match source {
+                    Some(from) => anyhow::ensure!(
+                        self.stored_matches_disk(tree, from)?,
+                        "The file changed on disk; the change was not saved"
+                    ),
+                    None => match self.check_removal(tree, id, context)? {
+                        Removal::Allowed(_) => {}
+                        Removal::Restore(_) => anyhow::bail!("The moved instance changed on disk"),
+                    },
+                }
                 let mut copy = StoredCopy::new(tree, to);
                 copy.add(parent, model, &ids)?;
                 let written = self.write_stored(tree, to, copy)?;
                 let mut errors = Vec::new();
                 match source_copy {
                     Some((from, copy)) => {
-                        let removed = self.write_stored(tree, from, copy)?;
+                        let removed = self.write_stored_unchecked(tree, from, copy)?;
                         errors = Self::apply_stored(tree, removed, &moving);
                     }
                     None => {
@@ -999,12 +1011,35 @@ impl JobThreadContext {
         Ok(())
     }
 
+    /// Deletes the files of `id`. Returns what's on disk instead when the disk
+    /// must win, which Studio is sent back.
     fn remove_instance(
         &self,
         tree: &RojoTree,
         id: Ref,
         context: &WriteContext,
     ) -> anyhow::Result<Option<crate::snapshot::InstanceSnapshot>> {
+        let path = match self.check_removal(tree, id, context)? {
+            Removal::Allowed(path) => path,
+            Removal::Restore(snapshot) => return Ok(*snapshot),
+        };
+        let mut lock = self.vfs.lock();
+        match lock.metadata(&path).with_not_found()? {
+            Some(metadata) if metadata.is_file() => lock.remove_file(&path)?,
+            Some(_) => lock.remove_dir_all(&path)?,
+            None => {}
+        }
+        Ok(None)
+    }
+
+    /// Decides whether the files of `id` can be deleted, without deleting
+    /// anything, so a move can check before it writes its destination.
+    fn check_removal(
+        &self,
+        tree: &RojoTree,
+        id: Ref,
+        context: &WriteContext,
+    ) -> anyhow::Result<Removal> {
         let instance = tree
             .get_instance(id)
             .ok_or_else(|| anyhow::anyhow!("Cannot remove unknown instance {id:?}"))?;
@@ -1017,7 +1052,7 @@ impl JobThreadContext {
         if context.authority == WriteAuthority::Filesystem
             && (context.stale || disk_patch != PatchSet::new())
         {
-            return Ok(snapshot);
+            return Ok(Removal::Restore(Box::new(snapshot)));
         }
         // A snapshot excludes ignored and unrecognized files. Never delete those as
         // a side effect of removing a represented directory from Studio, whichever
@@ -1037,8 +1072,15 @@ impl JobThreadContext {
             while let Some(directory) = pending.pop() {
                 for entry in self.vfs.read_dir(&directory)? {
                     let entry = entry?;
-                    if !tracked.contains(entry.path()) {
-                        return Ok(snapshot);
+                    // Syncback keeps an empty directory with a `.gitkeep` that
+                    // no instance lists, so it goes with the directory.
+                    let keep = entry.path().file_name() == Some(".gitkeep".as_ref());
+                    if !tracked.contains(entry.path()) && !keep {
+                        anyhow::bail!(
+                            "The folder also holds \"{}\", which isn't part of the project, \
+                             so it was kept",
+                            entry.path().display()
+                        );
                     }
                     if self.vfs.metadata(entry.path())?.is_dir() {
                         pending.push(entry.path().to_path_buf());
@@ -1046,13 +1088,7 @@ impl JobThreadContext {
                 }
             }
         }
-        let mut lock = self.vfs.lock();
-        match lock.metadata(path).with_not_found()? {
-            Some(metadata) if metadata.is_file() => lock.remove_file(path)?,
-            Some(_) => lock.remove_dir_all(path)?,
-            None => {}
-        }
-        Ok(None)
+        Ok(Removal::Allowed(path.clone()))
     }
 
     /// Reads the current disk state of a directory that stores instances inline.
@@ -2567,6 +2603,14 @@ impl JobThreadContext {
     }
 }
 
+/// Whether an instance's files can be deleted.
+enum Removal {
+    /// The files at this path can go.
+    Allowed(PathBuf),
+    /// The disk wins, and Studio gets back what it holds.
+    Restore(Box<Option<crate::snapshot::InstanceSnapshot>>),
+}
+
 enum RelocationOutcome {
     Moved,
     Restore(Box<Option<InstanceSnapshot>>),
@@ -3304,6 +3348,9 @@ fn filesystem_restoration(
 fn canonicalize_or_original(vfs: &Vfs, path: PathBuf) -> PathBuf {
     match vfs.canonicalize(&path) {
         Ok(canonical) => canonical,
+        // Deleting a directory reports its contents after the directory itself
+        // is gone, so a missing path is expected.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => path,
         Err(err) => {
             log::warn!("Could not canonicalize {}: {err}", path.display());
             path
@@ -5809,7 +5856,11 @@ mod tests {
                     ..PatchSet::new()
                 },
             );
-            assert!(errors.is_empty(), "{errors:?}");
+            // The folder comes back with an error that says why.
+            assert_eq!(errors.len(), unknown_file as usize, "{errors:?}");
+            if unknown_file {
+                assert!(errors[0].message.contains("notes.txt"), "{errors:?}");
+            }
             assert_eq!(accepted.removed_instances.is_empty(), unknown_file);
             assert_eq!(conflicts.added_instances.len(), unknown_file as usize);
             assert_eq!(
@@ -5821,6 +5872,29 @@ mod tests {
                 unknown_file
             );
         }
+    }
+
+    /// Syncback keeps empty directories with a `.gitkeep`, which no instance
+    /// lists, so it must not stop the directory from being deleted.
+    #[test]
+    fn deletions_remove_the_gitkeep_syncback_wrote() {
+        let (job, id) = part_job();
+        job.vfs.write("/project/Part/.gitkeep", "").unwrap();
+        let (accepted, _, errors) = studio_write(
+            &job,
+            PatchSet {
+                removed_instances: vec![id],
+                ..PatchSet::new()
+            },
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(accepted.removed_instances, vec![id]);
+        assert!(job
+            .vfs
+            .metadata("/project/Part")
+            .with_not_found()
+            .unwrap()
+            .is_none());
     }
 
     /// An inline edit rewrites its owner's whole file, so disk changes to the
