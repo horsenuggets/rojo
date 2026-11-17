@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.8`
+
 * Changing `syncbackRules.modelTrees` or `instancesAsDirectories` while serving now moves
   matching instances between model files and directories right away when Studio is
   authoritative, keeping their IDs so Studio sees no change. Instances stored in a
