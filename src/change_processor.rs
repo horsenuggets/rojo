@@ -309,6 +309,7 @@ impl JobThreadContext {
         let mut errors = Vec::new();
         let mut messages = Vec::new();
         let mut deletion_conflicts = Vec::new();
+        let mut with_ancestors = Vec::new();
         {
             let mut tree = self.tree.lock().unwrap();
             // Created subtrees go first, so the rest of the batch can move
@@ -368,7 +369,25 @@ impl JobThreadContext {
                     1,
                 );
             }
+            let removed: HashSet<Ref> = patch_set.removed_instances.iter().copied().collect();
             for &id in &patch_set.removed_instances {
+                // Deleting a descendant first, then its ancestor, arrives as one
+                // batch. The ancestor's removal takes the descendant with it, and
+                // removing the descendant first would make the ancestor look
+                // changed on disk.
+                let mut ancestor = tree.get_instance(id).map(|instance| instance.parent());
+                let mut removed_ancestor = None;
+                while let Some(parent) = ancestor.and_then(|parent| tree.get_instance(parent)) {
+                    if removed.contains(&parent.id()) {
+                        removed_ancestor = Some(parent.id());
+                        break;
+                    }
+                    ancestor = Some(parent.parent());
+                }
+                if let Some(ancestor) = removed_ancestor {
+                    with_ancestors.push((id, ancestor));
+                    continue;
+                }
                 let retained_move_failed = tree.get_instance(id).is_some()
                     && patch_set.updated_instances.iter().any(|update| {
                         update.changed_parent.is_some()
@@ -530,20 +549,56 @@ impl JobThreadContext {
                 }
             }
         }
+        // A descendant is deleted when the ancestor it went with was, however
+        // deeply its own ancestors were nested in the batch. Otherwise the
+        // ancestor's restoration already brought it back.
+        let mut pending: Vec<(Ref, Ref)> = with_ancestors;
+        loop {
+            let before = pending.len();
+            pending.retain(|&(id, ancestor)| {
+                if accepted.removed_instances.contains(&ancestor) {
+                    accepted.removed_instances.push(id);
+                    false
+                } else {
+                    true
+                }
+            });
+            if pending.len() == before {
+                break;
+            }
+        }
         // Saved updates were applied as they were written, so a later update in
         // the batch sees them. Removals wait until here, since a removed parent
         // must still be known while its removed children are handled.
         if !accepted.removed_instances.is_empty() {
             let mut tree = self.tree.lock().unwrap();
-            let removals = PatchSet {
-                removed_instances: accepted.removed_instances.clone(),
-                ..PatchSet::new()
-            };
-            messages.push(apply_patch_set(&mut tree, removals));
+            // The watcher can see the deleted files and remove an instance first,
+            // and removing an ancestor removes its descendants, so only what's
+            // still in the tree is removed here.
+            for &id in &accepted.removed_instances {
+                if tree.get_instance(id).is_some() {
+                    let removal = PatchSet {
+                        removed_instances: vec![id],
+                        ..PatchSet::new()
+                    };
+                    messages.push(apply_patch_set(&mut tree, removal));
+                }
+            }
         }
         if conflicts != PatchSet::new() {
             let mut tree = self.tree.lock().unwrap();
-            messages.push(apply_patch_set(&mut tree, conflicts.clone()));
+            // Removals go one at a time for the same reasons as above.
+            let mut restorations = conflicts.clone();
+            for id in std::mem::take(&mut restorations.removed_instances) {
+                if tree.get_instance(id).is_some() {
+                    let removal = PatchSet {
+                        removed_instances: vec![id],
+                        ..PatchSet::new()
+                    };
+                    messages.push(apply_patch_set(&mut tree, removal));
+                }
+            }
+            messages.push(apply_patch_set(&mut tree, restorations));
         }
         conflicts.added_instances.extend(deletion_conflicts);
         self.message_queue.push_messages(&messages);
@@ -3900,6 +3955,56 @@ mod tests {
                 ..empty_update(id)
             }],
             ..PatchSet::new()
+        }
+    }
+
+    /// Studio sends a descendant and its ancestor in one batch when both are
+    /// deleted, in either order. The ancestor's files go, and nothing comes
+    /// back, however deeply the deleted descendants are nested.
+    #[test]
+    fn batches_deleting_descendants_with_their_ancestor_delete_everything() {
+        let orders: [&[&[&str]]; 4] = [
+            &[&["Old", "Mid", "Leaf"], &["Old"]],
+            &[&["Old"], &["Old", "Mid", "Leaf"]],
+            &[&["Old", "Mid", "Leaf"], &["Old", "Mid"], &["Old"]],
+            &[&["Old", "Mid"], &["Old"], &["Old", "Mid", "Leaf"]],
+        ];
+        for order in orders {
+            let (job, _) = script_job(
+                vec![(
+                    "src",
+                    VfsSnapshot::dir([(
+                        "Old",
+                        VfsSnapshot::dir([(
+                            "Mid",
+                            VfsSnapshot::dir([("Leaf.luau", VfsSnapshot::file("return 1"))]),
+                        )]),
+                    )]),
+                )],
+                "/project/src",
+            );
+            let ids: Vec<Ref> = order.iter().map(|path| find(&job, path)).collect();
+            let (accepted, conflicts, errors) = studio_write(
+                &job,
+                PatchSet {
+                    removed_instances: ids.clone(),
+                    ..PatchSet::new()
+                },
+            );
+            assert!(errors.is_empty(), "{order:?} {errors:?}");
+            assert!(conflicts.added_instances.is_empty(), "{order:?}");
+            let accepted: HashSet<Ref> = accepted.removed_instances.into_iter().collect();
+            assert_eq!(accepted, ids.into_iter().collect(), "{order:?}");
+            assert!(job
+                .vfs
+                .metadata("/project/src/Old")
+                .with_not_found()
+                .unwrap()
+                .is_none());
+            let tree = job.tree.lock().unwrap();
+            assert!(tree
+                .descendants(tree.get_root_id())
+                .all(|instance| instance.name() != "Old"));
         }
     }
 
