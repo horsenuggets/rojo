@@ -194,6 +194,16 @@ impl JobThreadContext {
             }
         };
 
+        // Something new in a folder only adds that one entry, so only it is
+        // read, instead of the folder's whole subtree.
+        if let [id] = affected_ids[..] {
+            if current_path != path.as_path() {
+                if let Some(applied) = self.add_new_entry(&mut tree, id, current_path, &path) {
+                    return applied;
+                }
+            }
+        }
+
         for id in affected_ids {
             // A change to one of an instance's own files, like a directory's
             // init.meta.json or init.luau, can only change that instance and
@@ -270,6 +280,74 @@ impl JobThreadContext {
         // Notify anyone listening to the message queue about the changes we
         // just made.
         self.message_queue.push_messages(&applied_patches);
+    }
+
+    /// Handles a change to `path`, which no instance comes from yet, under the
+    /// folder `directory` that `parent` comes from, by reading only the entry
+    /// of `directory` that holds `path` and adding it. Returns `None` when the
+    /// entry could change the folder itself, like an `init` file, which needs
+    /// the folder read again.
+    fn add_new_entry(
+        &self,
+        tree: &mut RojoTree,
+        parent: Ref,
+        directory: &Path,
+        path: &Path,
+    ) -> Option<Vec<AppliedPatchSet>> {
+        let metadata = tree.get_metadata(parent)?;
+        let is_folder = matches!(
+            &metadata.instigating_source,
+            Some(InstigatingSource::Path(source)) if source == directory
+        ) && metadata
+            .middleware
+            .is_some_and(|middleware| middleware.is_dir());
+        if !is_folder {
+            return None;
+        }
+        let name = path.strip_prefix(directory).ok()?.components().next()?;
+        let entry = directory.join(name);
+        let name = name.as_os_str().to_str()?;
+        let changes_folder = name.starts_with("init.")
+            || name.ends_with(".meta.json")
+            || name.ends_with(".meta.jsonc")
+            || name.ends_with(".project.json");
+        if changes_folder || !tree.get_ids_at_path(&entry).is_empty() {
+            return None;
+        }
+
+        let mut context = metadata.context.clone();
+        if crate::snapshot::is_path_ignored(&context.path_ignore_rules, &entry) {
+            return Some(Vec::new());
+        }
+        // Children are read with their folder on the stack, like a full read
+        // of the folder does, so a link back to it is still caught.
+        let canonical = canonicalize_or_original(&self.vfs, directory.to_path_buf());
+        Arc::make_mut(
+            context
+                .active_directories
+                .get_or_insert_with(Default::default),
+        )
+        .push(canonical);
+        let snapshot = match snapshot_from_vfs(&context, &self.vfs, &entry) {
+            Ok(Some(snapshot)) => snapshot,
+            // Gone again, or not something Rojo reads.
+            Ok(None) => return Some(Vec::new()),
+            Err(error) => {
+                log::error!("Snapshot error: {error:?}");
+                return Some(Vec::new());
+            }
+        };
+        let applied = apply_patch_set(
+            tree,
+            PatchSet {
+                added_instances: vec![PatchAdd {
+                    parent_id: parent,
+                    instance: snapshot,
+                }],
+                ..PatchSet::new()
+            },
+        );
+        Some(vec![applied])
     }
 
     /// Deletes the empty `.gitkeep`s syncback left in `directory`, which just
@@ -6720,6 +6798,75 @@ mod tests {
                 find(&job, path);
             }
         }
+    }
+
+    /// Something new in a folder is read on its own, whether it's a file, a
+    /// folder that already has contents, or only reported through a file deep
+    /// inside it. Files Rojo doesn't read add nothing, and an `init` file still
+    /// changes what its folder is.
+    #[test]
+    fn new_entries_are_added_without_rereading_their_folder() {
+        let (job, _) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([(
+                    "Holder",
+                    VfsSnapshot::dir([("Existing.luau", VfsSnapshot::file("return 0"))]),
+                )]),
+            )],
+            "/project/src",
+        );
+        let existing = find(&job, &["Holder", "Existing"]);
+        job.vfs
+            .write("/project/src/Holder/Existing.luau", "return 'unseen'")
+            .unwrap();
+
+        job.vfs
+            .write("/project/src/Holder/File.luau", "return 1")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Create("/project/src/Holder/File.luau".into()));
+        job.vfs
+            .create_dir_all("/project/src/Holder/Deep/Inner")
+            .unwrap();
+        job.vfs
+            .write("/project/src/Holder/Deep/Inner/Leaf.luau", "return 2")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Create(
+            "/project/src/Holder/Deep/Inner/Leaf.luau".into(),
+        ));
+        job.vfs
+            .write("/project/src/Holder/.DS_Store", "junk")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Create("/project/src/Holder/.DS_Store".into()));
+
+        find(&job, &["Holder", "File"]);
+        find(&job, &["Holder", "Deep", "Inner", "Leaf"]);
+        let holder = find(&job, &["Holder"]);
+        {
+            let tree = job.tree.lock().unwrap();
+            // Only the new entries were read, so the unannounced edit wasn't.
+            assert_eq!(
+                tree.get_instance(existing)
+                    .unwrap()
+                    .properties()
+                    .get(&ustr("Source")),
+                Some(&Variant::String("return 0".into()))
+            );
+            let holder = tree.get_instance(holder).unwrap();
+            assert_eq!(holder.children().len(), 3);
+            assert_eq!(holder.class_name(), "Folder");
+        }
+
+        job.vfs
+            .write("/project/src/Holder/init.luau", "return 'module'")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Create("/project/src/Holder/init.luau".into()));
+        let holder = find(&job, &["Holder"]);
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(
+            tree.get_instance(holder).unwrap().class_name(),
+            "ModuleScript"
+        );
     }
 
     /// Deleting the last child of a folder from Studio keeps the folder in
