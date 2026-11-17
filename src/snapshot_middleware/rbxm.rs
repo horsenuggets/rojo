@@ -69,8 +69,9 @@ pub fn syncback_rbxm<'sync>(
 
 /// Keeps the adjacent metadata of a model file in step with its root's name.
 /// The root is named after the file when it is read, so a name the file system
-/// can't hold, or one shared with a sibling, is stored in the metadata. Anything
-/// else the metadata holds is left as it is.
+/// can't hold, or one shared with a sibling, is stored in the metadata. The
+/// model file holds the root's properties and attributes, so the metadata
+/// stops setting them, and its other fields are left as they are.
 pub(super) fn syncback_model_name(
     snapshot: &SyncbackSnapshot,
     fs_snapshot: &mut FsSnapshot,
@@ -97,7 +98,7 @@ pub(super) fn syncback_model_name(
         (existing, None) => (json_path, existing),
     };
     let existing = existing.as_deref().map(Vec::as_slice);
-    let updated = AdjacentMetadata::with_name(existing, &meta_path, snapshot.name_override())?;
+    let updated = AdjacentMetadata::for_model_root(existing, &meta_path, snapshot.name_override())?;
     match updated {
         Some(contents) if existing != Some(contents.as_slice()) => {
             fs_snapshot.add_file(meta_path, contents)

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     project::ProjectNode,
-    snapshot::{InstigatingSource, RojoTree},
+    snapshot::{InstanceMetadata, InstigatingSource, RojoTree},
     snapshot_middleware::Middleware,
 };
 
@@ -120,8 +120,10 @@ pub struct ModelTrees {
 }
 
 impl ModelTrees {
-    /// Finds every Instance in `dom` that matches a rule. Instances inside a
-    /// match are part of its file, so they are never matches themselves.
+    /// Finds every Instance in `dom` that matches a rule. Matches inside
+    /// another match are found too. Syncback never reaches them when the
+    /// outer one becomes a model file, but it does when the outer one keeps
+    /// its layout because a project defines it.
     pub fn find(rules: &CompiledModelTreeRules, dom: &WeakDom) -> Self {
         let mut trees = Self::default();
         if rules.is_empty() {
@@ -134,21 +136,19 @@ impl ModelTrees {
             for child_ref in instance.children() {
                 let child = dom.get_by_ref(*child_ref).unwrap();
                 let child_path = child_path(&path, &child.name);
-                match rules.middleware_for(&child_path) {
-                    Some(middleware) => {
-                        trees.roots.insert(*child_ref, middleware);
-                        let mut current = *child_ref;
-                        while trees.containers.insert(current) {
-                            match dom.get_by_ref(current) {
-                                Some(ancestor) if ancestor.parent().is_some() => {
-                                    current = ancestor.parent()
-                                }
-                                _ => break,
+                if let Some(middleware) = rules.middleware_for(&child_path) {
+                    trees.roots.insert(*child_ref, middleware);
+                    let mut current = *child_ref;
+                    while trees.containers.insert(current) {
+                        match dom.get_by_ref(current) {
+                            Some(ancestor) if ancestor.parent().is_some() => {
+                                current = ancestor.parent()
                             }
+                            _ => break,
                         }
                     }
-                    None => pending.push((*child_ref, child_path)),
                 }
+                pending.push((*child_ref, child_path));
             }
         }
         trees
@@ -170,6 +170,17 @@ impl ModelTrees {
 /// model file.
 pub fn is_model_file(middleware: Middleware) -> bool {
     matches!(middleware, Middleware::Rbxm | Middleware::Rbxmx)
+}
+
+/// Returns whether a project decides how this Instance is stored, either
+/// through a node of a project file or by being the root of a nested one. The
+/// `modelTrees` rules leave such Instances alone and apply below them.
+pub fn is_project_owned(metadata: &InstanceMetadata) -> bool {
+    metadata.middleware == Some(Middleware::Project)
+        || matches!(
+            metadata.instigating_source,
+            Some(InstigatingSource::ProjectNode { .. })
+        )
 }
 
 /// Returns every instance in `tree` whose subtree is on disk in a layout the
@@ -197,11 +208,9 @@ pub fn needs_relayout(
             let Some(metadata) = tree.get_metadata(*child_ref) else {
                 continue;
             };
-            // Project nodes fix both the path and the format of their source.
-            if matches!(
-                metadata.instigating_source,
-                Some(InstigatingSource::ProjectNode { .. })
-            ) {
+            // Project nodes fix both the path and the format of their source,
+            // and a nested project file is never replaced by a model.
+            if is_project_owned(metadata) {
                 pending.push((*child_ref, child_path));
                 continue;
             }
@@ -327,6 +336,131 @@ mod test {
         assert!(error.to_string().contains("ignorePaths"), "{error}");
         assert!(keep.join("Notes.luau").is_file());
         assert!(!root.join("src/FX.rbxm").exists());
+    }
+
+    #[test]
+    fn conversions_never_remove_ignored_files_rojo_does_not_read() {
+        let (_temp, root) = project_on_disk();
+        let effects = root.join("src/FX");
+        std::fs::create_dir_all(effects.join("Keep")).unwrap();
+        std::fs::write(effects.join("notes.md"), "Remember this.\n").unwrap();
+
+        let error = syncback(
+            &root,
+            r#"{
+                "instancesAsDirectories": true,
+                "ignorePaths": ["**/*.md"],
+                "modelTrees": [{ "pattern": "FX" }]
+            }"#,
+            effects_dom(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("notes.md"), "{error}");
+        assert!(effects.join("notes.md").is_file());
+        assert!(!root.join("src/FX.rbxm").exists());
+    }
+
+    #[test]
+    fn a_directory_named_like_the_model_file_makes_way_for_it() {
+        let (_temp, root) = project_on_disk();
+        let part = r#"{ "className": "Part" }"#;
+        for holder in ["FX", "FX.rbxm"] {
+            let child = root.join("src").join(holder).join("Spark");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join("init.meta.json"), part).unwrap();
+        }
+        let holder = |name: &str| {
+            InstanceBuilder::new("Folder")
+                .with_name(name)
+                .with_child(InstanceBuilder::new("Part").with_name("Spark"))
+        };
+
+        syncback(
+            &root,
+            r#"{
+                "instancesAsDirectories": true,
+                "modelTrees": [{ "pattern": "FX" }]
+            }"#,
+            WeakDom::new(
+                InstanceBuilder::new("Folder")
+                    .with_child(holder("FX"))
+                    .with_child(holder("FX.rbxm")),
+            ),
+        )
+        .unwrap();
+
+        assert!(root.join("src/FX.rbxm").is_file());
+        assert!(!root.join("src/FX").exists());
+        let moved = std::fs::read_to_string(root.join("src/FX.rbxm~2/init.meta.json")).unwrap();
+        assert!(moved.contains(r#""name": "FX.rbxm""#), "{moved}");
+    }
+
+    #[test]
+    fn a_displaced_directory_still_protects_its_ignored_files() {
+        let (_temp, root) = project_on_disk();
+        let part = r#"{ "className": "Part" }"#;
+        for holder in ["FX", "FX.rbxm"] {
+            let child = root.join("src").join(holder).join("Spark");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join("init.meta.json"), part).unwrap();
+        }
+        let notes = root.join("src/FX/notes.md");
+        std::fs::write(&notes, "Remember this.\n").unwrap();
+        let holder = |name: &str| {
+            InstanceBuilder::new("Folder")
+                .with_name(name)
+                .with_child(InstanceBuilder::new("Part").with_name("Spark"))
+        };
+
+        // The model file takes the name the other directory would use, which
+        // leaves that directory's own files unpaired and up for removal.
+        let error = syncback(
+            &root,
+            r#"{
+                "instancesAsDirectories": true,
+                "ignorePaths": ["**/*.md"],
+                "modelTrees": [{ "pattern": "FX" }]
+            }"#,
+            WeakDom::new(
+                InstanceBuilder::new("Folder")
+                    .with_child(holder("FX"))
+                    .with_child(holder("FX.rbxm")),
+            ),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("notes.md"), "{error}");
+        assert!(notes.is_file());
+        assert!(root.join("src/FX").is_dir());
+        assert!(root.join("src/FX.rbxm").is_dir());
+    }
+
+    #[test]
+    fn nested_project_files_are_never_replaced() {
+        let (_temp, root) = project_on_disk();
+        let nested = root.join("src/Nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("default.project.json"),
+            r#"{"name":"Nested","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+
+        syncback(
+            &root,
+            r#"{ "modelTrees": [{ "pattern": "**" }] }"#,
+            WeakDom::new(
+                InstanceBuilder::new("Folder")
+                    .with_child(InstanceBuilder::new("Folder").with_name("Nested"))
+                    .with_child(InstanceBuilder::new("Folder").with_name("Other")),
+            ),
+        )
+        .unwrap();
+
+        assert!(nested.join("default.project.json").is_file());
+        assert!(!root.join("src/Nested.rbxm").exists());
+        assert!(root.join("src/Other.rbxm").is_file());
     }
 
     #[test]
@@ -552,7 +686,7 @@ mod test {
     }
 
     #[test]
-    fn matches_own_their_descendants() {
+    fn matches_are_found_at_every_depth() {
         let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
         let root = dom.root_ref();
         let scenes = dom.insert(root, InstanceBuilder::new("Folder").with_name("Scenes"));
@@ -564,14 +698,16 @@ mod test {
 
         let trees = ModelTrees::find(&rules(&[("**/FX", None)]), &dom);
 
-        assert_eq!(trees.middleware(effects), Some(Middleware::Rbxm));
-        for referent in [root, scenes, intro, nested, outro, other] {
+        for referent in [effects, nested] {
+            assert_eq!(trees.middleware(referent), Some(Middleware::Rbxm));
+        }
+        for referent in [root, scenes, intro, outro, other] {
             assert_eq!(trees.middleware(referent), None);
         }
-        for referent in [root, scenes, intro, effects] {
+        for referent in [root, scenes, intro, effects, nested] {
             assert!(trees.contains(referent));
         }
-        for referent in [nested, outro, other] {
+        for referent in [outro, other] {
             assert!(!trees.contains(referent));
         }
     }

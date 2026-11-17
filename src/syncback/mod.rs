@@ -41,7 +41,7 @@ pub use file_names::{
 };
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
-pub use model_trees::{is_model_file, ModelTreeRule, ModelTrees};
+pub use model_trees::{is_model_file, is_project_owned, ModelTreeRule, ModelTrees};
 pub(crate) use property_filter::{can_write_property, is_unset_binary_string};
 pub use property_filter::{
     filter_json_properties_preallocated, filter_properties, filter_properties_preallocated,

@@ -589,6 +589,7 @@ pub fn syncback_dir_no_meta<'sync>(
             }
         }
 
+        let mut layout_changed = false;
         for new_child_ref in new_inst.children() {
             let new_child = snapshot.get_new_instance(*new_child_ref).unwrap();
             if let Some(remaining) = project_children.get_mut(new_child.name.as_str()) {
@@ -622,6 +623,7 @@ pub fn syncback_dir_no_meta<'sync>(
                 Some(old_child) if !snapshot.keeps_model_layout(*new_child_ref, old_child) => {
                     snapshot.validate_layout_change(old_child)?;
                     removed_children.push(old_child);
+                    layout_changed = true;
                     None
                 }
                 other => other,
@@ -632,6 +634,14 @@ pub fn syncback_dir_no_meta<'sync>(
                 }
                 None => fresh,
             });
+        }
+        // A model file can claim the path of an unrelated sibling, which
+        // leaves the Instance's own old files unpaired. They are then removed
+        // like those of a deleted Instance, so they get the same check.
+        if layout_changed {
+            for old_child in old_child_map.values() {
+                snapshot.validate_layout_change(*old_child)?;
+            }
         }
         removed_children.extend(old_child_map.into_values());
     } else {
