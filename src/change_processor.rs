@@ -4594,8 +4594,7 @@ mod tests {
         // The folder itself, or only a file inside it.
         for second in [r#"{"$path":"src"}"#, r#"{"$path":"src/Mover/Code.luau"}"#] {
             let temp = tempfile::tempdir().unwrap();
-            // A server always serves from a canonical path.
-            let root = &temp.path().canonicalize().unwrap();
+            let root = temp.path();
             std::fs::create_dir_all(root.join("src/Mover")).unwrap();
             std::fs::write(root.join("src/Mover/Code.luau"), "return 1").unwrap();
             std::fs::write(
@@ -4622,11 +4621,12 @@ mod tests {
     }
 
     /// A job serving the `default.project.json` in `root` on the real file
-    /// system, for tests that need its locks.
+    /// system, for tests that need its locks. Like a server, it serves from the
+    /// path the VFS canonicalizes `root` to.
     fn disk_job(root: &Path) -> JobThreadContext {
         let vfs = Arc::new(Vfs::new(memofs::StdBackend::new().unwrap()));
         vfs.set_watch_enabled(false);
-        let path = root.join("default.project.json");
+        let path = vfs.canonicalize(root).unwrap().join("default.project.json");
         let project = Project::load_exact(&vfs, &path, Some("Fallback")).unwrap();
         let snapshot = snapshot_from_vfs(&Default::default(), &vfs, &path)
             .unwrap()
