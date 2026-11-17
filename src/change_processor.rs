@@ -228,6 +228,22 @@ impl JobThreadContext {
             return;
         }
 
+        // A `.gitkeep` is never an instance, so its own events change nothing.
+        // Anything else that appears makes the `.gitkeep`s above it unneeded.
+        match &event {
+            VfsEvent::Create(path) | VfsEvent::Write(path) | VfsEvent::Remove(path)
+                if is_keep_file(path) =>
+            {
+                return;
+            }
+            VfsEvent::Create(path) => {
+                if let Some(directory) = path.parent() {
+                    self.remove_stale_keep_files(directory);
+                }
+            }
+            _ => {}
+        }
+
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
         let applied_patches = match event {
@@ -254,6 +270,48 @@ impl JobThreadContext {
         // Notify anyone listening to the message queue about the changes we
         // just made.
         self.message_queue.push_messages(&applied_patches);
+    }
+
+    /// Deletes the empty `.gitkeep`s syncback left in `directory`, which just
+    /// gained contents, and in the directories holding it, which aren't empty
+    /// either. Only directories inside the project folder are looked at, one
+    /// check each, and a `.gitkeep` with contents was written by someone else
+    /// and is kept.
+    fn remove_stale_keep_files(&self, directory: &Path) {
+        let root =
+            canonicalize_or_original(&self.vfs, self.project.folder_location().to_path_buf());
+        let start = canonicalize_or_original(&self.vfs, directory.to_path_buf());
+        let mut directory = Some(start.as_path());
+        while let Some(current) = directory {
+            if !current.starts_with(&root) {
+                break;
+            }
+            let keep = current.join(EMPTY_DIR_KEEP_NAME);
+            match self.vfs.read(&keep).with_not_found() {
+                Ok(Some(contents)) if contents.is_empty() => {
+                    if let Err(error) = self.vfs.remove_file(&keep).with_not_found() {
+                        log::warn!("Could not remove \"{}\" ({error}).", keep.display());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("Could not read \"{}\" ({error}).", keep.display()),
+            }
+            directory = current.parent();
+        }
+    }
+
+    /// Keeps a directory in version control once a deletion from Studio left
+    /// it empty, the way syncback keeps an empty directory.
+    fn keep_if_empty(&self, directory: &Path) {
+        let Ok(Some(mut entries)) = self.vfs.read_dir(directory).with_not_found() else {
+            return;
+        };
+        if entries.next().is_none() {
+            let keep = directory.join(EMPTY_DIR_KEEP_NAME);
+            if let Err(error) = self.vfs.write(&keep, []) {
+                log::warn!("Could not write \"{}\" ({error}).", keep.display());
+            }
+        }
     }
 
     /// Returns whether an event is about a path inside the project's `.rojo`
@@ -526,6 +584,20 @@ impl JobThreadContext {
                     }
                     continue;
                 }
+                // Only a folder whose children have files of their own can be
+                // left empty, so only those get a `.gitkeep` back.
+                let holder = tree
+                    .get_instance(id)
+                    .and_then(|instance| tree.get_metadata(instance.parent()))
+                    .filter(|parent| {
+                        parent
+                            .middleware
+                            .is_some_and(|middleware| middleware.is_dir())
+                    })
+                    .and_then(|parent| match &parent.instigating_source {
+                        Some(InstigatingSource::Path(path)) => Some(path.clone()),
+                        _ => None,
+                    });
                 match self.remove_instance(&tree, id, &context) {
                     Ok(Some(snapshot)) => {
                         if let Some(instance) = tree.get_instance(id) {
@@ -544,7 +616,12 @@ impl JobThreadContext {
                             });
                         }
                     }
-                    Ok(None) => accepted.removed_instances.push(id),
+                    Ok(None) => {
+                        accepted.removed_instances.push(id);
+                        if let Some(holder) = holder {
+                            self.keep_if_empty(&holder);
+                        }
+                    }
                     Err(err) => {
                         errors.push(WriteError {
                             id,
@@ -1129,6 +1206,7 @@ impl JobThreadContext {
         // A failed relocation can leave a journal that still needs its staged
         // files, so those are left for startup recovery, which clears them.
         result?;
+        self.remove_stale_keep_files(directory);
         // Another server's startup recovery may have cleared it already, once
         // the lock was released.
         self.vfs.remove_dir_all(&staging).with_not_found()?;
@@ -1234,7 +1312,7 @@ impl JobThreadContext {
                     // Syncback keeps an empty directory with an empty `.gitkeep`
                     // that no instance lists, so it goes with the directory. One
                     // with contents was written by someone else and is kept.
-                    let keep = entry.path().file_name() == Some(".gitkeep".as_ref())
+                    let keep = is_keep_file(entry.path())
                         && self
                             .vfs
                             .read(entry.path())
@@ -3724,6 +3802,13 @@ fn filesystem_restoration(
         patch.updated_instances.push(restoration);
     }
     patch
+}
+
+/// The file syncback writes to keep an empty directory in version control.
+const EMPTY_DIR_KEEP_NAME: &str = ".gitkeep";
+
+fn is_keep_file(path: &Path) -> bool {
+    path.file_name() == Some(EMPTY_DIR_KEEP_NAME.as_ref())
 }
 
 fn canonicalize_or_original(vfs: &Vfs, path: PathBuf) -> PathBuf {
@@ -6571,6 +6656,99 @@ mod tests {
                 job.vfs.metadata(kept).with_not_found().unwrap().is_some(),
                 "{kept}"
             );
+        }
+    }
+
+    fn exists(job: &JobThreadContext, path: &str) -> bool {
+        job.vfs.metadata(path).with_not_found().unwrap().is_some()
+    }
+
+    /// A `.gitkeep` is only needed while its directory is empty. Anything new
+    /// below it, however deep, makes every empty one on the way up go, and a
+    /// `.gitkeep` with contents or outside the project is left alone. Walks
+    /// every combination of how deep the new file is and what the outer
+    /// `.gitkeep` holds.
+    #[test]
+    fn new_contents_remove_the_gitkeeps_above_them() {
+        for deep in [false, true] {
+            for outer in ["", "notes"] {
+                let (job, _) = script_job(
+                    vec![(
+                        "src",
+                        VfsSnapshot::dir([(
+                            "Outer",
+                            VfsSnapshot::dir([
+                                (".gitkeep", VfsSnapshot::file(outer)),
+                                (
+                                    "Inner",
+                                    VfsSnapshot::dir([(".gitkeep", VfsSnapshot::file(""))]),
+                                ),
+                            ]),
+                        )]),
+                    )],
+                    "/project/src",
+                );
+                job.vfs
+                    .write("/outside.gitkeep-holder/.gitkeep", "")
+                    .unwrap();
+                let created = if deep {
+                    "/project/src/Outer/Inner/New.luau"
+                } else {
+                    "/project/src/Outer/New.luau"
+                };
+                job.vfs.write(created, "return 1").unwrap();
+                job.handle_vfs_event(VfsEvent::Create(created.into()));
+
+                let case = format!("deep {deep} outer {outer:?}");
+                assert_eq!(
+                    exists(&job, "/project/src/Outer/Inner/.gitkeep"),
+                    !deep,
+                    "{case}"
+                );
+                assert_eq!(
+                    exists(&job, "/project/src/Outer/.gitkeep"),
+                    !outer.is_empty(),
+                    "{case}"
+                );
+                assert!(exists(&job, "/outside.gitkeep-holder/.gitkeep"), "{case}");
+                // The new file is still read as usual.
+                let path: &[&str] = if deep {
+                    &["Outer", "Inner", "New"]
+                } else {
+                    &["Outer", "New"]
+                };
+                find(&job, path);
+            }
+        }
+    }
+
+    /// Deleting the last child of a folder from Studio keeps the folder in
+    /// version control, while deleting one of several doesn't.
+    #[test]
+    fn deleting_the_last_child_keeps_its_folder() {
+        for siblings in [false, true] {
+            let mut entries = vec![("Only.luau", VfsSnapshot::file("return 1"))];
+            if siblings {
+                entries.push(("Other.luau", VfsSnapshot::file("return 2")));
+            }
+            let (job, _) = script_job(
+                vec![(
+                    "src",
+                    VfsSnapshot::dir([("Holder", VfsSnapshot::dir(entries))]),
+                )],
+                "/project/src",
+            );
+            let only = find(&job, &["Holder", "Only"]);
+            let (accepted, _, errors) = studio_write(
+                &job,
+                PatchSet {
+                    removed_instances: vec![only],
+                    ..PatchSet::new()
+                },
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(accepted.removed_instances, vec![only]);
+            assert_eq!(exists(&job, "/project/src/Holder/.gitkeep"), !siblings);
         }
     }
 

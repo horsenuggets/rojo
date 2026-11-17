@@ -379,6 +379,53 @@ fn assert_created_subtrees_are_written(fixture: &str, check_layout: impl Fn(&std
     });
 }
 
+// A folder syncback kept with a `.gitkeep` doesn't need it once something is
+// created in it from Studio.
+#[test]
+fn studio_created_subtrees_remove_the_gitkeep_they_replace() {
+    use librojo::web_api::InstanceAddition;
+    use std::collections::HashMap;
+
+    run_serve_test("place_root", |session, _| {
+        let info = session.get_api_rojo().unwrap();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let mover = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "Mover")
+            .unwrap()
+            .id;
+        let keep = session.path().join("src/ReplicatedStorage/Mover/.gitkeep");
+        assert!(keep.is_file());
+
+        let (model, ids) = created_subtree("Created", &[]);
+        let response = post_write(
+            &session,
+            &WriteRequest {
+                session_id: info.session_id,
+                message_cursor: Some(read.message_cursor),
+                authority: WriteAuthority::Filesystem,
+                removed: Vec::new(),
+                added: HashMap::from([(
+                    ids.id,
+                    InstanceAddition {
+                        parent: mover,
+                        model,
+                        ids,
+                    },
+                )]),
+                updated: Vec::new(),
+            },
+        );
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(!keep.exists());
+        assert!(session
+            .path()
+            .join("src/ReplicatedStorage/Mover/Created")
+            .is_dir());
+    });
+}
+
 #[test]
 fn studio_created_subtrees_reject_ids_that_are_not_new() {
     use librojo::web_api::InstanceAddition;
