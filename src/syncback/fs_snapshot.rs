@@ -269,6 +269,64 @@ impl FsSnapshot {
         Ok(())
     }
 
+    /// Persists a rewritten model file along with its adjacent metadata, which
+    /// stops setting the properties the model file now holds. Every path must
+    /// be in `expected` and unchanged. The model file is written first, so if
+    /// writing stops partway, the metadata still sets the same values as before
+    /// and nothing is lost.
+    pub fn write_model_file_to_vfs<P: AsRef<Path>>(
+        &self,
+        base: P,
+        vfs: &Vfs,
+        expected: &HashMap<PathBuf, Option<Vec<u8>>>,
+        model: &Path,
+    ) -> io::Result<()> {
+        let mut lock = vfs.lock();
+        let base = base.as_ref();
+        if !self.added_dirs.is_empty() || !self.removed_dirs.is_empty() {
+            return Err(io::Error::other(
+                "A model file update cannot change directories",
+            ));
+        }
+        for (path, previous) in expected {
+            let current = lock.read(path).with_not_found()?;
+            if current.as_ref().map(|bytes| bytes.as_slice()) != previous.as_deref() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Filesystem changed before persistence",
+                ));
+            }
+        }
+        let mut writes = Vec::new();
+        for (path, contents) in &self.added_files {
+            let path = base.join(path);
+            let previous = expected.get(&path).ok_or_else(|| {
+                io::Error::other("The write target was not included in filesystem validation")
+            })?;
+            if previous.as_deref() != Some(contents.as_slice()) {
+                writes.push((path, contents, previous));
+            }
+        }
+        let mut removals = Vec::new();
+        for path in &self.removed_files {
+            let path = base.join(path);
+            if !expected.contains_key(&path) {
+                return Err(io::Error::other(
+                    "The removed path was not included in filesystem validation",
+                ));
+            }
+            removals.push(path);
+        }
+        writes.sort_by_key(|(path, _, _)| path.as_path() != model);
+        for (path, contents, previous) in writes {
+            lock.write_atomic(&path, contents, previous.as_deref())?;
+        }
+        for path in removals {
+            lock.remove_file(&path)?;
+        }
+        Ok(())
+    }
+
     /// Returns whether writing this snapshot would change any file's contents,
     /// compared with the contents captured in `expected`.
     pub fn changes_files<P: AsRef<Path>>(

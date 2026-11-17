@@ -33,7 +33,7 @@ use crate::{
     snapshot::{InstanceWithMeta, RojoTree},
     snapshot_middleware::{dir_init_files, Middleware},
     syncback::ref_properties::{attribute_ids, collect_referents, ids_on_disk, link_referents},
-    Project,
+    Project, REF_POINTER_ATTRIBUTE_PREFIX,
 };
 
 pub use addition::{drop_duplicate_ids, syncback_new_subtree};
@@ -101,8 +101,49 @@ pub(crate) fn link_scoped_referents(project: &Project, dom: &mut WeakDom) -> any
     if ignore_referents {
         return Ok(());
     }
+    // Linking rewrites every `Rojo_Target_*` attribute of an instance that
+    // points inside `dom`. One whose property was cleared must go, and one
+    // that points outside `dom`, held by the attribute alone, must stay.
+    let mut kept = Vec::new();
+    let mut cleared = Vec::new();
+    for referent in descendants(dom, dom.root_ref()) {
+        let instance = dom.get_by_ref(referent).unwrap();
+        let Some(Variant::Attributes(attributes)) = instance.properties.get(&ustr("Attributes"))
+        else {
+            continue;
+        };
+        for (name, value) in attributes.iter() {
+            let Some(property) = name.strip_prefix(REF_POINTER_ATTRIBUTE_PREFIX) else {
+                continue;
+            };
+            match instance.properties.get(&ustr(property)) {
+                Some(Variant::Ref(target)) if target.is_none() => {
+                    cleared.push((referent, name.clone()))
+                }
+                Some(Variant::Ref(target)) if dom.get_by_ref(*target).is_some() => {}
+                _ => kept.push((referent, name.clone(), value.clone())),
+            }
+        }
+    }
+    for (referent, name) in cleared {
+        if let Some(Variant::Attributes(attributes)) = dom
+            .get_by_ref_mut(referent)
+            .and_then(|instance| instance.properties.get_mut(&ustr("Attributes")))
+        {
+            attributes.remove(name.as_str());
+        }
+    }
     let links = collect_referents(dom);
-    link_referents(links, dom, &HashMap::new())
+    link_referents(links, dom, &HashMap::new())?;
+    for (referent, name, value) in kept {
+        if let Some(Variant::Attributes(attributes)) = dom
+            .get_by_ref_mut(referent)
+            .and_then(|instance| instance.properties.get_mut(&ustr("Attributes")))
+        {
+            attributes.insert(name, value);
+        }
+    }
+    Ok(())
 }
 
 fn syncback_scoped(

@@ -3,7 +3,7 @@ use crossbeam_channel::{select, Receiver, RecvError, Sender};
 use jod_thread::JoinHandle;
 use memofs::{IoResultExt, Vfs, VfsEvent};
 use rbx_dom_weak::{
-    types::{Ref, Variant},
+    types::{Attributes, Ref, Variant},
     ustr, HashMapExt as _, InstanceBuilder, Ustr, UstrMap, WeakDom,
 };
 use std::collections::{HashMap, HashSet};
@@ -15,6 +15,7 @@ use crate::{
     message_queue::MessageQueue,
     project::Project,
     resolution::normalize_json_variant,
+    rojo_ref::merge_link_attributes,
     snapshot::{
         apply_patch_set, compute_patch_set, compute_saved_patch_set, compute_shallow_patch_set,
         AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, InstigatingSource, PatchAdd,
@@ -29,6 +30,7 @@ use crate::{
         validate_write_targets, FsSnapshot, PropertyWriteDecision,
     },
     web::interface::{AddedIds, InstanceAddition, WriteAuthority, WriteError, WriteResult},
+    REF_POINTER_ATTRIBUTE_PREFIX,
 };
 
 /// How many times a Studio-authoritative write is retried when its file keeps
@@ -428,22 +430,33 @@ impl JobThreadContext {
                         errors.extend(Self::apply_stored(&mut tree, written, &[]));
                         Ok(())
                     })();
-                    if let Err(err) = result {
-                        errors.push(WriteError {
-                            id,
-                            property: None,
-                            message: format!("{err:#}"),
-                        });
-                        if let Some(instance) = tree.get_instance(id) {
-                            deletion_conflicts.push(PatchAdd {
-                                parent_id: instance.parent(),
-                                instance: snapshot_from_tree(&tree, id),
-                            });
+                    match result {
+                        // Rewriting the model already took the instance out of the
+                        // tree, so the removal is only reported.
+                        Ok(()) => {
+                            accepted.removed_instances.push(id);
                             messages.push(AppliedPatchSet {
                                 removed: vec![id],
-                                added: vec![id],
-                                updated: Vec::new(),
+                                ..AppliedPatchSet::new()
                             });
+                        }
+                        Err(err) => {
+                            errors.push(WriteError {
+                                id,
+                                property: None,
+                                message: format!("{err:#}"),
+                            });
+                            if let Some(instance) = tree.get_instance(id) {
+                                deletion_conflicts.push(PatchAdd {
+                                    parent_id: instance.parent(),
+                                    instance: snapshot_from_tree(&tree, id),
+                                });
+                                messages.push(AppliedPatchSet {
+                                    removed: vec![id],
+                                    added: vec![id],
+                                    updated: Vec::new(),
+                                });
+                            }
                         }
                     }
                     continue;
@@ -670,7 +683,7 @@ impl JobThreadContext {
         &self,
         tree: &RojoTree,
         stored: StoredIn,
-        copy: StoredCopy,
+        mut copy: StoredCopy,
     ) -> anyhow::Result<WrittenStored> {
         let owner = stored.owner();
         let instance = tree
@@ -685,6 +698,7 @@ impl JobThreadContext {
         let expected =
             FsSnapshot::capture_file_contents(&instance.metadata().relevant_paths, &self.vfs)?;
         let ids = copy.added_ids(copy.dom.root_ref());
+        link_outside_refs(tree, &mut copy.dom, &copy.ids);
         let outside = outside_refs(&copy.dom, &copy.ids);
         let staged = match stored {
             StoredIn::Inline(_) => {
@@ -695,7 +709,14 @@ impl JobThreadContext {
             }
         };
         validate_write_targets(&self.project, &staged)?;
-        staged.write_single_file_to_vfs(self.project.folder_location(), &self.vfs, &expected)?;
+        let base = self.project.folder_location();
+        match stored {
+            StoredIn::Inline(_) => staged.write_single_file_to_vfs(base, &self.vfs, &expected)?,
+            // A model file's adjacent metadata can change along with it.
+            StoredIn::Model(_) => {
+                staged.write_model_file_to_vfs(base, &self.vfs, &expected, &source)?
+            }
+        }
         let snapshot = match stored {
             StoredIn::Inline(_) => snapshot_shallow_from_vfs(&context, &self.vfs, &source)?,
             StoredIn::Model(_) => snapshot_from_vfs(&context, &self.vfs, &source)?,
@@ -839,7 +860,7 @@ impl JobThreadContext {
                 let source_copy = source.map(|from| {
                     let mut copy = StoredCopy::new(tree, from);
                     if let Some(moved) = copy.copy_of(id) {
-                        copy.dom.destroy(moved);
+                        copy.move_out(moved);
                     }
                     (from, copy)
                 });
@@ -882,7 +903,7 @@ impl JobThreadContext {
                 );
                 let mut copy = StoredCopy::new(tree, from);
                 if let Some(moved) = copy.copy_of(id) {
-                    copy.dom.destroy(moved);
+                    copy.move_out(moved);
                 }
                 let mut errors = self.place_subtree(tree, parent, model, &ids, context, &moving)?;
                 let removed = self.write_stored_unchecked(tree, from, copy)?;
@@ -963,7 +984,9 @@ impl JobThreadContext {
                     .map(str::to_lowercase)
             })
             .collect();
-        let outside = outside_refs(&model, &model_copies(&model, ids));
+        let copies = model_copies(&model, ids);
+        link_outside_refs(tree, &mut model, &copies);
+        let outside = outside_refs(&model, &copies);
         let new = syncback_new_subtree(
             &self.vfs,
             tree,
@@ -1030,7 +1053,7 @@ impl JobThreadContext {
     /// existing path. A crash leaves either all of them or none of them.
     fn install_new_files(&self, directory: &Path, files: FsSnapshot) -> anyhow::Result<()> {
         use crate::syncback::{
-            relocation::{cache_directory, execute_relocation},
+            relocation::{cache_directory, execute_staged_relocation, staging_directory},
             relocation_transaction::Relocation,
         };
 
@@ -1038,16 +1061,18 @@ impl JobThreadContext {
         self.vfs.create_dir_all(&cache)?;
         self.vfs.sync_path(&cache)?;
         self.vfs.sync_path(cache.parent().unwrap())?;
-        let staging = cache.join(format!("{}.new", uuid::Uuid::new_v4()));
-        self.vfs.create_dir_all(&staging)?;
-        let result = (|| -> anyhow::Result<()> {
-            files
-                .rebase(directory, &staging)?
-                .write_to_vfs("", &self.vfs)?;
+        let staging = staging_directory(&self.project).join(uuid::Uuid::new_v4().to_string());
+        let files = files.rebase(directory, &staging)?;
+        let journal = cache.join(uuid::Uuid::new_v4().to_string());
+        let result = execute_staged_relocation(&self.vfs, &journal, || {
+            self.vfs.create_dir_all(&staging)?;
+            files.write_to_vfs("", &self.vfs)?;
             let mut moves = Vec::new();
             for entry in self.vfs.read_dir(&staging)? {
                 let source = entry?.path().to_path_buf();
-                let name = source.file_name().context("A staged path has no name")?;
+                let name = source
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("A staged path has no name"))?;
                 let expected = self.vfs.snapshot_tree(&source)?;
                 moves.push(Relocation {
                     destination: directory.join(name),
@@ -1055,14 +1080,12 @@ impl JobThreadContext {
                     expected,
                 });
             }
-            let journal = cache.join(uuid::Uuid::new_v4().to_string());
-            execute_relocation(&self.vfs, &journal, moves, Vec::new())?;
-            Ok(())
-        })();
-        // Whatever wasn't installed stays out of the project.
-        let cleanup = self.vfs.remove_dir_all(&staging);
+            Ok(moves)
+        });
+        // A failed relocation can leave a journal that still needs its staged
+        // files, so those are left for startup recovery, which clears them.
         result?;
-        cleanup?;
+        self.vfs.remove_dir_all(&staging)?;
         Ok(())
     }
 
@@ -1963,11 +1986,13 @@ impl JobThreadContext {
         match self.persist_stored_move(tree, update, context) {
             Ok(unsaved) => {
                 let instance = tree.get_instance(id);
-                outcome.accepted.updated_instances.push(PatchUpdate {
+                let moved = PatchUpdate {
                     changed_parent: instance.map(|instance| instance.parent()),
                     changed_name: update.changed_name.clone(),
                     ..empty_update(id)
-                });
+                };
+                outcome.messages.push(saved_change_message(tree, &moved));
+                outcome.accepted.updated_instances.push(moved);
                 outcome.errors.extend(unsaved);
                 let remaining = PatchUpdate {
                     changed_parent: None,
@@ -2070,6 +2095,17 @@ impl JobThreadContext {
                 instance.name = name.clone();
             }
             for (key, value) in values {
+                // Studio never sees the attributes that link references, so
+                // the ones the instance has are kept.
+                let value = if key == "Attributes" {
+                    let edited = value.unwrap_or_else(|| Attributes::new().into());
+                    Some(merge_link_attributes(
+                        &edited,
+                        instance.properties.get(&key),
+                    ))
+                } else {
+                    value
+                };
                 match value {
                     Some(value) => instance.properties.insert(key, value),
                     None => instance.properties.remove(&key),
@@ -2081,6 +2117,7 @@ impl JobThreadContext {
         match result {
             Ok(unsaved) => {
                 outcome.accepted.updated_instances.push(update.clone());
+                outcome.messages.push(saved_change_message(tree, update));
                 outcome.errors.extend(unsaved);
             }
             Err(error) => {
@@ -2730,6 +2767,47 @@ fn model_copies(model: &WeakDom, ids: &AddedIds) -> HashMap<Ref, Ref> {
     copies
 }
 
+/// Stores references that leave `dom` as `Rojo_Target_*` attributes naming the
+/// target's `Rojo_Id`, the way a full syncback links them across files. A
+/// target without an ID is left as is, so [`outside_refs`] reports it.
+/// `copies` maps each copy in `dom` to the tree instance it stands for.
+fn link_outside_refs(tree: &RojoTree, dom: &mut WeakDom, copies: &HashMap<Ref, Ref>) {
+    for &copy in copies.keys() {
+        let Some(instance) = dom.get_by_ref(copy) else {
+            continue;
+        };
+        let linked: Vec<(Ustr, String)> = instance
+            .properties
+            .iter()
+            .filter_map(|(name, value)| match value {
+                Variant::Ref(target) if target.is_some() && dom.get_by_ref(*target).is_none() => {
+                    let id = tree.get_metadata(*target)?.specified_id.as_ref()?;
+                    Some((*name, id.to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        if linked.is_empty() {
+            continue;
+        }
+        let instance = dom.get_by_ref_mut(copy).unwrap();
+        let mut attributes = match instance.properties.remove(&ustr("Attributes")) {
+            Some(Variant::Attributes(attributes)) => attributes,
+            _ => Attributes::new(),
+        };
+        for (name, id) in linked {
+            instance.properties.remove(&name);
+            attributes.insert(
+                format!("{REF_POINTER_ATTRIBUTE_PREFIX}{name}"),
+                Variant::String(id),
+            );
+        }
+        instance
+            .properties
+            .insert(ustr("Attributes"), Variant::Attributes(attributes));
+    }
+}
+
 /// Returns the references a file can't hold, since they point at instances
 /// outside `dom`, as the tree instance and property that hold each one.
 /// `copies` maps each copy in `dom` to the tree instance it stands for.
@@ -2748,6 +2826,34 @@ fn outside_refs(dom: &WeakDom, copies: &HashMap<Ref, Ref>) -> Vec<(Ref, Ustr)> {
         }
     }
     outside
+}
+
+/// Tells every connected Studio about a change saved to a shared file, with
+/// the values the tree holds now that the file was read back. Rewriting a
+/// shared file keeps the tree in line with it, so the watcher has nothing left
+/// to report.
+fn saved_change_message(tree: &RojoTree, update: &PatchUpdate) -> AppliedPatchSet {
+    let Some(instance) = tree.get_instance(update.id) else {
+        return AppliedPatchSet::new();
+    };
+    AppliedPatchSet {
+        updated: vec![AppliedPatchUpdate {
+            id: update.id,
+            changed_name: update
+                .changed_name
+                .as_ref()
+                .map(|_| instance.name().to_owned()),
+            changed_class_name: None,
+            changed_parent: update.changed_parent.map(|_| instance.parent()),
+            changed_properties: update
+                .changed_properties
+                .keys()
+                .map(|key| (*key, instance.properties().get(key).cloned()))
+                .collect(),
+            changed_metadata: None,
+        }],
+        ..AppliedPatchSet::new()
+    }
 }
 
 /// The errors for what a write couldn't keep: instances that didn't survive
@@ -3112,6 +3218,35 @@ impl StoredCopy {
         }
         retarget_refs(&mut dom, &ids);
         StoredCopy { dom, ids }
+    }
+
+    /// Takes a copy and its descendants out, for a move to another file.
+    /// References to them point at the tree instances again, since those
+    /// still exist elsewhere.
+    fn move_out(&mut self, copy: Ref) {
+        let moved: HashMap<Ref, Ref> = self
+            .dom
+            .descendants_of(copy)
+            .filter_map(|instance| {
+                let referent = instance.referent();
+                self.ids
+                    .get(&referent)
+                    .map(|original| (referent, *original))
+            })
+            .collect();
+        self.dom.destroy(copy);
+        for &remaining in self.ids.keys() {
+            let Some(instance) = self.dom.get_by_ref_mut(remaining) else {
+                continue;
+            };
+            for value in instance.properties.values_mut() {
+                if let Variant::Ref(target) = value {
+                    if let Some(original) = moved.get(target) {
+                        *target = *original;
+                    }
+                }
+            }
+        }
     }
 
     /// Deletes a copy and its descendants. References to them become nil, the

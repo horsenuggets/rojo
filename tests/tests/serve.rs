@@ -581,6 +581,8 @@ fn studio_edits_inside_binary_models_keep_every_instance() {
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         assert!(response.conflicts.updated_instances.is_empty());
 
+        // Other connected Studios hear about the rename, and nothing else.
+        let mut renamed = false;
         for message in settled_messages(&session, fixture.cursor) {
             assert!(message.removed.is_empty(), "{:?}", message.removed);
             assert!(message.added.is_empty(), "{:?}", message.added.keys());
@@ -590,11 +592,34 @@ fn studio_edits_inside_binary_models_keep_every_instance() {
                     "re-reading the model reported {:?}",
                     update.changed_properties.keys()
                 );
+                renamed |= update.id == fixture.id("A")
+                    && update.changed_name.as_deref() == Some("Renamed");
             }
         }
+        assert!(renamed, "the rename was never announced");
         let weld = fixture.id("Weld");
         assert_eq!(read_ref(&session, weld, "Part0"), Some(fixture.id("A")));
         assert_eq!(read_ref(&session, weld, "Part1"), Some(fixture.id("B")));
+
+        // The attribute the model's metadata set moves into the model file,
+        // which now holds the root's properties, and it's still there.
+        let storage = session.path().join("src/ReplicatedStorage");
+        assert!(!storage.join("BinModel.meta.json").exists());
+        let read = session.get_api_read(fixture.info.root_instance_id).unwrap();
+        let attributes = read.instances[&fixture.id("BinModel")]
+            .properties
+            .get(&ustr("Attributes"))
+            .map(|value| value.as_ref().clone());
+        let Some(Variant::Attributes(attributes)) = attributes else {
+            panic!("The model lost its attributes");
+        };
+        // Binary models read string attributes back as binary strings.
+        let kind = match attributes.get("Kind") {
+            Some(Variant::String(kind)) => kind.as_bytes().to_vec(),
+            Some(Variant::BinaryString(kind)) => AsRef::<[u8]>::as_ref(kind).to_vec(),
+            other => panic!("unexpected Kind {other:?}"),
+        };
+        assert_eq!(kind, b"binary");
     });
 }
 
@@ -629,30 +654,83 @@ fn studio_moves_between_model_files_keep_their_ids() {
     });
 }
 
-// A file can only hold references between its own instances. Moving what a
-// reference points at out of its file is saved, and the reference that was
-// lost is reported.
+// A reference whose target moves to another file follows it through the
+// target's `Rojo_Id`, which the move keeps.
 #[test]
-fn studio_references_leaving_their_file_are_reported() {
+fn studio_references_follow_targets_with_ids_into_other_files() {
     run_serve_test("shared_files", |session, _| {
         let fixture = SharedFiles::read(&session);
         let pointer = fixture.id("Pointer");
-        assert_eq!(
-            read_ref(&session, pointer, "Value"),
-            Some(fixture.id("Base"))
-        );
+        let base = fixture.id("Base");
+        assert_eq!(read_ref(&session, pointer, "Value"), Some(base));
         let response = fixture.write(
             &session,
             Vec::new(),
             vec![InstanceUpdate {
                 changed_parent: Some(fixture.id("ReplicatedStorage")),
-                ..shared_update(fixture.id("Base"))
+                ..shared_update(base)
+            }],
+        );
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let storage = session.path().join("src/ReplicatedStorage");
+        assert!(storage.join("Base").is_dir());
+        let json = fs::read_to_string(storage.join("JsonModel.model.json")).unwrap();
+        assert!(json.contains("Rojo_Target_Value"), "{json}");
+        settled_messages(&session, fixture.cursor);
+        assert_eq!(read_ref(&session, pointer, "Value"), Some(base));
+    });
+}
+
+// A binary model holds references natively, so its targets have no
+// `Rojo_Id`. Moving one out of the file is saved, and the reference that was
+// lost is reported.
+#[test]
+fn studio_references_to_targets_without_ids_are_reported() {
+    run_serve_test("shared_files", |session, _| {
+        let fixture = SharedFiles::read(&session);
+        let response = fixture.write(
+            &session,
+            Vec::new(),
+            vec![InstanceUpdate {
+                changed_parent: Some(fixture.id("ReplicatedStorage")),
+                ..shared_update(fixture.id("A"))
             }],
         );
         assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
-        assert_eq!(response.errors[0].id, pointer);
-        assert_eq!(response.errors[0].property.as_deref(), Some("Value"));
-        assert!(session.path().join("src/ReplicatedStorage/Base").is_dir());
+        assert_eq!(response.errors[0].id, fixture.id("Weld"));
+        assert_eq!(response.errors[0].property.as_deref(), Some("Part0"));
+        assert!(session.path().join("src/ReplicatedStorage/A").is_dir());
+    });
+}
+
+// Clearing a reference in a JSON model removes its link attribute, so reading
+// the file back doesn't bring the reference back.
+#[test]
+fn studio_cleared_references_stay_cleared() {
+    run_serve_test("shared_files", |session, _| {
+        let fixture = SharedFiles::read(&session);
+        let pointer = fixture.id("Pointer");
+        let response = fixture.write(
+            &session,
+            Vec::new(),
+            vec![InstanceUpdate {
+                changed_properties: UstrMap::from_iter([(
+                    ustr("Value"),
+                    Some(Variant::Ref(Ref::none())),
+                )]),
+                ..shared_update(pointer)
+            }],
+        );
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let json = fs::read_to_string(
+            session
+                .path()
+                .join("src/ReplicatedStorage/JsonModel.model.json"),
+        )
+        .unwrap();
+        assert!(!json.contains("Rojo_Target_Value"), "{json}");
+        settled_messages(&session, fixture.cursor);
+        assert_eq!(read_ref(&session, pointer, "Value"), None);
     });
 }
 
@@ -662,9 +740,14 @@ fn studio_references_leaving_their_file_are_reported() {
 fn studio_deletions_inside_model_files_clear_references() {
     run_serve_test("shared_files", |session, _| {
         let fixture = SharedFiles::read(&session);
-        let response = fixture.write(&session, vec![fixture.id("A")], Vec::new());
+        let a = fixture.id("A");
+        let response = fixture.write(&session, vec![a], Vec::new());
         assert!(response.errors.is_empty(), "{:?}", response.errors);
-        settled_messages(&session, fixture.cursor);
+        // Studio forgets a saved deletion only when it's accepted, and every
+        // other connected Studio is told about it.
+        assert_eq!(response.accepted.removed_instances, vec![a]);
+        let messages = settled_messages(&session, fixture.cursor);
+        assert!(messages.iter().any(|message| message.removed.contains(&a)));
         let weld = fixture.id("Weld");
         assert_eq!(read_ref(&session, weld, "Part0"), None);
         assert_eq!(read_ref(&session, weld, "Part1"), Some(fixture.id("B")));
