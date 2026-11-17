@@ -4,10 +4,16 @@
 ]]
 
 local RunService = game:GetService("RunService")
+local SerializationService = game:GetService("SerializationService")
 
 local PatchSet = require(script.Parent.PatchSet)
 
+local createAdditions = require(script.createAdditions)
 local createPatchSet = require(script.createPatchSet)
+
+local function serialize(instance)
+	return SerializationService:SerializeInstancesAsync({ instance })
+end
 
 local ChangeBatcher = {}
 ChangeBatcher.__index = ChangeBatcher
@@ -27,6 +33,8 @@ function ChangeBatcher.new(instanceMap, onChangesFlushed)
 		__instanceMap = instanceMap,
 		__onChangesFlushed = onChangesFlushed,
 		__pendingPropertyChanges = {},
+		__pendingAdditions = {},
+		__serialize = serialize,
 	}, ChangeBatcher)
 
 	return self
@@ -35,6 +43,17 @@ end
 function ChangeBatcher:stop()
 	self.__renderSteppedConnection:Disconnect()
 	self.__pendingPropertyChanges = {}
+	self.__pendingAdditions = {}
+end
+
+function ChangeBatcher:isEmpty()
+	return next(self.__pendingPropertyChanges) == nil and next(self.__pendingAdditions) == nil
+end
+
+-- Queues an instance that appeared under a known parent. Whether it still
+-- needs sending is decided when the batch is sent.
+function ChangeBatcher:addChild(instance)
+	self.__pendingAdditions[instance] = true
 end
 
 function ChangeBatcher:add(instance, propertyName)
@@ -61,11 +80,15 @@ function ChangeBatcher:__cycle(dt)
 end
 
 function ChangeBatcher:__flush()
-	if next(self.__pendingPropertyChanges) == nil then
+	if self:isEmpty() then
 		return nil
 	end
 
+	-- New instances are known before the other changes are encoded, so moving
+	-- an existing instance into one in the same batch is a move to a known parent.
+	local additions = createAdditions(self.__instanceMap, self.__pendingAdditions, self.__serialize)
 	local patch = createPatchSet(self.__instanceMap, self.__pendingPropertyChanges)
+	patch.added = additions
 
 	if PatchSet.isEmpty(patch) then
 		return nil

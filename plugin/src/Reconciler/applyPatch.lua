@@ -74,8 +74,10 @@ local function applyPatch(instanceMap, patch)
 		-- addition.
 		--
 		-- This helps us make sure we only reify each instance once, and we
-		-- start from the top.
-		while patch.added[virtualInstance.Parent] ~= nil do
+		-- start from the top. An ancestor that already exists, like one Studio
+		-- created and the server is now announcing, is where this stops, or the
+		-- whole subtree would be created a second time.
+		while patch.added[virtualInstance.Parent] ~= nil and instanceMap.fromIds[virtualInstance.Parent] == nil do
 			id = virtualInstance.Parent
 			virtualInstance = patch.added[id]
 		end
