@@ -18,19 +18,19 @@ use crate::{
     rojo_ref::merge_link_attributes,
     snapshot::{
         apply_patch_set, compute_patch_set, compute_saved_patch_set, compute_shallow_patch_set,
-        AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, InstigatingSource, PatchAdd,
-        PatchSet, PatchUpdate, RojoTree, SnapshotReferents,
+        AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, InstanceWithMeta, InstigatingSource,
+        PatchAdd, PatchSet, PatchUpdate, RojoTree, SnapshotReferents,
     },
     snapshot_middleware::{
         snapshot_from_vfs, snapshot_project_node, snapshot_shallow_from_vfs, Middleware,
     },
     syncback::{
-        can_write_property, decide_property_write, drop_duplicate_ids, get_property_filter,
-        same_value, source_file, syncback_instance, syncback_model_file, syncback_new_subtree,
-        validate_write_targets, FsSnapshot, PropertyWriteDecision,
+        can_write_property, decide_property_write, drop_duplicate_ids, drop_ignored_properties,
+        get_property_filter, same_value, source_file, syncback_instance, syncback_model_file,
+        syncback_new_subtree, validate_write_targets, FsSnapshot, PropertyWriteDecision,
     },
     web::interface::{AddedIds, InstanceAddition, WriteAuthority, WriteError, WriteResult},
-    REF_POINTER_ATTRIBUTE_PREFIX,
+    REF_ID_ATTRIBUTE_NAME, REF_POINTER_ATTRIBUTE_PREFIX,
 };
 
 /// How many times a Studio-authoritative write is retried when its file keeps
@@ -420,7 +420,16 @@ impl JobThreadContext {
                 // model without it.
                 if let Some(StoredIn::Model(model)) = stored_in(&tree, id) {
                     let stored = StoredIn::Model(model);
-                    let result = (|| -> anyhow::Result<()> {
+                    // Like any other write, a disk change Studio hasn't seen wins
+                    // under Filesystem authority and is caught up with first under
+                    // Studio authority. Returns whether the instance is gone.
+                    let result = (|| -> anyhow::Result<bool> {
+                        if !self.catch_up_stored(&mut tree, stored, &context, &mut messages)? {
+                            return Ok(false);
+                        }
+                        if tree.get_instance(id).is_none() {
+                            return Ok(true);
+                        }
                         let mut copy = StoredCopy::new(&tree, stored);
                         let removed = copy
                             .copy_of(id)
@@ -428,35 +437,40 @@ impl JobThreadContext {
                         copy.delete(removed);
                         let written = self.write_stored(&tree, stored, copy)?;
                         errors.extend(Self::apply_stored(&mut tree, written, &[]));
-                        Ok(())
+                        Ok(true)
                     })();
-                    match result {
+                    let restore = match result {
                         // Rewriting the model already took the instance out of the
                         // tree, so the removal is only reported.
-                        Ok(()) => {
+                        Ok(true) => {
                             accepted.removed_instances.push(id);
                             messages.push(AppliedPatchSet {
                                 removed: vec![id],
                                 ..AppliedPatchSet::new()
                             });
+                            false
                         }
+                        Ok(false) => true,
                         Err(err) => {
                             errors.push(WriteError {
                                 id,
                                 property: None,
                                 message: format!("{err:#}"),
                             });
-                            if let Some(instance) = tree.get_instance(id) {
-                                deletion_conflicts.push(PatchAdd {
-                                    parent_id: instance.parent(),
-                                    instance: snapshot_from_tree(&tree, id),
-                                });
-                                messages.push(AppliedPatchSet {
-                                    removed: vec![id],
-                                    added: vec![id],
-                                    updated: Vec::new(),
-                                });
-                            }
+                            true
+                        }
+                    };
+                    if restore {
+                        if let Some(instance) = tree.get_instance(id) {
+                            deletion_conflicts.push(PatchAdd {
+                                parent_id: instance.parent(),
+                                instance: snapshot_from_tree(&tree, id),
+                            });
+                            messages.push(AppliedPatchSet {
+                                removed: vec![id],
+                                added: vec![id],
+                                updated: Vec::new(),
+                            });
                         }
                     }
                     continue;
@@ -648,8 +662,11 @@ impl JobThreadContext {
             tree.get_instance(addition.parent).is_some(),
             "The parent is no longer known"
         );
-        let model = rbx_binary::from_reader(addition.model.as_slice())
+        let mut model = rbx_binary::from_reader(addition.model.as_slice())
             .context("Could not read the created instances")?;
+        // Moved instances keep what their files hold, but new ones leave out
+        // what the project's syncback rules ignore.
+        drop_ignored_properties(&self.project, &mut model);
         let unsaved =
             self.place_subtree(tree, addition.parent, model, &addition.ids, context, &[])?;
         if tree.get_instance(root_id).is_some() {
@@ -670,20 +687,34 @@ impl JobThreadContext {
         stored: StoredIn,
         copy: StoredCopy,
     ) -> anyhow::Result<WrittenStored> {
+        let expected = self.check_stored(tree, stored)?;
+        self.write_stored_checked(tree, stored, copy, expected)
+    }
+
+    /// Captures the files `stored` names, then makes sure they still hold
+    /// what the tree has. Writing against the capture fails if an editor saves
+    /// in between, instead of overwriting the save.
+    fn check_stored(&self, tree: &RojoTree, stored: StoredIn) -> anyhow::Result<ExpectedFiles> {
+        let instance = tree
+            .get_instance(stored.owner())
+            .context("The file's owner is no longer known")?;
+        let expected =
+            FsSnapshot::capture_file_contents(&instance.metadata().relevant_paths, &self.vfs)?;
         anyhow::ensure!(
             self.stored_matches_disk(tree, stored)?,
             "The file changed on disk; the change was not saved"
         );
-        self.write_stored_unchecked(tree, stored, copy)
+        Ok(expected)
     }
 
-    /// Like [`Self::write_stored`], for a caller that already checked the file
-    /// against the tree before changing the tree.
-    fn write_stored_unchecked(
+    /// Like [`Self::write_stored`], for a caller that checked the file with
+    /// [`Self::check_stored`] before changing the tree.
+    fn write_stored_checked(
         &self,
         tree: &RojoTree,
         stored: StoredIn,
         mut copy: StoredCopy,
+        expected: ExpectedFiles,
     ) -> anyhow::Result<WrittenStored> {
         let owner = stored.owner();
         let instance = tree
@@ -695,8 +726,6 @@ impl JobThreadContext {
         };
         let source = source.clone();
         let context = instance.metadata().context.clone();
-        let expected =
-            FsSnapshot::capture_file_contents(&instance.metadata().relevant_paths, &self.vfs)?;
         let ids = copy.added_ids(copy.dom.root_ref());
         link_outside_refs(tree, &mut copy.dom, &copy.ids);
         let outside = outside_refs(&copy.dom, &copy.ids);
@@ -866,23 +895,20 @@ impl JobThreadContext {
                 });
                 // Both sides are checked before the destination is written, so
                 // a refused move never leaves a copy behind.
-                match source {
-                    Some(from) => anyhow::ensure!(
-                        self.stored_matches_disk(tree, from)?,
-                        "The file changed on disk; the change was not saved"
-                    ),
+                let source_expected = match source {
+                    Some(from) => Some(self.check_stored(tree, from)?),
                     None => match self.check_removal(tree, id, context)? {
-                        Removal::Allowed(_) => {}
+                        Removal::Allowed(_) => None,
                         Removal::Restore(_) => anyhow::bail!("The moved instance changed on disk"),
                     },
-                }
+                };
                 let mut copy = StoredCopy::new(tree, to);
                 copy.add(parent, model, &ids)?;
                 let written = self.write_stored(tree, to, copy)?;
                 let mut errors = Vec::new();
-                match source_copy {
-                    Some((from, copy)) => {
-                        let removed = self.write_stored_unchecked(tree, from, copy)?;
+                match source_copy.zip(source_expected) {
+                    Some(((from, copy), expected)) => {
+                        let removed = self.write_stored_checked(tree, from, copy, expected)?;
                         errors = Self::apply_stored(tree, removed, &moving);
                     }
                     None => {
@@ -897,16 +923,13 @@ impl JobThreadContext {
             (Some(from), None) => {
                 // Checked first, since placing the subtree takes it out of the
                 // tree while the source file still holds it.
-                anyhow::ensure!(
-                    self.stored_matches_disk(tree, from)?,
-                    "The file changed on disk; the change was not saved"
-                );
+                let expected = self.check_stored(tree, from)?;
                 let mut copy = StoredCopy::new(tree, from);
                 if let Some(moved) = copy.copy_of(id) {
                     copy.move_out(moved);
                 }
                 let mut errors = self.place_subtree(tree, parent, model, &ids, context, &moving)?;
-                let removed = self.write_stored_unchecked(tree, from, copy)?;
+                let removed = self.write_stored_checked(tree, from, copy, expected)?;
                 errors.extend(Self::apply_stored(tree, removed, &[]));
                 Ok(errors)
             }
@@ -949,25 +972,46 @@ impl JobThreadContext {
             // Written next to the script, then moved in, which promotes the
             // script to a directory the way a move into it would.
             let holder = parent_instance.parent();
+            // Placing the subtree replaces what's moving in the tree, so it's
+            // kept to put back if the script can't take it, since the file it
+            // came from still holds it.
+            let backups: Vec<_> = moving
+                .iter()
+                .filter_map(|&id| {
+                    let instance = tree.get_instance(id)?;
+                    Some((instance.parent(), backup_subtree(tree, id)))
+                })
+                .collect();
             let errors = self.place_subtree(tree, holder, model, ids, context, moving)?;
             let move_in = PatchUpdate {
                 changed_parent: Some(parent),
                 ..empty_update(ids.id)
             };
             let mut messages = Vec::new();
-            match self.relocate_instance(tree, &move_in, &mut messages, context) {
+            let failure = match self.relocate_instance(tree, &move_in, &mut messages, context) {
                 Ok(RelocationOutcome::Moved) => return Ok(errors),
                 Ok(RelocationOutcome::Restore(_)) => {
-                    let _ = self.remove_instance(tree, ids.id, context);
-                    tree.remove(ids.id);
-                    anyhow::bail!("The script changed on disk; the instance was not added");
+                    anyhow::anyhow!("The script changed on disk; the instance was not added")
                 }
-                Err(err) => {
-                    let _ = self.remove_instance(tree, ids.id, context);
-                    tree.remove(ids.id);
-                    return Err(err.context("Could not add the instance under the script"));
+                Err(err) => err.context("Could not add the instance under the script"),
+            };
+            let _ = self.remove_instance(tree, ids.id, context);
+            if tree.get_instance(ids.id).is_some() {
+                tree.remove(ids.id);
+            }
+            for (parent, (snapshot, referents)) in backups {
+                let id = referents.id.unwrap();
+                if tree.get_instance(parent).is_some() && tree.get_instance(id).is_none() {
+                    let mut inserted = Vec::new();
+                    tree.insert_instance_with_referents(
+                        parent,
+                        snapshot,
+                        &referents,
+                        &mut inserted,
+                    );
                 }
             }
+            return Err(failure);
         }
 
         let parent_context = parent_instance.metadata().context.clone();
@@ -1085,7 +1129,9 @@ impl JobThreadContext {
         // A failed relocation can leave a journal that still needs its staged
         // files, so those are left for startup recovery, which clears them.
         result?;
-        self.vfs.remove_dir_all(&staging)?;
+        // Another server's startup recovery may have cleared it already, once
+        // the lock was released.
+        self.vfs.remove_dir_all(&staging).with_not_found()?;
         Ok(())
     }
 
@@ -1101,9 +1147,44 @@ impl JobThreadContext {
             Removal::Allowed(path) => path,
             Removal::Restore(snapshot) => return Ok(*snapshot),
         };
+        // A file's adjacent metadata goes with it, or an instance written at
+        // the same name later would pick up its properties and ID. Files that
+        // share a stem, like `Code.luau` and `Code.txt`, share it too, so it
+        // stays while another instance still reads it.
+        let sidecars: Vec<PathBuf> = tree
+            .get_metadata(id)
+            .map(|metadata| {
+                metadata
+                    .relevant_paths
+                    .iter()
+                    .filter(|sidecar| {
+                        *sidecar != &path
+                            && sidecar.parent() == path.parent()
+                            && sidecar
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| {
+                                    name.ends_with(".meta.json") || name.ends_with(".meta.jsonc")
+                                })
+                            && tree
+                                .get_ids_at_path(sidecar)
+                                .iter()
+                                .all(|holder| *holder == id)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut lock = self.vfs.lock();
         match lock.metadata(&path).with_not_found()? {
-            Some(metadata) if metadata.is_file() => lock.remove_file(&path)?,
+            Some(metadata) if metadata.is_file() => {
+                lock.remove_file(&path)?;
+                for sidecar in sidecars {
+                    if lock.metadata(&sidecar).with_not_found()?.is_some() {
+                        lock.remove_file(&sidecar)?;
+                    }
+                }
+            }
             Some(_) => lock.remove_dir_all(&path)?,
             None => {}
         }
@@ -1150,9 +1231,14 @@ impl JobThreadContext {
             while let Some(directory) = pending.pop() {
                 for entry in self.vfs.read_dir(&directory)? {
                     let entry = entry?;
-                    // Syncback keeps an empty directory with a `.gitkeep` that
-                    // no instance lists, so it goes with the directory.
-                    let keep = entry.path().file_name() == Some(".gitkeep".as_ref());
+                    // Syncback keeps an empty directory with an empty `.gitkeep`
+                    // that no instance lists, so it goes with the directory. One
+                    // with contents was written by someone else and is kept.
+                    let keep = entry.path().file_name() == Some(".gitkeep".as_ref())
+                        && self
+                            .vfs
+                            .read(entry.path())
+                            .is_ok_and(|contents| contents.is_empty());
                     if !tracked.contains(entry.path()) && !keep {
                         anyhow::bail!(
                             "The folder also holds \"{}\", which isn't part of the project, \
@@ -1954,6 +2040,18 @@ impl JobThreadContext {
                 });
             }
         };
+        // Whatever happens to the move, the property edits that came with it
+        // go through the normal path, which saves or restores each of them.
+        let remaining = PatchUpdate {
+            changed_parent: None,
+            changed_name: None,
+            ..update.clone()
+        };
+        let persist_remaining = |tree: &mut RojoTree, outcome: &mut WriteOutcome| {
+            if !remaining.changed_properties.is_empty() && tree.get_instance(id).is_some() {
+                self.persist_property_update(tree, &remaining, outcome, context, 1);
+            }
+        };
         let destination = update
             .changed_parent
             .and_then(|parent| children_stored_in(tree, parent));
@@ -1964,6 +2062,7 @@ impl JobThreadContext {
                 Ok(true) => {}
                 Ok(false) => {
                     restore(tree, outcome);
+                    persist_remaining(tree, outcome);
                     return;
                 }
                 Err(error) => {
@@ -1973,6 +2072,7 @@ impl JobThreadContext {
                         message: format!("Could not read a shared file: {error:#}"),
                     });
                     restore(tree, outcome);
+                    persist_remaining(tree, outcome);
                     return;
                 }
             }
@@ -1994,14 +2094,7 @@ impl JobThreadContext {
                 outcome.messages.push(saved_change_message(tree, &moved));
                 outcome.accepted.updated_instances.push(moved);
                 outcome.errors.extend(unsaved);
-                let remaining = PatchUpdate {
-                    changed_parent: None,
-                    changed_name: None,
-                    ..update.clone()
-                };
-                if !remaining.changed_properties.is_empty() && tree.get_instance(id).is_some() {
-                    self.persist_property_update(tree, &remaining, outcome, context, 1);
-                }
+                persist_remaining(tree, outcome);
             }
             Err(error) => {
                 outcome.errors.push(WriteError {
@@ -2010,22 +2103,23 @@ impl JobThreadContext {
                     message: format!("{error:#}"),
                 });
                 restore(tree, outcome);
+                persist_remaining(tree, outcome);
             }
         }
     }
 
-    /// Persists an edit to a model file or an instance inside one by
-    /// rewriting the model file.
-    fn persist_model_edit(
+    /// Persists an edit to an instance in a shared file by rewriting the file:
+    /// a model file, or a directory's metadata when the edit sets references,
+    /// which only a rewrite can link.
+    fn persist_stored_edit(
         &self,
         tree: &mut RojoTree,
-        model: Ref,
+        stored: StoredIn,
         update: &PatchUpdate,
         outcome: &mut WriteOutcome,
         context: &WriteContext,
     ) {
         let id = update.id;
-        let stored = StoredIn::Model(model);
         let restore = |tree: &RojoTree, outcome: &mut WriteOutcome| {
             if let Some(instance) = tree.get_instance(id) {
                 outcome.conflicts.updated_instances.push(PatchUpdate {
@@ -2060,12 +2154,46 @@ impl JobThreadContext {
                 return;
             }
         }
-        if tree.get_instance(id).is_none() {
+        let Some(instance) = tree.get_instance(id) else {
             if context.authority == WriteAuthority::Studio {
                 outcome.errors.push(removed_on_disk(id));
             }
             return;
+        };
+
+        // Properties that other two-way edits refuse are refused here too, and
+        // Studio gets their saved values back. The rest are still saved.
+        let class = instance.class_name();
+        let filter_tree = WeakDom::new(InstanceBuilder::new(class));
+        let ignored = get_property_filter(&self.project, filter_tree.root()).unwrap_or_default();
+        let mut refused = UstrMap::new();
+        let mut allowed = update.clone();
+        allowed.changed_properties.retain(|key, _| {
+            let message = if !can_write_property(&self.project, class.as_str(), key.as_str()) {
+                "This property is excluded by reflection serialization rules"
+            } else if ignored.contains(key) {
+                "This property is excluded by the project's syncback rules"
+            } else {
+                return true;
+            };
+            outcome.errors.push(WriteError {
+                id,
+                property: Some(key.to_string()),
+                message: message.into(),
+            });
+            refused.insert(*key, instance.properties().get(key).cloned());
+            false
+        });
+        if !refused.is_empty() {
+            outcome.conflicts.updated_instances.push(PatchUpdate {
+                changed_properties: refused,
+                ..empty_update(id)
+            });
         }
+        if allowed.changed_name.is_none() && allowed.changed_properties.is_empty() {
+            return;
+        }
+        let update = &allowed;
 
         let result = (|| -> anyhow::Result<Vec<WriteError>> {
             anyhow::ensure!(
@@ -2164,15 +2292,20 @@ impl JobThreadContext {
                 owner,
             ),
         };
-        if disk_patch == PatchSet::new() {
-            return Ok(true);
-        }
-        if context.authority == WriteAuthority::Filesystem {
+        // A stale write was made without seeing a disk change, which the
+        // watcher may already have applied to the tree, so under Filesystem
+        // authority it's refused even when the tree and disk agree.
+        if context.authority == WriteAuthority::Filesystem
+            && (context.stale || disk_patch != PatchSet::new())
+        {
             let applied = apply_patch_set(tree, disk_patch);
             if !applied.is_empty() {
                 messages.push(applied);
             }
             return Ok(false);
+        }
+        if disk_patch == PatchSet::new() {
+            return Ok(true);
         }
         catch_up(tree, disk_patch, context.batch, messages);
         Ok(true)
@@ -2186,19 +2319,27 @@ impl JobThreadContext {
         context: &WriteContext,
         attempt: u32,
     ) {
-        // Model files store their whole subtree, so their edits rewrite it.
-        let model = match stored_in(tree, update.id) {
-            Some(StoredIn::Model(model)) => Some(model),
-            _ if tree
-                .get_metadata(update.id)
-                .is_some_and(|metadata| is_model_middleware(metadata.middleware)) =>
-            {
-                Some(update.id)
+        // Model files store their whole subtree, so their edits rewrite it. A
+        // reference set on an instance in a directory's metadata needs the
+        // same rewrite, which links it through attributes.
+        let sets_reference = update
+            .changed_properties
+            .values()
+            .any(|value| matches!(value, Some(Variant::Ref(_))));
+        let middleware = tree
+            .get_metadata(update.id)
+            .and_then(|metadata| metadata.middleware);
+        let stored = match stored_in(tree, update.id) {
+            Some(StoredIn::Model(model)) => Some(StoredIn::Model(model)),
+            Some(StoredIn::Inline(owner)) if sets_reference => Some(StoredIn::Inline(owner)),
+            _ if is_model_middleware(middleware) => Some(StoredIn::Model(update.id)),
+            _ if sets_reference && middleware == Some(Middleware::Dir) => {
+                Some(StoredIn::Inline(update.id))
             }
             _ => None,
         };
-        if let Some(model) = model {
-            self.persist_model_edit(tree, model, update, outcome, context);
+        if let Some(stored) = stored {
+            self.persist_stored_edit(tree, stored, update, outcome, context);
             return;
         }
         let WriteOutcome {
@@ -2708,6 +2849,10 @@ enum RelocationOutcome {
     Restore(Box<Option<InstanceSnapshot>>),
 }
 
+/// The contents of a shared file and its sidecars, captured before a write so
+/// the write fails if they change.
+type ExpectedFiles = HashMap<PathBuf, Option<Vec<u8>>>;
+
 /// A shared file that was rewritten, as it was read back, with the ids its
 /// instances are meant to keep.
 struct WrittenStored {
@@ -2733,7 +2878,7 @@ fn subtree_model(tree: &RojoTree, id: Ref, name: &str) -> (WeakDom, AddedIds) {
             parent,
             InstanceBuilder::new(instance.class_name())
                 .with_name(name)
-                .with_properties(instance.properties().clone()),
+                .with_properties(properties_with_id(&instance)),
         );
         AddedIds {
             id,
@@ -2752,6 +2897,27 @@ fn subtree_model(tree: &RojoTree, id: Ref, name: &str) -> (WeakDom, AddedIds) {
     let copies = model_copies(&dom, &ids);
     retarget_refs(&mut dom, &copies);
     (dom, ids)
+}
+
+/// Returns an instance's properties for a copy that's written back to disk.
+/// An ID that only its metadata holds, like a `.model.json` root's `id`, goes
+/// into a `Rojo_Id` attribute, so references to it survive the rewrite.
+fn properties_with_id(instance: &InstanceWithMeta) -> UstrMap<Variant> {
+    let mut properties = instance.properties().clone();
+    if let Some(id) = &instance.metadata().specified_id {
+        let attributes = properties
+            .entry(ustr("Attributes"))
+            .or_insert_with(|| Attributes::new().into());
+        if let Variant::Attributes(attributes) = attributes {
+            if attributes.get(REF_ID_ATTRIBUTE_NAME).is_none() {
+                attributes.insert(
+                    REF_ID_ATTRIBUTE_NAME.into(),
+                    Variant::String(id.to_string()),
+                );
+            }
+        }
+    }
+    properties
 }
 
 /// Maps the instances of a model with one top-level instance to the ids in
@@ -2867,7 +3033,9 @@ fn unsaved_errors(unstored: Vec<Ref>, outside: Vec<(Ref, Ustr)>) -> Vec<WriteErr
     let references = outside.into_iter().map(|(id, property)| WriteError {
         id,
         property: Some(property.to_string()),
-        message: "This reference points outside its file, so it was not saved".into(),
+        message: "This reference points at an instance in another file that has no Rojo_Id, \
+                  so it was not saved"
+            .into(),
     });
     instances.chain(references).collect()
 }
@@ -3201,7 +3369,7 @@ impl StoredCopy {
             let instance = tree.get_instance(id).unwrap();
             InstanceBuilder::new(instance.class_name())
                 .with_name(instance.name())
-                .with_properties(instance.properties().clone())
+                .with_properties(properties_with_id(&instance))
         };
         let mut dom = WeakDom::new(builder(owner));
         let mut ids = HashMap::from([(dom.root_ref(), owner)]);
@@ -3399,6 +3567,29 @@ fn inline_subtree(tree: &RojoTree, owner: Ref, edit: &InlineEdit) -> WeakDom {
         }
     }
     dom
+}
+
+/// Copies a subtree out of the tree, metadata and referents included, so it
+/// can be inserted again exactly as it was.
+fn backup_subtree(tree: &RojoTree, id: Ref) -> (InstanceSnapshot, SnapshotReferents) {
+    let instance = tree.get_instance(id).unwrap();
+    let (children, referents): (Vec<_>, Vec<_>) = instance
+        .children()
+        .iter()
+        .map(|child| backup_subtree(tree, *child))
+        .unzip();
+    (
+        InstanceSnapshot::new()
+            .name(instance.name())
+            .class_name(instance.class_name())
+            .properties(instance.properties().clone())
+            .metadata(instance.metadata().clone())
+            .children(children),
+        SnapshotReferents {
+            id: Some(id),
+            children: referents,
+        },
+    )
 }
 
 /// Builds a snapshot of an instance and its descendants as the server has them.
@@ -6114,27 +6305,302 @@ mod tests {
         }
     }
 
-    /// Syncback keeps empty directories with a `.gitkeep`, which no instance
-    /// lists, so it must not stop the directory from being deleted.
+    /// A project with one model file, whose root has an ID only its metadata
+    /// holds.
+    fn model_job() -> (JobThreadContext, Ref, Ref) {
+        let (job, _) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([(
+                    "Extra.model.json",
+                    VfsSnapshot::file(
+                        r#"{"className":"Folder","id":"extra-id","children":[{"className":"Part","name":"Child"}]}"#,
+                    ),
+                )]),
+            )],
+            "/project/src",
+        );
+        let extra = find(&job, &["Extra"]);
+        let child = find(&job, &["Extra", "Child"]);
+        (job, extra, child)
+    }
+
+    fn rename(id: Ref, name: &str) -> PatchSet {
+        PatchSet {
+            updated_instances: vec![PatchUpdate {
+                changed_name: Some(name.into()),
+                ..empty_update(id)
+            }],
+            ..PatchSet::new()
+        }
+    }
+
+    fn read_model(job: &JobThreadContext) -> String {
+        String::from_utf8(
+            job.vfs
+                .read("/project/src/Extra.model.json")
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// A stale write was made without seeing a disk change, so under
+    /// Filesystem authority it's refused, even once the watcher has brought
+    /// the tree in line with the disk.
     #[test]
-    fn deletions_remove_the_gitkeep_syncback_wrote() {
-        let (job, id) = part_job();
-        job.vfs.write("/project/Part/.gitkeep", "").unwrap();
+    fn stale_filesystem_model_edits_are_refused() {
+        for stale in [false, true] {
+            let (job, _, child) = model_job();
+            let cursor = job.message_queue.cursor();
+            if stale {
+                job.message_queue.push_messages(&[AppliedPatchSet::new()]);
+            }
+            let (accepted, conflicts, _) = job.handle_tree_event_at_cursor(
+                rename(child, "Renamed"),
+                Some(cursor),
+                WriteAuthority::Filesystem,
+            );
+            let model = read_model(&job);
+            assert_eq!(model.contains("Renamed"), !stale, "{model}");
+            assert_eq!(accepted.updated_instances.is_empty(), stale);
+            assert_eq!(conflicts.updated_instances.is_empty(), !stale);
+        }
+    }
+
+    /// Deleting inside a model file follows the same rule as other writes. A
+    /// disk change Studio hasn't seen wins under Filesystem authority, and is
+    /// kept under Studio authority while the deletion is saved.
+    #[test]
+    fn model_deletions_catch_up_with_the_disk_first() {
+        for authority in [WriteAuthority::Filesystem, WriteAuthority::Studio] {
+            let (job, _, child) = model_job();
+            job.vfs
+                .write(
+                    "/project/src/Extra.model.json",
+                    r#"{"className":"Folder","id":"extra-id","attributes":{"Disk":true},"children":[{"className":"Part","name":"Child"}]}"#,
+                )
+                .unwrap();
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                PatchSet {
+                    removed_instances: vec![child],
+                    ..PatchSet::new()
+                },
+                Some(job.message_queue.cursor()),
+                authority,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            let model = read_model(&job);
+            assert!(model.contains("Disk"), "{model}");
+            let deleted = authority == WriteAuthority::Studio;
+            assert_eq!(model.contains("Child"), !deleted, "{model}");
+            assert_eq!(accepted.removed_instances.contains(&child), deleted);
+            assert_eq!(conflicts.added_instances.is_empty(), deleted);
+        }
+    }
+
+    /// A model edit refuses the properties other two-way edits refuse, gives
+    /// Studio their saved values back, and still saves the rest.
+    #[test]
+    fn model_edits_refuse_properties_that_dont_serialize() {
+        let (job, _, child) = model_job();
+        let mut update = rename(child, "Renamed");
+        update.updated_instances[0].changed_properties.insert(
+            ustr("Position"),
+            Some(Variant::Vector3(Vector3::new(1.0, 2.0, 3.0))),
+        );
+        let (accepted, conflicts, errors) = studio_write(&job, update);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].property.as_deref(), Some("Position"));
+        assert_eq!(accepted.updated_instances.len(), 1);
+        assert!(conflicts.updated_instances[0]
+            .changed_properties
+            .contains_key(&ustr("Position")));
+        let model = read_model(&job);
+        assert!(
+            model.contains("Renamed") && !model.contains("Position"),
+            "{model}"
+        );
+    }
+
+    /// Rewriting a model file keeps the ID its root's metadata held, so
+    /// references to it still resolve.
+    #[test]
+    fn model_rewrites_keep_their_root_id() {
+        let (job, extra, child) = model_job();
+        let (_, _, errors) = studio_write(&job, rename(child, "Renamed"));
+        assert!(errors.is_empty(), "{errors:?}");
+        let model = read_model(&job);
+        assert!(model.contains("extra-id"), "{model}");
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(
+            tree.get_specified_id(&crate::RojoRef::new("extra-id".into())),
+            Some(extra)
+        );
+    }
+
+    /// A move out of a model file into a script that changed on disk is
+    /// refused, and the moved instance is back in the tree under its ID, as
+    /// the model file still holds it.
+    #[test]
+    fn refused_moves_under_scripts_put_the_instance_back() {
+        let (job, _) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([
+                    (
+                        "Extra.model.json",
+                        VfsSnapshot::file(
+                            r#"{"className":"Folder","children":[{"className":"Part","name":"Moved"}]}"#,
+                        ),
+                    ),
+                    ("Code.luau", VfsSnapshot::file("return 1")),
+                ]),
+            )],
+            "/project/src",
+        );
+        let moved = find(&job, &["Extra", "Moved"]);
+        let extra = find(&job, &["Extra"]);
+        let code = find(&job, &["Code"]);
+        job.vfs.write("/project/src/Code.luau", "return 2").unwrap();
+
+        // A property edit in the same update is still saved where it is.
+        let mut update = parent_update(moved, code);
+        update.updated_instances[0]
+            .changed_properties
+            .insert(ustr("Transparency"), Some(Variant::Float32(0.5)));
+        let (_, _, errors) = job.handle_tree_event_at_cursor(
+            update,
+            Some(job.message_queue.cursor()),
+            WriteAuthority::Filesystem,
+        );
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("script"), "{errors:?}");
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(tree.get_instance(moved).unwrap().parent(), extra);
+        let model: serde_json::Value =
+            serde_json::from_slice(&job.vfs.read("/project/src/Extra.model.json").unwrap())
+                .unwrap();
+        assert_eq!(model["children"][0]["name"], "Moved");
+        assert_eq!(model["children"][0]["properties"]["Transparency"], 0.5);
+        assert!(job
+            .vfs
+            .metadata("/project/src/Moved")
+            .with_not_found()
+            .unwrap()
+            .is_none());
+    }
+
+    /// Deleting a file-backed instance takes its adjacent metadata with it, in
+    /// either format, so nothing stale is left for a later file at that name.
+    #[test]
+    fn deletions_remove_adjacent_metadata() {
+        for sidecar in ["Code.meta.json", "Code.meta.jsonc"] {
+            let (job, id) = script_job(
+                vec![
+                    ("Code.luau", VfsSnapshot::file("return 1")),
+                    (
+                        sidecar,
+                        VfsSnapshot::file(r#"{"attributes":{"Kind":"code"}}"#),
+                    ),
+                ],
+                "/project/Code.luau",
+            );
+            let (accepted, _, errors) = studio_write(
+                &job,
+                PatchSet {
+                    removed_instances: vec![id],
+                    ..PatchSet::new()
+                },
+            );
+            assert!(errors.is_empty(), "{sidecar} {errors:?}");
+            assert_eq!(accepted.removed_instances, vec![id]);
+            for path in ["/project/Code.luau", &format!("/project/{sidecar}")] {
+                assert!(
+                    job.vfs.metadata(path).with_not_found().unwrap().is_none(),
+                    "{path} was left behind"
+                );
+            }
+        }
+    }
+
+    /// Files that share a stem share their adjacent metadata, so deleting one
+    /// of them leaves it for the other.
+    #[test]
+    fn deletions_keep_metadata_another_file_reads() {
+        let (job, src) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([
+                    ("Code.luau", VfsSnapshot::file("return 1")),
+                    ("Code.txt", VfsSnapshot::file("text")),
+                    (
+                        "Code.meta.json",
+                        VfsSnapshot::file(r#"{"attributes":{"Kind":"shared"}}"#),
+                    ),
+                ]),
+            )],
+            "/project/src",
+        );
+        let script = {
+            let tree = job.tree.lock().unwrap();
+            let children = tree.get_instance(src).unwrap().children().to_vec();
+            children
+                .into_iter()
+                .find(|child| tree.get_instance(*child).unwrap().class_name() == "ModuleScript")
+                .unwrap()
+        };
         let (accepted, _, errors) = studio_write(
             &job,
             PatchSet {
-                removed_instances: vec![id],
+                removed_instances: vec![script],
                 ..PatchSet::new()
             },
         );
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(accepted.removed_instances, vec![id]);
+        assert_eq!(accepted.removed_instances, vec![script]);
         assert!(job
             .vfs
-            .metadata("/project/Part")
+            .metadata("/project/src/Code.luau")
             .with_not_found()
             .unwrap()
             .is_none());
+        for kept in ["/project/src/Code.txt", "/project/src/Code.meta.json"] {
+            assert!(
+                job.vfs.metadata(kept).with_not_found().unwrap().is_some(),
+                "{kept}"
+            );
+        }
+    }
+
+    /// Syncback keeps empty directories with a `.gitkeep`, which no instance
+    /// lists, so it must not stop the directory from being deleted.
+    #[test]
+    fn deletions_remove_the_gitkeep_syncback_wrote() {
+        // An empty one is syncback's. One with contents is someone else's.
+        for contents in ["", "notes"] {
+            let (job, id) = part_job();
+            job.vfs.write("/project/Part/.gitkeep", contents).unwrap();
+            let (accepted, _, errors) = studio_write(
+                &job,
+                PatchSet {
+                    removed_instances: vec![id],
+                    ..PatchSet::new()
+                },
+            );
+            let ours = contents.is_empty();
+            assert_eq!(errors.is_empty(), ours, "{errors:?}");
+            assert_eq!(accepted.removed_instances.contains(&id), ours);
+            assert_eq!(
+                job.vfs
+                    .metadata("/project/Part")
+                    .with_not_found()
+                    .unwrap()
+                    .is_none(),
+                ours
+            );
+        }
     }
 
     /// An inline edit rewrites its owner's whole file, so disk changes to the

@@ -180,6 +180,39 @@ return function()
 		end
 	end)
 
+	-- A model only holds references between its own instances. Every
+	-- combination of a reference that's unset, points inside the new subtree,
+	-- or points at a known instance outside it.
+	it("should return the references the model can't hold", function()
+		for _, target in { "none", "inside", "outside" } do
+			local root, instanceMap, _, run = harness()
+			local known = Instance.new("Part")
+			known.Parent = root
+			instanceMap:insert("KNOWN", known)
+			local created = folder("Created", root)
+			local inner = Instance.new("Part")
+			inner.Parent = created
+			local pointer = Instance.new("ObjectValue")
+			pointer.Parent = created
+			if target == "inside" then
+				pointer.Value = inner
+			elseif target == "outside" then
+				pointer.Value = known
+			end
+
+			local _, references = run({ created })
+			if target == "outside" then
+				expect(#references).to.equal(1)
+				expect(references[1][1]).to.equal(pointer)
+				expect(references[1][2]).to.equal("Value")
+			else
+				expect(#references).to.equal(0)
+			end
+			instanceMap:stop()
+			root:Destroy()
+		end
+	end)
+
 	it("should empty the candidate set", function()
 		local root, instanceMap, _, _ = harness()
 		local candidates = { [folder("Created", root)] = true }

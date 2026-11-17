@@ -136,6 +136,41 @@ return function()
 			expect(changeBatcher:__flush()).to.equal(nil)
 		end)
 
+		-- What a batch started from is taken with it, before anything yields,
+		-- and handed back with the batch, so an edit made meanwhile can start
+		-- the next batch from its own cursor.
+		it("should hand each batch the context taken with it", function()
+			local instanceMap = InstanceMap.new()
+			local root = Instance.new("Folder")
+			instanceMap:insert("ROOT", root)
+			local cursor = 1
+			local taken = {}
+			local sent = {}
+			local changeBatcher = ChangeBatcher.new(instanceMap, function(patch, context)
+				table.insert(sent, context)
+				return patch
+			end, function()
+				table.insert(taken, cursor)
+				return cursor
+			end)
+			changeBatcher.__serialize = function()
+				-- An edit while serializing starts a batch from a newer cursor.
+				cursor = 2
+				return "MODEL"
+			end
+			local created = Instance.new("Folder")
+			created.Parent = root
+			changeBatcher:addChild(created)
+
+			changeBatcher:__flush()
+
+			expect(table.concat(taken, ",")).to.equal("1")
+			expect(table.concat(sent, ",")).to.equal("1")
+			changeBatcher:stop()
+			instanceMap:stop()
+			root:Destroy()
+		end)
+
 		-- Serializing a new instance yields. A flush due meanwhile does nothing,
 		-- changes made meanwhile wait for the next batch, and a batch whose
 		-- session stopped meanwhile is never sent.
