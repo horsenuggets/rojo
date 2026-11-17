@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.1.6`
+
 * Yield while hydrating and diffing during the initial sync, so connecting to a large
   place no longer runs past Studio's script timeout. Studio stops a timed-out script
   without an error the plugin can catch, which left the session stuck on "Connecting"
@@ -41,9 +43,6 @@ Making a new release? Simply add the new header with the version and date undern
   judging them against half of it. An edit made before the sync has compared that
   instance still counts as a difference, and accepting the sync replaces it with the
   filesystem's value.
-
-## `7.7.1-horse.1.6`
-
 * Fixed a live edit place falling back to the user's sync settings when its session
   address and its `__RojoPlus_LiveEditUrl` marker differ only by an `http://` prefix.
 * Added `syncbackRules.modelTrees`, a list of rules that store whole subtrees in a single
