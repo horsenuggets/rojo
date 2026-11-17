@@ -239,6 +239,74 @@ return function()
 		expect(pending[1].status).to.equal("Pending")
 	end)
 
+	-- A write still waiting when the session stops is never sent, and it's
+	-- reported as failed.
+	it("should not send writes queued when the session stops", function()
+		local settle = nil
+		local started = {}
+		local session = setmetatable({
+			__apiContext = {
+				write = function(_self, patch)
+					table.insert(started, patch.name)
+					return Promise.new(function(resolve)
+						settle = resolve
+					end)
+				end,
+			},
+			__syncResults = {},
+		}, ServeSession)
+		local first = session:__writePatch({ name = "first", updated = {}, added = {}, removed = {} })
+		local second = session:__writePatch({ name = "second", updated = {}, added = {}, removed = {} })
+		session.__status = ServeSession.Status.Disconnected
+		settle(writeResult())
+		first:await()
+		second:await()
+		expect(table.concat(started, ",")).to.equal("first")
+		expect(session:getSyncResults()[2].status).to.equal("Failed")
+	end)
+
+	-- The server can announce a saved deletion before answering the write.
+	-- An undo made before the announcement survives it and is created again,
+	-- while a deletion that wasn't undone is applied as usual.
+	it("should keep undone deletions when their announcement comes first", function()
+		local InstanceMap = require(script.Parent.InstanceMap)
+		for _, undone in { false, true } do
+			local instanceMap = InstanceMap.new()
+			local parent = Instance.new("Folder")
+			local deleted = Instance.new("Folder")
+			local child = Instance.new("Folder")
+			child.Parent = deleted
+			instanceMap:insert("PARENT", parent)
+			instanceMap:insert("DELETED", deleted)
+			instanceMap:insert("CHILD", child)
+			local queued = {}
+			local session = setmetatable({
+				__instanceMap = instanceMap,
+				__pendingDeletions = { DELETED = deleted },
+				__markBatchStart = function() end,
+				__changeBatcher = {
+					addChild = function(_self, instance)
+						table.insert(queued, instance)
+					end,
+				},
+			}, ServeSession)
+			if undone then
+				deleted.Parent = parent
+			end
+			local patch = { removed = { "DELETED" }, added = {}, updated = {} }
+
+			session:__keepUndoneDeletions(patch)
+
+			expect(#patch.removed).to.equal(if undone then 0 else 1)
+			expect(instanceMap.fromIds.DELETED == nil).to.equal(undone)
+			expect(instanceMap.fromInstances[child] == nil).to.equal(undone)
+			expect(#queued).to.equal(if undone then 1 else 0)
+			instanceMap:stop()
+			parent:Destroy()
+			deleted:Destroy()
+		end
+	end)
+
 	-- A later write waits for the one before it, whether that one succeeds or
 	-- fails, so an edit never reaches the server before the write that made
 	-- its instance.

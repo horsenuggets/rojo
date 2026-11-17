@@ -330,6 +330,47 @@ function ServeSession:__untrackSavedRemovals(result)
 	end
 end
 
+--[[
+	The server announces a deletion this session saved, and the announcement
+	can arrive before the write's response. If an undo brought the instance
+	back meanwhile, removing it again would undo the undo, so it's left out of
+	the patch, stops being tracked, and is created again.
+]]
+function ServeSession:__keepUndoneDeletions(patch)
+	local pending = self.__pendingDeletions
+	if pending == nil or #patch.removed == 0 then
+		return
+	end
+	local removed = {}
+	local undone = {}
+	for _, id in patch.removed do
+		local instance = pending[id]
+		if instance ~= nil and instance.Parent ~= nil then
+			table.insert(undone, instance)
+			pending[id] = nil
+		else
+			table.insert(removed, id)
+		end
+	end
+	if #undone == 0 then
+		return
+	end
+	patch.removed = removed
+	for _, instance in undone do
+		for _, descendant in instance:GetDescendants() do
+			self.__instanceMap:removeInstance(descendant)
+		end
+		self.__instanceMap:removeInstance(instance)
+	end
+	for _, instance in undone do
+		local parent = instance.Parent
+		if parent ~= nil and self.__instanceMap.fromInstances[parent] ~= nil then
+			self:__markBatchStart()
+			self.__changeBatcher:addChild(instance)
+		end
+	end
+end
+
 function ServeSession:__queueChange(instance, propertyName)
 	self:__markBatchStart()
 	self.__changeBatcher:add(instance, propertyName)
@@ -357,20 +398,40 @@ function ServeSession:__writePatch(patch, messageCursor)
 		end
 	end
 
+	-- The instances this write deletes are remembered until it's answered, so
+	-- an announcement of the deletion can tell whether an undo came first.
+	self.__pendingDeletions = self.__pendingDeletions or {}
+	for _, id in patch.removed do
+		if self.__instanceMap ~= nil and self.__instanceMap.fromIds[id] ~= nil then
+			self.__pendingDeletions[id] = self.__instanceMap.fromIds[id]
+		end
+	end
+	local function forgetDeletions()
+		for _, id in patch.removed do
+			self.__pendingDeletions[id] = nil
+		end
+	end
+
 	-- Writes reach the server in the order they were made, so a later edit to
-	-- an instance never arrives before the write that created it.
+	-- an instance never arrives before the write that created it. A write
+	-- still waiting when the session stops is never sent.
 	local previous = self.__lastWrite or Promise.resolve()
 	local write = previous
 		:andThen(function()
+			if self.__status == Status.Disconnected then
+				return Promise.reject("The session stopped before this write was sent")
+			end
 			return self.__apiContext:write(patch, messageCursor, authority)
 		end)
 		:andThen(function(result)
+			forgetDeletions()
 			self:__untrackRejectedAdditions(patch, result)
 			self:__untrackSavedRemovals(result)
 			finish(ServeSession.getWriteStatus(result), result)
 			return result
 		end)
 		:catch(function(err)
+			forgetDeletions()
 			self:__untrackRejectedAdditions(patch, nil)
 			finish("Failed", {
 				errors = {
@@ -722,6 +783,7 @@ function ServeSession:__replaceInstances(idList)
 end
 
 function ServeSession:__applyPatch(patch)
+	self:__keepUndoneDeletions(patch)
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording =
 		ChangeHistoryService:TryBeginRecording(ServeSession.PATCH_RECORDING_PREFIX .. patchTimestamp)
