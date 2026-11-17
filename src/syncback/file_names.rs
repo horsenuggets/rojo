@@ -406,7 +406,9 @@ fn output_paths(middleware: Middleware, stem: &str) -> Vec<String> {
     if middleware.is_dir() {
         paths.push(format!("{stem}/init.meta.json"));
     } else {
+        // Both sidecars are applied when the file is read.
         paths.push(format!("{stem}.meta.json"));
+        paths.push(format!("{stem}.meta.jsonc"));
     }
     paths
 }
@@ -510,11 +512,10 @@ mod test {
             free_stem("Folder", "Folder", &["FOLDER", "Folder~2"]),
             "Folder~3"
         );
-        // A script's metadata sidecar counts too.
-        assert_eq!(
-            free_stem("Mod", "ModuleScript", &["Mod.meta.json"]),
-            "Mod~2"
-        );
+        // A script's metadata sidecars count too, in either format.
+        for sidecar in ["Mod.meta.json", "Mod.meta.jsonc"] {
+            assert_eq!(free_stem("Mod", "ModuleScript", &[sidecar]), "Mod~2");
+        }
         assert_eq!(free_stem("Mod", "ModuleScript", &["Mod"]), "Mod");
         // Names that aren't safe file names are sanitized first.
         assert_eq!(

@@ -51,7 +51,12 @@ impl<'a> SubscribeMessage<'a> {
 
         let mut added = HashMap::new();
         for id in patch.added {
-            let instance = tree.get_instance(id).unwrap();
+            // Messages are read from the tree when they're sent, and an
+            // instance added then removed again is already gone. A later
+            // message removes it, so there's nothing to announce.
+            let Some(instance) = tree.get_instance(id) else {
+                continue;
+            };
             added.insert(id, Instance::from_rojo_instance(instance));
 
             for instance in tree.descendants(id) {
@@ -593,6 +598,24 @@ mod tests {
     use super::*;
     use crate::snapshot::{apply_patch_set, InstanceSnapshot, PatchUpdate};
     use rbx_dom_weak::ustr;
+
+    /// An instance created and removed again before its message is sent is
+    /// left out, instead of the server panicking while it holds the tree.
+    #[test]
+    fn messages_leave_out_additions_that_are_gone() {
+        let tree = RojoTree::new(InstanceSnapshot::new().name("Root"));
+        let gone = Ref::new();
+        let message = SubscribeMessage::from_patch_update(
+            &tree,
+            AppliedPatchSet {
+                added: vec![gone],
+                removed: vec![gone],
+                ..AppliedPatchSet::new()
+            },
+        );
+        assert!(message.added.is_empty());
+        assert_eq!(message.removed, vec![gone]);
+    }
 
     /// Encodes an update body the way the plugin does, with msgpack from a
     /// loosely shaped value.

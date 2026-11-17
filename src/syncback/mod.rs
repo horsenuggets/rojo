@@ -36,7 +36,7 @@ use crate::{
     Project, REF_POINTER_ATTRIBUTE_PREFIX,
 };
 
-pub use addition::{drop_duplicate_ids, syncback_new_subtree};
+pub use addition::{drop_duplicate_ids, drop_ignored_properties, syncback_new_subtree};
 pub use file_names::{
     directory_middleware_for_instance, extension_for_middleware, name_for_inst, sibling_order_key,
     unique_child_stems, validate_file_name,
