@@ -63,6 +63,7 @@ fn compute_patch_set_with(
         // for all of the IDs that we know about so far.
         rewrite_refs_in_updates(&context, &mut patch_set.updated_instances);
         rewrite_refs_in_additions(&context, &mut patch_set.added_instances);
+        drop_unchanged_refs(tree, &mut patch_set.updated_instances);
     } else if id != tree.get_root_id() {
         patch_set.removed_instances.push(id);
     }
@@ -87,6 +88,27 @@ fn rewrite_refs_in_updates(context: &ComputePatchContext, updates: &mut [PatchUp
             }
         }
     }
+}
+
+/// A snapshot's references hold snapshot ids, so they only compare equal to the
+/// tree once rewritten. Drops the ones that turned out unchanged, and updates
+/// left with nothing to change, so rereading a file with references is a no-op.
+fn drop_unchanged_refs(tree: &RojoTree, updates: &mut Vec<PatchUpdate>) {
+    updates.retain_mut(|update| {
+        if let Some(instance) = tree.get_instance(update.id) {
+            update.changed_properties.retain(|name, value| match value {
+                Some(Variant::Ref(referent)) => {
+                    instance.properties().get(name) != Some(&Variant::Ref(*referent))
+                }
+                _ => true,
+            });
+        }
+        update.changed_name.is_some()
+            || update.changed_class_name.is_some()
+            || update.changed_parent.is_some()
+            || update.changed_metadata.is_some()
+            || !update.changed_properties.is_empty()
+    });
 }
 
 fn rewrite_refs_in_additions(context: &ComputePatchContext, additions: &mut [PatchAdd]) {
@@ -230,10 +252,15 @@ fn compute_property_patches(
             // if we start syncing models using SerializationService
             // (or GetObjects) it will affect how Studio deserializes things.
             if !instance.properties().contains_key(&migration_prop) {
-                changed_properties.insert(migration_prop, Some(Variant::Bool(false)));
+                changed_properties
+                    .entry(migration_prop)
+                    .or_insert(Some(Variant::Bool(false)));
             }
             match changed_properties.get(&migration_prop) {
-                Some(Some(Variant::Bool(_))) => {}
+                // A snapshot that agrees with the tree, like a model file that
+                // stores the property, must not produce an update. Studio can't
+                // set it, so it would replace the whole model.
+                None | Some(Some(Variant::Bool(_))) => {}
                 Some(None) => {
                     changed_properties.remove(&migration_prop);
                 }
@@ -493,6 +520,37 @@ mod test {
         };
 
         assert_eq!(patch_set, expected_patch_set);
+    }
+
+    /// A file that still holds the references the tree has, like a model file
+    /// read again after a write, must not produce updates.
+    #[test]
+    fn unchanged_refs_are_not_updates() {
+        let snapshot = || {
+            let target = Ref::new();
+            InstanceSnapshot::new()
+                .name("foo")
+                .class_name("foo")
+                .children(vec![
+                    InstanceSnapshot::new()
+                        .name("Weld")
+                        .class_name("Weld")
+                        .properties(UstrMap::from_iter([(ustr("Part0"), Variant::Ref(target))])),
+                    InstanceSnapshot::new()
+                        .name("Part")
+                        .class_name("Part")
+                        .snapshot_id(target),
+                ])
+        };
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("foo").class_name("foo"));
+        let root_id = tree.get_root_id();
+        let initial = compute_patch_set(Some(snapshot()), &tree, root_id);
+        apply_patch_set(&mut tree, initial);
+
+        assert_eq!(
+            compute_patch_set(Some(snapshot()), &tree, root_id),
+            PatchSet::new()
+        );
     }
 
     /// The same as rewrite_ref_existing_instance_update, except that the

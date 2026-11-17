@@ -74,8 +74,10 @@ local function applyPatch(instanceMap, patch)
 		-- addition.
 		--
 		-- This helps us make sure we only reify each instance once, and we
-		-- start from the top.
-		while patch.added[virtualInstance.Parent] ~= nil do
+		-- start from the top. An ancestor that already exists, like one Studio
+		-- created and the server is now announcing, is where this stops, or the
+		-- whole subtree would be created a second time.
+		while patch.added[virtualInstance.Parent] ~= nil and instanceMap.fromIds[virtualInstance.Parent] == nil do
 			id = virtualInstance.Parent
 			virtualInstance = patch.added[id]
 		end
@@ -224,13 +226,10 @@ local function applyPatch(instanceMap, patch)
 			end
 		end
 
-		if update.changedMetadata ~= nil then
-			-- TODO: Support changing metadata. This will become necessary when
-			-- Rojo persistently tracks metadata for each instance in order to
-			-- remove extra instances.
-			unappliedUpdate.changedMetadata = update.changedMetadata
-			partiallyApplied = true
-		end
+		-- Metadata lives on the server, which every diff reads it from, so a
+		-- change to it has nothing to apply in Studio. Reporting it as unapplied
+		-- would make the sync fallback replace the instance, breaking every
+		-- reference to it.
 
 		if update.changedProperties ~= nil then
 			for propertyName, propertyValue in pairs(update.changedProperties) do

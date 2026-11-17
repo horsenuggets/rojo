@@ -101,13 +101,17 @@ function ServeSession.new(options)
 		self:__onInstanceChanged(instance, propertyName)
 	end
 
+	local function onChildAdded(child)
+		self:__onChildAdded(child)
+	end
+
 	local function onChangesFlushed(patch)
 		local cursor = self.__pendingWriteCursor
 		self.__pendingWriteCursor = nil
 		return self:__writePatch(patch, cursor)
 	end
 
-	local instanceMap = InstanceMap.new(onInstanceChanged)
+	local instanceMap = InstanceMap.new(onInstanceChanged, onChildAdded)
 	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed)
 	local reconciler = Reconciler.new(instanceMap)
 
@@ -182,6 +186,23 @@ function ServeSession:__onInstanceChanged(instance, propertyName)
 	self:__queueChange(instance, propertyName)
 end
 
+-- An instance appeared under a known parent, which is how instances made in
+-- Studio show up. Like edits, they are held during the initial sync.
+function ServeSession:__onChildAdded(child)
+	if not self.__twoWaySync then
+		return
+	end
+
+	local deferred = self.__deferredChanges
+	if deferred ~= nil then
+		table.insert(deferred, { child = child })
+		return
+	end
+
+	self:__markBatchStart()
+	self.__changeBatcher:addChild(child)
+end
+
 -- Sends the held edits, in the order they happened, now that every instance
 -- they could refer to is known.
 function ServeSession:__releaseDeferredChanges()
@@ -192,7 +213,72 @@ function ServeSession:__releaseDeferredChanges()
 	self.__deferredChanges = nil
 
 	for _, change in deferred do
-		self:__queueChange(change.instance, change.propertyName)
+		if change.child ~= nil then
+			self:__markBatchStart()
+			self.__changeBatcher:addChild(change.child)
+		else
+			self:__queueChange(change.instance, change.propertyName)
+		end
+	end
+end
+
+-- Retain the revision preceding the first local change, even if a websocket
+-- update arrives before this batch is sent.
+function ServeSession:__markBatchStart()
+	if self.__changeBatcher:isEmpty() then
+		self.__pendingWriteCursor = self.__apiContext:getMessageCursor()
+	end
+end
+
+-- Collects every id an addition gave out, root first.
+local function collectAddedIds(entry, out)
+	table.insert(out, entry.id)
+	for _, child in entry.children do
+		collectAddedIds(child, out)
+	end
+	return out
+end
+
+--[[
+	Stops tracking instances Studio created that the server didn't store. They
+	stay in Studio, but nothing refers to ids the server never took.
+]]
+function ServeSession:__untrackRejectedAdditions(patch, result)
+	if next(patch.added) == nil then
+		return
+	end
+
+	local rejected = {}
+	if result == nil then
+		for _, addition in patch.added do
+			for _, id in collectAddedIds(addition.ids, {}) do
+				rejected[id] = true
+			end
+		end
+	else
+		for _, err in result.errors or {} do
+			-- An error about one property of a saved instance, like a reference
+			-- that couldn't be stored, leaves the instance saved and tracked.
+			if err.property ~= nil then
+				continue
+			end
+			local addition = patch.added[err.id]
+			if addition ~= nil then
+				for _, id in collectAddedIds(addition.ids, {}) do
+					rejected[id] = true
+				end
+			else
+				rejected[err.id] = true
+			end
+		end
+	end
+
+	for _, addition in patch.added do
+		for _, id in collectAddedIds(addition.ids, {}) do
+			if rejected[id] then
+				self.__instanceMap:removeId(id)
+			end
+		end
 	end
 end
 
@@ -210,12 +296,25 @@ function ServeSession:__syncStep(budget)
 	end
 end
 
-function ServeSession:__queueChange(instance, propertyName)
-	-- Retain the revision preceding the first local change, even if a websocket
-	-- update arrives before this batch is sent.
-	if next(self.__changeBatcher.__pendingPropertyChanges) == nil then
-		self.__pendingWriteCursor = self.__apiContext:getMessageCursor()
+--[[
+	Stops tracking instances whose deletion the server saved, with their
+	descendants. Their files are gone, so if an undo brings them back, they are
+	new instances to the server and must be sent as created.
+]]
+function ServeSession:__untrackSavedRemovals(result)
+	for _, id in result.accepted.removed_instances do
+		local instance = self.__instanceMap.fromIds[id]
+		if instance ~= nil then
+			for _, descendant in instance:GetDescendants() do
+				self.__instanceMap:removeInstance(descendant)
+			end
+		end
+		self.__instanceMap:removeId(id)
 	end
+end
+
+function ServeSession:__queueChange(instance, propertyName)
+	self:__markBatchStart()
 	self.__changeBatcher:add(instance, propertyName)
 end
 
@@ -244,10 +343,13 @@ function ServeSession:__writePatch(patch, messageCursor)
 	return self.__apiContext
 		:write(patch, messageCursor, authority)
 		:andThen(function(result)
+			self:__untrackRejectedAdditions(patch, result)
+			self:__untrackSavedRemovals(result)
 			finish(ServeSession.getWriteStatus(result), result)
 			return result
 		end)
 		:catch(function(err)
+			self:__untrackRejectedAdditions(patch, nil)
 			finish("Failed", {
 				errors = {
 					{

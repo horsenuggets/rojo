@@ -107,6 +107,30 @@ impl FsSnapshot {
         self.removed_dirs.insert(path.as_ref().to_path_buf());
     }
 
+    /// Moves every added path from inside `from` to the same place inside `to`,
+    /// so new files can be staged somewhere else before they're installed.
+    /// Fails if the snapshot removes anything or adds a path outside `from`.
+    pub fn rebase(self, from: &Path, to: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.removed_files.is_empty() && self.removed_dirs.is_empty(),
+            "Only new files can be staged"
+        );
+        let move_path = |path: PathBuf| -> anyhow::Result<PathBuf> {
+            let suffix = path
+                .strip_prefix(from)
+                .map_err(|_| anyhow::anyhow!("{} is outside {}", path.display(), from.display()))?;
+            Ok(to.join(suffix))
+        };
+        let mut rebased = Self::new();
+        for path in self.added_dirs {
+            rebased.added_dirs.insert(move_path(path)?);
+        }
+        for (path, contents) in self.added_files {
+            rebased.added_files.insert(move_path(path)?, contents);
+        }
+        Ok(rebased)
+    }
+
     /// Writes the `FsSnapshot` to the provided VFS, using the provided `base`
     /// as a root for the other paths in the `FsSnapshot`.
     ///
@@ -245,6 +269,64 @@ impl FsSnapshot {
         Ok(())
     }
 
+    /// Persists a rewritten model file along with its adjacent metadata, which
+    /// stops setting the properties the model file now holds. Every path must
+    /// be in `expected` and unchanged. The model file is written first, so if
+    /// writing stops partway, the metadata still sets the same values as before
+    /// and nothing is lost.
+    pub fn write_model_file_to_vfs<P: AsRef<Path>>(
+        &self,
+        base: P,
+        vfs: &Vfs,
+        expected: &HashMap<PathBuf, Option<Vec<u8>>>,
+        model: &Path,
+    ) -> io::Result<()> {
+        let mut lock = vfs.lock();
+        let base = base.as_ref();
+        if !self.added_dirs.is_empty() || !self.removed_dirs.is_empty() {
+            return Err(io::Error::other(
+                "A model file update cannot change directories",
+            ));
+        }
+        for (path, previous) in expected {
+            let current = lock.read(path).with_not_found()?;
+            if current.as_ref().map(|bytes| bytes.as_slice()) != previous.as_deref() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Filesystem changed before persistence",
+                ));
+            }
+        }
+        let mut writes = Vec::new();
+        for (path, contents) in &self.added_files {
+            let path = base.join(path);
+            let previous = expected.get(&path).ok_or_else(|| {
+                io::Error::other("The write target was not included in filesystem validation")
+            })?;
+            if previous.as_deref() != Some(contents.as_slice()) {
+                writes.push((path, contents, previous));
+            }
+        }
+        let mut removals = Vec::new();
+        for path in &self.removed_files {
+            let path = base.join(path);
+            if !expected.contains_key(&path) {
+                return Err(io::Error::other(
+                    "The removed path was not included in filesystem validation",
+                ));
+            }
+            removals.push(path);
+        }
+        writes.sort_by_key(|(path, _, _)| path.as_path() != model);
+        for (path, contents, previous) in writes {
+            lock.write_atomic(&path, contents, previous.as_deref())?;
+        }
+        for path in removals {
+            lock.remove_file(&path)?;
+        }
+        Ok(())
+    }
+
     /// Returns whether writing this snapshot would change any file's contents,
     /// compared with the contents captured in `expected`.
     pub fn changes_files<P: AsRef<Path>>(
@@ -341,6 +423,27 @@ impl FsSnapshot {
 mod tests {
     use super::*;
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn rebase_moves_added_paths_and_rejects_anything_else() {
+        let from = Path::new("/project/src");
+        let to = Path::new("/project/.rojo/stage");
+        let snapshot = FsSnapshot::new()
+            .with_added_dir(from.join("Folder"))
+            .with_added_file(from.join("Folder/init.meta.json"), b"{}".to_vec());
+        let rebased = snapshot.rebase(from, to).unwrap();
+        assert_eq!(rebased.added_dirs(), vec![to.join("Folder").as_path()]);
+        assert_eq!(
+            rebased.added_files.get(&to.join("Folder/init.meta.json")),
+            Some(&b"{}".to_vec())
+        );
+
+        let outside = FsSnapshot::new().with_added_file("/elsewhere/file.luau", Vec::new());
+        assert!(outside.rebase(from, to).is_err());
+        let mut removal = FsSnapshot::new();
+        removal.remove_file(from.join("old.luau"));
+        assert!(removal.rebase(from, to).is_err());
+    }
 
     #[test]
     fn filtered_merge_rejects_duplicate_destinations_before_mutating() {

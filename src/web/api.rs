@@ -163,25 +163,15 @@ impl ApiService {
         }
 
         let mut errors: Vec<_> = request
-            .added
-            .into_keys()
-            .map(|id| WriteError {
-                id,
-                property: None,
-                message: "Creating instances through two-way sync is not supported yet".into(),
+            .updated
+            .iter()
+            .filter(|update| update.changed_metadata.is_some())
+            .map(|update| WriteError {
+                id: update.id,
+                property: Some("metadata".into()),
+                message: "Changing metadata through two-way sync is not supported".into(),
             })
             .collect();
-        errors.extend(
-            request
-                .updated
-                .iter()
-                .filter(|update| update.changed_metadata.is_some())
-                .map(|update| WriteError {
-                    id: update.id,
-                    property: Some("metadata".into()),
-                    message: "Changing metadata through two-way sync is not supported".into(),
-                }),
-        );
         let updated_instances = {
             // Studio never receives link attributes, so its attribute edits are
             // completed with the ones the instance already has before persisting.
@@ -219,6 +209,7 @@ impl ApiService {
                     added_instances: Vec::new(),
                     updated_instances,
                 },
+                additions: request.added,
                 result_sender,
             })
             .unwrap();

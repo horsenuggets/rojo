@@ -32,8 +32,9 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// cursors to write requests and accepted, conflicted, and failed results to write
 /// responses, which older peers neither send nor understand. Version 7 made write
 /// requests carry the plugin's chosen `WriteAuthority`. Version 8 adds identity-preserving
-/// instance reparenting through `changedParent` updates.
-pub const PROTOCOL_VERSION: u64 = 8;
+/// instance reparenting through `changedParent` updates. Version 9 makes `added` carry
+/// Studio-created subtrees as `InstanceAddition`s.
+pub const PROTOCOL_VERSION: u64 = 9;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
@@ -125,9 +126,122 @@ pub struct InstanceUpdate {
 
     // TODO: Transform from UstrMap<String, Option<_>> to something else, since
     // null will get lost when decoding from JSON in some languages.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_changed_properties")]
     pub changed_properties: UstrMap<Option<Variant>>,
     pub changed_metadata: Option<InstanceMetadata>,
+}
+
+/// Reads changed properties, accepting an empty array for `Attributes`.
+///
+/// The plugin's msgpack encoder writes every empty Luau table as an array, so
+/// removing an instance's last attribute arrives as `{"Attributes": []}`. Every
+/// other property, and any non-empty `Attributes`, is read unchanged.
+fn deserialize_changed_properties<'de, D>(
+    deserializer: D,
+) -> Result<UstrMap<Option<Variant>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+
+    struct PropertiesVisitor;
+
+    impl<'de> Visitor<'de> for PropertiesVisitor {
+        type Value = UstrMap<Option<Variant>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of property names to values")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut properties = UstrMap::default();
+            while let Some(name) = map.next_key::<Ustr>()? {
+                let value = if name == "Attributes" {
+                    map.next_value::<Option<LenientAttributesVariant>>()?
+                        .map(|lenient| lenient.0)
+                } else {
+                    map.next_value::<Option<Variant>>()?
+                };
+                properties.insert(name, value);
+            }
+            Ok(properties)
+        }
+    }
+
+    deserializer.deserialize_map(PropertiesVisitor)
+}
+
+/// An `Attributes` variant, `{"Attributes": <map>}`, whose map may also be sent
+/// as an empty array.
+struct LenientAttributesVariant(Variant);
+
+impl<'de> Deserialize<'de> for LenientAttributesVariant {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, Visitor};
+
+        struct TaggedVisitor;
+
+        impl<'de> Visitor<'de> for TaggedVisitor {
+            type Value = LenientAttributesVariant;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an Attributes value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let tag: String = map
+                    .next_key()?
+                    .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                if tag != "Attributes" {
+                    return Err(A::Error::custom(format!(
+                        "expected the Attributes property to hold Attributes, not {tag}"
+                    )));
+                }
+                let attributes = map.next_value::<AttributesOrEmpty>()?.0;
+                if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom("expected a single Attributes value"));
+                }
+                Ok(LenientAttributesVariant(Variant::Attributes(attributes)))
+            }
+        }
+
+        deserializer.deserialize_map(TaggedVisitor)
+    }
+}
+
+/// An attribute map, or an empty array standing in for an empty map.
+struct AttributesOrEmpty(rbx_dom_weak::types::Attributes);
+
+impl<'de> Deserialize<'de> for AttributesOrEmpty {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{value::MapAccessDeserializer, Error, MapAccess, SeqAccess, Visitor};
+
+        struct EntriesVisitor;
+
+        impl<'de> Visitor<'de> for EntriesVisitor {
+            type Value = AttributesOrEmpty;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map of attributes, or an empty array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::invalid_type(
+                        serde::de::Unexpected::Seq,
+                        &"a map of attributes, or an empty array",
+                    ));
+                }
+                Ok(AttributesOrEmpty(Default::default()))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                Deserialize::deserialize(MapAccessDeserializer::new(map)).map(AttributesOrEmpty)
+            }
+        }
+
+        deserializer.deserialize_any(EntriesVisitor)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,9 +364,38 @@ pub struct WriteRequest {
     pub authority: WriteAuthority,
     pub removed: Vec<Ref>,
 
+    /// Subtrees created in Studio, keyed by the id Studio gave each root.
     #[serde(default)]
-    pub added: HashMap<Ref, ()>,
+    pub added: HashMap<Ref, InstanceAddition>,
     pub updated: Vec<InstanceUpdate>,
+}
+
+/// A subtree created in Studio. Studio picks every id itself and starts
+/// tracking the instances under them before sending, so the server's
+/// announcement of the same instances is recognized instead of duplicated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceAddition {
+    /// The managed instance the subtree was created under.
+    pub parent: Ref,
+    /// The subtree serialized by Studio as a binary model with one root.
+    #[serde(with = "serde_bytes")]
+    pub model: Vec<u8>,
+    /// The ids Studio assigned, shaped like the subtree.
+    pub ids: AddedIds,
+}
+
+/// The id Studio assigned to one instance of an added subtree. A model doesn't
+/// keep Studio's ids, so the name and class let the server pair each id with
+/// its instance. Same-named siblings pair in their order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddedIds {
+    pub id: Ref,
+    pub name: String,
+    pub class_name: Ustr,
+    #[serde(default)]
+    pub children: Vec<AddedIds>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -451,9 +594,90 @@ mod tests {
     use crate::snapshot::{apply_patch_set, InstanceSnapshot, PatchUpdate};
     use rbx_dom_weak::ustr;
 
+    /// Encodes an update body the way the plugin does, with msgpack from a
+    /// loosely shaped value.
+    fn plugin_update(changed_properties: serde_json::Value) -> Vec<u8> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body {
+            id: Ref,
+            changed_name: Option<String>,
+            changed_class_name: Option<String>,
+            changed_properties: serde_json::Value,
+            changed_metadata: Option<()>,
+        }
+        rmp_serde::to_vec_named(&Body {
+            id: Ref::new(),
+            changed_name: None,
+            changed_class_name: None,
+            changed_properties,
+            changed_metadata: None,
+        })
+        .unwrap()
+    }
+
+    // Removing an instance's last attribute is sent as an empty array, which
+    // used to fail the whole write.
+    #[test]
+    fn reads_an_empty_attributes_array_as_no_attributes() {
+        let bytes = plugin_update(serde_json::json!({ "Attributes": { "Attributes": [] } }));
+        let decoded: InstanceUpdate = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            decoded.changed_properties.get(&ustr("Attributes")),
+            Some(&Some(Variant::Attributes(Default::default())))
+        );
+    }
+
+    #[test]
+    fn reads_attributes_and_other_properties_unchanged() {
+        let mut attributes = rbx_dom_weak::types::Attributes::new();
+        attributes.insert("Health".into(), Variant::Float64(5.0));
+        attributes.insert("Label".into(), Variant::String("a".into()));
+        let mut changed_properties = UstrMap::default();
+        changed_properties.insert(ustr("Attributes"), Some(Variant::Attributes(attributes)));
+        changed_properties.insert(ustr("Name"), Some(Variant::String("Renamed".into())));
+        changed_properties.insert(
+            ustr("Data"),
+            Some(Variant::BinaryString(vec![0u8, 1, 255].into())),
+        );
+        changed_properties.insert(ustr("Reset"), None);
+        let update = InstanceUpdate {
+            id: Ref::new(),
+            changed_parent: None,
+            changed_name: None,
+            changed_class_name: None,
+            changed_properties,
+            changed_metadata: None,
+        };
+
+        let from_msgpack: InstanceUpdate =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&update).unwrap()).unwrap();
+        let from_json: InstanceUpdate =
+            serde_json::from_value(serde_json::to_value(&update).unwrap()).unwrap();
+        for decoded in [from_msgpack, from_json] {
+            assert_eq!(decoded.changed_properties, update.changed_properties);
+        }
+    }
+
+    #[test]
+    fn rejects_attributes_that_are_not_an_attribute_map() {
+        for value in [
+            serde_json::json!({ "Attributes": { "Attributes": [1] } }),
+            serde_json::json!({ "Attributes": { "String": "x" } }),
+            serde_json::json!({ "Attributes": { "Attributes": {}, "String": "x" } }),
+        ] {
+            let bytes = plugin_update(value.clone());
+            assert!(
+                rmp_serde::from_slice::<InstanceUpdate>(&bytes).is_err(),
+                "accepted {}",
+                value
+            );
+        }
+    }
+
     #[test]
     fn structural_protocol_round_trips_json_and_messagepack() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
         let id = Ref::new();
         let parent = Ref::new();
         let update = InstanceUpdate {

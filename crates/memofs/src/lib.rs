@@ -22,6 +22,7 @@ mod noop_backend;
 mod relocation;
 mod snapshot;
 mod std_backend;
+mod watch_batch;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
