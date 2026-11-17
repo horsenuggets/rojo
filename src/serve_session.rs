@@ -117,6 +117,7 @@ impl ServeSession {
 
         let root_project = Arc::new(Project::load_initial_project(&vfs, start_path)?);
         crate::syncback::relocation::recover_relocations(&vfs, &root_project)?;
+        crate::syncback::relocation::recover_relayouts(&vfs, &root_project)?;
 
         let mut tree = RojoTree::new(InstanceSnapshot::new());
 
