@@ -395,10 +395,11 @@ impl JobThreadContext {
     }
 
     /// Reads the project file again, so two-way sync writes with its current
-    /// rules. When the `modelTrees` rules changed, matching instances move to
-    /// their new layout if Studio is authoritative. Under Filesystem authority
-    /// the files on disk decide, so layouts stay as they are. Before any write
-    /// says which side wins, the first one decides.
+    /// rules. When the syncback rules changed, instances whose layout is stale
+    /// move to the one the rules ask for if Studio is authoritative. Any rule
+    /// counts, since lifting an exclusion can let a refused relayout go ahead.
+    /// Under Filesystem authority the files on disk decide, so layouts stay as
+    /// they are. Before any write says which side wins, the first one decides.
     fn reload_project(&self) {
         let current = self.project();
         let reloaded = match Project::load_exact(&self.vfs, &current.file_location, None) {
@@ -410,16 +411,16 @@ impl JobThreadContext {
                 return;
             }
         };
-        let changed = layout_rules(&current) != layout_rules(&reloaded);
-        *self.project.project.lock().unwrap() = Arc::new(reloaded);
-        if !changed {
+        if current.syncback_rules == reloaded.syncback_rules {
+            *self.project.project.lock().unwrap() = Arc::new(reloaded);
             return;
         }
+        *self.project.project.lock().unwrap() = Arc::new(reloaded);
         let authority = *self.project.authority.lock().unwrap();
         match authority {
             Some(WriteAuthority::Studio) => self.relayout(),
-            Some(WriteAuthority::Filesystem) => log::info!(
-                "The modelTrees rules changed, but the filesystem is authoritative, so no files were moved."
+            Some(WriteAuthority::Filesystem) => log::debug!(
+                "The syncback rules changed, but the filesystem is authoritative, so layouts on disk stay as they are."
             ),
             None => self
                 .project
@@ -460,13 +461,27 @@ impl JobThreadContext {
             }
         };
         let mut tree = self.tree.lock().unwrap();
-        let stale = stale_layouts(
+        // A model file can't sit in a folder's metadata, so an instance stored
+        // there moves with its outermost ancestor in the same file, which is
+        // written out as files of its own with every rule applied.
+        let mut targets: Vec<Ref> = Vec::new();
+        for mut id in stale_layouts(
             &rules,
             &tree,
             crate::syncback::instances_as_directories(&project),
-        );
+        ) {
+            while let Some(parent) = tree.get_instance(id).map(|instance| instance.parent()) {
+                if children_stored_in(&tree, parent).is_none() {
+                    break;
+                }
+                id = parent;
+            }
+            if !targets.contains(&id) {
+                targets.push(id);
+            }
+        }
         let mut moved = 0;
-        for id in stale {
+        for id in targets {
             let Some(instance) = tree.get_instance(id) else {
                 continue;
             };
@@ -488,7 +503,8 @@ impl JobThreadContext {
 
     /// Rewrites one instance and its descendants in the layout the project's
     /// rules give it, under the same IDs. Its old files are set aside first, so
-    /// the new ones can take their name, and are put back if writing fails.
+    /// the new ones can take their name. If writing fails, or the new files
+    /// would lose anything, the old files and the tree are put back.
     fn relayout_instance(&self, tree: &mut RojoTree, id: Ref) -> anyhow::Result<()> {
         let instance = tree.get_instance(id).context("The instance is gone")?;
         let parent = instance.parent();
@@ -501,27 +517,68 @@ impl JobThreadContext {
             authority: WriteAuthority::Studio,
             batch: &[],
         };
+        let backup = backup_subtree(tree, id);
+
         // An instance in its folder's metadata moves out of it like any move.
-        if stored_in(tree, id).is_some() {
-            self.persist_stored_move(
+        if let Some(stored) = stored_in(tree, id) {
+            let owner = tree
+                .get_instance(stored.owner())
+                .context("The file's owner is gone")?;
+            let owner_files =
+                FsSnapshot::capture_file_contents(&owner.metadata().relevant_paths, &self.vfs)?;
+            let result = self.persist_stored_move(
                 tree,
                 &PatchUpdate {
                     changed_parent: Some(parent),
                     ..empty_update(id)
                 },
                 &context,
-            )?;
-            return Ok(());
+            );
+            return self.finish_relayout(tree, id, parent, backup, result, || {
+                for (path, contents) in &owner_files {
+                    match contents {
+                        Some(contents) => self.vfs.write(path, contents)?,
+                        None => {
+                            self.vfs.remove_file(path).with_not_found()?;
+                        }
+                    }
+                }
+                Ok(())
+            });
         }
 
         let path = match self.check_removal(tree, id, &context)? {
             Removal::Allowed(path) => path,
             Removal::Restore(_) => anyhow::bail!("its files changed on disk"),
         };
-        let name = instance.name().to_owned();
-        let (model, ids) = subtree_model(tree, id, &name);
         let mut entries = vec![path.clone()];
         entries.extend(own_sidecars(tree, id, &path));
+        // Files the project's syncback rules exclude are never rewritten, like
+        // a full syncback leaves them alone.
+        let project = self.project();
+        if let Some(rules) = &project.syncback_rules {
+            let globs = Some(rules.compile_globs()?);
+            let mut pending = entries.clone();
+            while let Some(entry) = pending.pop() {
+                anyhow::ensure!(
+                    crate::syncback::is_valid_path(&globs, project.folder_location(), &entry),
+                    "\"{}\" is excluded by the project's syncback rules",
+                    entry.display()
+                );
+                if self
+                    .vfs
+                    .metadata(&entry)
+                    .with_not_found()?
+                    .is_some_and(|m| m.is_dir())
+                {
+                    for child in self.vfs.read_dir(&entry)? {
+                        pending.push(child?.path().to_path_buf());
+                    }
+                }
+            }
+        }
+        let name = instance.name().to_owned();
+        let (model, ids) = subtree_model(tree, id, &name);
 
         // Kept apart from the staging that recovery clears, so files set aside
         // by an interrupted relayout are never lost.
@@ -565,16 +622,64 @@ impl JobThreadContext {
             put_back(&moved);
             return Err(error.into());
         }
-        match self.place_subtree(tree, parent, model, &ids, &context, &[id]) {
-            Ok(_) => {
-                self.vfs.remove_dir_all(&aside)?;
-                Ok(())
+        let result = self.place_subtree(tree, parent, model, &ids, &context, &[id]);
+        let lossless = matches!(&result, Ok(errors) if errors.is_empty());
+        self.finish_relayout(tree, id, parent, backup, result, || {
+            put_back(&moved);
+            Ok(())
+        })?;
+        if lossless {
+            self.vfs.remove_dir_all(&aside)?;
+        }
+        Ok(())
+    }
+
+    /// Keeps a relayout that saved everything. Otherwise deletes the new files,
+    /// calls `restore_files` to put the old ones back, and puts the subtree
+    /// back in the tree under its IDs.
+    fn finish_relayout(
+        &self,
+        tree: &mut RojoTree,
+        id: Ref,
+        parent: Ref,
+        backup: (InstanceSnapshot, SnapshotReferents),
+        result: anyhow::Result<Vec<WriteError>>,
+        restore_files: impl FnOnce() -> io::Result<()>,
+    ) -> anyhow::Result<()> {
+        let error = match result {
+            Ok(errors) if errors.is_empty() => return Ok(()),
+            Ok(errors) => anyhow::anyhow!(
+                "the new layout couldn't keep everything ({})",
+                errors
+                    .iter()
+                    .map(|error| error.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Err(error) => error,
+        };
+        if let Some(InstigatingSource::Path(written)) = tree
+            .get_metadata(id)
+            .and_then(|metadata| metadata.instigating_source.clone())
+        {
+            let sidecars = own_sidecars(tree, id, &written);
+            let mut lock = self.vfs.lock();
+            match lock.metadata(&written).with_not_found()? {
+                Some(metadata) if metadata.is_dir() => lock.remove_dir_all(&written)?,
+                Some(_) => lock.remove_file(&written)?,
+                None => {}
             }
-            Err(error) => {
-                put_back(&moved);
-                Err(error)
+            for sidecar in sidecars {
+                lock.remove_file(&sidecar).with_not_found()?;
             }
         }
+        if tree.get_instance(id).is_some() {
+            tree.remove(id);
+        }
+        restore_files()?;
+        let (snapshot, referents) = backup;
+        tree.insert_instance_with_referents(parent, snapshot, &referents, &mut Vec::new());
+        Err(error)
     }
 
     /// Deletes the empty `.gitkeep`s syncback left in `directory`, which just
@@ -4083,18 +4188,6 @@ fn filesystem_restoration(
         patch.updated_instances.push(restoration);
     }
     patch
-}
-
-/// The project rules that decide how instances are laid out on disk.
-fn layout_rules(project: &Project) -> (Vec<crate::syncback::ModelTreeRule>, bool) {
-    (
-        project
-            .syncback_rules
-            .as_ref()
-            .map(|rules| rules.model_trees.clone())
-            .unwrap_or_default(),
-        crate::syncback::instances_as_directories(project),
-    )
 }
 
 /// Returns the adjacent metadata of the file at `path`, which `id` comes from,

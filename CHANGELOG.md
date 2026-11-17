@@ -33,7 +33,10 @@ Making a new release? Simply add the new header with the version and date undern
 
 * Changing `syncbackRules.modelTrees` or `instancesAsDirectories` while serving now moves
   matching instances between model files and directories right away when Studio is
-  authoritative, keeping their IDs so Studio sees no change. Under Filesystem authority,
+  authoritative, keeping their IDs so Studio sees no change. Instances stored in a
+  folder's metadata move out with their outermost ancestor there. A relayout that would
+  rewrite a file `ignorePaths` excludes is refused, and one that would lose an instance
+  is undone, until a later rule change lets it through. Under Filesystem authority,
   layouts on disk never change. Before any write says which side wins, the first one
   decides. Other project file changes, like `ignoreProperties`, now apply to two-way sync
   writes without restarting the server.

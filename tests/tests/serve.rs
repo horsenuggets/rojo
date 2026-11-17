@@ -413,13 +413,120 @@ fn announce_authority(
 }
 
 fn set_model_trees(session: &crate::rojo_test::serve_util::TestServeSession, rules: &str) {
+    set_syncback_rules(session, &format!(r#""modelTrees":{rules}"#));
+}
+
+/// Rewrites the `place_root` project with `instancesAsDirectories` and the
+/// given extra syncback rules.
+fn set_syncback_rules(session: &crate::rojo_test::serve_util::TestServeSession, rules: &str) {
     fs::write(
         session.path().join("default.project.json"),
         format!(
-            r#"{{"name":"place_root","tree":{{"$className":"DataModel","$path":"src"}},"syncbackRules":{{"instancesAsDirectories":true,"modelTrees":{rules}}}}}"#
+            r#"{{"name":"place_root","tree":{{"$className":"DataModel","$path":"src"}},"syncbackRules":{{"instancesAsDirectories":true,{rules}}}}}"#
         ),
     )
     .unwrap();
+}
+
+/// Waits for an instance named `name` and returns its ID.
+fn wait_for_instance(session: &crate::rojo_test::serve_util::TestServeSession, name: &str) -> Ref {
+    let root = session.get_api_rojo().unwrap().root_instance_id;
+    let mut found = Ref::none();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(root).unwrap();
+            match read.instances.values().find(|i| i.name == name) {
+                Some(instance) => {
+                    found = instance.id;
+                    true
+                }
+                None => false,
+            }
+        }),
+        "{name} never appeared"
+    );
+    found
+}
+
+fn parent_of(session: &crate::rojo_test::serve_util::TestServeSession, id: Ref) -> Option<Ref> {
+    let root = session.get_api_rojo().unwrap().root_instance_id;
+    let read = session.get_api_read(root).unwrap();
+    read.instances.get(&id).map(|instance| instance.parent)
+}
+
+// A rule can match an instance stored in a folder's metadata. Its outermost
+// ancestor in that file is written out as files, and every ID is kept.
+#[test]
+fn model_tree_rules_reach_instances_stored_in_metadata() {
+    run_serve_test("place_root", |session, _| {
+        let mover_dir = session.path().join("src/ReplicatedStorage/Mover");
+        fs::write(
+            mover_dir.join("init.meta.json"),
+            r#"{"children":[{"name":"Outer","className":"Folder","children":[{"name":"FX","className":"Folder","children":[{"name":"Spark","className":"Part"}]}]}]}"#,
+        )
+        .unwrap();
+        let spark = wait_for_instance(&session, "Spark");
+        let fx = wait_for_instance(&session, "FX");
+        let outer = wait_for_instance(&session, "Outer");
+        announce_authority(&session, WriteAuthority::Studio);
+
+        set_model_trees(
+            &session,
+            r#"[{"pattern":"ReplicatedStorage/Mover/Outer/FX"}]"#,
+        );
+        assert!(
+            eventually(|| mover_dir.join("Outer/FX.rbxm").is_file()),
+            "FX never became a model"
+        );
+        // The model is written before the metadata that held it.
+        assert!(eventually(|| !fs::read_to_string(
+            mover_dir.join("init.meta.json")
+        )
+        .unwrap()
+        .contains("Outer")));
+        thread::sleep(Duration::from_millis(1000));
+        assert_eq!(parent_of(&session, fx), Some(outer));
+        assert_eq!(parent_of(&session, spark), Some(fx));
+    });
+}
+
+// Files the syncback rules exclude are never rewritten, so a relayout that
+// would absorb one is refused, and a relayout that would lose an instance
+// is undone, leaving files and IDs as they were.
+#[test]
+fn model_tree_relayouts_never_touch_excluded_files_or_lose_instances() {
+    run_serve_test("place_root", |session, _| {
+        let storage = session.path().join("src/ReplicatedStorage");
+        fs::write(storage.join("Mover/Keep.luau"), "return 'keep'").unwrap();
+        fs::create_dir(storage.join("Mover/Dropped")).unwrap();
+        fs::write(storage.join("Mover/Dropped/Code.luau"), "return 1").unwrap();
+        let keep = wait_for_instance(&session, "Keep");
+        let dropped = wait_for_instance(&session, "Dropped");
+        announce_authority(&session, WriteAuthority::Studio);
+
+        set_syncback_rules(
+            &session,
+            r#""modelTrees":[{"pattern":"ReplicatedStorage/Mover"}],"ignorePaths":["src/ReplicatedStorage/Mover/Keep.luau"]"#,
+        );
+        thread::sleep(Duration::from_millis(1500));
+        assert!(storage.join("Mover/Keep.luau").is_file());
+        assert!(!storage.join("Mover.rbxm").exists());
+
+        // Now it can move, and does.
+        set_model_trees(&session, r#"[{"pattern":"ReplicatedStorage/Mover"}]"#);
+        assert!(eventually(|| storage.join("Mover.rbxm").is_file()));
+
+        // Going back to directories would drop what ignoreTrees excludes.
+        set_syncback_rules(
+            &session,
+            r#""modelTrees":[],"ignoreTrees":["ReplicatedStorage/Mover/Dropped"]"#,
+        );
+        thread::sleep(Duration::from_millis(1500));
+        assert!(storage.join("Mover.rbxm").is_file());
+        assert!(!storage.join("Mover").exists());
+        assert!(parent_of(&session, keep).is_some());
+        assert!(parent_of(&session, dropped).is_some());
+    });
 }
 
 // Changing the modelTrees rules while serving moves matching instances to
