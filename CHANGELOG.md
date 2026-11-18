@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.3`
+
+* Included AvatarSettings, HttpService, and TestService in whole-place exports. They are
+  persisted place services with the Service tag, but were absent from the container
+  allowlist, so their children and properties were silently omitted.
+
 ## `7.7.1-horse.2.2`
 
 * Fixed whole-place exports failing with a capture-root mismatch when runtime players are

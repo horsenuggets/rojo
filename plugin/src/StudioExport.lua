@@ -19,8 +19,10 @@ const Types = require("./Types")
 -- Service and NotCreatable tags alone cannot distinguish Lighting from internal
 -- services. Restrict drafts to known place containers, then verify reflection tags.
 const PLACE_SERVICES = {
+	AvatarSettings = true,
 	Chat = true,
 	CollectionService = true,
+	HttpService = true,
 	Lighting = true,
 	LocalizationService = true,
 	MaterialService = true,
@@ -34,6 +36,7 @@ const PLACE_SERVICES = {
 	StarterPack = true,
 	StarterPlayer = true,
 	Teams = true,
+	TestService = true,
 	TextChatService = true,
 	Workspace = true,
 }
