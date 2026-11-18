@@ -211,7 +211,23 @@ impl JobThreadContext {
     /// It then computes and applies changes for each affected instance ID and
     /// returns a vector of applied patch sets.
     fn apply_patches(&self, path: PathBuf) -> Vec<AppliedPatchSet> {
+        self.apply_patches_with_publication(path, |_, _| {})
+    }
+
+    fn apply_patches_with_publication(
+        &self,
+        path: PathBuf,
+        before_publication: impl FnOnce(&RojoTree, &[AppliedPatchSet]),
+    ) -> Vec<AppliedPatchSet> {
         let mut tree = self.tree.lock().unwrap();
+        let applied = self.apply_patches_to_tree(&mut tree, path);
+        before_publication(&tree, &applied);
+        // Readers must not observe the changed DOM before its revision is published.
+        self.message_queue.push_messages(&applied);
+        applied
+    }
+
+    fn apply_patches_to_tree(&self, tree: &mut RojoTree, path: PathBuf) -> Vec<AppliedPatchSet> {
         let mut applied_patches = Vec::new();
 
         // Find the nearest ancestor to this path that has
@@ -240,7 +256,7 @@ impl JobThreadContext {
         // read, instead of the folder's whole subtree.
         if let [id] = affected_ids[..] {
             if current_path != path.as_path() {
-                if let Some(applied) = self.add_new_entry(&mut tree, id, current_path, &path) {
+                if let Some(applied) = self.add_new_entry(tree, id, current_path, &path) {
                     return applied;
                 }
             }
@@ -256,7 +272,7 @@ impl JobThreadContext {
                     .get_metadata(id)
                     .and_then(|metadata| metadata.instigating_source.as_ref())
                     .is_some_and(|source| source.path() != current_path);
-            if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, id, own_file) {
+            if let Some(patch) = compute_and_apply_changes(tree, &self.vfs, id, own_file) {
                 if !patch.is_empty() {
                     applied_patches.push(patch);
                 }
@@ -303,7 +319,7 @@ impl JobThreadContext {
 
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
-        let applied_patches = match event {
+        match event {
             VfsEvent::Create(path) | VfsEvent::Write(path) => {
                 self.apply_patches(canonicalize_or_original(&self.vfs, path))
             }
@@ -323,10 +339,6 @@ impl JobThreadContext {
                 Vec::new()
             }
         };
-
-        // Notify anyone listening to the message queue about the changes we
-        // just made.
-        self.message_queue.push_messages(&applied_patches);
 
         if project_file_changed {
             self.reload_project();
@@ -927,11 +939,6 @@ impl JobThreadContext {
         }
         // A request is based on the last revision applied before its local batch began.
         // The current server DOM is not a baseline when a watcher has advanced it.
-        let context = WriteContext {
-            stale: message_cursor != Some(self.message_queue.cursor()),
-            authority,
-            batch: &patch_set.updated_instances,
-        };
         log::trace!("Persisting PatchSet from client: {:#?}", patch_set);
         let mut accepted = PatchSet::new();
         let mut conflicts = PatchSet::new();
@@ -939,8 +946,13 @@ impl JobThreadContext {
         let mut messages = Vec::new();
         let mut deletion_conflicts = Vec::new();
         let mut with_ancestors = Vec::new();
+        let mut tree = self.tree.lock().unwrap();
+        let context = WriteContext {
+            stale: message_cursor != Some(self.message_queue.cursor()),
+            authority,
+            batch: &patch_set.updated_instances,
+        };
         {
-            let mut tree = self.tree.lock().unwrap();
             let package_block = |tree: &RojoTree, id: Ref, structural: bool| {
                 package_write_block(tree, &self.vfs, id, structural, context.stale)
             };
@@ -1414,9 +1426,7 @@ impl JobThreadContext {
         // the batch sees them. Removals wait until here, since a removed parent
         // must still be known while its removed children are handled.
         if !accepted.removed_instances.is_empty() {
-            let mut tree = self.tree.lock().unwrap();
-            // The watcher can see the deleted files and remove an instance first,
-            // and removing an ancestor removes its descendants, so only what's
+            // Removing an ancestor also removes its descendants, so only what's
             // still in the tree is removed here.
             for &id in &accepted.removed_instances {
                 if tree.get_instance(id).is_some() {
@@ -1429,7 +1439,6 @@ impl JobThreadContext {
             }
         }
         if conflicts != PatchSet::new() {
-            let mut tree = self.tree.lock().unwrap();
             // Removals go one at a time for the same reasons as above.
             let mut restorations = conflicts.clone();
             for id in std::mem::take(&mut restorations.removed_instances) {
@@ -5507,6 +5516,38 @@ mod tests {
                 .children(vec![snapshot]),
         );
         job
+    }
+
+    #[test]
+    fn watcher_mutations_and_publication_share_the_tree_revision_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = package_relocation_job(temp.path(), true);
+        let path = job
+            .vfs
+            .canonicalize(temp.path().join("Local/First/Left/Code.luau"))
+            .unwrap();
+        let id = job.tree.lock().unwrap().get_ids_at_path(&path)[0];
+        let before = job.message_queue.cursor();
+        job.vfs.write(&path, "return 73\n").unwrap();
+
+        let changes = job.apply_patches_with_publication(path.clone(), |tree, changes| {
+            assert!(!changes.is_empty());
+            assert_eq!(job.message_queue.cursor(), before);
+            assert!(matches!(
+                job.tree.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert_eq!(
+                tree.get_instance(id).unwrap().properties()[&ustr("Source")],
+                Variant::String("return 73\n".into())
+            );
+        });
+
+        assert_eq!(job.message_queue.cursor(), before + changes.len() as u32);
+        let published = job.message_queue.cursor();
+        assert!(job.apply_patches(path.clone()).is_empty());
+        assert!(job.apply_patches(path).is_empty());
+        assert_eq!(job.message_queue.cursor(), published);
     }
 
     #[test]
