@@ -45,6 +45,8 @@ Making a new release? Simply add the new header with the version and date undern
   and reported whole-tree source conflicts as unsaved writes rather than empty success.
 * Reported excluded or unpersisted package properties individually without acknowledging
   unsaved edits, while saving the allowed properties in the same batch.
+* Preserved selected original project entrypoints during package syncback, preventing
+  transparent nested projects from repeatedly revisiting their outer project.
 * Resolved local package dependency aliases through each installed package's own shims,
   preserving other original-source aliases and reversing imports during syncback.
 * Associated installed cache events with existing original-source instances, retaining

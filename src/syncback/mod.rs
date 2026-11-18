@@ -621,11 +621,25 @@ fn syncback_snapshot<'sync>(
     {
         let metadata = old.metadata();
         let physical = if get_best_middleware(&snapshot) == Middleware::Project {
-            metadata
-                .relevant_paths
-                .iter()
-                .rev()
-                .find(|path| Project::is_project_file(path))
+            // Referenced projects share metadata with their outer project. Keep
+            // the original inner project selected by syncback_project, but still
+            // redirect installed entrypoints to the authoritative source.
+            if Project::is_project_file(&snapshot.path)
+                && metadata.relevant_paths.contains(&snapshot.path)
+                && metadata
+                    .context
+                    .package_mount
+                    .as_ref()
+                    .is_some_and(|(source, _)| snapshot.path.starts_with(source))
+            {
+                Some(&snapshot.path)
+            } else {
+                metadata
+                    .relevant_paths
+                    .iter()
+                    .rev()
+                    .find(|path| Project::is_project_file(path))
+            }
         } else {
             metadata.relevant_paths.first()
         };
