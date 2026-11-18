@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.2`
+
 * Fixed whole-place exports failing with a capture-root mismatch when runtime players are
   present. Player instances are excluded with a warning, matching Studio serialization,
   while persistent children and properties of the Players service remain captured.
