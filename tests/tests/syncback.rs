@@ -112,7 +112,33 @@ fn package_sources_cli_build_sourcemap_and_round_trip() {
 }
 
 #[test]
-fn package_sources_cli_syncback_preserves_selected_inner_project() {
+fn package_sources_cli_syncback_preserves_selected_inner_project_file() {
+    package_sources_cli_syncback_preserves_selected_inner_project(
+        "inner.project.json",
+        "Source/Foo",
+    );
+}
+
+#[test]
+fn package_sources_cli_syncback_preserves_selected_inner_project_directory() {
+    package_sources_cli_syncback_preserves_selected_inner_project(
+        "inner/default.project.json",
+        "../Source/Foo",
+    );
+}
+
+#[test]
+fn package_sources_cli_syncback_preserves_selected_inner_project_directory_jsonc() {
+    package_sources_cli_syncback_preserves_selected_inner_project(
+        "inner/default.project.jsonc",
+        "../Source/Foo",
+    );
+}
+
+fn package_sources_cli_syncback_preserves_selected_inner_project(
+    inner_project: &str,
+    inner_source: &str,
+) {
     use crate::rojo_test::package_sources::{self as fixture, INSTALLED, ORIGINAL};
     use std::{
         fs,
@@ -127,14 +153,21 @@ fn package_sources_cli_syncback_preserves_selected_inner_project() {
     // Both projects share one instance. The outer project must not replace the
     // inner project selected during syncback, even on a transparent root.
     for package in ["Source/ForkedPackages/foo", INSTALLED] {
+        let inner_path = if inner_project.starts_with("inner/") {
+            "inner"
+        } else {
+            inner_project
+        };
         fs::write(
             root.join(package).join("default.project.json"),
-            r#"{"tree":{"$path":"inner.project.json"}}"#,
+            serde_json::json!({"tree": {"$path": inner_path}}).to_string(),
         )
         .unwrap();
+        let inner_project = root.join(package).join(inner_project);
+        fs::create_dir_all(inner_project.parent().unwrap()).unwrap();
         fs::write(
-            root.join(package).join("inner.project.json"),
-            r#"{"tree":{"$path":"Source/Foo"}}"#,
+            inner_project,
+            serde_json::json!({"tree": {"$path": inner_source}}).to_string(),
         )
         .unwrap();
     }
