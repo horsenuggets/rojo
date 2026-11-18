@@ -31,10 +31,17 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.0`
+
 * Added source-authoritative Wally package mounts using validated install provenance.
   Local package edits sync to declared sources, while registry and generated differences
   warn without writes. DataModel aliases use clone-safe native imports and round-trip
   without rewriting authored aliases.
+* Preserved authoritative source paths in sourcemaps and expanded referenced project
+  mappings for package-aware import resolution.
+* Guarded package replacements, moves, promotions, and relayout recovery with exact
+  ownership evidence, source-generation checks, and canonical ancestor validation.
+* Added interruption, ownership-change, source-conflict, and package round-trip coverage.
 
 ## `7.7.1-horse.1.8`
 
