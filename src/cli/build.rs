@@ -138,7 +138,7 @@ impl BuildCommand {
 
 /// The different kinds of output that Rojo+ can build to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputKind {
+pub(super) enum OutputKind {
     /// An XML model file.
     Rbxmx,
 
@@ -153,7 +153,7 @@ enum OutputKind {
 }
 
 impl OutputKind {
-    fn from_output_path(output: &Path) -> Option<OutputKind> {
+    pub(super) fn from_output_path(output: &Path) -> Option<OutputKind> {
         let extension = output.extension()?.to_str()?;
 
         match extension {
@@ -176,7 +176,7 @@ impl OutputKind {
     }
 }
 
-fn xml_encode_config() -> rbx_xml::EncodeOptions<'static> {
+pub(super) fn xml_encode_config() -> rbx_xml::EncodeOptions<'static> {
     rbx_xml::EncodeOptions::new().property_behavior(rbx_xml::EncodePropertyBehavior::WriteUnknown)
 }
 

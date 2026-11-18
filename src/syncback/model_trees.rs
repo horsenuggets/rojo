@@ -3,6 +3,7 @@
 //! The `modelTrees` syncback rule matches Instances by their path in the
 //! DataModel. A matching Instance and all of its descendants are written to one
 //! `.rbxm` or `.rbxmx` file, instead of a file or directory for each of them.
+//! Terrain defaults to a binary subtree so its opaque voxel data stays intact.
 
 use std::collections::{HashMap, HashSet};
 
@@ -110,9 +111,17 @@ impl CompiledModelTreeRules {
             .find(|(matcher, _)| matcher.is_match(inst_path))
             .map(|(_, middleware)| *middleware)
     }
+
+    fn middleware_for_instance(&self, inst_path: &str, class_name: &str) -> Option<Middleware> {
+        if self.project_nodes.contains(inst_path) {
+            return None;
+        }
+        self.middleware_for(inst_path)
+            .or_else(|| (class_name == "Terrain").then_some(Middleware::Rbxm))
+    }
 }
 
-/// The Instances of a DOM that `modelTrees` rules store as model files.
+/// The Instances stored as model files by explicit rules or Terrain's binary default.
 #[derive(Default)]
 pub struct ModelTrees {
     roots: HashMap<Ref, Middleware>,
@@ -120,13 +129,17 @@ pub struct ModelTrees {
 }
 
 impl ModelTrees {
-    /// Finds every Instance in `dom` that matches a rule. Matches inside
-    /// another match are found too. Syncback never reaches them when the
+    /// Finds explicit rule matches and Terrain's binary defaults in `dom`.
+    /// Matches inside another match are found too. Syncback never reaches them when the
     /// outer one becomes a model file, but it does when the outer one keeps
     /// its layout because a project defines it.
     pub fn find(rules: &CompiledModelTreeRules, dom: &WeakDom) -> Self {
         let mut trees = Self::default();
-        if rules.is_empty() {
+        if rules.is_empty()
+            && !dom
+                .descendants()
+                .any(|instance| instance.class == "Terrain")
+        {
             return trees;
         }
         // The root has an empty path, so it can't match and is never a model.
@@ -136,7 +149,9 @@ impl ModelTrees {
             for child_ref in instance.children() {
                 let child = dom.get_by_ref(*child_ref).unwrap();
                 let child_path = child_path(&path, &child.name);
-                if let Some(middleware) = rules.middleware_for(&child_path) {
+                if let Some(middleware) =
+                    rules.middleware_for_instance(&child_path, child.class.as_str())
+                {
                     trees.roots.insert(*child_ref, middleware);
                     let mut current = *child_ref;
                     while trees.containers.insert(current) {
@@ -186,7 +201,7 @@ pub fn is_project_owned(metadata: &InstanceMetadata) -> bool {
 /// Returns every instance in `tree` whose subtree is on disk in a layout the
 /// `modelTrees` rules no longer ask for. That is a matching Instance stored
 /// any other way than its rule's format, or, when `as_directories` is set, a
-/// model file no rule matches. Syncback skips subtrees whose content is
+/// non-Terrain model file no rule matches. Syncback skips subtrees whose content is
 /// unchanged, so without this a changed rule would only apply to Instances
 /// that happen to change in the place.
 pub fn needs_relayout(
@@ -217,10 +232,15 @@ pub fn stale_layouts(
     as_directories: bool,
 ) -> Vec<Ref> {
     let mut stale_instances = Vec::new();
-    if rules.is_empty() && !as_directories {
+    let dom = tree.inner();
+    if rules.is_empty()
+        && !as_directories
+        && !dom
+            .descendants()
+            .any(|instance| instance.class == "Terrain")
+    {
         return stale_instances;
     }
-    let dom = tree.inner();
     let mut pending = vec![(tree.get_root_id(), String::new())];
     while let Some((referent, path)) = pending.pop() {
         let instance = dom.get_by_ref(referent).unwrap();
@@ -236,7 +256,7 @@ pub fn stale_layouts(
                 pending.push((*child_ref, child_path));
                 continue;
             }
-            let wanted = rules.middleware_for(&child_path);
+            let wanted = rules.middleware_for_instance(&child_path, child.class.as_str());
             let stale = match (wanted, metadata.middleware) {
                 (Some(wanted), current) => current != Some(wanted),
                 (None, Some(current)) => as_directories && is_model_file(current),
@@ -269,7 +289,7 @@ mod test {
     use super::*;
     use std::path::Path;
 
-    use rbx_dom_weak::InstanceBuilder;
+    use rbx_dom_weak::{types::Variant, InstanceBuilder};
 
     use crate::{
         snapshot::{InstanceMetadata, InstanceSnapshot},
@@ -326,6 +346,334 @@ mod test {
         let root = dunce::canonicalize(temp.path()).unwrap();
         std::fs::create_dir(root.join("src")).unwrap();
         (temp, root)
+    }
+
+    fn terrain_dom() -> WeakDom {
+        WeakDom::new(
+            InstanceBuilder::new("Folder").with_child(
+                InstanceBuilder::new("Terrain")
+                    .with_property(
+                        "SmoothGrid",
+                        Variant::BinaryString(vec![0, 255, 128, 0, 17].into()),
+                    )
+                    .with_property("WaterTransparency", 0.375_f32)
+                    .with_child(InstanceBuilder::new("Clouds").with_property("Cover", 0.75_f32)),
+            ),
+        )
+    }
+
+    fn assert_terrain_model(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let dom = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        let terrain = dom.get_by_ref(dom.root().children()[0]).unwrap();
+        assert_eq!(terrain.class.as_str(), "Terrain");
+        assert_eq!(
+            terrain.properties[&rbx_dom_weak::ustr("SmoothGrid")],
+            Variant::BinaryString(vec![0, 255, 128, 0, 17].into())
+        );
+        assert_eq!(
+            terrain.properties[&rbx_dom_weak::ustr("WaterTransparency")],
+            Variant::Float32(0.375)
+        );
+        assert_eq!(terrain.children().len(), 1);
+        assert_eq!(
+            dom.get_by_ref(terrain.children()[0])
+                .unwrap()
+                .class
+                .as_str(),
+            "Clouds"
+        );
+    }
+
+    #[test]
+    fn terrain_is_a_binary_subtree_with_or_without_directory_layout() {
+        for as_directories in [false, true] {
+            let (_temp, root) = project_on_disk();
+            let rules = format!(r#"{{"instancesAsDirectories":{as_directories}}}"#);
+            syncback(&root, &rules, terrain_dom()).unwrap();
+            let model = root.join("src/Terrain.rbxm");
+            assert_terrain_model(&model);
+            assert!(!root.join("src/Terrain").exists());
+            let before = std::fs::read(&model).unwrap();
+            syncback(&root, &rules, terrain_dom()).unwrap();
+            assert_eq!(std::fs::read(&model).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn terrain_directories_migrate_once_and_never_expand_back() {
+        let (_temp, root) = project_on_disk();
+        let directory = root.join("src/Terrain");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("init.meta.json"),
+            r#"{"className":"Terrain"}"#,
+        )
+        .unwrap();
+        for as_directories in [true, false, true] {
+            let rules = format!(r#"{{"instancesAsDirectories":{as_directories}}}"#);
+            syncback(&root, &rules, terrain_dom()).unwrap();
+            assert_terrain_model(&root.join("src/Terrain.rbxm"));
+            assert!(!directory.exists());
+        }
+    }
+
+    #[test]
+    fn terrain_migration_respects_excluded_files_and_subtrees() {
+        for (rules, expected) in [
+            (
+                r#"{"instancesAsDirectories":true,"ignorePaths":["src/Terrain/notes.md"]}"#,
+                "ignorePaths",
+            ),
+            (
+                r#"{"instancesAsDirectories":true,"ignoreTrees":["Terrain/Clouds"]}"#,
+                "ignoreTrees",
+            ),
+        ] {
+            let (_temp, root) = project_on_disk();
+            let directory = root.join("src/Terrain");
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(
+                directory.join("init.meta.json"),
+                r#"{"className":"Terrain"}"#,
+            )
+            .unwrap();
+            std::fs::write(directory.join("notes.md"), "Keep this.\n").unwrap();
+            let error = syncback(&root, rules, terrain_dom()).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(directory.join("notes.md").is_file());
+            assert!(!root.join("src/Terrain.rbxm").exists());
+        }
+    }
+
+    #[test]
+    fn terrain_project_sources_keep_their_explicit_binary_paths() {
+        let (_temp, root) = project_on_disk();
+        let model = root.join("src/pinned.rbxm");
+        let dom = terrain_dom();
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+        std::fs::write(&model, &bytes).unwrap();
+        let project = root.join("default.project.json");
+        std::fs::write(&project, r#"{"name":"Test","tree":{"$className":"Folder","Terrain":{"$path":"src/pinned.rbxm"}},"syncbackRules":{"instancesAsDirectories":true}}"#).unwrap();
+        let vfs = memofs::Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let session = crate::serve_session::ServeSession::new(vfs, &project).unwrap();
+        let mut input = terrain_dom();
+        let terrain = input.root().children()[0];
+        input
+            .get_by_ref_mut(terrain)
+            .unwrap()
+            .properties
+            .insert(rbx_dom_weak::ustr("WaterWaveSize"), Variant::Float32(0.25));
+        let staged = crate::syncback::syncback_loop(
+            session.vfs(),
+            &mut session.tree(),
+            input,
+            session.root_project(),
+        )
+        .unwrap();
+        staged.write_to_vfs(&root, session.vfs()).unwrap();
+        assert_terrain_model(&model);
+        assert!(!root.join("src/Terrain.rbxm").exists());
+        let after = rbx_binary::from_reader(std::fs::read(&model).unwrap().as_slice()).unwrap();
+        assert_eq!(
+            after
+                .get_by_ref(after.root().children()[0])
+                .unwrap()
+                .properties[&rbx_dom_weak::ustr("WaterWaveSize")],
+            Variant::Float32(0.25)
+        );
+    }
+
+    #[test]
+    fn terrain_created_in_studio_has_a_binary_destination_and_project_lfs_rule() {
+        let (_temp, root) = project_on_disk();
+        let project = root.join("default.project.json");
+        std::fs::write(&project, r#"{"name":"Test","tree":{"$path":"src"},"syncbackRules":{"instancesAsDirectories":true}}"#).unwrap();
+        let vfs = memofs::Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let session = crate::serve_session::ServeSession::new(vfs, &project).unwrap();
+        let tree = session.tree();
+        let created = crate::syncback::syncback_new_subtree(
+            session.vfs(),
+            &tree,
+            session.root_project(),
+            tree.get_root_id(),
+            &root.join("src"),
+            &HashSet::new(),
+            terrain_dom(),
+        )
+        .unwrap();
+        assert_eq!(created.root_path, root.join("src/Terrain.rbxm"));
+        assert!(!root.join(".gitattributes").exists());
+        created
+            .fs_snapshot
+            .write_to_vfs(&root, session.vfs())
+            .unwrap();
+        assert_terrain_model(&created.root_path);
+        assert!(std::fs::read_to_string(root.join(".gitattributes"))
+            .unwrap()
+            .contains("filter=lfs diff=lfs merge=lfs -text"));
+    }
+
+    #[test]
+    fn terrain_scoped_child_updates_keep_voxels_and_establish_lfs() {
+        let (_temp, root) = project_on_disk();
+        syncback(&root, r#"{"instancesAsDirectories":true}"#, terrain_dom()).unwrap();
+        let attributes = root.join(".gitattributes");
+        if attributes.exists() {
+            std::fs::remove_file(&attributes).unwrap();
+        }
+        let project = root.join("default.project.json");
+        let vfs = memofs::Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let session = crate::serve_session::ServeSession::new(vfs, &project).unwrap();
+        let tree = session.tree();
+        let terrain = tree
+            .inner()
+            .descendants()
+            .find(|instance| instance.class == "Terrain")
+            .unwrap()
+            .referent();
+        let properties = tree.get_instance(terrain).unwrap().properties().clone();
+        let updated = WeakDom::new(
+            InstanceBuilder::new("Terrain")
+                .with_properties(properties)
+                .with_child(InstanceBuilder::new("Clouds").with_property("Cover", 0.25_f32)),
+        );
+        let model = root.join("src/Terrain.rbxm");
+        let expected = crate::syncback::FsSnapshot::capture_file_contents(
+            &[
+                model.clone(),
+                root.join("src/Terrain.meta.json"),
+                root.join("src/Terrain.meta.jsonc"),
+            ],
+            session.vfs(),
+        )
+        .unwrap();
+        let staged = crate::syncback::syncback_model_file(
+            session.vfs(),
+            &tree,
+            session.root_project(),
+            terrain,
+            updated,
+        )
+        .unwrap();
+        crate::syncback::validate_write_targets(session.root_project(), &staged).unwrap();
+        staged
+            .write_model_file_to_vfs(&root, session.vfs(), &expected, &model)
+            .unwrap();
+        assert_terrain_model(&model);
+        let dom = rbx_binary::from_reader(std::fs::read(&model).unwrap().as_slice()).unwrap();
+        let clouds = dom
+            .descendants()
+            .find(|instance| instance.class == "Clouds")
+            .unwrap();
+        assert_eq!(
+            clouds.properties[&rbx_dom_weak::ustr("Cover")],
+            Variant::Float32(0.25)
+        );
+        assert!(std::fs::read_to_string(attributes)
+            .unwrap()
+            .contains("filter=lfs diff=lfs merge=lfs -text"));
+    }
+
+    #[test]
+    #[ignore = "Requires native.rbxm in ROJO_TERRAIN_TEST_DIR from a live Studio Terrain capture"]
+    fn native_terrain_syncback_build_and_lfs_round_trip() {
+        let fixture = std::path::PathBuf::from(
+            std::env::var_os("ROJO_TERRAIN_TEST_DIR")
+                .expect("Set ROJO_TERRAIN_TEST_DIR to the live Terrain fixture directory"),
+        );
+        let bytes = std::fs::read(fixture.join("native.rbxm")).unwrap();
+        let mut input = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        let terrain = input.root().children()[0];
+        assert_eq!(input.get_by_ref(terrain).unwrap().class.as_str(), "Terrain");
+        let properties = input.get_by_ref(terrain).unwrap().properties.clone();
+        assert!(properties.contains_key(&rbx_dom_weak::ustr("SmoothGrid")));
+        assert!(properties.contains_key(&rbx_dom_weak::ustr("MaterialColors")));
+        let child_count = input.get_by_ref(terrain).unwrap().children().len();
+        let workspace = input.insert(input.root_ref(), InstanceBuilder::new("Workspace"));
+        input.transfer_within(terrain, workspace);
+        let (_temp, root) = project_on_disk();
+        std::fs::create_dir(root.join("src/Workspace")).unwrap();
+        let project = root.join("default.project.json");
+        std::fs::write(&project, r#"{"name":"TerrainTest","tree":{"$className":"DataModel","Workspace":{"$className":"Workspace","$path":"src/Workspace"}},"syncbackRules":{"instancesAsDirectories":true}}"#).unwrap();
+        let vfs = memofs::Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let session = crate::serve_session::ServeSession::new(vfs, &project).unwrap();
+        let staged = crate::syncback::syncback_loop(
+            session.vfs(),
+            &mut session.tree(),
+            input,
+            session.root_project(),
+        )
+        .unwrap();
+        assert!(
+            !root.join(".gitattributes").exists(),
+            "Staging must not write attributes"
+        );
+        staged.write_to_vfs(&root, session.vfs()).unwrap();
+        let model = root.join("src/Workspace/Terrain.rbxm");
+        assert!(model.is_file());
+        let stored = rbx_binary::from_reader(std::fs::read(&model).unwrap().as_slice()).unwrap();
+        let stored_terrain = stored.get_by_ref(stored.root().children()[0]).unwrap();
+        for name in [
+            "SmoothGrid",
+            "Materials",
+            "MaterialColors",
+            "WaterColor",
+            "WaterReflectance",
+            "WaterTransparency",
+            "WaterWaveSize",
+            "WaterWaveSpeed",
+        ] {
+            let key = rbx_dom_weak::ustr(name);
+            if let Some(value) = properties.get(&key) {
+                assert!(
+                    stored_terrain.properties.get(&key) == Some(value),
+                    "Native Terrain property {name} changed on disk"
+                );
+            }
+        }
+        assert_eq!(stored_terrain.children().len(), child_count);
+        let attributes = std::fs::read_to_string(root.join(".gitattributes")).unwrap();
+        assert!(attributes.contains("src/Workspace/Terrain.rbxm"));
+        assert!(attributes.contains("filter=lfs diff=lfs merge=lfs -text"));
+        let built = root.join("rebuilt.rbxl");
+        crate::cli::BuildCommand {
+            project,
+            output: Some(built.clone()),
+            plugin: None,
+            jobs: std::num::NonZeroUsize::new(1),
+            watch: false,
+        }
+        .run()
+        .unwrap();
+        let rebuilt = rbx_binary::from_reader(std::fs::read(built).unwrap().as_slice()).unwrap();
+        let rebuilt_terrain = rebuilt
+            .descendants()
+            .find(|instance| instance.class == "Terrain")
+            .unwrap();
+        for name in [
+            "SmoothGrid",
+            "Materials",
+            "MaterialColors",
+            "WaterColor",
+            "WaterTransparency",
+            "WaterWaveSize",
+            "WaterWaveSpeed",
+        ] {
+            let key = rbx_dom_weak::ustr(name);
+            if let Some(value) = properties.get(&key) {
+                assert!(
+                    rebuilt_terrain.properties.get(&key) == Some(value),
+                    "Native Terrain property {name} changed on rebuild"
+                );
+            }
+        }
+        assert_eq!(rebuilt_terrain.children().len(), child_count);
     }
 
     #[test]
@@ -596,6 +944,35 @@ mod test {
         let root = tree.get_root_id();
         let holder = tree.get_instance(root).unwrap().children()[0];
         (tree, root, holder)
+    }
+
+    #[test]
+    fn terrain_layout_detection_works_without_explicit_model_rules() {
+        let rules = rules(&[]);
+        for middleware in [Middleware::Dir, Middleware::Rbxm] {
+            let tree = RojoTree::new(on_disk(
+                "root",
+                Middleware::Dir,
+                "/root",
+                vec![on_disk("Terrain", middleware, "/root/Terrain", vec![]).class_name("Terrain")],
+            ));
+            let root = tree.get_root_id();
+            let terrain = tree.get_instance(root).unwrap().children()[0];
+            let models = ModelTrees::find(&rules, tree.inner());
+            assert_eq!(models.middleware(terrain), Some(Middleware::Rbxm));
+            assert!(models.contains(root));
+            for as_directories in [false, true] {
+                let stale = stale_layouts(&rules, &tree, as_directories);
+                assert_eq!(
+                    stale,
+                    if middleware == Middleware::Dir {
+                        vec![terrain]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+        }
     }
 
     #[test]
