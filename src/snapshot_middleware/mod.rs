@@ -82,7 +82,18 @@ pub(crate) fn prepare_requires(
                 path_mappings: &require_context.path_mappings,
                 project_root: &require_context.project_root,
             };
-            match luaurc::resolve_requires_in_context(&original, &info, require_context.datamodel) {
+            let package_dependencies = snapshot
+                .metadata
+                .context
+                .package_mount
+                .as_ref()
+                .and_then(|(_, installed)| installed.parent());
+            match luaurc::resolve_requires_with_package_dependencies(
+                &original,
+                &info,
+                require_context.datamodel,
+                package_dependencies,
+            ) {
                 Ok(emitted) if emitted != original => {
                     *source = emitted.clone();
                     snapshot.metadata.source_transform =

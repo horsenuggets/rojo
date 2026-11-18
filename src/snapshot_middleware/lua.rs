@@ -96,7 +96,16 @@ fn snapshot_lua_source(
             project_root: &req_ctx.project_root,
         };
 
-        match luaurc::resolve_requires_in_context(&contents, &info, req_ctx.datamodel) {
+        let package_dependencies = context
+            .package_mount
+            .as_ref()
+            .and_then(|(_, installed)| installed.parent());
+        match luaurc::resolve_requires_with_package_dependencies(
+            &contents,
+            &info,
+            req_ctx.datamodel,
+            package_dependencies,
+        ) {
             Ok(resolved) => resolved,
             Err(err) => {
                 log::warn!("Failed to resolve requires in {}: {}", path.display(), err);

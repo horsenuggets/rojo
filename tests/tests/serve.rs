@@ -207,9 +207,14 @@ fn package_sources_serve_preserves_stale_source_edits_without_restoring_studio()
 #[test]
 fn package_sources_serve_reverses_generated_imports_and_rejects_ambiguous_edits() {
     use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
-    let original = "local Child = require('@packages/_Index/scope_foo@local/foo/Source/Foo/Child')\nreturn Child + 1\n";
+    let original = "local Child = require('@children/Child')\nreturn Child + 1\n";
     let mut session = TestServeSession::with_setup("add_folder", |root| {
         fixture::setup(root);
+        fs::write(
+            root.join(".luaurc"),
+            r#"{"aliases":{"packages":"Packages","shared":"Source/Shared","children":"Source/ForkedPackages/foo/Source/Foo"}}"#,
+        )
+        .unwrap();
         fs::write(root.join(fixture::ORIGINAL), original).unwrap();
     });
     let info = session.wait_to_come_online();

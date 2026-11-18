@@ -82,6 +82,15 @@ pub fn resolve_requires_in_context(
     info: &ResolveInfo,
     datamodel: bool,
 ) -> anyhow::Result<String> {
+    resolve_requires_with_package_dependencies(source, info, datamodel, None)
+}
+
+pub(crate) fn resolve_requires_with_package_dependencies(
+    source: &str,
+    info: &ResolveInfo,
+    datamodel: bool,
+    package_dependencies: Option<&Path>,
+) -> anyhow::Result<String> {
     let file_dir = info
         .file_path
         .parent()
@@ -89,16 +98,31 @@ pub fn resolve_requires_in_context(
 
     let luaurc = find_luaurc(info.vfs, file_dir)?;
 
-    let aliases = match &luaurc {
-        Some((aliases, _)) => aliases,
-        None => return Ok(source.to_string()),
-    };
+    let mut aliases = luaurc
+        .as_ref()
+        .map(|(aliases, _)| aliases.clone())
+        .unwrap_or_default();
+    if let Some(directory) = package_dependencies {
+        // Package ownership changes only this namespace. Other authored aliases
+        // still resolve from the original source configuration, not its stale copy.
+        aliases.retain(|name, _| !name.eq_ignore_ascii_case("packages"));
+        aliases.insert(
+            "packages".into(),
+            directory
+                .to_str()
+                .context("Non-UTF8 package dependency directory")?
+                .to_owned(),
+        );
+    }
 
     if aliases.is_empty() {
         return Ok(source.to_string());
     }
 
-    let luaurc_dir = luaurc.as_ref().unwrap().1.as_path();
+    let luaurc_dir = luaurc
+        .as_ref()
+        .map(|(_, directory)| directory.as_path())
+        .unwrap_or(info.project_root);
 
     // Quick check: skip parsing if no custom alias strings present
     // (alias names match without regard to case, so the check does too)
@@ -123,7 +147,7 @@ pub fn resolve_requires_in_context(
     let replacements = find_require_replacements(
         source,
         file_dir,
-        aliases,
+        &aliases,
         luaurc_dir,
         info.path_mappings,
         info.project_root,
@@ -745,6 +769,56 @@ fn resolve_alias_require(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn package_dependency_aliases_work_without_authored_config_in_places_and_models() {
+        let vfs = Vfs::new(memofs::InMemoryFs::new());
+        let mappings = vec![
+            (
+                PathBuf::from("Source/Foo"),
+                vec![
+                    "ReplicatedStorage".into(),
+                    "Packages".into(),
+                    "_Index".into(),
+                    "Foo".into(),
+                    "foo".into(),
+                ],
+            ),
+            (
+                PathBuf::from("Packages/_Index/Foo"),
+                vec![
+                    "ReplicatedStorage".into(),
+                    "Packages".into(),
+                    "_Index".into(),
+                    "Foo".into(),
+                ],
+            ),
+        ];
+        let info = ResolveInfo {
+            file_path: Path::new("/project/Source/Foo/init.luau"),
+            vfs: &vfs,
+            path_mappings: &mappings,
+            project_root: Path::new("/project"),
+        };
+        for (datamodel, expected) in [
+            (false, "return require(\"./Util\")"),
+            (
+                true,
+                "return require(\"@game/ReplicatedStorage/Packages/_Index/Foo/Util\")",
+            ),
+        ] {
+            assert_eq!(
+                resolve_requires_with_package_dependencies(
+                    "return require('@PaCkAgEs/Util')",
+                    &info,
+                    datamodel,
+                    Some(Path::new("/project/Packages/_Index/Foo")),
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn source_round_trip_restores_only_proven_import_tokens() {

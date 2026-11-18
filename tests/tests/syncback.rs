@@ -112,6 +112,162 @@ fn package_sources_cli_build_sourcemap_and_round_trip() {
 }
 
 #[test]
+fn package_sources_private_aliases_do_not_use_the_consumers_namespace() {
+    use crate::rojo_test::package_sources::{self as fixture, ORIGINAL};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fixture::setup(&root);
+    let authored = "local dependency = require(\"@packages/Util\")\nlocal helper = require(\"@shared/Util\")\nreturn dependency, helper, 1\n";
+    fs::write(root.join(ORIGINAL), authored).unwrap();
+    let manifest_path = "Source/ForkedPackages/foo/wally.toml";
+    fs::write(
+        root.join(manifest_path),
+        "[package]\nname = \"scope/foo\"\nrealm = \"shared\"\n[dependencies]\nUtil = \"scope/private@1.0.0\"\n",
+    )
+    .unwrap();
+    let root_manifest = root.join("wally.toml");
+    fs::write(
+        &root_manifest,
+        format!(
+            "{}Util = \"scope/registry@1.2.3\"\n",
+            fs::read_to_string(&root_manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    for (path, contents) in [
+        (
+            ".luaurc",
+            r#"{"aliases":{"Packages":"Packages","shared":"Source/Shared"}}"#,
+        ),
+        (
+            "Packages/Util.luau",
+            "return require(\"./_Index/scope_registry@1.2.3/registry\")\n",
+        ),
+        (
+            "Packages/_Index/scope_foo@local/Util.luau",
+            "return require(\"../scope_private@1.0.0/private\")\n",
+        ),
+        (
+            "Packages/_Index/scope_foo@local/.luaurc",
+            r#"{"aliases":{"packages":"./"}}"#,
+        ),
+        (
+            "Packages/_Index/scope_private@1.0.0/private/init.luau",
+            "return 99\n",
+        ),
+        ("Source/App.luau", "return require(\"@packages/Util\")\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    let metadata_path = root.join("wally.install.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    metadata["manifest_hash"] = serde_json::json!(format!(
+        "{:x}",
+        Sha256::digest(fs::read(&root_manifest).unwrap())
+    ));
+    metadata["local_manifests"][manifest_path] = serde_json::json!(format!(
+        "{:x}",
+        Sha256::digest(fs::read(root.join(manifest_path)).unwrap())
+    ));
+    metadata["package_roots"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name":"scope/private", "kind":"registry", "realm":"shared",
+            "install_path":"Packages/_Index/scope_private@1.0.0/private", "package_version":"1.0.0"
+        }));
+    metadata["generated_paths"].as_array_mut().unwrap().extend(
+        [
+            "Packages/Util.luau",
+            "Packages/_Index/scope_foo@local/Util.luau",
+            "Packages/_Index/scope_foo@local/.luaurc",
+        ]
+        .into_iter()
+        .map(serde_json::Value::from),
+    );
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    let output = temp.path().join("input.rbxl");
+    let result = Command::new(ROJO_PATH)
+        .arg("build")
+        .arg(&root)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut dom = rbx_binary::from_reader(fs::File::open(&output).unwrap()).unwrap();
+    let local = dom
+        .descendants()
+        .find(|instance| instance.name == "foo")
+        .unwrap()
+        .referent();
+    let app = dom
+        .descendants()
+        .find(|instance| instance.name == "App")
+        .unwrap();
+    assert_eq!(
+        app.properties[&ustr("Source")],
+        Variant::String("return require(\"@game/ReplicatedStorage/Packages/Util\")\n".into())
+    );
+    let Variant::String(emitted) = &dom.get_by_ref(local).unwrap().properties[&ustr("Source")]
+    else {
+        panic!("Missing source")
+    };
+    assert!(
+        emitted.contains("@game/ReplicatedStorage/Packages/_Index/scope_foo@local/Util"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("@game/ReplicatedStorage/Shared/Util"),
+        "{emitted}"
+    );
+    let edited = emitted.replace("helper, 1", "helper, 2");
+    dom.get_by_ref_mut(local)
+        .unwrap()
+        .properties
+        .insert(ustr("Source"), Variant::String(edited));
+    let before = fixture::files(&root);
+    rbx_binary::to_writer(
+        fs::File::create(&output).unwrap(),
+        &dom,
+        dom.root().children(),
+    )
+    .unwrap();
+    let result = Command::new(ROJO_PATH)
+        .arg("syncback")
+        .arg(&root)
+        .arg("--input")
+        .arg(&output)
+        .arg("--non-interactive")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut expected = before;
+    expected.insert(
+        ORIGINAL.into(),
+        authored.replace("helper, 1", "helper, 2").into_bytes(),
+    );
+    assert_eq!(fixture::files(&root), expected);
+}
+
+#[test]
 fn package_sources_cli_registry_and_generated_differences_are_warning_only() {
     use crate::rojo_test::package_sources as fixture;
     use std::fs;

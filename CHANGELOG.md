@@ -43,6 +43,8 @@ Making a new release? Simply add the new header with the version and date undern
   ownership evidence, source-generation checks, and canonical ancestor validation.
 * Kept live properties and ownership metadata intact while serializing package batches,
   and reported whole-tree source conflicts as unsaved writes rather than empty success.
+* Resolved local package dependency aliases through each installed package's own shims,
+  preserving other original-source aliases and reversing imports during syncback.
 * Normalized provenance and test comparison keys across Windows, Linux, and macOS.
 * Added interruption, ownership-change, source-conflict, and package round-trip coverage.
 
