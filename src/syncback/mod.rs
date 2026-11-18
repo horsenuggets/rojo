@@ -280,6 +280,7 @@ fn syncback_scoped(
         }
         output.retarget_added_file(&json_path, &jsonc_path);
     }
+    output.guard_packages(vfs, old_inst.metadata().context.package_sources.as_deref());
     Ok(output)
 }
 
@@ -329,12 +330,60 @@ pub fn source_file(instance: &InstanceWithMeta) -> Option<PathBuf> {
     }
 }
 
+/// Package edits never use Studio authority to overwrite an unseen source edit.
+/// Return a warning before catch-up can publish a restoration to Studio.
+pub(crate) fn package_source_conflict(vfs: &Vfs, tree: &RojoTree, id: Ref) -> anyhow::Result<bool> {
+    let Some(instance) = tree.get_instance(id) else {
+        return Ok(false);
+    };
+    for (path, expected) in &instance.metadata().package_file_contents {
+        let current = vfs.read(path).with_not_found()?;
+        let baseline = expected
+            .as_ref()
+            .map(|bytes| Variant::BinaryString(bytes.clone().into()));
+        let filesystem = current.map(|bytes| Variant::BinaryString(bytes.to_vec().into()));
+        if decide_property_write(baseline.as_ref(), filesystem.as_ref(), baseline.as_ref())
+            == PropertyWriteDecision::RestoreFilesystem
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn syncback_loop(
     vfs: &Vfs,
     old_tree: &mut RojoTree,
     mut new_tree: WeakDom,
     project: &Project,
 ) -> anyhow::Result<FsSnapshot> {
+    let package_paths: Vec<_> = old_tree
+        .inner()
+        .descendants()
+        .filter_map(|instance| {
+            let instance = old_tree.get_instance(instance.referent())?;
+            let packages = instance.metadata().context.package_sources.as_ref()?;
+            Some(
+                instance
+                    .metadata()
+                    .relevant_paths
+                    .iter()
+                    .filter(|path| packages.is_local_source(path))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect();
+    for instance in old_tree.inner().descendants() {
+        if package_source_conflict(vfs, old_tree, instance.referent())? {
+            anyhow::bail!(
+                "Package source changed concurrently for {}. Preserving filesystem and Studio edits without writing the batch",
+                instance.referent()
+            );
+        }
+    }
+    let package_expected = FsSnapshot::capture_file_contents(&package_paths, vfs)?;
     let ignore_patterns = project
         .syncback_rules
         .as_ref()
@@ -541,6 +590,16 @@ pub fn syncback_loop(
         }
     }
 
+    fs_snapshot.guard_packages(
+        vfs,
+        old_tree
+            .root()
+            .metadata()
+            .context
+            .package_sources
+            .as_deref(),
+    );
+    fs_snapshot.package_expected = package_expected;
     Ok(fs_snapshot)
 }
 
@@ -549,14 +608,82 @@ pub fn syncback_loop(
 /// when the project's rules leave the instance out, or a model file already
 /// holds exactly this subtree. Instances in `relayout` are always rewritten.
 fn syncback_snapshot<'sync>(
-    snapshot: SyncbackSnapshot<'sync>,
+    mut snapshot: SyncbackSnapshot<'sync>,
     ignore_patterns: &Option<Vec<IgnorableGlob>>,
     project: &Project,
     relayout: &HashSet<Ref>,
     fs_snapshot: &mut FsSnapshot,
     file_owners: &mut HashMap<PathBuf, Ref>,
 ) -> anyhow::Result<Option<(Vec<SyncbackSnapshot<'sync>>, PathBuf)>> {
+    if let Some(old) = snapshot
+        .old_inst()
+        .filter(|old| old.metadata().context.package_mount.is_some())
+    {
+        let metadata = old.metadata();
+        let physical = if get_best_middleware(&snapshot) == Middleware::Project {
+            metadata
+                .relevant_paths
+                .iter()
+                .rev()
+                .find(|path| Project::is_project_file(path))
+        } else {
+            metadata.relevant_paths.first()
+        };
+        if let Some(physical) = physical {
+            snapshot.path = physical.clone();
+        }
+    }
     let inst_path = snapshot.get_new_inst_path(snapshot.new);
+    if let Some(packages) = snapshot
+        .data
+        .old_tree
+        .root()
+        .metadata()
+        .context
+        .package_sources
+        .as_ref()
+    {
+        let old = snapshot.old_inst();
+        let reason = old
+            .as_ref()
+            .and_then(|old| {
+                old.metadata()
+                    .relevant_paths
+                    .iter()
+                    .find_map(|path| packages.read_only_node(snapshot.vfs(), path))
+            })
+            .or_else(|| {
+                if old.is_none() {
+                    packages.blocked(snapshot.vfs(), &snapshot.path, false)
+                } else {
+                    None
+                }
+            });
+        let reason = reason.or_else(|| {
+            if !is_model_file(get_best_middleware(&snapshot)) {
+                return None;
+            }
+            let old = old.as_ref()?;
+            snapshot
+                .data
+                .old_tree
+                .descendants(old.id())
+                .find_map(|instance| {
+                    if instance.metadata().is_package_mount_root() {
+                        return Some("A model file cannot absorb a Wally package mount".into());
+                    }
+                    instance
+                        .metadata()
+                        .relevant_paths
+                        .iter()
+                        .find_map(|path| packages.read_only_node(snapshot.vfs(), path))
+                })
+        });
+        if let Some(reason) = reason {
+            log::warn!("Skipping Studio package difference at {inst_path}. {reason}. Files and Studio were left unchanged");
+            return Ok(None);
+        }
+    }
     let project_path = project.folder_location();
     let mut written_path = snapshot.path.clone();
     {
@@ -678,6 +805,10 @@ fn syncback_snapshot<'sync>(
                 syncback.removed_children.len()
             );
             'remove: for inst in &syncback.removed_children {
+                if inst.metadata().is_package_mount_root() {
+                    log::warn!("Skipping removed local package mount {}. Its ownership is declared by wally.toml and no source files were removed", inst.name());
+                    continue;
+                }
                 // Instances stored inside a parent's metadata have no files of
                 // their own and disappear when that metadata is rewritten.
                 let Some(source) = inst.metadata().instigating_source.as_ref() else {
@@ -1058,6 +1189,97 @@ mod test {
     use super::*;
     use crate::snapshot::{InstanceMetadata, InstanceSnapshot};
     use rbx_dom_weak::{types::Attributes, UstrMap};
+
+    #[test]
+    fn whole_tree_package_conflicts_return_errors_without_saving_any_edit() {
+        for changed in ["Target", "Sibling"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let vfs = Vfs::new_default().unwrap();
+            vfs.set_watch_enabled(false);
+            fs_err::create_dir(root.join("Source")).unwrap();
+            let project_path = root.join("default.project.json");
+            vfs.write(
+                &project_path,
+                r#"{"name":"Test","tree":{"$path":"Source"}}"#,
+            )
+            .unwrap();
+            let project = Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+            let baseline = "return 'baseline'\n";
+            let filesystem = "return 'filesystem'\n";
+            let mut children = Vec::new();
+            for name in ["Target", "Sibling"] {
+                let path = root.join(format!("Source/{name}.luau"));
+                vfs.write(&path, baseline).unwrap();
+                let mut metadata = InstanceMetadata::new();
+                metadata
+                    .package_file_contents
+                    .insert(path, Some(baseline.as_bytes().to_vec()));
+                children.push(
+                    InstanceSnapshot::new()
+                        .name(name)
+                        .class_name("ModuleScript")
+                        .properties(UstrMap::from_iter([(
+                            ustr("Source"),
+                            Variant::String(baseline.into()),
+                        )]))
+                        .metadata(metadata),
+                );
+            }
+            let mut tree = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("Test")
+                    .class_name("Folder")
+                    .children(children),
+            );
+            let target = tree.root().children()[0];
+            vfs.write(root.join(format!("Source/{changed}.luau")), filesystem)
+                .unwrap();
+            assert_eq!(
+                package_source_conflict(&vfs, &tree, target).unwrap(),
+                changed == "Target"
+            );
+            let edited = WeakDom::new(
+                rbx_dom_weak::InstanceBuilder::new("Folder")
+                    .with_name("Test")
+                    .with_child(
+                        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+                            .with_name("Target")
+                            .with_property("Source", "return 'studio'\n"),
+                    )
+                    .with_child(
+                        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+                            .with_name("Sibling")
+                            .with_property("Source", baseline),
+                    ),
+            );
+
+            let error = syncback_loop(&vfs, &mut tree, edited, &project)
+                .err()
+                .expect("A rejected batch must not be acknowledged as an empty success");
+
+            assert!(error
+                .to_string()
+                .contains("Package source changed concurrently"));
+            for name in ["Target", "Sibling"] {
+                assert_eq!(
+                    fs_err::read_to_string(root.join(format!("Source/{name}.luau"))).unwrap(),
+                    if name == changed {
+                        filesystem
+                    } else {
+                        baseline
+                    }
+                );
+            }
+            for instance in tree.inner().descendants().skip(1) {
+                assert_eq!(
+                    instance.properties.get(&ustr("Source")),
+                    Some(&Variant::String(baseline.into()))
+                );
+            }
+            assert!(!root.join(".rojo").exists());
+        }
+    }
 
     #[test]
     fn scoped_script_writes_reject_suffix_changes_without_touching_disk() {

@@ -58,6 +58,58 @@ pub use self::{
     util::PathExt,
 };
 
+pub(crate) fn prepare_requires(
+    snapshot: &mut InstanceSnapshot,
+    vfs: &Vfs,
+    require_context: &std::sync::Arc<crate::snapshot::RequireContext>,
+) -> anyhow::Result<()> {
+    use rbx_dom_weak::{types::Variant, ustr};
+    // Preserve middleware boundaries. Model-file descendants intentionally have
+    // no inherited filesystem context; adding one would produce false disk conflicts.
+    if snapshot.metadata.context.reserved_cache_path().is_some() {
+        snapshot.metadata.context.require_context = Some(require_context.clone());
+    }
+    // Model payloads are not filesystem Luau source and retain their native imports.
+    if let Some(Variant::String(source)) = snapshot.properties.get_mut(&ustr("Source")) {
+        if let Some(path) = snapshot.metadata.relevant_paths.iter().find(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == "luau" || ext == "lua")
+        }) {
+            let original = source.clone();
+            let info = luaurc::ResolveInfo {
+                file_path: path,
+                vfs,
+                path_mappings: &require_context.path_mappings,
+                project_root: &require_context.project_root,
+            };
+            let package_dependencies = snapshot
+                .metadata
+                .context
+                .package_mount
+                .as_ref()
+                .and_then(|(_, installed)| installed.parent());
+            match luaurc::resolve_requires_with_package_dependencies(
+                &original,
+                &info,
+                require_context.datamodel,
+                package_dependencies,
+            ) {
+                Ok(emitted) if emitted != original => {
+                    *source = emitted.clone();
+                    snapshot.metadata.source_transform =
+                        Some(crate::snapshot::SourceTransform { original, emitted });
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("Cannot resolve imports in {}. {error:#}", path.display()),
+            }
+        }
+    }
+    for child in &mut snapshot.children {
+        prepare_requires(child, vfs, require_context)?;
+    }
+    Ok(())
+}
+
 /// Snapshots `path` without the children that are stored in their own files.
 /// Directories keep children written into their metadata. The result must be
 /// compared with `compute_shallow_patch_set`, which doesn't treat the children
@@ -95,6 +147,34 @@ pub fn snapshot_from_vfs(
     vfs: &Vfs,
     path: &Path,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
+    if let Some((source, _)) = &context.package_mount {
+        crate::package_sources::contained(vfs, source, path)?;
+    }
+    if let Some(packages) = &context.package_sources {
+        if path == packages.root.join("wally.install.json") {
+            return Ok(None);
+        }
+        if let Some(package) = packages.local_mount(path) {
+            packages.check_generation(vfs)?;
+            let source = packages.root.join(package.source_path.as_ref().unwrap());
+            let installed = packages.root.join(&package.install_path);
+            let physical = packages.original_path(&crate::package_sources::normalize(path));
+            let mut mounted = context.clone();
+            mounted.package_mount = Some((source.clone(), installed.clone()));
+            let mut snapshot = snapshot_from_vfs(&mounted, vfs, &physical)?;
+            if let Some(snapshot) = &mut snapshot {
+                if physical == source {
+                    snapshot.name = installed
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                        .into();
+                }
+            }
+            return Ok(snapshot);
+        }
+    }
     if context.reserved_cache_path().is_some() {
         // Unambiguous cache descendants must be rejected even when probing below a
         // file would fail. Parent components can instead lead back out of the cache.
@@ -394,6 +474,54 @@ impl Middleware {
         };
         if let Ok(Some(ref mut snapshot)) = output {
             snapshot.metadata.middleware = Some(*self);
+            if let Some((source, installed)) = &context.package_mount {
+                if path == source
+                    || (*self == Middleware::Project
+                        && path.parent() == Some(source.as_path())
+                        && path.file_name().is_some_and(|name| {
+                            crate::project::DEFAULT_PROJECT_NAMES
+                                .iter()
+                                .any(|default| name == *default)
+                        }))
+                {
+                    snapshot.name = installed
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                        .into();
+                    // The entrypoint may redirect below the package root. Retain the
+                    // mount directory so cache events refresh this instance instead
+                    // of being mistaken for a newly discovered sibling.
+                    if !snapshot.metadata.relevant_paths.contains(source) {
+                        snapshot.metadata.relevant_paths.push(source.clone());
+                    }
+                }
+                for path in &snapshot.metadata.relevant_paths {
+                    crate::package_sources::contained(vfs, source, path)?;
+                    if !vfs
+                        .metadata(path)
+                        .with_not_found()?
+                        .is_some_and(|metadata| metadata.is_dir())
+                    {
+                        let contents = vfs.read(path).with_not_found()?.map(|bytes| bytes.to_vec());
+                        snapshot
+                            .metadata
+                            .package_file_contents
+                            .insert(path.clone(), contents);
+                    }
+                }
+                snapshot.metadata.installed_paths = snapshot
+                    .metadata
+                    .relevant_paths
+                    .iter()
+                    .filter_map(|path| {
+                        path.strip_prefix(source)
+                            .ok()
+                            .map(|suffix| installed.join(suffix))
+                    })
+                    .collect();
+            }
         }
         output
     }

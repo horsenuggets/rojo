@@ -255,10 +255,9 @@ impl ApiService {
             }
         };
 
-        let message_queue = self.serve_session.message_queue();
-        let message_cursor = message_queue.cursor();
-
+        // Writers retain the tree lock until publishing the matching queue revision.
         let tree = self.serve_session.tree();
+        let message_cursor = self.serve_session.message_queue().cursor();
 
         let mut instances = HashMap::new();
 

@@ -8,6 +8,501 @@ use crate::rojo_test::{
     syncback_util::{run_syncback_test, snapshot_rbxm},
 };
 
+#[test]
+fn package_sources_cli_build_sourcemap_and_round_trip() {
+    use crate::rojo_test::package_sources::{self as fixture, ORIGINAL};
+    use std::fs;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fixture::setup(&root);
+    let output = temp.path().join("input.rbxl");
+    let build = || {
+        let result = Command::new(ROJO_PATH)
+            .arg("build")
+            .arg(&root)
+            .arg("--output")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        rbx_binary::from_reader(fs::File::open(&output).unwrap()).unwrap()
+    };
+    let mut dom = build();
+    let local = dom
+        .descendants()
+        .find(|inst| inst.name == "foo")
+        .unwrap()
+        .referent();
+    assert_eq!(
+        dom.get_by_ref(local).unwrap().properties[&ustr("Source")],
+        Variant::String("return { Value = 1 }\n".into())
+    );
+    let app = dom.descendants().find(|inst| inst.name == "App").unwrap();
+    assert!(
+        matches!(&app.properties[&ustr("Source")], Variant::String(source) if source.contains("@game/ReplicatedStorage/Shared/Util"))
+    );
+    assert!(!dom.descendants().any(|inst| inst.name == "ForkedPackages"));
+    let map = Command::new(ROJO_PATH)
+        .arg("sourcemap")
+        .arg(&root)
+        .arg("--include-non-scripts")
+        .output()
+        .unwrap();
+    assert!(
+        map.status.success(),
+        "{}",
+        String::from_utf8_lossy(&map.stderr)
+    );
+    let map: serde_json::Value = serde_json::from_slice(&map.stdout).unwrap();
+    fn local_node(value: &serde_json::Value) -> Option<&serde_json::Value> {
+        if value["name"] == "foo" {
+            return Some(value);
+        }
+        value["children"].as_array()?.iter().find_map(local_node)
+    }
+    let paths = local_node(&map).unwrap()["filePaths"].as_array().unwrap();
+    assert_eq!(paths[0], ORIGINAL);
+    assert!(paths.iter().any(|path| path
+        .as_str()
+        .unwrap()
+        .contains("Packages/_Index/scope_foo@local/foo/Source/Foo/init.luau")));
+    // A normal source edit is authoritative without changing any manifest hash.
+    fs::write(root.join(ORIGINAL), "return { Value = 2 }\n").unwrap();
+    dom = build();
+    let local = dom
+        .descendants()
+        .find(|inst| inst.name == "foo")
+        .unwrap()
+        .referent();
+    assert_eq!(
+        dom.get_by_ref(local).unwrap().properties[&ustr("Source")],
+        Variant::String("return { Value = 2 }\n".into())
+    );
+    let before = fixture::files(&root);
+    dom.get_by_ref_mut(local).unwrap().properties.insert(
+        ustr("Source"),
+        Variant::String("return { Value = 3 }\n".into()),
+    );
+    rbx_binary::to_writer(
+        fs::File::create(&output).unwrap(),
+        &dom,
+        dom.root().children(),
+    )
+    .unwrap();
+    let result = Command::new(ROJO_PATH)
+        .arg("syncback")
+        .arg(&root)
+        .arg("--input")
+        .arg(&output)
+        .arg("--non-interactive")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut expected = before;
+    expected.insert(ORIGINAL.into(), b"return { Value = 3 }\n".to_vec());
+    assert_eq!(fixture::files(&root), expected);
+}
+
+#[test]
+fn package_sources_private_aliases_do_not_use_the_consumers_namespace() {
+    use crate::rojo_test::package_sources::{self as fixture, ORIGINAL};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fixture::setup(&root);
+    let authored = "local dependency = require(\"@packages/Util\")\nlocal helper = require(\"@shared/Util\")\nreturn dependency, helper, 1\n";
+    fs::write(root.join(ORIGINAL), authored).unwrap();
+    let manifest_path = "Source/ForkedPackages/foo/wally.toml";
+    fs::write(
+        root.join(manifest_path),
+        "[package]\nname = \"scope/foo\"\nrealm = \"shared\"\n[dependencies]\nUtil = \"scope/private@1.0.0\"\n",
+    )
+    .unwrap();
+    let root_manifest = root.join("wally.toml");
+    fs::write(
+        &root_manifest,
+        format!(
+            "{}Util = \"scope/registry@1.2.3\"\n",
+            fs::read_to_string(&root_manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    for (path, contents) in [
+        (
+            ".luaurc",
+            r#"{"aliases":{"Packages":"Packages","shared":"Source/Shared"}}"#,
+        ),
+        (
+            "Packages/Util.luau",
+            "return require(\"./_Index/scope_registry@1.2.3/registry\")\n",
+        ),
+        (
+            "Packages/_Index/scope_foo@local/Util.luau",
+            "return require(\"../scope_private@1.0.0/private\")\n",
+        ),
+        (
+            "Packages/_Index/scope_foo@local/.luaurc",
+            r#"{"aliases":{"packages":"./"}}"#,
+        ),
+        (
+            "Packages/_Index/scope_private@1.0.0/private/init.luau",
+            "return 99\n",
+        ),
+        ("Source/App.luau", "return require(\"@packages/Util\")\n"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    let metadata_path = root.join("wally.install.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    metadata["manifest_hash"] = serde_json::json!(format!(
+        "{:x}",
+        Sha256::digest(fs::read(&root_manifest).unwrap())
+    ));
+    metadata["local_manifests"][manifest_path] = serde_json::json!(format!(
+        "{:x}",
+        Sha256::digest(fs::read(root.join(manifest_path)).unwrap())
+    ));
+    metadata["package_roots"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name":"scope/private", "kind":"registry", "realm":"shared",
+            "install_path":"Packages/_Index/scope_private@1.0.0/private", "package_version":"1.0.0"
+        }));
+    metadata["generated_paths"].as_array_mut().unwrap().extend(
+        [
+            "Packages/Util.luau",
+            "Packages/_Index/scope_foo@local/Util.luau",
+            "Packages/_Index/scope_foo@local/.luaurc",
+        ]
+        .into_iter()
+        .map(serde_json::Value::from),
+    );
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    let output = temp.path().join("input.rbxl");
+    let result = Command::new(ROJO_PATH)
+        .arg("build")
+        .arg(&root)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut dom = rbx_binary::from_reader(fs::File::open(&output).unwrap()).unwrap();
+    let local = dom
+        .descendants()
+        .find(|instance| instance.name == "foo")
+        .unwrap()
+        .referent();
+    let app = dom
+        .descendants()
+        .find(|instance| instance.name == "App")
+        .unwrap();
+    assert_eq!(
+        app.properties[&ustr("Source")],
+        Variant::String("return require(\"@game/ReplicatedStorage/Packages/Util\")\n".into())
+    );
+    let Variant::String(emitted) = &dom.get_by_ref(local).unwrap().properties[&ustr("Source")]
+    else {
+        panic!("Missing source")
+    };
+    assert!(
+        emitted.contains("@game/ReplicatedStorage/Packages/_Index/scope_foo@local/Util"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("@game/ReplicatedStorage/Shared/Util"),
+        "{emitted}"
+    );
+    let edited = emitted.replace("helper, 1", "helper, 2");
+    dom.get_by_ref_mut(local)
+        .unwrap()
+        .properties
+        .insert(ustr("Source"), Variant::String(edited));
+    let before = fixture::files(&root);
+    rbx_binary::to_writer(
+        fs::File::create(&output).unwrap(),
+        &dom,
+        dom.root().children(),
+    )
+    .unwrap();
+    let result = Command::new(ROJO_PATH)
+        .arg("syncback")
+        .arg(&root)
+        .arg("--input")
+        .arg(&output)
+        .arg("--non-interactive")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut expected = before;
+    expected.insert(
+        ORIGINAL.into(),
+        authored.replace("helper, 1", "helper, 2").into_bytes(),
+    );
+    assert_eq!(fixture::files(&root), expected);
+}
+
+#[test]
+fn package_sources_cli_registry_and_generated_differences_are_warning_only() {
+    use crate::rojo_test::package_sources as fixture;
+    use std::fs;
+    for (target, mutation) in ["registry", "Foo"]
+        .into_iter()
+        .flat_map(|target| ["source", "rename", "delete"].map(move |mutation| (target, mutation)))
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fixture::setup(&root);
+        let output = temp.path().join("input.rbxl");
+        assert!(Command::new(ROJO_PATH)
+            .arg("build")
+            .arg(&root)
+            .arg("--output")
+            .arg(&output)
+            .status()
+            .unwrap()
+            .success());
+        let mut dom = rbx_binary::from_reader(fs::File::open(&output).unwrap()).unwrap();
+        let id = dom
+            .descendants()
+            .find(|inst| inst.name == target)
+            .unwrap()
+            .referent();
+        match mutation {
+            "source" => {
+                dom.get_by_ref_mut(id).unwrap().properties.insert(
+                    ustr("Source"),
+                    Variant::String("return 'Studio difference'\n".into()),
+                );
+            }
+            "rename" => dom.get_by_ref_mut(id).unwrap().name = "Renamed".into(),
+            "delete" => dom.destroy(id),
+            _ => unreachable!(),
+        }
+        rbx_binary::to_writer(
+            fs::File::create(&output).unwrap(),
+            &dom,
+            dom.root().children(),
+        )
+        .unwrap();
+        let before = fixture::files(&root);
+        let result = Command::new(ROJO_PATH)
+            .arg("syncback")
+            .arg(&root)
+            .arg("--input")
+            .arg(&output)
+            .arg("--non-interactive")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("read-only"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(fixture::files(&root), before);
+    }
+}
+
+#[test]
+fn package_sources_cli_invalid_or_absent_provenance_fails_closed() {
+    use crate::rojo_test::package_sources as fixture;
+    use std::fs;
+    for case in fixture::INVALID_INSTALL_CASES {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fixture::setup(&root);
+        fixture::invalidate(&root, case);
+        let output = temp.path().join("input.rbxl");
+        let result = Command::new(ROJO_PATH)
+            .arg("build")
+            .arg(&root)
+            .arg("--output")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{case} {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut dom = rbx_binary::from_reader(fs::File::open(&output).unwrap()).unwrap();
+        let id = dom
+            .descendants()
+            .find(|inst| inst.name == "registry")
+            .unwrap()
+            .referent();
+        dom.get_by_ref_mut(id)
+            .unwrap()
+            .properties
+            .insert(ustr("Source"), Variant::String("return 'changed'\n".into()));
+        rbx_binary::to_writer(
+            fs::File::create(&output).unwrap(),
+            &dom,
+            dom.root().children(),
+        )
+        .unwrap();
+        let before = fixture::files(&root);
+        let result = Command::new(ROJO_PATH)
+            .arg("syncback")
+            .arg(&root)
+            .arg("--input")
+            .arg(&output)
+            .arg("--non-interactive")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{case} {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("wally.install.json"));
+        assert_eq!(fixture::files(&root), before, "{case}");
+    }
+}
+
+#[test]
+fn package_sources_reject_duplicate_original_or_installed_module_mounts() {
+    use crate::rojo_test::package_sources as fixture;
+    use std::fs;
+    for path in [
+        "Source/ForkedPackages/foo/Source/Foo/Child.luau",
+        "Packages/_Index/scope_foo@local/foo/Source/Foo/Child.luau",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fixture::setup(&root);
+        let project = root.join("place.project.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&project).unwrap()).unwrap();
+        value["tree"]["ReplicatedStorage"]["Duplicate"] = serde_json::json!({"$path":path});
+        fs::write(project, serde_json::to_vec(&value).unwrap()).unwrap();
+        let before = fixture::files(&root);
+        let result = Command::new(ROJO_PATH)
+            .arg("build")
+            .arg(&root)
+            .arg("--output")
+            .arg(temp.path().join("output.rbxl"))
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("mounted more than once"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(fixture::files(&root), before);
+    }
+}
+
+#[test]
+fn package_sources_cli_additions_and_renames_leave_installed_outputs_untouched() {
+    use crate::rojo_test::package_sources as fixture;
+    use std::fs;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fixture::setup(&root);
+    let output = temp.path().join("input.rbxl");
+    assert!(Command::new(ROJO_PATH)
+        .arg("build")
+        .arg(&root)
+        .arg("--output")
+        .arg(&output)
+        .status()
+        .unwrap()
+        .success());
+    let mut dom = rbx_binary::from_reader(fs::File::open(&output).unwrap()).unwrap();
+    let parent = dom
+        .descendants()
+        .find(|inst| inst.name == "foo")
+        .unwrap()
+        .referent();
+    let child = dom
+        .descendants()
+        .find(|inst| inst.name == "Child")
+        .unwrap()
+        .referent();
+    dom.get_by_ref_mut(child).unwrap().name = "Renamed".into();
+    dom.insert(
+        parent,
+        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+            .with_name("Added")
+            .with_property("Source", "return 101\n"),
+    );
+    rbx_binary::to_writer(
+        fs::File::create(&output).unwrap(),
+        &dom,
+        dom.root().children(),
+    )
+    .unwrap();
+    let mut expected = fixture::files(&root);
+    let result = Command::new(ROJO_PATH)
+        .arg("syncback")
+        .arg(&root)
+        .arg("--input")
+        .arg(&output)
+        .arg("--non-interactive")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let contents = expected
+        .remove("Source/ForkedPackages/foo/Source/Foo/Child.luau")
+        .unwrap();
+    expected.insert(
+        "Source/ForkedPackages/foo/Source/Foo/Renamed.luau".into(),
+        contents,
+    );
+    expected.insert(
+        "Source/ForkedPackages/foo/Source/Foo/Added.luau".into(),
+        b"return 101\n".to_vec(),
+    );
+    assert_eq!(fixture::files(&root), expected);
+    let result = Command::new(ROJO_PATH)
+        .arg("sourcemap")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let map = String::from_utf8(result.stdout).unwrap();
+    assert!(
+        map.contains("Packages/_Index/scope_foo@local/foo/Source/Foo/Added.luau"),
+        "A newly added source must keep its alternate import path before reinstall"
+    );
+}
+
 macro_rules! syncback_tests {
     ($($test_name:ident => $list:expr$(,)?),*) => {$(
         #[test]

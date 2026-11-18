@@ -71,6 +71,10 @@ pub struct TestServeSession {
 
 impl TestServeSession {
     pub fn new(name: &str) -> Self {
+        Self::with_setup(name, |_| {})
+    }
+
+    pub fn with_setup(name: &str, setup: impl FnOnce(&Path)) -> Self {
         let working_dir = get_working_dir_path();
 
         let source_path = Path::new(SERVE_TESTS_PATH).join(name);
@@ -91,6 +95,8 @@ impl TestServeSession {
             copy_recursive(&source_path, &project_path)
                 .expect("Couldn't copy project to temporary directory");
         };
+
+        setup(&project_path);
 
         // This is an ugly workaround for FSEvents sometimes reporting events
         // for the above copy operations, similar to this Stack Overflow question:

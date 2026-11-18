@@ -143,6 +143,140 @@ pub(crate) struct RelayoutManifest {
     /// Each original path, with the name its backup has in the same folder as
     /// this manifest.
     pub entries: Vec<(PathBuf, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<RelayoutPackage>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RelayoutPackage {
+    version: u32,
+    ownership: super::relocation_transaction::ReplacementOwnership,
+    originals: Vec<super::relocation_transaction::Relocation>,
+}
+
+impl RelayoutManifest {
+    pub(crate) fn prepare(
+        vfs: &memofs::Vfs,
+        directory: &Path,
+        paths: &[PathBuf],
+        destination_directory: &Path,
+    ) -> std::io::Result<Self> {
+        let originals = paths
+            .iter()
+            .map(|path| {
+                Ok(super::relocation_transaction::Relocation {
+                    source: path.clone(),
+                    destination: path.clone(),
+                    expected: vfs.snapshot_tree(path)?,
+                })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let package = super::relocation_transaction::capture_structural_ownership(
+            vfs, directory, &originals,
+        )?
+        .map(|ownership| {
+            // Relayout writes only children of this container. Individual protected
+            // files are still checked by the serializer's write-target guard.
+            let originals = originals
+                .into_iter()
+                .map(|mut entry| {
+                    entry.destination = destination_directory.to_path_buf();
+                    entry
+                })
+                .collect();
+            RelayoutPackage {
+                version: 2,
+                ownership,
+                originals,
+            }
+        });
+        let manifest = Self {
+            entries: paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| (path.clone(), index.to_string()))
+                .collect(),
+            package,
+        };
+        manifest.validate_package(vfs, directory)?;
+        Ok(manifest)
+    }
+
+    pub(crate) fn expected_original(&self, index: usize) -> Option<&memofs::VfsSnapshot> {
+        self.package
+            .as_ref()?
+            .originals
+            .get(index)
+            .map(|entry| &entry.expected)
+    }
+
+    pub(crate) fn validate_package(
+        &self,
+        vfs: &memofs::Vfs,
+        directory: &Path,
+    ) -> std::io::Result<()> {
+        let Some(package) = &self.package else {
+            // Legacy records can only be checked against current declarations.
+            // Removed historical declarations are not reconstructible from paths.
+            let originals: Vec<_> = self
+                .entries
+                .iter()
+                .map(|(path, _)| super::relocation_transaction::Relocation {
+                    source: path.clone(),
+                    destination: path.clone(),
+                    expected: memofs::VfsSnapshot::file(Vec::new()),
+                })
+                .collect();
+            if super::relocation_transaction::capture_structural_ownership(
+                vfs, directory, &originals,
+            )?
+            .is_some()
+            {
+                return Err(std::io::Error::other("Legacy relayout has no durable package ownership witness. Journal and backups retained"));
+            }
+            return Ok(());
+        };
+        if package.version != 2
+            || self.entries.len() != package.originals.len()
+            || self.entries.iter().zip(&package.originals).enumerate().any(
+                |(index, ((path, backup), entry))| {
+                    path != &entry.source || backup != &index.to_string()
+                },
+            )
+        {
+            return Err(std::io::Error::other("Invalid package relayout evidence"));
+        }
+        let mut fs = vfs.lock();
+        super::relocation_transaction::validate_structural_ownership(
+            &mut fs,
+            directory,
+            Some(&package.ownership),
+            &package.originals,
+        )?;
+        for (index, entry) in package.originals.iter().enumerate() {
+            super::relocation_transaction::require_canonical_parent(
+                &mut fs,
+                &entry.destination.join(".relayout-output"),
+            )?;
+            use memofs::IoResultExt;
+            let backup = fs
+                .snapshot_tree(&directory.join(index.to_string()))
+                .with_not_found()?;
+            let valid = match backup {
+                Some(actual) => actual == entry.expected,
+                None => {
+                    fs.snapshot_tree(&entry.source).with_not_found()?.as_ref()
+                        == Some(&entry.expected)
+                }
+            };
+            if !valid {
+                return Err(std::io::Error::other(
+                    "Package relayout original or backup changed or disappeared. Journal and backups retained",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) const RELAYOUT_MANIFEST_NAME: &str = "manifest.json";
@@ -187,6 +321,19 @@ pub(crate) fn recover_relayouts(
     if vfs.read_dir(&root).with_not_found()?.is_none() {
         return Ok(());
     }
+    // Validate every package journal before creating a lock or restoring any batch.
+    // Repeat under the lock below because another server may have changed the cache.
+    for folder in vfs.read_dir(&root)? {
+        let folder = folder?.path().to_path_buf();
+        if let Some(bytes) = vfs
+            .read(folder.join(RELAYOUT_MANIFEST_NAME))
+            .with_not_found()?
+        {
+            if let Ok(manifest) = serde_json::from_slice::<RelayoutManifest>(&bytes) {
+                manifest.validate_package(vfs, &folder)?;
+            }
+        }
+    }
     let _guard = lock_relayouts(vfs, project)?;
     let Some(folders) = vfs.read_dir(&root).with_not_found()? else {
         return Ok(());
@@ -205,6 +352,7 @@ pub(crate) fn recover_relayouts(
             );
             continue;
         };
+        manifest.validate_package(vfs, &folder)?;
         let mut restored_all = true;
         for (original, backup) in manifest.entries {
             let backup = folder.join(backup);
@@ -249,7 +397,7 @@ pub(crate) fn execute_staged_relocation(
 ) -> std::io::Result<()> {
     execute_transaction(vfs, journal, || {
         let moves = stage()?;
-        super::relocation_transaction::execute(vfs, journal, moves, Vec::new())
+        super::relocation_transaction::execute_staged(vfs, journal, moves)
     })
 }
 
@@ -274,6 +422,16 @@ pub(crate) fn execute_promotion(
 ) -> std::io::Result<()> {
     execute_transaction(vfs, journal, || {
         super::relocation_transaction::execute_promotion(vfs, journal, promotion, absent_paths)
+    })
+}
+
+pub(crate) fn execute_replacements(
+    vfs: &memofs::Vfs,
+    journal: &Path,
+    entries: Vec<super::relocation_transaction::Replacement>,
+) -> std::io::Result<()> {
+    execute_transaction(vfs, journal, || {
+        super::relocation_transaction::execute_replacements(vfs, journal, entries)
     })
 }
 
@@ -854,6 +1012,7 @@ mod tests {
             let sidecar = temp.path().join("src/Mover.meta.json");
             let manifest = RelayoutManifest {
                 entries: vec![(folder.clone(), "0".into()), (sidecar.clone(), "1".into())],
+                package: None,
             };
             std::fs::write(
                 aside.join(RELAYOUT_MANIFEST_NAME),

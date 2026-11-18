@@ -74,6 +74,23 @@ pub struct ResolveInfo<'a> {
 /// Returns the transformed source, or the original if no changes were
 /// needed.
 pub fn resolve_requires(source: &str, info: &ResolveInfo) -> anyhow::Result<String> {
+    resolve_requires_in_context(source, info, false)
+}
+
+pub fn resolve_requires_in_context(
+    source: &str,
+    info: &ResolveInfo,
+    datamodel: bool,
+) -> anyhow::Result<String> {
+    resolve_requires_with_package_dependencies(source, info, datamodel, None)
+}
+
+pub(crate) fn resolve_requires_with_package_dependencies(
+    source: &str,
+    info: &ResolveInfo,
+    datamodel: bool,
+    package_dependencies: Option<&Path>,
+) -> anyhow::Result<String> {
     let file_dir = info
         .file_path
         .parent()
@@ -81,16 +98,31 @@ pub fn resolve_requires(source: &str, info: &ResolveInfo) -> anyhow::Result<Stri
 
     let luaurc = find_luaurc(info.vfs, file_dir)?;
 
-    let aliases = match &luaurc {
-        Some((aliases, _)) => aliases,
-        None => return Ok(source.to_string()),
-    };
+    let mut aliases = luaurc
+        .as_ref()
+        .map(|(aliases, _)| aliases.clone())
+        .unwrap_or_default();
+    if let Some(directory) = package_dependencies {
+        // Package ownership changes only this namespace. Other authored aliases
+        // still resolve from the original source configuration, not its stale copy.
+        aliases.retain(|name, _| !name.eq_ignore_ascii_case("packages"));
+        aliases.insert(
+            "packages".into(),
+            directory
+                .to_str()
+                .context("Non-UTF8 package dependency directory")?
+                .to_owned(),
+        );
+    }
 
     if aliases.is_empty() {
         return Ok(source.to_string());
     }
 
-    let luaurc_dir = luaurc.as_ref().unwrap().1.as_path();
+    let luaurc_dir = luaurc
+        .as_ref()
+        .map(|(_, directory)| directory.as_path())
+        .unwrap_or(info.project_root);
 
     // Quick check: skip parsing if no custom alias strings present
     // (alias names match without regard to case, so the check does too)
@@ -115,7 +147,7 @@ pub fn resolve_requires(source: &str, info: &ResolveInfo) -> anyhow::Result<Stri
     let replacements = find_require_replacements(
         source,
         file_dir,
-        aliases,
+        &aliases,
         luaurc_dir,
         info.path_mappings,
         info.project_root,
@@ -131,10 +163,86 @@ pub fn resolve_requires(source: &str, info: &ResolveInfo) -> anyhow::Result<Stri
     let mut sorted = replacements;
     sorted.sort_by(|a, b| b.start.cmp(&a.start));
 
-    for replacement in sorted {
+    for mut replacement in sorted {
+        if datamodel {
+            if let Some(relative) = replacement
+                .new_text
+                .strip_prefix("require(\"")
+                .and_then(|s| s.strip_suffix("\")"))
+            {
+                let mut target = to_datamodel_path(file_dir, info.path_mappings, info.project_root);
+                if is_init {
+                    target.pop();
+                }
+                for part in relative.split('/') {
+                    match part {
+                        "." => {}
+                        ".." => {
+                            anyhow::ensure!(
+                                target.pop().is_some(),
+                                "Alias require escapes the DataModel"
+                            );
+                        }
+                        part => target.push(part.to_owned()),
+                    }
+                }
+                replacement.new_text = format!("require(\"@game/{}\")", target.join("/"));
+            }
+        }
         result.replace_range(replacement.start..replacement.end, &replacement.new_text);
     }
 
+    Ok(result)
+}
+
+/// Invert only proven token correspondences. Changed import topology is not a
+/// license to guess an alias or leak a generated import into source.
+pub(crate) fn restore_source(
+    transform: &crate::snapshot::SourceTransform,
+    edited: &str,
+) -> anyhow::Result<String> {
+    if edited == transform.emitted {
+        return Ok(transform.original.clone());
+    }
+    fn calls(source: &str) -> anyhow::Result<Vec<(Range<usize>, String)>> {
+        let ast = full_moon::parse(source).map_err(|e| {
+            anyhow::anyhow!("Cannot safely reverse imports in unparsable source {e:?}")
+        })?;
+        let mut result = Vec::new();
+        visit_block(ast.nodes(), &mut |range, content| {
+            result.push((range, content))
+        });
+        result.sort_by_key(|(range, _)| range.start);
+        Ok(result)
+    }
+    let original = calls(&transform.original)?;
+    let emitted = calls(&transform.emitted)?;
+    let edited_calls = calls(edited)?;
+    anyhow::ensure!(
+        original.len() == emitted.len() && emitted.len() == edited_calls.len(),
+        "Import structure changed. Resolve source imports on the filesystem before syncback"
+    );
+    let mut result = edited.to_owned();
+    let ambiguous = |before: &str, after: &str| {
+        original.iter().zip(&emitted).any(|(original, emitted)| {
+            emitted.1 == after && &transform.original[original.0.clone()] != before
+        })
+    };
+    for ((original, emitted), edited) in original.iter().zip(&emitted).zip(&edited_calls).rev() {
+        if original.1 != emitted.1 {
+            anyhow::ensure!(
+                edited.1 == emitted.1
+                    && result.get(edited.0.clone()) == transform.emitted.get(emitted.0.clone()),
+                "Generated import was edited ambiguously. Resolve it in the original source"
+            );
+            anyhow::ensure!(
+                !emitted.1.is_empty()
+                    && !ambiguous(&transform.original[original.0.clone()], &emitted.1),
+                "Ambiguous emitted import alias"
+            );
+            result.replace_range(edited.0.clone(), &transform.original[original.0.clone()]);
+        }
+    }
     Ok(result)
 }
 
@@ -161,22 +269,11 @@ fn compute_relative_require(
     project_root: &Path,
     is_init: bool,
 ) -> String {
-    let require_path = if !path_mappings.is_empty() {
-        compute_datamodel_relative(
-            script_dir,
-            alias_target,
-            path_mappings,
-            project_root,
-            is_init,
-        )
+    let target = sub_path.map_or_else(|| alias_target.to_path_buf(), |sub| alias_target.join(sub));
+    if !path_mappings.is_empty() {
+        compute_datamodel_relative(script_dir, &target, path_mappings, project_root, is_init)
     } else {
-        compute_filesystem_relative(script_dir, alias_target)
-    };
-
-    match sub_path {
-        Some(sub) if require_path.ends_with('/') => format!("{require_path}{sub}"),
-        Some(sub) => format!("{require_path}/{sub}"),
-        None => require_path,
+        compute_filesystem_relative(script_dir, &target)
     }
 }
 
@@ -233,13 +330,20 @@ fn to_datamodel_path(
     path_mappings: &[(PathBuf, Vec<String>)],
     project_root: &Path,
 ) -> Vec<String> {
-    // Make the path relative to the project root
-    let relative = fs_path.strip_prefix(project_root).unwrap_or(fs_path);
+    let normalized = crate::package_sources::normalize(fs_path);
+    let relative = normalized.strip_prefix(project_root).unwrap_or(&normalized);
 
     // Find the best matching $path mapping (longest match first,
     // since mappings are sorted by length descending)
     for (mount_fs, mount_dm) in path_mappings {
-        if let Ok(remainder) = relative.strip_prefix(mount_fs) {
+        let without_extension = mount_fs
+            .extension()
+            .filter(|extension| *extension == "lua" || *extension == "luau")
+            .map(|_| mount_fs.with_extension(""));
+        if let Ok(remainder) = relative
+            .strip_prefix(mount_fs)
+            .or_else(|_| relative.strip_prefix(without_extension.as_deref().unwrap_or(mount_fs)))
+        {
             let mut dm_path = mount_dm.clone();
             for component in remainder.components() {
                 dm_path.push(component.as_os_str().to_string_lossy().into_owned());
@@ -504,7 +608,8 @@ fn visit_expr(expr: &Expression, callback: &mut dyn FnMut(Range<usize>, String))
         Expression::FunctionCall(call) => {
             visit_call(call, callback);
         }
-        Expression::Parentheses { expression, .. } => {
+        Expression::Parentheses { expression, .. }
+        | Expression::TypeAssertion { expression, .. } => {
             visit_expr(expression, callback);
         }
         Expression::Function(function) => {
@@ -618,8 +723,9 @@ fn resolve_alias_require(
         None => (without_at, None),
     };
 
-    // @self is natively supported by Roblox's require-by-string
-    if alias_name.eq_ignore_ascii_case("self") {
+    // Native Roblox aliases must bypass custom alias lookup, including its unknown-alias
+    // warning. A .luaurc entry cannot override their runtime meaning.
+    if alias_name.eq_ignore_ascii_case("self") || alias_name.eq_ignore_ascii_case("game") {
         return None;
     }
 
@@ -663,6 +769,135 @@ fn resolve_alias_require(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn package_dependency_aliases_work_without_authored_config_in_places_and_models() {
+        let vfs = Vfs::new(memofs::InMemoryFs::new());
+        let mappings = vec![
+            (
+                PathBuf::from("Source/Foo"),
+                vec![
+                    "ReplicatedStorage".into(),
+                    "Packages".into(),
+                    "_Index".into(),
+                    "Foo".into(),
+                    "foo".into(),
+                ],
+            ),
+            (
+                PathBuf::from("Packages/_Index/Foo"),
+                vec![
+                    "ReplicatedStorage".into(),
+                    "Packages".into(),
+                    "_Index".into(),
+                    "Foo".into(),
+                ],
+            ),
+        ];
+        let info = ResolveInfo {
+            file_path: Path::new("/project/Source/Foo/init.luau"),
+            vfs: &vfs,
+            path_mappings: &mappings,
+            project_root: Path::new("/project"),
+        };
+        for (datamodel, expected) in [
+            (false, "return require(\"./Util\")"),
+            (
+                true,
+                "return require(\"@game/ReplicatedStorage/Packages/_Index/Foo/Util\")",
+            ),
+        ] {
+            assert_eq!(
+                resolve_requires_with_package_dependencies(
+                    "return require('@PaCkAgEs/Util')",
+                    &info,
+                    datamodel,
+                    Some(Path::new("/project/Packages/_Index/Foo")),
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn source_round_trip_restores_only_proven_import_tokens() {
+        let transform = crate::snapshot::SourceTransform {
+            original: "local Lib = require('@packages/Foo')\nreturn Lib.Value\n".into(),
+            emitted:
+                "local Lib = require(\"@game/ReplicatedStorage/Packages/Foo\")\nreturn Lib.Value\n"
+                    .into(),
+        };
+        assert_eq!(
+            restore_source(&transform, &transform.emitted).unwrap(),
+            transform.original
+        );
+        let edited = transform.emitted.replace("Lib.Value", "Lib.OtherValue");
+        assert_eq!(
+            restore_source(&transform, &edited).unwrap(),
+            transform.original.replace("Lib.Value", "Lib.OtherValue")
+        );
+        for edited in [
+            transform.emitted.replace("Packages/Foo", "Packages/Bar"),
+            transform
+                .emitted
+                .replace("require(", "require(-- edited import comment\n"),
+            format!("{}\nrequire(\"@game/Other\")", transform.emitted),
+            "invalid Luau (((".into(),
+        ] {
+            assert!(restore_source(&transform, &edited).is_err());
+        }
+    }
+
+    #[test]
+    fn datamodel_aliases_survive_clone_and_reparent_contexts() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/project/.luaurc",
+            VfsSnapshot::file(r#"{"aliases":{"packages":"Packages"}}"#),
+        )
+        .unwrap();
+        let vfs = Vfs::new(fs);
+        let mappings = vec![
+            (
+                PathBuf::from("Original"),
+                vec!["ServerScriptService".into(), "Original".into()],
+            ),
+            (
+                PathBuf::from("Clone"),
+                vec!["Workspace".into(), "Cloned".into()],
+            ),
+            (
+                PathBuf::from("Packages"),
+                vec!["ReplicatedStorage".into(), "Packages".into()],
+            ),
+        ];
+        for file in [
+            "/project/Original/Run.client.luau",
+            "/project/Clone/Run.client.luau",
+            "/project/Clone/init.luau",
+        ] {
+            let info = ResolveInfo {
+                file_path: Path::new(file),
+                vfs: &vfs,
+                path_mappings: &mappings,
+                project_root: Path::new("/project"),
+            };
+            assert_eq!(
+                resolve_requires_in_context("return require(\"@packages/Foo\")", &info, true)
+                    .unwrap(),
+                "return require(\"@game/ReplicatedStorage/Packages/Foo\")"
+            );
+            assert!(!resolve_requires_in_context(
+                "return require(\"@packages/Foo\")",
+                &info,
+                false
+            )
+            .unwrap()
+            .contains("@game"));
+        }
+    }
 
     #[test]
     fn relative_path_sibling() {
@@ -1270,12 +1505,76 @@ return {}"#,
         )]);
 
         let source = find_source_by_name(&session, "Main").expect("should find Main script");
-        // DataModel: ServerScriptService.Server.Main -> ReplicatedStorage.Packages.SharedLib
-        // Relative: ../../ReplicatedStorage/Packages/SharedLib
+        // Absolute DataModel imports survive cloning or reparenting the caller.
         assert!(
-            source.contains(r#"require("../../ReplicatedStorage/Packages/SharedLib")"#),
-            "cross-service alias should resolve to relative path, got: {source}"
+            source.contains(r#"require("@game/ReplicatedStorage/Packages/SharedLib")"#),
+            "Cross-service alias should remain anchored to the DataModel, got {source}"
         );
+    }
+
+    #[test]
+    fn integration_typed_server_require_is_lowered_and_restored() {
+        let original = "local Maid = require(\"@packages/Maid\") :: any\nlocal Native = require(\"@game/ReplicatedStorage/Native\") :: any\nreturn Maid\n";
+        let session = create_test_session(vec![(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(
+                        r#"{
+                            "name": "test",
+                            "tree": {
+                                "$className": "DataModel",
+                                "ReplicatedStorage": {
+                                    "$className": "ReplicatedStorage",
+                                    "Packages": { "$path": "Packages" }
+                                },
+                                "ServerScriptService": {
+                                    "$className": "ServerScriptService",
+                                    "GameSystems": { "$path": "src" }
+                                }
+                            }
+                        }"#,
+                    ),
+                ),
+                (
+                    ".luaurc",
+                    VfsSnapshot::file(r#"{"aliases":{"packages":"Packages"}}"#),
+                ),
+                (
+                    "Packages",
+                    VfsSnapshot::dir([("Maid.luau", VfsSnapshot::file("return {}"))]),
+                ),
+                (
+                    "src",
+                    VfsSnapshot::dir([(
+                        "ScavengerHuntSystem",
+                        VfsSnapshot::dir([(
+                            "ServerDuckiez.server.luau",
+                            VfsSnapshot::file(original),
+                        )]),
+                    )]),
+                ),
+            ]),
+        )]);
+        let emitted = find_source_by_name(&session, "ServerDuckiez").unwrap();
+        assert_eq!(
+            emitted,
+            original.replace("@packages/Maid", "@game/ReplicatedStorage/Packages/Maid")
+        );
+        let transform = crate::snapshot::SourceTransform {
+            original: original.into(),
+            emitted: emitted.clone(),
+        };
+        assert_eq!(
+            restore_source(&transform, &emitted.replace("return Maid", "return Native")).unwrap(),
+            original.replace("return Maid", "return Native")
+        );
+        assert!(restore_source(
+            &transform,
+            &emitted.replace("Packages/Maid", "Packages/Other")
+        )
+        .is_err());
     }
 
     #[test]
@@ -1470,6 +1769,51 @@ return {}"#,
         .into_iter()
         .map(|replacement| replacement.new_text)
         .collect()
+    }
+
+    #[test]
+    fn leaves_native_aliases_untouched_even_when_configured() {
+        let aliases = HashMap::from([
+            ("game".to_string(), "NotTheDataModel".to_string()),
+            ("self".to_string(), "NotTheScript".to_string()),
+            ("packages".to_string(), "Packages".to_string()),
+        ]);
+        for alias in ["game", "Game", "GAME", "self", "Self", "SELF"] {
+            let source = format!("return require(\"@{alias}/Module\")");
+            let replacements = find_require_replacements(
+                &source,
+                Path::new("/project/Source"),
+                &aliases,
+                Path::new("/project"),
+                &[],
+                Path::new("/project"),
+                false,
+            )
+            .unwrap();
+            assert!(
+                replacements.is_empty(),
+                "Native alias @{alias} was rewritten"
+            );
+        }
+        assert_eq!(
+            rewritten_source("local a = require(\"@game/ReplicatedStorage/Module\")\nlocal b = require(\"@packages/Maid\")\n"),
+            "local a = require(\"@game/ReplicatedStorage/Module\")\nlocal b = require(\"../Packages/Maid\")\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_requires_inside_type_assertions() {
+        let source = [
+            "local Maid = require(\"@packages/Maid\") :: any",
+            "const Other = (require(\"@packages/Other\") :: any) :: unknown",
+            "local function load() return require(\"@packages/Lazy\") :: any end",
+            "return { Value = require(\"@packages/Value\").Field :: any }",
+        ]
+        .join("\n");
+        let expected = source.replace("@packages/", "../Packages/");
+        assert_eq!(rewritten_source(&source), expected);
+        let untouched = "local x = loader.require(\"@packages/Maid\") :: any\nlocal function f(require) return require(\"@packages/Maid\") :: any end\n";
+        assert_eq!(rewritten_source(untouched), untouched);
     }
 
     #[test]

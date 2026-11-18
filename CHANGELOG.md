@@ -31,6 +31,27 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.0`
+
+* Added source-authoritative Wally package mounts using validated install provenance.
+  Local package edits sync to declared sources, while registry and generated differences
+  warn without writes. DataModel aliases use clone-safe native imports and round-trip
+  without rewriting authored aliases.
+* Preserved authoritative source paths in sourcemaps and expanded referenced project
+  mappings for package-aware import resolution.
+* Guarded package replacements, moves, promotions, and relayout recovery with exact
+  ownership evidence, source-generation checks, and canonical ancestor validation.
+* Kept live properties and ownership metadata intact while serializing package batches,
+  and reported whole-tree source conflicts as unsaved writes rather than empty success.
+* Resolved local package dependency aliases through each installed package's own shims,
+  preserving other original-source aliases and reversing imports during syncback.
+* Associated installed cache events with existing original-source instances, retaining
+  redirected package-root watches and preventing duplicate mounts or false revisions.
+* Published DOM mutations and their read cursors as one revision, preserving strict stale
+  write checks without exposing an updated tree with an older cursor.
+* Normalized provenance and test comparison keys across Windows, Linux, and macOS.
+* Added interruption, ownership-change, source-conflict, and package round-trip coverage.
+
 ## `7.7.1-horse.1.8`
 
 * Changing `syncbackRules.modelTrees` or `instancesAsDirectories` while serving now moves
