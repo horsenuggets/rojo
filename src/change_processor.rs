@@ -3138,6 +3138,10 @@ impl JobThreadContext {
                 .changed_parent
                 .is_some_and(|parent| parent != instance.parent())
                 || (stored_in(tree, update.id).is_none()
+                    && !matches!(
+                        instance.metadata().middleware,
+                        Some(Middleware::Rbxm | Middleware::Rbxmx)
+                    )
                     && update
                         .changed_name
                         .as_deref()
@@ -8800,6 +8804,146 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_root_renames_rewrite_models_and_preserve_adjacent_metadata() {
+        for extension in ["rbxm", "rbxmx"] {
+            for sidecar in [false, true] {
+                let dom = WeakDom::new(
+                    InstanceBuilder::new("Folder").with_child(
+                        InstanceBuilder::new("Folder")
+                            .with_name("Original")
+                            .with_child(InstanceBuilder::new("Part").with_name("Child")),
+                    ),
+                );
+                let mut bytes = Vec::new();
+                match extension {
+                    "rbxm" => {
+                        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap()
+                    }
+                    "rbxmx" => rbx_xml::to_writer(
+                        &mut bytes,
+                        &dom,
+                        dom.root().children(),
+                        rbx_xml::EncodeOptions::new()
+                            .property_behavior(rbx_xml::EncodePropertyBehavior::WriteUnknown),
+                    )
+                    .unwrap(),
+                    _ => unreachable!(),
+                }
+                let filename = format!("Extra.{extension}");
+                let path = format!("/project/src/{filename}");
+                let mut files = vec![(filename.as_str(), VfsSnapshot::file(bytes))];
+                if sidecar {
+                    files.push((
+                        "Extra.meta.json",
+                        VfsSnapshot::file(r#"{"attributes":{"Keep":true}}"#),
+                    ));
+                }
+                let (job, _) = script_job(vec![("src", VfsSnapshot::dir(files))], "/project/src");
+                let extra = find(&job, &["Extra"]);
+                let child = find(&job, &["Extra", "Child"]);
+                let (accepted, conflicts, errors) = studio_write(&job, rename(extra, "Renamed"));
+                assert!(errors.is_empty(), "{extension} {errors:?}");
+                assert_eq!(conflicts, PatchSet::new());
+                assert_eq!(accepted.updated_instances.len(), 1);
+                assert!(exists(&job, &path));
+                assert!(!exists(&job, "/project/src/Renamed"));
+                let metadata: serde_json::Value = serde_json::from_slice(
+                    &job.vfs
+                        .read("/project/src/Extra.meta.json")
+                        .unwrap_or_else(|error| panic!("{extension} sidecar={sidecar}: {error}")),
+                )
+                .unwrap();
+                assert_eq!(metadata["name"], "Renamed");
+                let snapshot =
+                    snapshot_from_vfs(&Default::default(), &job.vfs, Path::new(&path)).unwrap();
+                let tree = job.tree.lock().unwrap();
+                assert_eq!(compute_patch_set(snapshot, &tree, extra), PatchSet::new());
+                assert_eq!(tree.get_instance(child).unwrap().parent(), extra);
+                assert_eq!(tree.get_instance(extra).unwrap().name(), "Renamed");
+                if sidecar {
+                    let Variant::Attributes(attributes) =
+                        &tree.get_instance(extra).unwrap().properties()[&ustr("Attributes")]
+                    else {
+                        panic!("The model root lost its adjacent metadata attributes");
+                    };
+                    assert_eq!(attributes.get("Keep"), Some(&Variant::Bool(true)));
+                }
+                drop(tree);
+                let previous_model = job.vfs.read(&path).unwrap();
+                let previous_metadata = job.vfs.read("/project/src/Extra.meta.json").unwrap();
+                let cursor = job.message_queue.cursor();
+                job.message_queue.push_messages(&[AppliedPatchSet::new()]);
+                let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                    rename(extra, "Rejected"),
+                    Some(cursor),
+                    WriteAuthority::Filesystem,
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+                assert!(accepted.updated_instances.is_empty());
+                assert_eq!(conflicts.updated_instances.len(), 1);
+                assert_eq!(job.vfs.read(&path).unwrap(), previous_model);
+                assert_eq!(
+                    job.vfs.read("/project/src/Extra.meta.json").unwrap(),
+                    previous_metadata
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terrain_model_root_rename_preserves_voxels_clouds_and_tracks_lfs() {
+        let smooth_grid = Variant::BinaryString(vec![0, 255, 128, 0, 17].into());
+        let dom = WeakDom::new(
+            InstanceBuilder::new("Folder").with_child(
+                InstanceBuilder::new("Terrain")
+                    .with_property("SmoothGrid", smooth_grid.clone())
+                    .with_child(InstanceBuilder::new("Clouds").with_property("Cover", 0.75_f32)),
+            ),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+        let (job, _) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([("Terrain.rbxm", VfsSnapshot::file(bytes))]),
+            )],
+            "/project/src",
+        );
+        let terrain = find(&job, &["Terrain"]);
+        let (accepted, conflicts, errors) = studio_write(&job, rename(terrain, "Landscape"));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(conflicts, PatchSet::new());
+        assert_eq!(accepted.updated_instances.len(), 1);
+        let bytes = job.vfs.read("/project/src/Terrain.rbxm").unwrap();
+        let saved = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        let root = saved.get_by_ref(saved.root().children()[0]).unwrap();
+        assert_eq!(root.name, "Landscape");
+        assert_eq!(root.class, "Terrain");
+        assert_eq!(root.properties[&ustr("SmoothGrid")], smooth_grid);
+        assert_eq!(root.children().len(), 1);
+        let clouds = saved.get_by_ref(root.children()[0]).unwrap();
+        assert_eq!(clouds.class, "Clouds");
+        assert_eq!(clouds.properties[&ustr("Cover")], Variant::Float32(0.75));
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&job.vfs.read("/project/src/Terrain.meta.json").unwrap())
+                .unwrap();
+        assert_eq!(metadata["name"], "Landscape");
+        let attributes = job.vfs.read_to_string("/project/.gitattributes").unwrap();
+        assert!(
+            attributes.contains("\"/src/Terrain.rbxm\" filter=lfs diff=lfs merge=lfs -text"),
+            "{attributes}"
+        );
+        let snapshot = snapshot_from_vfs(
+            &Default::default(),
+            &job.vfs,
+            Path::new("/project/src/Terrain.rbxm"),
+        )
+        .unwrap();
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(compute_patch_set(snapshot, &tree, terrain), PatchSet::new());
+    }
+
     fn read_model(job: &JobThreadContext) -> String {
         String::from_utf8(
             job.vfs
@@ -8818,18 +8962,24 @@ mod tests {
         for stale in [false, true] {
             let (job, _, child) = model_job();
             let cursor = job.message_queue.cursor();
+            let original = read_model(&job);
             if stale {
                 job.message_queue.push_messages(&[AppliedPatchSet::new()]);
             }
-            let (accepted, conflicts, _) = job.handle_tree_event_at_cursor(
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
                 rename(child, "Renamed"),
                 Some(cursor),
                 WriteAuthority::Filesystem,
             );
+            assert!(errors.is_empty(), "{errors:?}");
             let model = read_model(&job);
             assert_eq!(model.contains("Renamed"), !stale, "{model}");
             assert_eq!(accepted.updated_instances.is_empty(), stale);
             assert_eq!(conflicts.updated_instances.is_empty(), !stale);
+            if stale {
+                assert_eq!(model, original);
+                assert!(!exists(&job, "/project/src/Extra.meta.json"));
+            }
         }
     }
 
