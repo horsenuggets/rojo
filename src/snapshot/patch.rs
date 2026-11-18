@@ -88,6 +88,52 @@ impl AppliedPatchSet {
     pub fn is_empty(&self) -> bool {
         self.removed.is_empty() && self.added.is_empty() && self.updated.is_empty()
     }
+
+    pub(crate) fn combine(patches: impl IntoIterator<Item = Self>) -> Self {
+        use std::collections::{HashMap, HashSet};
+        let mut combined = Self::new();
+        let mut updates = HashMap::new();
+        for patch in patches {
+            combined.removed.extend(patch.removed);
+            combined.added.extend(patch.added);
+            for update in patch.updated {
+                let index = *updates.entry(update.id).or_insert_with(|| {
+                    combined.updated.push(AppliedPatchUpdate::new(update.id));
+                    combined.updated.len() - 1
+                });
+                let current = &mut combined.updated[index];
+                if update.changed_name.is_some() {
+                    current.changed_name = update.changed_name;
+                }
+                if update.changed_class_name.is_some() {
+                    current.changed_class_name = update.changed_class_name;
+                }
+                if update.changed_parent.is_some() {
+                    current.changed_parent = update.changed_parent;
+                }
+                if update.changed_metadata.is_some() {
+                    current.changed_metadata = update.changed_metadata;
+                }
+                current.changed_properties.extend(update.changed_properties);
+            }
+        }
+        let added: HashSet<_> = combined.added.iter().copied().collect();
+        let removed: HashSet<_> = combined.removed.iter().copied().collect();
+        let mut seen = HashSet::new();
+        combined
+            .removed
+            .retain(|id| !added.contains(id) && seen.insert(*id));
+        seen.clear();
+        combined
+            .added
+            .retain(|id| !removed.contains(id) && seen.insert(*id));
+        // Additions are serialized from the final tree. Their refreshed Source
+        // already belongs to that addition, not a second undoable edit.
+        combined
+            .updated
+            .retain(|update| !added.contains(&update.id) && !removed.contains(&update.id));
+        combined
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +163,69 @@ impl AppliedPatchUpdate {
             changed_parent: None,
             changed_properties: UstrMap::new(),
             changed_metadata: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rbx_dom_weak::ustr;
+
+    #[test]
+    fn combined_patches_replace_stale_sources_in_one_structural_edit() {
+        let id = Ref::new();
+        let parent = Ref::new();
+        let first = AppliedPatchSet {
+            updated: vec![AppliedPatchUpdate {
+                changed_name: Some("RenamedShared".into()),
+                changed_parent: Some(parent),
+                changed_properties: [(ustr("Source"), Some(Variant::String("old path".into())))]
+                    .into_iter()
+                    .collect(),
+                ..AppliedPatchUpdate::new(id)
+            }],
+            ..AppliedPatchSet::new()
+        };
+        let refresh = AppliedPatchSet {
+            updated: vec![AppliedPatchUpdate {
+                changed_properties: [(ustr("Source"), Some(Variant::String("new path".into())))]
+                    .into_iter()
+                    .collect(),
+                ..AppliedPatchUpdate::new(id)
+            }],
+            ..AppliedPatchSet::new()
+        };
+        let combined = AppliedPatchSet::combine([first, refresh]);
+        assert_eq!(combined.updated.len(), 1);
+        let update = &combined.updated[0];
+        assert_eq!(update.changed_name.as_deref(), Some("RenamedShared"));
+        assert_eq!(update.changed_parent, Some(parent));
+        assert_eq!(
+            update.changed_properties[&ustr("Source")],
+            Some(Variant::String("new path".into()))
+        );
+    }
+
+    #[test]
+    fn combined_patches_fold_updates_into_additions_and_cancel_removed_additions() {
+        for removed in [false, true] {
+            let id = Ref::new();
+            let combined = AppliedPatchSet::combine([
+                AppliedPatchSet {
+                    added: vec![id],
+                    ..AppliedPatchSet::new()
+                },
+                AppliedPatchSet {
+                    removed: if removed { vec![id] } else { Vec::new() },
+                    updated: vec![AppliedPatchUpdate::new(id)],
+                    ..AppliedPatchSet::new()
+                },
+            ]);
+            assert!(combined.updated.is_empty());
+            assert!(combined.removed.is_empty());
+            assert_eq!(combined.added, if removed { Vec::new() } else { vec![id] });
+            assert_eq!(combined.is_empty(), removed);
         }
     }
 }

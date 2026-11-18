@@ -30,6 +30,7 @@ use std::{
 
 use crate::{
     glob::{Glob, IgnorableGlob},
+    project::DEFAULT_PROJECT_NAMES,
     snapshot::{InstanceWithMeta, RojoTree},
     snapshot_middleware::{dir_init_files, Middleware},
     syncback::ref_properties::{attribute_ids, collect_referents, ids_on_disk, link_referents},
@@ -621,11 +622,29 @@ fn syncback_snapshot<'sync>(
     {
         let metadata = old.metadata();
         let physical = if get_best_middleware(&snapshot) == Middleware::Project {
-            metadata
-                .relevant_paths
-                .iter()
-                .rev()
-                .find(|path| Project::is_project_file(path))
+            // Referenced projects share metadata with their outer project. Keep
+            // the original inner project (or its directory) selected by
+            // syncback_project, but still redirect installed entrypoints to the
+            // authoritative source.
+            if ((Project::is_project_file(&snapshot.path)
+                && metadata.relevant_paths.contains(&snapshot.path))
+                || DEFAULT_PROJECT_NAMES
+                    .iter()
+                    .any(|name| metadata.relevant_paths.contains(&snapshot.path.join(name))))
+                && metadata
+                    .context
+                    .package_mount
+                    .as_ref()
+                    .is_some_and(|(source, _)| snapshot.path.starts_with(source))
+            {
+                Some(&snapshot.path)
+            } else {
+                metadata
+                    .relevant_paths
+                    .iter()
+                    .rev()
+                    .find(|path| Project::is_project_file(path))
+            }
         } else {
             metadata.relevant_paths.first()
         };

@@ -250,12 +250,7 @@ impl ServeSession {
         if let Some(snapshot) = &mut snapshot {
             // Use the expanded snapshot, not only explicit project nodes. This
             // includes nested default projects and referenced top-level projects.
-            let path_mappings = extract_path_mappings(snapshot, root_project.folder_location())?;
-            let require_context = Arc::new(RequireContext {
-                project_root: root_project.folder_location().to_path_buf(),
-                path_mappings,
-                datamodel: snapshot.class_name == "DataModel",
-            });
+            let require_context = build_require_context(snapshot, root_project.folder_location())?;
             crate::snapshot_middleware::prepare_requires(snapshot, &vfs, &require_context)?;
         }
 
@@ -388,6 +383,17 @@ pub enum ServeSessionError {
         #[from]
         source: anyhow::Error,
     },
+}
+
+pub(crate) fn build_require_context(
+    snapshot: &InstanceSnapshot,
+    root: &Path,
+) -> anyhow::Result<Arc<RequireContext>> {
+    Ok(Arc::new(RequireContext {
+        project_root: root.to_path_buf(),
+        path_mappings: extract_path_mappings(snapshot, root)?,
+        datamodel: snapshot.class_name == "DataModel",
+    }))
 }
 
 /// Recursively extracts `$path` mappings from the project tree.
