@@ -377,8 +377,10 @@ pub fn syncback_loop(
         .collect();
     for instance in old_tree.inner().descendants() {
         if package_source_conflict(vfs, old_tree, instance.referent())? {
-            log::warn!("Package source changed concurrently. Preserving filesystem and Studio edits without writing the batch");
-            return Ok(FsSnapshot::new());
+            anyhow::bail!(
+                "Package source changed concurrently for {}. Preserving filesystem and Studio edits without writing the batch",
+                instance.referent()
+            );
         }
     }
     let package_expected = FsSnapshot::capture_file_contents(&package_paths, vfs)?;
@@ -1187,6 +1189,97 @@ mod test {
     use super::*;
     use crate::snapshot::{InstanceMetadata, InstanceSnapshot};
     use rbx_dom_weak::{types::Attributes, UstrMap};
+
+    #[test]
+    fn whole_tree_package_conflicts_return_errors_without_saving_any_edit() {
+        for changed in ["Target", "Sibling"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let vfs = Vfs::new_default().unwrap();
+            vfs.set_watch_enabled(false);
+            fs_err::create_dir(root.join("Source")).unwrap();
+            let project_path = root.join("default.project.json");
+            vfs.write(
+                &project_path,
+                r#"{"name":"Test","tree":{"$path":"Source"}}"#,
+            )
+            .unwrap();
+            let project = Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+            let baseline = "return 'baseline'\n";
+            let filesystem = "return 'filesystem'\n";
+            let mut children = Vec::new();
+            for name in ["Target", "Sibling"] {
+                let path = root.join(format!("Source/{name}.luau"));
+                vfs.write(&path, baseline).unwrap();
+                let mut metadata = InstanceMetadata::new();
+                metadata
+                    .package_file_contents
+                    .insert(path, Some(baseline.as_bytes().to_vec()));
+                children.push(
+                    InstanceSnapshot::new()
+                        .name(name)
+                        .class_name("ModuleScript")
+                        .properties(UstrMap::from_iter([(
+                            ustr("Source"),
+                            Variant::String(baseline.into()),
+                        )]))
+                        .metadata(metadata),
+                );
+            }
+            let mut tree = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("Test")
+                    .class_name("Folder")
+                    .children(children),
+            );
+            let target = tree.root().children()[0];
+            vfs.write(root.join(format!("Source/{changed}.luau")), filesystem)
+                .unwrap();
+            assert_eq!(
+                package_source_conflict(&vfs, &tree, target).unwrap(),
+                changed == "Target"
+            );
+            let edited = WeakDom::new(
+                rbx_dom_weak::InstanceBuilder::new("Folder")
+                    .with_name("Test")
+                    .with_child(
+                        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+                            .with_name("Target")
+                            .with_property("Source", "return 'studio'\n"),
+                    )
+                    .with_child(
+                        rbx_dom_weak::InstanceBuilder::new("ModuleScript")
+                            .with_name("Sibling")
+                            .with_property("Source", baseline),
+                    ),
+            );
+
+            let error = syncback_loop(&vfs, &mut tree, edited, &project)
+                .err()
+                .expect("A rejected batch must not be acknowledged as an empty success");
+
+            assert!(error
+                .to_string()
+                .contains("Package source changed concurrently"));
+            for name in ["Target", "Sibling"] {
+                assert_eq!(
+                    fs_err::read_to_string(root.join(format!("Source/{name}.luau"))).unwrap(),
+                    if name == changed {
+                        filesystem
+                    } else {
+                        baseline
+                    }
+                );
+            }
+            for instance in tree.inner().descendants().skip(1) {
+                assert_eq!(
+                    instance.properties.get(&ustr("Source")),
+                    Some(&Variant::String(baseline.into()))
+                );
+            }
+            assert!(!root.join(".rojo").exists());
+        }
+    }
 
     #[test]
     fn scoped_script_writes_reject_suffix_changes_without_touching_disk() {
