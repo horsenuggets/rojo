@@ -33,8 +33,8 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// responses, which older peers neither send nor understand. Version 7 made write
 /// requests carry the plugin's chosen `WriteAuthority`. Version 8 adds identity-preserving
 /// instance reparenting through `changedParent` updates. Version 9 makes `added` carry
-/// Studio-created subtrees as `InstanceAddition`s.
-pub const PROTOCOL_VERSION: u64 = 9;
+/// Studio-created subtrees as `InstanceAddition`s. Version 10 adds live Studio export jobs.
+pub const PROTOCOL_VERSION: u64 = 10;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,18 +136,18 @@ pub struct InstanceUpdate {
     pub changed_metadata: Option<InstanceMetadata>,
 }
 
-/// Reads changed properties, accepting an empty array for `Attributes`.
+/// Reads property maps and attributes, accepting empty Luau tables sent as arrays.
 ///
-/// The plugin's msgpack encoder writes every empty Luau table as an array, so
-/// removing an instance's last attribute arrives as `{"Attributes": []}`. Every
-/// other property, and any non-empty `Attributes`, is read unchanged.
-fn deserialize_changed_properties<'de, D>(
+/// The plugin's msgpack encoder writes every empty Luau table as an array, including
+/// empty service property maps and the map inside an `Attributes` variant. Nonempty
+/// arrays are never accepted in place of maps.
+pub(crate) fn deserialize_changed_properties<'de, D>(
     deserializer: D,
 ) -> Result<UstrMap<Option<Variant>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::{MapAccess, Visitor};
+    use serde::de::{Error, MapAccess, SeqAccess, Visitor};
 
     struct PropertiesVisitor;
 
@@ -158,6 +158,15 @@ where
             formatter.write_str("a map of property names to values")
         }
 
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(A::Error::custom(
+                    "Expected a property map or an empty array.",
+                ));
+            }
+            Ok(UstrMap::default())
+        }
+
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut properties = UstrMap::default();
             while let Some(name) = map.next_key::<Ustr>()? {
@@ -165,7 +174,9 @@ where
                     map.next_value::<Option<LenientAttributesVariant>>()?
                         .map(|lenient| lenient.0)
                 } else {
-                    map.next_value::<Option<Variant>>()?
+                    map.next_value::<Option<Variant>>().map_err(|error| {
+                        A::Error::custom(format!("Invalid property \"{name}\". {error}"))
+                    })?
                 };
                 properties.insert(name, value);
             }
@@ -173,7 +184,7 @@ where
         }
     }
 
-    deserializer.deserialize_map(PropertiesVisitor)
+    deserializer.deserialize_any(PropertiesVisitor)
 }
 
 /// An `Attributes` variant, `{"Attributes": <map>}`, whose map may also be sent
@@ -427,6 +438,7 @@ pub type WriteResult = (PatchSet, PatchSet, Vec<WriteError>);
 #[serde(rename_all = "camelCase")]
 #[strum(serialize_all = "camelCase")]
 pub enum SocketPacketType {
+    Export,
     Messages,
     // TODO: Can we cleanly use the socket for all communication?
     // Serialize,
@@ -445,6 +457,7 @@ pub struct MessagesPacket<'a> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SocketPacketBody<'a> {
+    Export(super::export::CaptureRequest),
     Messages(MessagesPacket<'a>),
     // TODO: Can we cleanly use the socket for all communication?
     // Serialize(SerializePacket),
@@ -700,7 +713,7 @@ mod tests {
 
     #[test]
     fn structural_protocol_round_trips_json_and_messagepack() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
         let id = Ref::new();
         let parent = Ref::new();
         let update = InstanceUpdate {

@@ -157,6 +157,10 @@ function ApiContext:disconnect()
 	self.__wsClient = nil
 end
 
+function ApiContext:getBaseUrl()
+	return self.__baseUrl
+end
+
 function ApiContext:getMessageCursor()
 	return self.__messageCursor
 end

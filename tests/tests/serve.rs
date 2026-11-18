@@ -118,7 +118,9 @@ fn assert_numeric_api_writes_converge(cases: &[(f64, f64)]) {
                     let packet = session
                         .get_api_socket_packet(SocketPacketType::Messages, read.message_cursor)
                         .unwrap();
-                    let SocketPacketBody::Messages(packet) = packet.body;
+                    let SocketPacketBody::Messages(packet) = packet.body else {
+                        panic!("Expected a messages packet");
+                    };
                     assert!(
                         packet
                             .messages
@@ -367,7 +369,9 @@ fn assert_created_subtrees_are_written(fixture: &str, check_layout: impl Fn(&std
         let packet = session
             .get_api_socket_packet(SocketPacketType::Messages, cursor)
             .unwrap();
-        let SocketPacketBody::Messages(packet) = packet.body;
+        let SocketPacketBody::Messages(packet) = packet.body else {
+            panic!("Expected a messages packet");
+        };
         for message in &packet.messages {
             for id in message.added.keys() {
                 assert!(
@@ -825,7 +829,9 @@ fn settled_messages(
     let packet = session
         .get_api_socket_packet(SocketPacketType::Messages, cursor)
         .unwrap();
-    let SocketPacketBody::Messages(packet) = packet.body;
+    let SocketPacketBody::Messages(packet) = packet.body else {
+        panic!("Expected a messages packet");
+    };
     packet.messages
 }
 
@@ -1160,7 +1166,9 @@ fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {
         let setup = session
             .get_api_socket_packet(SocketPacketType::Messages, initial.message_cursor)
             .unwrap();
-        let SocketPacketBody::Messages(setup) = setup.body;
+        let SocketPacketBody::Messages(setup) = setup.body else {
+            panic!("Expected a messages packet");
+        };
         assert!(setup
             .messages
             .iter()
@@ -1206,7 +1214,9 @@ fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {
         let packet = session
             .get_api_socket_packet(SocketPacketType::Messages, cursor)
             .unwrap();
-        let SocketPacketBody::Messages(body) = packet.body;
+        let SocketPacketBody::Messages(body) = packet.body else {
+            panic!("Expected a messages packet");
+        };
         assert!(body.messages.iter().all(|message| {
             !message.removed.contains(&source) && !message.added.contains_key(&source)
         }));

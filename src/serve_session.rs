@@ -85,6 +85,8 @@ pub struct ServeSession {
     /// A channel to send mutation requests on. These will be handled by the
     /// ChangeProcessor and trigger changes in the tree.
     tree_mutation_sender: Sender<TreeMutation>,
+
+    export_jobs: Arc<crate::web::export::ExportJobs>,
 }
 
 impl ServeSession {
@@ -179,7 +181,12 @@ impl ServeSession {
             message_queue,
             tree_mutation_sender,
             vfs,
+            export_jobs: Arc::default(),
         })
+    }
+
+    pub(crate) fn export_jobs(&self) -> Arc<crate::web::export::ExportJobs> {
+        Arc::clone(&self.export_jobs)
     }
 
     pub fn tree_handle(&self) -> Arc<Mutex<RojoTree>> {

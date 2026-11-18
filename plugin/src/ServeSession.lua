@@ -19,6 +19,7 @@ local Reconciler = require(script.Parent.Reconciler)
 local ReconcilerServices = require(script.Parent.Reconciler.services)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
+local StudioExport = require(script.Parent.StudioExport)
 local orderSwaps = require(script.Parent.orderSwaps)
 local yieldBudget = require(script.Parent.yieldBudget)
 
@@ -537,6 +538,17 @@ function ServeSession:start()
 				self:__applyGameAndPlaceId(serverInfo)
 
 				return self.__apiContext:connectWebSocket({
+					["export"] = function(body)
+						if self.__status == Status.Disconnected then
+							return
+						end
+						-- Independent capture never flushes or writes syncback patches.
+						task.spawn(function()
+							StudioExport.run(self.__apiContext, body):catch(function(err)
+								Log.warn("Studio export failed. {}", tostring(err))
+							end)
+						end)
+					end,
 					["messages"] = function(messagesPacket)
 						if self.__status == Status.Disconnected then
 							return
