@@ -5519,6 +5519,93 @@ mod tests {
     }
 
     #[test]
+    fn repeated_installed_mount_events_preserve_local_identity_and_cursor() {
+        for redirected in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = package_relocation_job(temp.path(), true);
+            let root = job.project().folder_location().to_path_buf();
+            if redirected {
+                job.vfs
+                    .write(
+                        root.join("Local/First/default.project.json"),
+                        r#"{"tree":{"$path":"Left"}}"#,
+                    )
+                    .unwrap();
+            }
+            let project_path = root.join("default.project.json");
+            job.vfs
+                .write(
+                    &project_path,
+                    r#"{"name":"Test","tree":{"$path":"Packages"}}"#,
+                )
+                .unwrap();
+            let context = job.tree.lock().unwrap().root().metadata().context.clone();
+            let snapshot = snapshot_from_vfs(&context, &job.vfs, &project_path)
+                .unwrap()
+                .unwrap();
+            *job.tree.lock().unwrap() = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("Root")
+                    .metadata(InstanceMetadata::new().context(&context))
+                    .children(vec![snapshot]),
+            );
+            let id = find(&job, &["_Index", "First", "library"]);
+            let count = job.tree.lock().unwrap().inner().descendants().count();
+            let before = job.message_queue.cursor();
+            let installed = job
+                .vfs
+                .canonicalize(root.join("Packages/_Index/First/library"))
+                .unwrap();
+
+            for event in [
+                VfsEvent::Create(installed.clone()),
+                VfsEvent::Write(installed.clone()),
+                VfsEvent::Create(installed),
+            ] {
+                job.handle_vfs_event(event);
+                assert_eq!(find(&job, &["_Index", "First", "library"]), id);
+                assert_eq!(
+                    job.tree.lock().unwrap().inner().descendants().count(),
+                    count
+                );
+                assert_eq!(job.message_queue.cursor(), before);
+            }
+
+            let source = job
+                .vfs
+                .canonicalize(root.join("Local/First/Left/Code.luau"))
+                .unwrap();
+            let code = job.tree.lock().unwrap().get_ids_at_path(&source)[0];
+            job.vfs.write(&source, "return 91\n").unwrap();
+            job.handle_vfs_event(VfsEvent::Write(source.clone()));
+            assert!(job.message_queue.cursor() > before);
+            assert_eq!(
+                job.tree
+                    .lock()
+                    .unwrap()
+                    .get_instance(code)
+                    .unwrap()
+                    .properties()[&ustr("Source")],
+                Variant::String("return 91\n".into())
+            );
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                property_update(code, "Source", Variant::String("return 92\n".into())),
+                Some(before),
+                WriteAuthority::Filesystem,
+            );
+            assert_eq!(accepted, PatchSet::new());
+            assert_eq!(conflicts, PatchSet::new());
+            assert!(errors
+                .iter()
+                .any(|error| error.message.contains("baseline is stale")));
+            assert_eq!(
+                job.vfs.read_to_string(&source).unwrap().as_str(),
+                "return 91\n"
+            );
+        }
+    }
+
+    #[test]
     fn watcher_mutations_and_publication_share_the_tree_revision_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let job = package_relocation_job(temp.path(), true);

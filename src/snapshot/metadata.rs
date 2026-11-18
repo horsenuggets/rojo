@@ -100,6 +100,10 @@ impl InstanceMetadata {
         }
     }
 
+    pub(crate) fn watch_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.relevant_paths.iter().chain(&self.installed_paths)
+    }
+
     pub(crate) fn is_package_mount_root(&self) -> bool {
         self.context
             .package_mount

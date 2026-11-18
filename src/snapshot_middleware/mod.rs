@@ -475,13 +475,14 @@ impl Middleware {
         if let Ok(Some(ref mut snapshot)) = output {
             snapshot.metadata.middleware = Some(*self);
             if let Some((source, installed)) = &context.package_mount {
-                if *self == Middleware::Project
-                    && path.parent() == Some(source.as_path())
-                    && path.file_name().is_some_and(|name| {
-                        crate::project::DEFAULT_PROJECT_NAMES
-                            .iter()
-                            .any(|default| name == *default)
-                    })
+                if path == source
+                    || (*self == Middleware::Project
+                        && path.parent() == Some(source.as_path())
+                        && path.file_name().is_some_and(|name| {
+                            crate::project::DEFAULT_PROJECT_NAMES
+                                .iter()
+                                .any(|default| name == *default)
+                        }))
                 {
                     snapshot.name = installed
                         .file_name()
@@ -489,6 +490,12 @@ impl Middleware {
                         .to_string_lossy()
                         .into_owned()
                         .into();
+                    // The entrypoint may redirect below the package root. Retain the
+                    // mount directory so cache events refresh this instance instead
+                    // of being mistaken for a newly discovered sibling.
+                    if !snapshot.metadata.relevant_paths.contains(source) {
+                        snapshot.metadata.relevant_paths.push(source.clone());
+                    }
                 }
                 for path in &snapshot.metadata.relevant_paths {
                     crate::package_sources::contained(vfs, source, path)?;

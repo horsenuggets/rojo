@@ -45,6 +45,8 @@ Making a new release? Simply add the new header with the version and date undern
   and reported whole-tree source conflicts as unsaved writes rather than empty success.
 * Resolved local package dependency aliases through each installed package's own shims,
   preserving other original-source aliases and reversing imports during syncback.
+* Associated installed cache events with existing original-source instances, retaining
+  redirected package-root watches and preventing duplicate mounts or false revisions.
 * Published DOM mutations and their read cursors as one revision, preserving strict stale
   write checks without exposing an updated tree with an older cursor.
 * Normalized provenance and test comparison keys across Windows, Linux, and macOS.

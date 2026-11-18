@@ -323,12 +323,14 @@ impl RojoTree {
                 // If this instance's source path changed, we need to update our
                 // path associations so that file changes will trigger updates
                 // to this instance correctly.
-                if existing_metadata.relevant_paths != metadata.relevant_paths {
-                    for existing_path in &existing_metadata.relevant_paths {
+                if existing_metadata.relevant_paths != metadata.relevant_paths
+                    || existing_metadata.installed_paths != metadata.installed_paths
+                {
+                    for existing_path in existing_metadata.watch_paths() {
                         self.path_to_ids.remove(existing_path, id);
                     }
 
-                    for new_path in &metadata.relevant_paths {
+                    for new_path in metadata.watch_paths() {
                         self.path_to_ids.insert(new_path.clone(), id);
                     }
                 }
@@ -394,7 +396,7 @@ impl RojoTree {
     }
 
     fn insert_metadata(&mut self, id: Ref, metadata: InstanceMetadata) {
-        for path in &metadata.relevant_paths {
+        for path in metadata.watch_paths() {
             self.path_to_ids.insert(path.clone(), id);
         }
 
@@ -414,11 +416,11 @@ impl RojoTree {
     fn remove_metadata(&mut self, id: Ref) {
         let metadata = self.metadata_map.remove(&id).unwrap();
 
-        if let Some(specified) = metadata.specified_id {
-            self.specified_id_to_refs.remove(&specified, id);
+        if let Some(specified) = &metadata.specified_id {
+            self.specified_id_to_refs.remove(specified, id);
         }
 
-        for path in &metadata.relevant_paths {
+        for path in metadata.watch_paths() {
             self.path_to_ids.remove(path, id);
         }
     }
@@ -566,6 +568,36 @@ mod test {
     };
 
     use super::{RojoTree, SnapshotReferents};
+    use std::path::PathBuf;
+
+    #[test]
+    fn installed_watch_aliases_follow_metadata_updates_and_removal() {
+        let source = PathBuf::from("/source/init.luau");
+        let old_alias = PathBuf::from("/cache/old/init.luau");
+        let new_alias = PathBuf::from("/cache/new/init.luau");
+        let mut metadata = InstanceMetadata::new().relevant_paths(vec![source.clone()]);
+        metadata.installed_paths = vec![old_alias.clone()];
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root").children(
+            vec![InstanceSnapshot::new()
+                    .name("Library")
+                    .class_name("ModuleScript")
+                    .metadata(metadata.clone())],
+        ));
+        let id = tree.root().children()[0];
+        assert_eq!(tree.get_ids_at_path(&source), [id]);
+        assert_eq!(tree.get_ids_at_path(&old_alias), [id]);
+
+        metadata.installed_paths = vec![new_alias.clone(), source.clone()];
+        tree.update_metadata(id, metadata);
+        assert!(tree.get_ids_at_path(&old_alias).is_empty());
+        assert_eq!(tree.get_ids_at_path(&source), [id]);
+        assert_eq!(tree.get_ids_at_path(&new_alias), [id]);
+
+        tree.remove(id);
+        assert!(tree.get_ids_at_path(&source).is_empty());
+        assert!(tree.get_ids_at_path(&old_alias).is_empty());
+        assert!(tree.get_ids_at_path(&new_alias).is_empty());
+    }
 
     #[test]
     fn serialization_clone_preserves_referents_metadata_and_indexes() {
