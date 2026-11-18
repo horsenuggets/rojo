@@ -24,9 +24,168 @@ pub struct FsSnapshot {
     /// Shared attributes stay at their real destinations during instance staging.
     shared_edits: HashMap<PathBuf, AttributesEdit>,
     shared_error: Option<String>,
+    package_sources: Option<crate::package_sources::PackageSources>,
+    pub(super) package_expected: HashMap<PathBuf, Option<Vec<u8>>>,
 }
 
 impl FsSnapshot {
+    /// Filter all operation kinds together, before any persistence. A protected
+    /// removal cancels the batch because its replacement may be elsewhere.
+    pub(crate) fn guard_packages(
+        &mut self,
+        vfs: &Vfs,
+        packages: Option<&crate::package_sources::PackageSources>,
+    ) {
+        let Some(packages) = packages else {
+            return;
+        };
+        self.package_sources = Some(packages.clone());
+        let allowed = |path: &Path, subtree: bool| {
+            if let Some(reason) = packages.blocked(vfs, path, subtree) {
+                log::warn!("Skipping Studio package difference at {}. {reason}. No files or Studio instances were changed", path.display());
+                false
+            } else {
+                true
+            }
+        };
+        if self.removed_dirs.iter().any(|path| !allowed(path, true))
+            || self.removed_files.iter().any(|path| !allowed(path, false))
+        {
+            self.added_files.clear();
+            self.added_dirs.clear();
+            self.removed_files.clear();
+            self.removed_dirs.clear();
+            return;
+        }
+        self.added_files.retain(|path, contents| {
+            // Identical installed files are not differences and need no warning.
+            if vfs
+                .read(path)
+                .ok()
+                .is_some_and(|bytes| bytes.as_slice() == contents)
+            {
+                return false;
+            }
+            allowed(path, false)
+        });
+        self.added_dirs.retain(|path| {
+            !vfs.metadata(path)
+                .ok()
+                .is_some_and(|metadata| metadata.is_dir())
+                && allowed(path, false)
+        });
+    }
+
+    fn check_packages(&self, vfs: &Vfs) -> io::Result<()> {
+        for (path, expected) in &self.package_expected {
+            if vfs
+                .read(path)
+                .with_not_found()?
+                .as_ref()
+                .map(|bytes| bytes.as_slice())
+                != expected.as_deref()
+            {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, format!("Package source changed before persistence at {}. Both edits were preserved", path.display())));
+            }
+        }
+        if let Some(previous) = &self.package_sources {
+            let current = crate::package_sources::PackageSources::load(vfs, &previous.root)
+                .map_err(io::Error::other)?;
+            if current.as_ref() != Some(previous) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Wally package ownership changed before persistence",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_package_batch(&self, base: &Path, vfs: &Vfs) -> io::Result<bool> {
+        use super::{relocation::execute_replacements, relocation_transaction::Replacement};
+        use memofs::{InMemoryFs, VfsSnapshot};
+        let Some(packages) = &self.package_sources else {
+            return Ok(false);
+        };
+        let paths: Vec<_> = self
+            .added_paths()
+            .into_iter()
+            .chain(self.removed_paths())
+            .map(|path| base.join(path))
+            .collect();
+        if !paths.iter().any(|path| packages.is_local_source(path)) {
+            return Ok(false);
+        }
+        let mut roots = std::collections::BTreeSet::new();
+        for path in paths {
+            let mut path = crate::package_sources::normalize(&path);
+            // Only replace changed files or newly created/removed directories.
+            // Existing parents and authoritative manifests must not be rewritten
+            // merely because a descendant changed.
+            while let Some(parent) = path.parent() {
+                if vfs.metadata(parent).with_not_found()?.is_some() {
+                    break;
+                }
+                path = parent.to_path_buf();
+            }
+            roots.insert(path);
+        }
+        let roots: Vec<_> = roots
+            .iter()
+            .filter(|path| {
+                !roots
+                    .iter()
+                    .any(|ancestor| ancestor != *path && path.starts_with(ancestor))
+            })
+            .cloned()
+            .collect();
+        let mut memory = InMemoryFs::new();
+        memory.load_snapshot(&packages.root, VfsSnapshot::empty_dir())?;
+        let mut entries = Vec::new();
+        for path in roots {
+            let expected = vfs.lock().snapshot_tree(&path).with_not_found()?;
+            if let Some(snapshot) = &expected {
+                memory.load_snapshot(&path, snapshot.clone())?;
+            }
+            entries.push(Replacement {
+                path,
+                expected,
+                desired: None,
+            });
+        }
+        let staged = Vfs::new(memory);
+        for entry in &entries {
+            if let Some(parent) = entry.path.parent() {
+                staged.create_dir_all(parent)?;
+            }
+        }
+        // Stage with no ownership field so this doesn't recurse into a transaction.
+        let writes = Self {
+            added_files: self.added_files.clone(),
+            added_dirs: self.added_dirs.clone(),
+            removed_files: self.removed_files.clone(),
+            removed_dirs: self.removed_dirs.clone(),
+            shared_edits: self.shared_edits.clone(),
+            shared_error: self.shared_error.clone(),
+            package_sources: None,
+            package_expected: HashMap::new(),
+        };
+        writes.write_to_vfs(base, &staged)?;
+        for entry in &mut entries {
+            entry.desired = staged.lock().snapshot_tree(&entry.path).with_not_found()?;
+        }
+        self.check_packages(vfs)?;
+        let cache = packages.root.join(".rojo/relocations");
+        vfs.create_dir_all(&cache)?;
+        vfs.lock().sync_path(cache.parent().unwrap())?;
+        vfs.lock().sync_path(&cache)?;
+        let journal = cache.join(uuid::Uuid::new_v4().to_string());
+        execute_replacements(vfs, &journal, entries)?;
+        // Leave terminal journals to the same startup recovery/retirement policy
+        // as ordinary relocations; an interrupted write always retains its intent.
+        Ok(true)
+    }
+
     /// Creates a new `FsSnapshot`.
     pub fn new() -> Self {
         Self {
@@ -36,6 +195,8 @@ impl FsSnapshot {
             removed_dirs: HashSet::new(),
             shared_edits: HashMap::new(),
             shared_error: None,
+            package_sources: None,
+            package_expected: HashMap::new(),
         }
     }
 
@@ -237,6 +398,10 @@ impl FsSnapshot {
     ///
     /// This includes removals, but makes no effort to minimize work done.
     pub fn write_to_vfs<P: AsRef<Path>>(&self, base: P, vfs: &Vfs) -> io::Result<()> {
+        self.check_packages(vfs)?;
+        if self.write_package_batch(base.as_ref(), vfs)? {
+            return Ok(());
+        }
         let mut lock = vfs.lock();
 
         let base_path = base.as_ref();
@@ -329,6 +494,7 @@ impl FsSnapshot {
         vfs: &Vfs,
         expected: &HashMap<PathBuf, Option<Vec<u8>>>,
     ) -> io::Result<()> {
+        self.check_packages(vfs)?;
         let mut lock = vfs.lock();
         let base = base.as_ref();
         if !self.removed_files.is_empty() || !self.removed_dirs.is_empty() {
@@ -388,6 +554,7 @@ impl FsSnapshot {
         expected: &HashMap<PathBuf, Option<Vec<u8>>>,
         model: &Path,
     ) -> io::Result<()> {
+        self.check_packages(vfs)?;
         let mut lock = vfs.lock();
         let base = base.as_ref();
         if !self.added_dirs.is_empty() || !self.removed_dirs.is_empty() {

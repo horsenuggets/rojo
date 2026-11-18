@@ -49,6 +49,37 @@ Making a new release? Simply add the new header with the version and date undern
   Consuming clones and CI still need Git LFS installed and configured normally. Continuous
   voxel-edit capture is separate from this filesystem representation.
 
+## `7.7.1-horse.2.0`
+
+* Added source-authoritative Wally package mounts using validated install provenance.
+  Local package edits sync to declared sources, while registry and generated differences
+  warn without writes. DataModel aliases use clone-safe native imports and round-trip
+  without rewriting authored aliases.
+* Preserved authoritative source paths in sourcemaps and expanded referenced project
+  mappings for package-aware import resolution.
+* Refreshed import mappings and authored-source transformations before publishing project
+  remounts or structural watcher changes, without changing unrelated references. Remounts
+  and their final imports form one undoable patch, while ordinary script saves stay shallow.
+* Preserved effective source overrides and working imports on resolution failure. Rejected
+  remounts keep the previous project rules, layout, and revision intact.
+* Guarded package replacements, moves, promotions, and relayout recovery with exact
+  ownership evidence, source-generation checks, and canonical ancestor validation.
+* Kept live properties and ownership metadata intact while serializing package batches,
+  and reported whole-tree source conflicts as unsaved writes rather than empty success.
+* Reported excluded or unpersisted package properties individually without acknowledging
+  unsaved edits, while saving the allowed properties in the same batch. Canonical saved
+  values are acknowledged and corrected in Studio after refreshing project-owned nodes.
+* Preserved selected original project files and directory entrypoints during package
+  syncback, preventing transparent nested projects from revisiting their outer project.
+* Resolved local package dependency aliases through each installed package's own shims,
+  preserving other original-source aliases and reversing imports during syncback.
+* Associated installed cache events with existing original-source instances, retaining
+  redirected package-root watches and preventing duplicate mounts or false revisions.
+* Published DOM mutations and their read cursors as one revision, preserving strict stale
+  write checks without exposing an updated tree with an older cursor.
+* Normalized provenance and test comparison keys across Windows, Linux, and macOS.
+* Added interruption, ownership-change, source-conflict, and package round-trip coverage.
+
 ## `7.7.1-horse.1.8`
 
 * Changing `syncbackRules.modelTrees` or `instancesAsDirectories` while serving now moves

@@ -1,6 +1,6 @@
 [package]
 name = "rojo"
-version = "7.7.1-horse.1.8"
+version = "7.7.1-horse.2.0"
 rust-version = "1.89"
 authors = [
     "Lucien Greathouse <me@lpghatguy.com>",
@@ -90,6 +90,8 @@ ritz = "0.1.0"
 roblox_install = "1.0.0"
 serde = { version = "1.0.197", features = ["derive", "rc"] }
 serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
+sha2 = "0.10.9"
+semver = "1.0.22"
 jsonc-parser = { version = "0.27.0", features = ["serde"] }
 strum = { version = "0.27", features = ["derive"] }
 toml = "0.5.11"
