@@ -244,6 +244,15 @@ function StudioExport.capture(request, dependencies)
 					properties = dependencies.serviceProperties(service, warnings),
 				})
 				for _, child in service:GetChildren() do
+					-- Studio omits runtime players even when Archivable is true, so they
+					-- must not contribute roots to the reconstruction manifest.
+					if child.ClassName == "Player" then
+						table.insert(
+							warnings,
+							`Excluded runtime player "{child:GetFullName()}" (not serialized by Studio).`
+						)
+						continue
+					end
 					addRoot(child, service.Name)
 				end
 			elseif
