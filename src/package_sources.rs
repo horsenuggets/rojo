@@ -260,9 +260,12 @@ impl PackageSources {
             let manifest_path = source.join("wally.toml");
             contained(vfs, &self.root, &self.root.join(&manifest_path))?;
             let (bytes, value) = manifest(vfs, &self.root.join(&manifest_path))?;
-            let key = manifest_path.to_str().context("Non-UTF8 manifest path")?;
+            let key = manifest_path
+                .to_str()
+                .context("Non-UTF8 manifest path")?
+                .replace('\\', "/");
             ensure!(
-                install.local_manifests.get(key) == Some(&sha256(&bytes)),
+                install.local_manifests.get(&key) == Some(&sha256(&bytes)),
                 "Local manifest hash missing or changed for {key}"
             );
             for dependency in local_requirements(&value, false)? {

@@ -115,8 +115,23 @@ pub fn files(root: &Path) -> BTreeMap<String, Vec<u8>> {
                 .strip_prefix(root)
                 .unwrap()
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
             (!path.starts_with(".rojo/")).then(|| (path, fs::read(entry.path()).unwrap()))
         })
         .collect()
+}
+
+#[test]
+fn file_comparisons_use_portable_keys_and_exclude_recovery_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    fs::create_dir_all(root.join("Source/nested")).unwrap();
+    fs::create_dir_all(root.join(".rojo/relocations/batch")).unwrap();
+    fs::write(root.join("Source/nested/init.luau"), b"return 1\n").unwrap();
+    fs::write(root.join(".rojo/relocations/batch/backup"), b"private").unwrap();
+
+    assert_eq!(
+        files(root),
+        BTreeMap::from([("Source/nested/init.luau".into(), b"return 1\n".to_vec())])
+    );
 }
