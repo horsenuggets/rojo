@@ -1060,7 +1060,43 @@ impl JobThreadContext {
                         message: reason,
                     });
                 } else {
-                    local_updates.push(update);
+                    let project = self.project();
+                    let instance = tree.get_instance(update.id).unwrap();
+                    let filter_tree = WeakDom::new(InstanceBuilder::new(instance.class_name()));
+                    let ignored =
+                        get_property_filter(&project, filter_tree.root()).unwrap_or_default();
+                    let path = tree.inner().full_path_of(update.id, "/");
+                    let ignored_tree = project.syncback_rules.as_ref().is_some_and(|rules| {
+                        rules
+                            .ignore_trees
+                            .iter()
+                            .any(|ignored| path.starts_with(ignored))
+                    });
+                    let mut allowed = update.clone();
+                    allowed.changed_properties.retain(|property, _| {
+                        let reason = if ignored_tree {
+                            "This instance is excluded by the project's syncback tree rules"
+                        } else if ignored.contains(property) {
+                            "This property is excluded by the project's syncback rules"
+                        } else if !can_write_property(
+                            &project,
+                            instance.class_name().as_str(),
+                            property.as_str(),
+                        ) {
+                            "This property is excluded by reflection serialization rules"
+                        } else {
+                            return true;
+                        };
+                        errors.push(WriteError {
+                            id: update.id,
+                            property: Some(property.to_string()),
+                            message: reason.into(),
+                        });
+                        false
+                    });
+                    if !allowed.changed_properties.is_empty() {
+                        local_updates.push(allowed);
+                    }
                 }
             }
             if !local_updates.is_empty() {
@@ -1122,9 +1158,36 @@ impl JobThreadContext {
                     Ok(())
                 })();
                 match result {
-                    Ok(()) => accepted
-                        .updated_instances
-                        .extend(local_updates.into_iter().cloned()),
+                    Ok(()) => {
+                        let database = rbx_reflection_database::get().unwrap();
+                        for mut update in local_updates {
+                            let instance = tree.get_instance(update.id);
+                            let defaults = instance
+                                .and_then(|instance| {
+                                    database.classes.get(instance.class_name().as_str())
+                                })
+                                .map(|class| &class.default_properties);
+                            // Successful serialization can still omit a path or an
+                            // unsupported property. Acknowledge only the refreshed
+                            // durable value, never merely a successful batch.
+                            update.changed_properties.retain(|property, requested| {
+                                let default = defaults.and_then(|values| values.get(property.as_str()));
+                                let saved = instance.and_then(|instance| instance.properties().get(property)).or(default);
+                                if instance.is_some() && same_value(saved, requested.as_ref().or(default)) {
+                                    return true;
+                                }
+                                errors.push(WriteError {
+                                    id: update.id,
+                                    property: Some(property.to_string()),
+                                    message: "The package property was not saved by the project's syncback rules or file format".into(),
+                                });
+                                false
+                            });
+                            if !update.changed_properties.is_empty() {
+                                accepted.updated_instances.push(update);
+                            }
+                        }
+                    }
                     Err(error) => {
                         log::warn!("Package source batch was not written. {error:#}. Studio was left unchanged");
                         for update in local_updates {
@@ -5635,6 +5698,88 @@ mod tests {
         assert!(job.apply_patches(path.clone()).is_empty());
         assert!(job.apply_patches(path).is_empty());
         assert_eq!(job.message_queue.cursor(), published);
+    }
+
+    #[test]
+    fn package_batches_report_each_excluded_or_unpersisted_property() {
+        for exclusion in ["property", "tree", "path"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut job = package_relocation_job(temp.path(), true);
+            let context = job.tree.lock().unwrap().root().metadata().context.clone();
+            let snapshot = snapshot_from_vfs(
+                &context,
+                &job.vfs,
+                &job.project().folder_location().join("default.project.json"),
+            )
+            .unwrap()
+            .unwrap();
+            *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+            let id = {
+                let tree = job.tree.lock().unwrap();
+                tree.descendants(tree.get_root_id())
+                    .find(|instance| {
+                        instance.name() == "Code"
+                            && instance
+                                .metadata()
+                                .relevant_paths
+                                .iter()
+                                .any(|path| path.ends_with("Local/First/Left/Code.luau"))
+                    })
+                    .unwrap()
+                    .id()
+            };
+            let rules = match exclusion {
+                "property" => serde_json::json!({
+                    "ignoreProperties": { "ModuleScript": ["Archivable"] }
+                }),
+                "tree" => serde_json::json!({ "ignoreTrees": ["First"] }),
+                "path" => serde_json::json!({ "ignorePaths": ["Local/First"] }),
+                _ => unreachable!(),
+            };
+            Arc::get_mut(job.project.project.get_mut().unwrap())
+                .unwrap()
+                .syncback_rules = Some(serde_json::from_value(rules).unwrap());
+            let source = temp.path().join("Local/First/Left/Code.luau");
+            let installed = temp.path().join("Packages/_Index/First/library");
+            let installed_before = job.vfs.snapshot_tree(&installed).unwrap();
+            let mut patch = property_update(id, "Source", Variant::String("return 42\n".into()));
+            patch.updated_instances[0]
+                .changed_properties
+                .insert(ustr("Archivable"), Some(Variant::Bool(false)));
+            let (accepted, conflicts, errors) = studio_write(&job, patch);
+            assert_eq!(conflicts, PatchSet::new(), "{exclusion}");
+            assert!(
+                errors.iter().any(|error| {
+                    error.id == id && error.property.as_deref() == Some("Archivable")
+                }),
+                "{exclusion} {errors:?}"
+            );
+            if exclusion == "property" {
+                assert_eq!(
+                    accepted,
+                    property_update(id, "Source", Variant::String("return 42\n".into()))
+                );
+                assert_eq!(
+                    job.vfs.read_to_string(&source).unwrap().as_str(),
+                    "return 42\n"
+                );
+                assert_eq!(errors.len(), 1, "{errors:?}");
+            } else {
+                assert_eq!(accepted, PatchSet::new(), "{exclusion}");
+                assert!(
+                    errors.iter().any(|error| {
+                        error.id == id && error.property.as_deref() == Some("Source")
+                    }),
+                    "{exclusion} {errors:?}"
+                );
+                assert_eq!(
+                    job.vfs.read_to_string(&source).unwrap().as_str(),
+                    "return 1\n"
+                );
+                assert_eq!(errors.len(), 2, "{errors:?}");
+            }
+            assert_eq!(job.vfs.snapshot_tree(&installed).unwrap(), installed_before);
+        }
     }
 
     #[test]
