@@ -6,7 +6,7 @@ expectedPlaceIds: ~
 gameId: ~
 placeId: ~
 projectName: move_folder_of_stuff
-protocolVersion: 9
+protocolVersion: 10
 rootInstanceId: id-2
 serverVersion: "[server-version]"
 sessionId: id-1

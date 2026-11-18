@@ -59,6 +59,9 @@ pub fn syncback_rbxm<'sync>(
 
     let mut fs_snapshot = FsSnapshot::new().with_added_file(&snapshot.path, serialized);
     syncback_model_name(snapshot, &mut fs_snapshot)?;
+    if inst.class == "Terrain" {
+        fs_snapshot.plan_terrain_lfs(snapshot.project(), snapshot.vfs(), &snapshot.path)?;
+    }
 
     Ok(SyncbackReturn {
         fs_snapshot,
@@ -115,6 +118,49 @@ mod test {
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn only_terrain_roots_plan_lfs_and_staging_does_not_write() {
+        use crate::{project::Project, snapshot::RojoTree, syncback::syncback_model_file};
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        for class in ["Terrain", "Folder"] {
+            let mut backend = InMemoryFs::new();
+            backend
+                .load_snapshot("/project", VfsSnapshot::empty_dir())
+                .unwrap();
+            backend
+                .load_snapshot(
+                    "/project/default.project.json",
+                    VfsSnapshot::file(r#"{"name":"Test","tree":{"$className":"Folder"}}"#),
+                )
+                .unwrap();
+            let vfs = Vfs::new(backend);
+            let project =
+                Project::load_exact(&vfs, Path::new("/project/default.project.json"), None)
+                    .unwrap();
+            let path = Path::new("/project/Root.rbxm");
+            let old = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("Root")
+                    .class_name(class)
+                    .metadata(
+                        InstanceMetadata::new()
+                            .instigating_source(path)
+                            .middleware(super::super::Middleware::Rbxm),
+                    ),
+            );
+            let dom = WeakDom::new(InstanceBuilder::new(class).with_name("Root"));
+            let staged = syncback_model_file(&vfs, &old, &project, old.get_root_id(), dom).unwrap();
+            assert_eq!(
+                staged
+                    .added_files()
+                    .contains(&Path::new("/project/.gitattributes")),
+                class == "Terrain"
+            );
+            assert!(vfs.read("/project/.gitattributes").is_err());
+            assert!(vfs.read(path).is_err());
+        }
+    }
 
     #[test]
     fn model_from_vfs() {

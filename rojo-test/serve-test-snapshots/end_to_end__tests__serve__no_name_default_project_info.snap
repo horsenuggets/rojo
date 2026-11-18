@@ -6,7 +6,7 @@ expectedPlaceIds: ~
 gameId: ~
 placeId: ~
 projectName: top-level
-protocolVersion: 9
+protocolVersion: 10
 rootInstanceId: id-2
 serverVersion: "[server-version]"
 sessionId: id-1

@@ -39,6 +39,14 @@ pub async fn call(
     let service = ApiService::new(serve_session, remote_addr);
 
     match (request.method(), request.uri().path()) {
+        (_, path) if path == "/api/export" || path.starts_with("/api/export/") => {
+            super::export::route(
+                service.serve_session.export_jobs(),
+                service.serve_session.session_id(),
+                request,
+            )
+            .await
+        }
         (&Method::GET, "/api/rojo") => service.handle_api_rojo().await,
         (&Method::GET, path) if path.starts_with("/api/read/") => {
             service.handle_api_read(request).await
@@ -550,6 +558,7 @@ async fn handle_websocket_subscription(
     input_cursor: u32,
 ) -> anyhow::Result<()> {
     let mut websocket = websocket.await?;
+    let (_export_connection, mut export_requests) = serve_session.export_jobs().connect();
 
     let session_id = serve_session.session_id();
     let tree_handle = serve_session.tree_handle();
@@ -567,6 +576,16 @@ async fn handle_websocket_subscription(
         let receiver = message_queue.subscribe(cursor);
 
         tokio::select! {
+            Some(capture) = export_requests.next() => {
+                let packet = SocketPacket {
+                    session_id,
+                    packet_type: SocketPacketType::Export,
+                    body: SocketPacketBody::Export(capture),
+                };
+                if websocket.send(Message::Binary(serialize_msgpack(packet)?)).await.is_err() {
+                    break;
+                }
+            }
             // Handle new messages from the message queue
             result = receiver => {
                 match result {

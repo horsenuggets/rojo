@@ -50,14 +50,23 @@ local ApiReadResponse = t.interface({
 	instances = t.map(RbxId, ApiInstance),
 })
 
-local SocketPacketType = t.union(t.literal("messages"))
+local SocketPacketType = t.union(t.literal("messages"), t.literal("export"))
+
+local ExportPacket = t.interface({
+	jobId = t.string,
+	scope = t.union(t.literal("place"), t.literal("model")),
+	paths = t.array(t.string),
+	selection = t.boolean,
+	allowIncomplete = t.boolean,
+	partSize = t.literal(1048576),
+})
 
 local MessagesPacket = t.interface({
 	messageCursor = t.number,
 	messages = t.array(ApiSubscribeMessage),
 })
 
-local SocketPacketBody = t.union(MessagesPacket)
+local SocketPacketBody = t.union(MessagesPacket, ExportPacket)
 
 local ApiSocketPacket = t.interface({
 	sessionId = t.string,
@@ -96,6 +105,7 @@ return strict("Types", {
 	ApiInfoResponse = ApiInfoResponse,
 	ApiReadResponse = ApiReadResponse,
 	ApiSocketPacket = ApiSocketPacket,
+	ExportPacket = ExportPacket,
 	ApiError = ApiError,
 
 	ApiInstance = ApiInstance,

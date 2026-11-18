@@ -60,6 +60,7 @@ impl Internable<()> for SocketPacket<'_> {
     fn intern(&self, redactions: &mut RedactionMap, extra: ()) {
         redactions.intern(self.session_id);
         match &self.body {
+            SocketPacketBody::Export(packet) => redactions.intern(packet.job_id),
             SocketPacketBody::Messages(packet) => packet.intern(redactions, extra),
         }
     }
