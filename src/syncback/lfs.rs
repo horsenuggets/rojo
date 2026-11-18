@@ -110,16 +110,39 @@ pub(super) fn plan(
     vfs: &Vfs,
     target: &Path,
 ) -> anyhow::Result<(PathBuf, AttributesEdit)> {
-    ensure!(
-        !target
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::CurDir)),
-        "LFS target must be normalized"
-    );
     target
         .to_str()
         .context("LFS paths must contain valid UTF-8")?;
-    let base = project.folder_location();
+    let base = vfs.canonicalize(project.folder_location())?;
+    // Resolve existing components before handling missing ones, since a symlink
+    // followed by ".." must use filesystem rather than lexical semantics.
+    let mut ancestor = target;
+    let mut tail = Vec::new();
+    let mut target = loop {
+        if let Some(resolved) = vfs.canonicalize(ancestor).with_not_found()? {
+            if !tail.is_empty() {
+                ensure!(
+                    vfs.metadata(&resolved)?.is_dir(),
+                    "LFS ancestor must be a directory"
+                );
+            }
+            break resolved;
+        }
+        let Some(Component::Normal(name)) = ancestor.components().next_back() else {
+            anyhow::bail!("LFS missing path components must be normal file names");
+        };
+        tail.push(name);
+        ancestor = ancestor
+            .parent()
+            .context("LFS target has no existing ancestor")?;
+    };
+    for name in tail.into_iter().rev() {
+        target.push(name);
+    }
+    target
+        .to_str()
+        .context("LFS paths must contain valid UTF-8")?;
+    let base = base.as_path();
     let mut lock = vfs.lock();
     // External sources need a rule within their own scope. Never create the future
     // model destination's parent, since relocation installs that directory itself.
@@ -276,6 +299,69 @@ mod tests {
     }
 
     #[test]
+    fn parent_relative_external_destinations_use_existing_scope() {
+        let (project, vfs) = project("[]");
+        vfs.write("/external/Terrain.rbxm", b"model").unwrap();
+        vfs.write("/external/.gitattributes", b"# Keep external rules\n")
+            .unwrap();
+        for relative in ["Terrain.rbxm", "future/Terrain.rbxm"] {
+            let target = Path::new("/project/../external").join(relative);
+            let (path, edit) = plan(&project, &vfs, &target).unwrap();
+            assert_eq!(path, Path::new("/external/.gitattributes"));
+            assert_eq!(edit.expected, Some(b"# Keep external rules\n".to_vec()));
+            assert_eq!(
+                edit.contents,
+                format!(
+                    "# Keep external rules\n{}\n",
+                    exact_rule(Path::new(relative)).unwrap()
+                )
+                .as_bytes()
+            );
+        }
+        assert!(vfs.metadata("/external/future").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlinks_before_parent_components_use_native_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let project_dir = root.join("project");
+        let external = root.join("external");
+        std::fs::create_dir(&project_dir).unwrap();
+        std::fs::create_dir_all(external.join("nested")).unwrap();
+        std::fs::write(
+            project_dir.join("default.project.json"),
+            r#"{"name":"Test","tree":{"$className":"DataModel"}}"#,
+        )
+        .unwrap();
+        std::fs::write(external.join("Terrain.rbxm"), b"model").unwrap();
+        symlink(external.join("nested"), project_dir.join("link")).unwrap();
+        symlink(&project_dir, root.join("alias")).unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let project =
+            Project::load_exact(&vfs, &root.join("alias/default.project.json"), None).unwrap();
+        for relative in ["Terrain.rbxm", "future/Terrain.rbxm"] {
+            let (path, edit) =
+                plan(&project, &vfs, &root.join("alias/link/..").join(relative)).unwrap();
+            assert_eq!(path, external.join(".gitattributes"));
+            assert_eq!(
+                edit.contents,
+                format!("{}\n", exact_rule(Path::new(relative)).unwrap()).as_bytes()
+            );
+        }
+        // The canonical project base still bounds internal attribute precedence.
+        let (path, _) = plan(&project, &vfs, &root.join("alias/future/Terrain.rbxm")).unwrap();
+        assert_eq!(path, project_dir.join(".gitattributes"));
+        assert!(!external.join("future").exists());
+        assert!(!external.join(".gitattributes").exists());
+        assert!(plan(&project, &vfs, &root.join("alias/missing/../Terrain.rbxm")).is_err());
+    }
+
+    #[test]
     fn later_overrides_are_repaired_without_repeated_growth() {
         let rule = exact_rule(Path::new("Terrain.rbxm")).unwrap();
         let original = format!("{rule}\n*.rbxm -filter -diff -merge text\n");
@@ -335,6 +421,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path, Path::new("/project/src/.gitattributes"));
+        let (relative_path, relative_edit) = plan(
+            &project,
+            &vfs,
+            Path::new("/project/src/../src/future/Terrain.rbxm"),
+        )
+        .unwrap();
+        assert_eq!(relative_path, path);
+        assert_eq!(relative_edit.expected, edit.expected);
+        assert_eq!(relative_edit.contents, edit.contents);
         assert!(vfs.metadata("/project/src/future").is_err());
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("src")).unwrap();
