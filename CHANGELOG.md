@@ -31,6 +31,11 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added source-authoritative Wally package mounts using validated install provenance.
+  Local package edits sync to declared sources, while registry and generated differences
+  warn without writes. DataModel aliases use clone-safe native imports and round-trip
+  without rewriting authored aliases.
+
 ## `7.7.1-horse.1.8`
 
 * Changing `syncbackRules.modelTrees` or `instancesAsDirectories` while serving now moves

@@ -22,6 +22,404 @@ use librojo::web_api::{
 };
 
 #[test]
+fn package_sources_serve_routes_originals_and_watches_without_reinstall() {
+    use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
+    let mut session = TestServeSession::with_setup("add_folder", fixture::setup);
+    let info = session.wait_to_come_online();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let id = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "foo")
+        .unwrap()
+        .id;
+    let before = fixture::files(session.path());
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(read.message_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: Vec::new(),
+        added: Default::default(),
+        updated: vec![
+            fixture::source_update(id, "return { Value = 11 }\n"),
+            fixture::source_update(
+                read.instances
+                    .values()
+                    .find(|instance| instance.name == "Child")
+                    .unwrap()
+                    .id,
+                "return 13\n",
+            ),
+        ],
+    });
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let mut expected = before;
+    expected.insert(
+        fixture::ORIGINAL.into(),
+        b"return { Value = 11 }\n".to_vec(),
+    );
+    expected.insert(
+        "Source/ForkedPackages/foo/Source/Foo/Child.luau".into(),
+        b"return 13\n".to_vec(),
+    );
+    assert_eq!(fixture::files(session.path()), expected);
+    fs::write(
+        session.path().join(fixture::ORIGINAL),
+        "return { Value = 12 }\n",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        if read.instances.get(&id).is_some_and(|instance| {
+            instance
+                .properties
+                .get(&ustr("Source"))
+                .map(|value| value.as_ref())
+                == Some(&Variant::String("return { Value = 12 }\n".into()))
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Original package source was not watched"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let child = session
+        .path()
+        .join("Source/ForkedPackages/foo/Source/Foo/Added.luau");
+    fs::write(&child, "return 99\n").unwrap();
+    for present in [true, false] {
+        if !present {
+            fs::remove_file(&child).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            if read
+                .instances
+                .values()
+                .any(|instance| instance.name == "Added")
+                == present
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Original package add/remove was not watched"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
+fn package_sources_serve_blocks_registry_generated_and_structural_writes_without_reversion() {
+    use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
+    for target in ["registry", "Foo"] {
+        let mut session = TestServeSession::with_setup("add_folder", fixture::setup);
+        let info = session.wait_to_come_online();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let id = read
+            .instances
+            .values()
+            .find(|instance| instance.name == target)
+            .unwrap()
+            .id;
+        let before = fixture::files(session.path());
+        for remove in [false, true] {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            let response = session.post_api_write(&WriteRequest {
+                session_id: info.session_id,
+                message_cursor: Some(read.message_cursor),
+                authority: WriteAuthority::Studio,
+                removed: if remove { vec![id] } else { vec![] },
+                added: Default::default(),
+                updated: if remove {
+                    vec![]
+                } else {
+                    vec![InstanceUpdate {
+                        id,
+                        changed_name: Some("Renamed".into()),
+                        changed_class_name: None,
+                        changed_parent: None,
+                        changed_metadata: None,
+                        changed_properties: UstrMap::from_iter([(
+                            ustr("Source"),
+                            Some(Variant::String("return 'changed'\n".into())),
+                        )]),
+                    }]
+                },
+            });
+            assert!(!response.errors.is_empty());
+            assert!(
+                response.conflicts.updated_instances.is_empty()
+                    && response.conflicts.removed_instances.is_empty()
+                    && response.conflicts.added_instances.is_empty(),
+                "A warning must not revert Studio {response:?}"
+            );
+            assert_eq!(fixture::files(session.path()), before);
+        }
+    }
+}
+
+#[test]
+fn package_sources_serve_preserves_stale_source_edits_without_restoring_studio() {
+    use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
+    let mut session = TestServeSession::with_setup("add_folder", fixture::setup);
+    let info = session.wait_to_come_online();
+    let original = session.get_api_read(info.root_instance_id).unwrap();
+    let id = original
+        .instances
+        .values()
+        .find(|instance| instance.name == "foo")
+        .unwrap()
+        .id;
+    fs::write(session.path().join(fixture::ORIGINAL), "return 22\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        if read.message_cursor != original.message_cursor {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    let before = fixture::files(session.path());
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(original.message_cursor),
+        authority: WriteAuthority::Studio,
+        removed: vec![],
+        added: Default::default(),
+        updated: vec![fixture::source_update(id, "return 33\n")],
+    });
+    assert!(!response.errors.is_empty());
+    assert!(
+        response.conflicts.updated_instances.is_empty()
+            && response.conflicts.removed_instances.is_empty()
+            && response.conflicts.added_instances.is_empty()
+    );
+    assert_eq!(fixture::files(session.path()), before);
+}
+
+#[test]
+fn package_sources_serve_reverses_generated_imports_and_rejects_ambiguous_edits() {
+    use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
+    let original = "local Child = require('@packages/_Index/scope_foo@local/foo/Source/Foo/Child')\nreturn Child + 1\n";
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fixture::setup(root);
+        fs::write(root.join(fixture::ORIGINAL), original).unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let instance = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "foo")
+        .unwrap();
+    let id = instance.id;
+    let emitted = match instance.properties[&ustr("Source")].as_ref() {
+        Variant::String(source) => source.clone(),
+        _ => panic!("Missing source"),
+    };
+    assert!(
+        emitted.contains("@game/ReplicatedStorage/Packages/_Index/scope_foo@local/foo/Child"),
+        "{emitted}"
+    );
+    let mut expected = fixture::files(session.path());
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(read.message_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: vec![],
+        added: Default::default(),
+        updated: vec![fixture::source_update(
+            id,
+            &emitted.replace("Child + 1", "Child + 2"),
+        )],
+    });
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    expected.insert(
+        fixture::ORIGINAL.into(),
+        original.replace("Child + 1", "Child + 2").into_bytes(),
+    );
+    assert_eq!(fixture::files(session.path()), expected);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let read = loop {
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        if read.instances[&id].properties[&ustr("Source")].as_ref()
+            == &Variant::String(emitted.replace("Child + 1", "Child + 2"))
+        {
+            break read;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    };
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(read.message_cursor),
+        authority: WriteAuthority::Studio,
+        removed: vec![],
+        added: Default::default(),
+        updated: vec![fixture::source_update(
+            id,
+            &emitted.replace("/foo/Child", "/foo/Other"),
+        )],
+    });
+    assert!(!response.errors.is_empty());
+    assert!(response.conflicts.updated_instances.is_empty());
+    assert_eq!(fixture::files(session.path()), expected);
+}
+
+#[test]
+fn package_sources_serve_invalid_or_absent_provenance_fails_closed() {
+    use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
+    for case in fixture::INVALID_INSTALL_CASES {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fixture::setup(root);
+            fixture::invalidate(root, case);
+        });
+        let info = session.wait_to_come_online();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let id = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "registry")
+            .unwrap()
+            .id;
+        let before = fixture::files(session.path());
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(read.message_cursor),
+            authority: WriteAuthority::Studio,
+            removed: vec![],
+            added: Default::default(),
+            updated: vec![fixture::source_update(id, "return 'changed'\n")],
+        });
+        assert!(!response.errors.is_empty(), "{case}");
+        assert!(
+            response.conflicts.updated_instances.is_empty()
+                && response.conflicts.added_instances.is_empty()
+                && response.conflicts.removed_instances.is_empty()
+        );
+        assert_eq!(fixture::files(session.path()), before, "{case}");
+    }
+}
+
+#[test]
+fn package_sources_serve_add_rename_and_remove_use_original_directories() {
+    use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
+    use librojo::web_api::InstanceAddition;
+    let mut session = TestServeSession::with_setup("add_folder", fixture::setup);
+    let info = session.wait_to_come_online();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let parent = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "foo")
+        .unwrap()
+        .id;
+    let before = fixture::files(session.path());
+    let (model, ids) = created_subtree("Added", &[("Module", "ModuleScript")]);
+    let folder_id = ids.id;
+    let module_id = ids.children[0].id;
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(read.message_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: vec![],
+        updated: vec![],
+        added: std::collections::HashMap::from([(
+            folder_id,
+            InstanceAddition { parent, model, ids },
+        )]),
+    });
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let original = session
+        .path()
+        .join("Source/ForkedPackages/foo/Source/Foo/Added");
+    assert_eq!(
+        fs::read_to_string(original.join("Module.luau")).unwrap(),
+        "return \"Module\"\n"
+    );
+    assert!(!session
+        .path()
+        .join(fixture::INSTALLED)
+        .join("Added")
+        .exists());
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let mut rename = fixture::source_update(module_id, "return \"Module\"\n");
+    rename.changed_name = Some("Renamed".into());
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(read.message_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: vec![],
+        added: Default::default(),
+        updated: vec![rename],
+    });
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(original.join("Renamed.luau").is_file());
+    assert!(!original.join("Module.luau").exists());
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(read.message_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: vec![folder_id],
+        added: Default::default(),
+        updated: vec![],
+    });
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(!original.exists());
+    assert_eq!(fixture::files(session.path()), before);
+}
+
+#[test]
+fn package_sources_serve_batches_model_properties_with_script_sources() {
+    use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
+    let model_path = "Source/ForkedPackages/foo/Source/Foo/Thing.model.json";
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fixture::setup(root);
+        fs::write(root.join(model_path), r#"{"className":"Folder","children":[{"name":"Nested","className":"NumberValue","properties":{"Value":3}}]}"#).unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let script = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "foo")
+        .unwrap()
+        .id;
+    let child = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "Nested")
+        .unwrap()
+        .id;
+    let mut model = fixture::source_update(child, "");
+    model.changed_properties = UstrMap::from_iter([(ustr("Value"), Some(Variant::Float64(4.0)))]);
+    let mut expected = fixture::files(session.path());
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(read.message_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: vec![],
+        added: Default::default(),
+        updated: vec![fixture::source_update(script, "return 23\n"), model],
+    });
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let model = fs::read(session.path().join(model_path)).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&model).unwrap();
+    assert_eq!(value["children"][0]["properties"]["Value"], 4);
+    expected.insert(model_path.into(), model);
+    expected.insert(fixture::ORIGINAL.into(), b"return 23\n".to_vec());
+    assert_eq!(fixture::files(session.path()), expected);
+}
+
+#[test]
 fn numeric_api_writes_normalize_disk_json_and_converge() {
     assert_numeric_api_writes_converge(&[(5.0000005, 5.0), (-5.0000005, -5.0)]);
 }

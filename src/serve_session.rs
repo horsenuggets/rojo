@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::{
     change_processor::{ChangeProcessor, TreeMutation},
     message_queue::MessageQueue,
-    project::{Project, ProjectError, ProjectNode},
+    project::{Project, ProjectError},
     session_id::SessionId,
     snapshot::{
         apply_patch_set, compute_patch_set, AppliedPatchSet, InstanceContext, InstanceSnapshot,
@@ -87,6 +87,106 @@ pub struct ServeSession {
     tree_mutation_sender: Sender<TreeMutation>,
 }
 
+// Validate relayout witnesses before either recovery pass mutates sources. Legacy
+// records remain conservative; paths alone cannot prove historical package ownership.
+fn preflight_startup_recovery(
+    vfs: &Vfs,
+    project: &Project,
+    packages: Option<&crate::package_sources::PackageSources>,
+) -> io::Result<()> {
+    use memofs::IoResultExt;
+    use std::path::Component;
+
+    let root = project.folder_location();
+    let failure = |path: &Path, reason: &str| {
+        io::Error::other(format!(
+            "Startup recovery refused for {} ({reason}). Journal and backups retained. Restore the original canonical directories and Wally ownership, or copy backups to a safe location and reconcile manually before retrying",
+            path.display()
+        ))
+    };
+    for cache in [
+        crate::syncback::relocation::cache_directory(project),
+        crate::syncback::relocation::relayout_directory(project),
+    ] {
+        for ancestor in cache.ancestors() {
+            if let Some(canonical) = vfs.canonicalize(ancestor).with_not_found()? {
+                if canonical != ancestor {
+                    return Err(failure(
+                        &cache,
+                        "Recovery cache traverses a noncanonical ancestor",
+                    ));
+                }
+                break;
+            }
+        }
+    }
+    let relayouts = crate::syncback::relocation::relayout_directory(project);
+    let Some(folders) = vfs.read_dir(&relayouts).with_not_found()? else {
+        return Ok(());
+    };
+    for folder in folders {
+        let folder = folder?.path().to_path_buf();
+        if vfs.canonicalize(&folder)? != folder {
+            return Err(failure(
+                &folder,
+                "Relayout backup directory is not canonical",
+            ));
+        }
+        let Some(bytes) = vfs
+            .read(folder.join(crate::syncback::relocation::RELAYOUT_MANIFEST_NAME))
+            .with_not_found()?
+        else {
+            continue;
+        };
+        let Ok(manifest) =
+            serde_json::from_slice::<crate::syncback::relocation::RelayoutManifest>(&bytes)
+        else {
+            // The legacy recovery pass preserves unreadable manifests unchanged.
+            continue;
+        };
+        manifest.validate_package(vfs, &folder)?;
+        let has_package_evidence = manifest.package.is_some();
+        for (original, backup) in manifest.entries {
+            if !original.starts_with(root)
+                || original
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+                || Path::new(&backup).components().count() != 1
+                || !matches!(
+                    Path::new(&backup).components().next(),
+                    Some(Component::Normal(_))
+                )
+            {
+                return Err(failure(
+                    &folder,
+                    "Legacy relayout contains an escaping or nonnormalized path",
+                ));
+            }
+            let Some(parent) = original.parent() else {
+                return Err(failure(&folder, "Relayout original has no parent"));
+            };
+            if vfs.canonicalize(parent).with_not_found()?.as_deref() != Some(parent) {
+                return Err(failure(
+                    &folder,
+                    "Relayout original parent is missing or noncanonical",
+                ));
+            }
+            if let Some(packages) = packages {
+                if !has_package_evidence
+                    && (packages.is_local_source(&original)
+                        || packages.blocked(vfs, &original, true).is_some())
+                {
+                    return Err(failure(
+                        &folder,
+                        "Legacy relayout has no durable package ownership witness",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ServeSession {
     /// Start a new serve session from the given in-memory filesystem and start
     /// path.
@@ -116,6 +216,12 @@ impl ServeSession {
         log::trace!("Starting new ServeSession at path {}", start_path.display());
 
         let root_project = Arc::new(Project::load_initial_project(&vfs, start_path)?);
+        // Establish package authority before recovery can touch original sources.
+        // Replacement journals additionally verify their durable generation witness;
+        // missing or stale provenance never grants rollback ownership.
+        let package_sources =
+            crate::package_sources::PackageSources::load(&vfs, root_project.folder_location())?;
+        preflight_startup_recovery(&vfs, &root_project, package_sources.as_ref())?;
         crate::syncback::relocation::recover_relocations(&vfs, &root_project)?;
         crate::syncback::relocation::recover_relayouts(&vfs, &root_project)?;
 
@@ -129,21 +235,29 @@ impl ServeSession {
         // Journals are private server state, never source instances.
         instance_context.set_reserved_cache_path(root_project.folder_location().join(".rojo"));
 
-        // Enable .luaurc alias resolution. Alias requires are
-        // transformed into relative require-by-string paths during
-        // snapshotting. This applies to both build and serve modes.
-        let path_mappings = extract_path_mappings(&root_project);
-        instance_context.require_context = Some(Arc::new(RequireContext {
-            project_root: root_project.folder_location().to_path_buf(),
-            path_mappings,
-        }));
+        // Ordinary application recovery can restore manifests. Use the final
+        // filesystem state rather than keeping a pre-recovery ownership snapshot.
+        instance_context.package_sources =
+            crate::package_sources::PackageSources::load(&vfs, root_project.folder_location())?
+                .map(Arc::new);
 
         log::trace!("Generating snapshot of instances from VFS");
         let load = || snapshot_from_vfs(&instance_context, &vfs, start_path);
-        let snapshot = match &pool {
+        let mut snapshot = match &pool {
             Some(pool) => pool.install(load),
             None => load(),
         }?;
+        if let Some(snapshot) = &mut snapshot {
+            // Use the expanded snapshot, not only explicit project nodes. This
+            // includes nested default projects and referenced top-level projects.
+            let path_mappings = extract_path_mappings(snapshot, root_project.folder_location())?;
+            let require_context = Arc::new(RequireContext {
+                project_root: root_project.folder_location().to_path_buf(),
+                path_mappings,
+                datamodel: snapshot.class_name == "DataModel",
+            });
+            crate::snapshot_middleware::prepare_requires(snapshot, &vfs, &require_context)?;
+        }
 
         log::trace!("Computing initial patch set");
         let patch_set = compute_patch_set(snapshot, &tree, root_id);
@@ -288,28 +402,49 @@ pub enum ServeSessionError {
 /// This produces:
 /// - `("Packages", ["Packages"])`
 /// - `("Source/Plugin", ["Plugin"])`
-fn extract_path_mappings(project: &Project) -> Vec<(PathBuf, Vec<String>)> {
+fn extract_path_mappings(
+    snapshot: &InstanceSnapshot,
+    root: &Path,
+) -> anyhow::Result<Vec<(PathBuf, Vec<String>)>> {
     let mut mappings = Vec::new();
-
-    fn walk(node: &ProjectNode, dm_path: &[String], mappings: &mut Vec<(PathBuf, Vec<String>)>) {
-        if let Some(ref path_node) = node.path {
-            mappings.push((path_node.path().to_path_buf(), dm_path.to_vec()));
+    fn walk(
+        snapshot: &InstanceSnapshot,
+        root: &Path,
+        dm: &[String],
+        mappings: &mut Vec<(PathBuf, Vec<String>)>,
+    ) {
+        for path in snapshot
+            .metadata
+            .relevant_paths
+            .iter()
+            .chain(&snapshot.metadata.installed_paths)
+        {
+            if let Ok(relative) = path.strip_prefix(root) {
+                mappings.push((relative.to_path_buf(), dm.to_vec()));
+            }
         }
-
-        for (name, child) in &node.children {
-            let mut child_path = dm_path.to_vec();
-            child_path.push(name.clone());
-            walk(child, &child_path, mappings);
+        for child in &snapshot.children {
+            let mut path = dm.to_vec();
+            path.push(child.name.to_string());
+            walk(child, root, &path, mappings);
         }
     }
-
-    walk(&project.tree, &[], &mut mappings);
-
-    // Sort by filesystem path length (longest first) so that
-    // more specific mappings match before broader ones.
-    mappings.sort_by(|a, b| b.0.components().count().cmp(&a.0.components().count()));
-
-    mappings
+    walk(snapshot, root, &[], &mut mappings);
+    mappings.sort_by(|a, b| {
+        b.0.components()
+            .count()
+            .cmp(&a.0.components().count())
+            .then(a.0.cmp(&b.0))
+    });
+    mappings.dedup();
+    if let Some(packages) = &snapshot.metadata.context.package_sources {
+        for pair in mappings.windows(2) {
+            if pair[0].0 == pair[1].0 && packages.is_local_source(&root.join(&pair[0].0)) {
+                anyhow::bail!("Local package source {} is mounted more than once. Remove the duplicate source mount instead of creating divergent module identities", pair[0].0.display());
+            }
+        }
+    }
+    Ok(mappings)
 }
 
 #[cfg(test)]

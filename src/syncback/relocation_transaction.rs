@@ -14,8 +14,9 @@
 //!
 //! This is not globally atomic to editors. Source validation is not an OS compare-and-swap;
 //! an edit can race validation and follow the moved inode. Post-move validation detects
-//! content changes, but cannot detect identical-byte replacement (ABA). Symlink/ancestor
-//! substitution by an adversarial process is outside this contract. Unix durability relies
+//! content changes, but cannot detect identical-byte replacement (ABA). Recovery preflights
+//! canonical ancestors and package authority; adversarial substitutions racing those checks
+//! are outside this contract. Unix durability relies
 //! on filesystem fsync semantics; Windows flushes files and uses write-through moves, but
 //! does not promise power-loss ordering of directory creation. In-memory durability lasts
 //! only for the lifetime of the shared backend.
@@ -29,6 +30,7 @@ use memofs::{IoResultExt, Vfs, VfsLock, VfsSnapshot};
 use serde::{Deserialize, Serialize};
 
 const JOURNAL_VERSION: u32 = 1;
+const STRUCTURAL_VERSION: u32 = 2;
 const COMMIT: &[u8] = b"committed\n";
 const ROLLBACK: &[u8] = b"rolled back\n";
 
@@ -46,6 +48,8 @@ struct Journal {
     moves: Vec<Relocation>,
     #[serde(default)]
     absent_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ownership: Option<ReplacementOwnership>,
 }
 
 /// Replaces disjoint original trees with one directory. Each entry's destination is
@@ -64,12 +68,49 @@ struct PromotionJournal {
     promotion: Promotion,
     #[serde(default)]
     absent_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ownership: Option<ReplacementOwnership>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Recovery {
     Committed,
     RolledBack,
+}
+
+/// Generated scratch output is not an authoritative source move. Package installs
+/// use absence-checked replacements, keeping scratch bytes outside source ownership.
+pub(crate) fn execute_staged(
+    vfs: &Vfs,
+    directory: &Path,
+    moves: Vec<Relocation>,
+) -> io::Result<()> {
+    let Some(ownership) = capture_structural_ownership(vfs, directory, &moves)? else {
+        return execute(vfs, directory, moves, Vec::new());
+    };
+    let staging = ownership.policy.root.join(".rojo/staging");
+    let mut entries = Vec::new();
+    {
+        let mut fs = vfs.lock();
+        validate(&mut fs, directory, &moves, true)?;
+        for entry in moves {
+            if !entry.source.starts_with(&staging)
+                || !ownership.policy.is_local_source(&entry.destination)
+            {
+                return Err(recovery_refused(
+                    directory,
+                    "Package output must originate in private scratch staging",
+                ));
+            }
+            require_expected(&fs, &entry.source, &entry.expected)?;
+            entries.push(Replacement {
+                path: entry.destination,
+                expected: None,
+                desired: Some(entry.expected),
+            });
+        }
+    }
+    execute_replacements(vfs, directory, entries)
 }
 
 /// Execute disjoint moves. Paths must be absolute and lexically normalized. All source
@@ -83,7 +124,9 @@ pub fn execute(
     moves: Vec<Relocation>,
     absent_paths: Vec<PathBuf>,
 ) -> io::Result<()> {
+    let ownership = capture_structural_ownership(vfs, journal_dir, &moves)?;
     let mut fs = vfs.lock();
+    validate_structural_ownership(&mut fs, journal_dir, ownership.as_ref(), &moves)?;
     validate(&mut fs, journal_dir, &moves, true)?;
     require_absent(&fs, &absent_paths)?;
     for relocation in &moves {
@@ -100,9 +143,10 @@ pub fn execute(
         }
     }
     let journal = Journal {
-        version: JOURNAL_VERSION,
+        version: STRUCTURAL_VERSION,
         moves,
         absent_paths,
+        ownership,
     };
     let bytes = serde_json::to_vec(&journal).map_err(io::Error::other)?;
     publish_intent(&mut fs, journal_dir, &bytes)?;
@@ -112,6 +156,7 @@ pub fn execute(
 fn execute_prepared(fs: &mut VfsLock<'_>, journal_dir: &Path, journal: &Journal) -> io::Result<()> {
     let result = (|| {
         require_absent(fs, &journal.absent_paths)?;
+        validate_structural_ownership(fs, journal_dir, journal.ownership.as_ref(), &journal.moves)?;
         for (index, relocation) in journal.moves.iter().enumerate() {
             flush_tree(fs, &relocation.source)?;
             transfer(
@@ -121,6 +166,7 @@ fn execute_prepared(fs: &mut VfsLock<'_>, journal_dir: &Path, journal: &Journal)
                 &relocation.expected,
             )?;
         }
+        validate_prepared_structure(fs, journal_dir)?;
         for (index, relocation) in journal.moves.iter().enumerate() {
             transfer(
                 fs,
@@ -145,33 +191,118 @@ fn execute_prepared(fs: &mut VfsLock<'_>, journal_dir: &Path, journal: &Journal)
 }
 
 /// Recover one transaction, idempotently. Call before collecting session snapshots.
-/// Missing/corrupt intents or markers fail closed without removing any data. This API
-/// does not scan a project or choose a cache location on the caller's behalf.
+/// Missing/corrupt intents or markers fail closed without removing any data. Package
+/// writes require durable ownership evidence matching the current Wally generation.
+/// Version-two structural records persist this witness before staging. Untagged legacy
+/// application journals remain recoverable unless current declarations protect their paths;
+/// they cannot prove historical package ownership after those declarations were removed.
+/// This API does not choose a cache location on the caller's behalf.
 pub fn recover(vfs: &Vfs, journal_dir: &Path) -> io::Result<Recovery> {
+    // Validate current authority before acquiring the VFS lock. The locked recovery
+    // checks the same durable evidence again before performing any mutation.
+    require_canonical_parent(&mut vfs.lock(), &journal_dir.join("intent.json"))?;
+    let bytes = read_file(&vfs.lock(), &journal_dir.join("intent.json"))?;
+    let intent: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if intent.get("kind").and_then(serde_json::Value::as_str) == Some("replacement") {
+        let journal: ReplacementJournal =
+            serde_json::from_value(intent).map_err(io::Error::other)?;
+        let ownership = journal.ownership.as_ref().ok_or_else(|| {
+            recovery_refused(
+                journal_dir,
+                "Legacy package journal has no durable ownership evidence",
+            )
+        })?;
+        ownership
+            .policy
+            .check_generation(vfs)
+            .map_err(|error| recovery_refused(journal_dir, &format!("{error:#}")))?;
+        for entry in &journal.entries {
+            crate::package_sources::contained(vfs, &ownership.policy.root, &entry.path)
+                .map_err(|error| recovery_refused(journal_dir, &format!("{error:#}")))?;
+            if let Some(reason) = ownership.policy.blocked(vfs, &entry.path, true) {
+                return Err(recovery_refused(journal_dir, &reason));
+            }
+        }
+    } else if intent
+        .get("ownership")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        // Old moves/promotions carry no package generation witness. Keep ordinary
+        // application recovery working, but never infer package ownership from one.
+        let paths: Vec<PathBuf> = if intent.get("kind").is_some() {
+            let journal: PromotionJournal =
+                serde_json::from_value(intent).map_err(io::Error::other)?;
+            std::iter::once(journal.promotion.destination)
+                .chain(
+                    journal
+                        .promotion
+                        .originals
+                        .into_iter()
+                        .flat_map(|entry| [entry.source, entry.destination]),
+                )
+                .collect()
+        } else {
+            let journal: Journal = serde_json::from_value(intent).map_err(io::Error::other)?;
+            journal
+                .moves
+                .into_iter()
+                .flat_map(|entry| [entry.source, entry.destination])
+                .collect()
+        };
+        for ancestor in journal_dir.ancestors().skip(1) {
+            if let Some(policy) = crate::package_sources::PackageSources::load(vfs, ancestor)
+                .map_err(io::Error::other)?
+            {
+                for path in &paths {
+                    if policy.is_local_source(path) || policy.blocked(vfs, path, true).is_some() {
+                        return Err(recovery_refused(
+                            journal_dir,
+                            "Move or promotion journal has no package ownership witness",
+                        ));
+                    }
+                }
+                break;
+            }
+        }
+    }
     recover_locked(&mut vfs.lock(), journal_dir)
 }
 
 fn recover_locked(fs: &mut VfsLock<'_>, journal_dir: &Path) -> io::Result<Recovery> {
     let bytes = read_file(fs, &journal_dir.join("intent.json"))?;
     let intent: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if intent.get("kind").and_then(serde_json::Value::as_str) == Some("replacement") {
+        let journal: ReplacementJournal =
+            serde_json::from_value(intent).map_err(io::Error::other)?;
+        return recover_replacement(fs, journal_dir, &journal);
+    }
     if intent.get("kind").is_some() {
         let journal: PromotionJournal = serde_json::from_value(intent).map_err(io::Error::other)?;
-        if journal.version != JOURNAL_VERSION || journal.kind != "promotion" {
+        if ![JOURNAL_VERSION, STRUCTURAL_VERSION].contains(&journal.version)
+            || journal.kind != "promotion"
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Unknown promotion journal",
             ));
         }
+        validate_structural_ownership(
+            fs,
+            journal_dir,
+            journal.ownership.as_ref(),
+            &journal.promotion.originals,
+        )?;
         return recover_promotion(fs, journal_dir, &journal.promotion);
     }
     // Keep recognizing version-one untagged move journals created by older sessions.
     let journal: Journal = serde_json::from_value(intent).map_err(io::Error::other)?;
-    if journal.version != JOURNAL_VERSION {
+    if ![JOURNAL_VERSION, STRUCTURAL_VERSION].contains(&journal.version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Unknown relocation journal version",
         ));
     }
+    validate_structural_ownership(fs, journal_dir, journal.ownership.as_ref(), &journal.moves)?;
     validate(fs, journal_dir, &journal.moves, false)?;
     let committed = marker(fs, journal_dir, "commit", COMMIT)?;
     let rolled_back = marker(fs, journal_dir, "rollback", ROLLBACK)?;
@@ -263,7 +394,14 @@ pub fn execute_promotion(
     promotion: Promotion,
     absent_paths: Vec<PathBuf>,
 ) -> io::Result<()> {
+    let ownership = capture_structural_ownership(vfs, journal_dir, &promotion.originals)?;
     let mut fs = vfs.lock();
+    validate_structural_ownership(
+        &mut fs,
+        journal_dir,
+        ownership.as_ref(),
+        &promotion.originals,
+    )?;
     let output = validate_promotion(&mut fs, journal_dir, &promotion, true)?;
     require_absent(&fs, &absent_paths)?;
     for entry in &promotion.originals {
@@ -280,10 +418,11 @@ pub fn execute_promotion(
         ));
     }
     let journal = PromotionJournal {
-        version: JOURNAL_VERSION,
+        version: STRUCTURAL_VERSION,
         kind: "promotion".to_owned(),
         promotion,
         absent_paths,
+        ownership,
     };
     publish_intent(
         &mut fs,
@@ -299,6 +438,23 @@ pub fn execute_promotion(
     )
 }
 
+fn validate_prepared_structure(fs: &mut VfsLock<'_>, directory: &Path) -> io::Result<()> {
+    let bytes = read_file(fs, &directory.join("intent.json"))?;
+    let intent: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if intent.get("kind").is_some() {
+        let journal: PromotionJournal = serde_json::from_value(intent).map_err(io::Error::other)?;
+        validate_structural_ownership(
+            fs,
+            directory,
+            journal.ownership.as_ref(),
+            &journal.promotion.originals,
+        )
+    } else {
+        let journal: Journal = serde_json::from_value(intent).map_err(io::Error::other)?;
+        validate_structural_ownership(fs, directory, journal.ownership.as_ref(), &journal.moves)
+    }
+}
+
 fn execute_promotion_prepared(
     fs: &mut VfsLock<'_>,
     journal_dir: &Path,
@@ -308,9 +464,11 @@ fn execute_promotion_prepared(
 ) -> io::Result<()> {
     let result = (|| {
         require_absent(fs, absent_paths)?;
+        validate_prepared_structure(fs, journal_dir)?;
         materialize(fs, &journal_dir.join("output"), output)?;
         flush_tree(fs, &journal_dir.join("output"))?;
         fs.sync_path(journal_dir)?;
+        validate_prepared_structure(fs, journal_dir)?;
         for (index, entry) in promotion.originals.iter().enumerate() {
             flush_tree(fs, &entry.source)?;
             transfer(
@@ -330,6 +488,7 @@ fn execute_promotion_prepared(
             )?;
         }
         flush_tree(fs, &journal_dir.join("output"))?;
+        validate_prepared_structure(fs, journal_dir)?;
         transfer(
             fs,
             &journal_dir.join("output"),
@@ -546,6 +705,434 @@ fn recover_promotion(
     Ok(Recovery::RolledBack)
 }
 
+/// One disjoint source tree replacement. None represents absence, not an empty file.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Replacement {
+    pub path: PathBuf,
+    pub expected: Option<VfsSnapshot>,
+    pub desired: Option<VfsSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReplacementJournal {
+    version: u32,
+    kind: String,
+    entries: Vec<Replacement>,
+    // Version-one journals remain readable, but missing package authority is never
+    // permission to roll back. Preserve their backups for manual resolution.
+    #[serde(default)]
+    ownership: Option<ReplacementOwnership>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ReplacementOwnership {
+    policy: crate::package_sources::PackageSources,
+    authority: Vec<(PathBuf, VfsSnapshot)>,
+}
+
+impl ReplacementOwnership {
+    fn capture(vfs: &Vfs, directory: &Path) -> io::Result<Self> {
+        let root = directory
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| {
+                vfs.metadata(ancestor.join("wally.toml"))
+                    .with_not_found()
+                    .is_ok_and(|value| value.is_some())
+            })
+            .ok_or_else(|| {
+                recovery_refused(
+                    directory,
+                    "Package writes require authoritative Wally manifests",
+                )
+            })?;
+        let policy = crate::package_sources::PackageSources::load(vfs, root)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| recovery_refused(directory, "Missing package ownership"))?;
+        policy.check_generation(vfs).map_err(io::Error::other)?;
+        let mut paths = vec![root.join("wally.toml"), root.join("wally.install.json")];
+        for package in &policy.install.as_ref().unwrap().package_roots {
+            if let Some(source) = &package.source_path {
+                paths.push(root.join(source).join("wally.toml"));
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let authority = paths
+            .into_iter()
+            .map(|path| {
+                let snapshot = vfs.snapshot_tree(&path)?;
+                Ok((path, snapshot))
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(Self { policy, authority })
+    }
+}
+
+fn recovery_refused(directory: &Path, reason: &str) -> io::Error {
+    io::Error::other(format!(
+        "Package recovery refused ({reason}). Journal and backups retained at {}. Restore the original Wally manifests, provenance, and canonical source directories before retrying, or copy the retained backups to a safe location and reconcile manually. Do not delete the journal or rerun Wally over unresolved sources",
+        directory.display()
+    ))
+}
+
+pub(crate) fn require_canonical_parent(fs: &mut VfsLock<'_>, path: &Path) -> io::Result<()> {
+    let result = (|| {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("Path has no parent"))?;
+        if fs.normalize(parent)? != parent || !fs.metadata(parent)?.is_dir() {
+            return Err(io::Error::other(
+                "Parent is not an existing canonical directory",
+            ));
+        }
+        Ok(())
+    })();
+    result.map_err(|error| io::Error::new(error.kind(), format!("Recovery cannot validate the parent of {} ({error}). Restore the original directories before retrying; journal and backups are retained", path.display())))
+}
+
+fn validate_replacement_ownership(
+    fs: &mut VfsLock<'_>,
+    directory: &Path,
+    journal: &ReplacementJournal,
+) -> io::Result<()> {
+    let ownership = journal.ownership.as_ref().ok_or_else(|| {
+        recovery_refused(
+            directory,
+            "Legacy package journal has no durable ownership evidence",
+        )
+    })?;
+    validate_ownership_evidence(fs, directory, ownership)?;
+    for entry in &journal.entries {
+        if !entry.path.starts_with(&ownership.policy.root) {
+            return Err(recovery_refused(
+                directory,
+                "Recorded source escapes its package project",
+            ));
+        }
+        require_canonical_parent(fs, &entry.path)?;
+    }
+    Ok(())
+}
+
+fn validate_ownership_evidence(
+    fs: &mut VfsLock<'_>,
+    directory: &Path,
+    ownership: &ReplacementOwnership,
+) -> io::Result<()> {
+    require_canonical_parent(fs, directory)?;
+    if fs.metadata(directory).with_not_found()?.is_some() {
+        require_canonical_parent(fs, &directory.join("intent.json"))?;
+    }
+    if !directory.starts_with(&ownership.policy.root)
+        || ownership.policy.problem.is_some()
+        || ownership.authority.is_empty()
+    {
+        return Err(recovery_refused(
+            directory,
+            "Invalid recorded package ownership",
+        ));
+    }
+    // Preflight the entire batch, not only the next endpoint. Otherwise a later
+    // unsafe ancestor could be discovered after earlier entries were restored.
+    for (path, expected) in &ownership.authority {
+        require_canonical_parent(fs, path)?;
+        if fs.snapshot_tree(path).with_not_found()?.as_ref() != Some(expected) {
+            return Err(recovery_refused(
+                directory,
+                "Wally generation changed since the transaction was prepared",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn capture_structural_ownership(
+    vfs: &Vfs,
+    directory: &Path,
+    moves: &[Relocation],
+) -> io::Result<Option<ReplacementOwnership>> {
+    for ancestor in directory.ancestors().skip(1) {
+        if let Some(policy) =
+            crate::package_sources::PackageSources::load(vfs, ancestor).map_err(io::Error::other)?
+        {
+            let mut involved = false;
+            for entry in moves {
+                for path in [&entry.source, &entry.destination] {
+                    if let Some(reason) = policy.blocked(vfs, path, true) {
+                        return Err(recovery_refused(directory, &reason));
+                    }
+                    involved |= policy.is_local_source(path);
+                }
+            }
+            return if involved {
+                ReplacementOwnership::capture(vfs, directory).map(Some)
+            } else {
+                Ok(None)
+            };
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn validate_structural_ownership(
+    fs: &mut VfsLock<'_>,
+    directory: &Path,
+    ownership: Option<&ReplacementOwnership>,
+    moves: &[Relocation],
+) -> io::Result<()> {
+    let Some(ownership) = ownership else {
+        return Ok(());
+    };
+    validate_ownership_evidence(fs, directory, ownership)?;
+    for entry in moves {
+        let owner = ownership.policy.local_source_owner(&entry.source);
+        if owner.is_none() || owner != ownership.policy.local_source_owner(&entry.destination) {
+            return Err(recovery_refused(
+                directory,
+                "Structural transaction crosses authoritative package sources",
+            ));
+        }
+        for path in [&entry.source, &entry.destination] {
+            // Promotion children do not have a parent until output installation.
+            // Validate the closest existing ancestor, without following a substituted link.
+            let mut candidate = path.as_path();
+            while fs
+                .metadata(candidate.parent().ok_or_else(|| conflict(path))?)
+                .with_not_found()?
+                .is_none()
+            {
+                candidate = candidate.parent().unwrap();
+            }
+            require_canonical_parent(fs, candidate)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_retained_permissions(
+    fs: &mut VfsLock<'_>,
+    source: &Path,
+    output: &Path,
+    expected: &VfsSnapshot,
+    desired: &VfsSnapshot,
+) -> io::Result<()> {
+    match (expected, desired) {
+        (VfsSnapshot::Dir { children: before }, VfsSnapshot::Dir { children: after }) => {
+            for (name, desired) in after {
+                if let Some(expected) = before.get(name) {
+                    copy_retained_permissions(
+                        fs,
+                        &source.join(name),
+                        &output.join(name),
+                        expected,
+                        desired,
+                    )?;
+                }
+            }
+        }
+        (VfsSnapshot::File { .. }, VfsSnapshot::File { .. }) => {}
+        _ => return Ok(()),
+    }
+    fs.copy_permissions(source, output)
+}
+
+fn validate_replacements(directory: &Path, journal: &ReplacementJournal) -> io::Result<()> {
+    if journal.version != JOURNAL_VERSION || journal.kind != "replacement" {
+        return Err(io::Error::other("Unknown replacement journal"));
+    }
+    for (index, entry) in journal.entries.iter().enumerate() {
+        if !entry.path.is_absolute()
+            || entry
+                .path
+                .components()
+                .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+            || entry.path.starts_with(directory)
+            || directory.starts_with(&entry.path)
+            || journal.entries[..index].iter().any(|other| {
+                entry.path.starts_with(&other.path) || other.path.starts_with(&entry.path)
+            })
+        {
+            return Err(io::Error::other(
+                "Replacement paths must be normalized, disjoint, and outside their journal",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reuse relocation's durable staging, no-clobber moves, and recovery protocol
+/// for a package batch. The VFS lock prevents publishing intermediate watcher states.
+pub(crate) fn execute_replacements(
+    vfs: &Vfs,
+    directory: &Path,
+    entries: Vec<Replacement>,
+) -> io::Result<()> {
+    let journal = ReplacementJournal {
+        version: JOURNAL_VERSION,
+        kind: "replacement".into(),
+        entries,
+        ownership: Some(ReplacementOwnership::capture(vfs, directory)?),
+    };
+    validate_replacements(directory, &journal)?;
+    let ownership = journal.ownership.as_ref().unwrap();
+    for entry in &journal.entries {
+        if let Some(reason) = ownership.policy.blocked(vfs, &entry.path, true) {
+            return Err(recovery_refused(directory, &reason));
+        }
+    }
+    let mut fs = vfs.lock();
+    validate_replacement_ownership(&mut fs, directory, &journal)?;
+    for entry in &journal.entries {
+        if fs.snapshot_tree(&entry.path).with_not_found()? != entry.expected {
+            return Err(conflict(&entry.path));
+        }
+    }
+    publish_intent(
+        &mut fs,
+        directory,
+        &serde_json::to_vec(&journal).map_err(io::Error::other)?,
+    )?;
+    let result = (|| {
+        for (index, entry) in journal.entries.iter().enumerate() {
+            if let Some(desired) = &entry.desired {
+                let output = directory.join(format!("output-{index}"));
+                materialize(&mut fs, &output, desired)?;
+                if let Some(expected) = &entry.expected {
+                    copy_retained_permissions(&mut fs, &entry.path, &output, expected, desired)?;
+                }
+                flush_tree(&mut fs, &output)?;
+                fs.sync_path(directory)?;
+            }
+        }
+        validate_replacement_ownership(&mut fs, directory, &journal)?;
+        for (index, entry) in journal.entries.iter().enumerate() {
+            if let Some(expected) = &entry.expected {
+                transfer(&mut fs, &entry.path, &stage(directory, index), expected)?;
+            } else if fs.snapshot_tree(&entry.path).with_not_found()?.is_some() {
+                return Err(conflict(&entry.path));
+            }
+        }
+        validate_replacement_ownership(&mut fs, directory, &journal)?;
+        for (index, entry) in journal.entries.iter().enumerate() {
+            if let Some(desired) = &entry.desired {
+                transfer(
+                    &mut fs,
+                    &directory.join(format!("output-{index}")),
+                    &entry.path,
+                    desired,
+                )?;
+            }
+        }
+        for entry in &journal.entries {
+            if fs.snapshot_tree(&entry.path).with_not_found()? != entry.desired {
+                return Err(conflict(&entry.path));
+            }
+        }
+        validate_replacement_ownership(&mut fs, directory, &journal)?;
+        persist(&mut fs, directory, "commit", COMMIT)
+    })();
+    if let Err(error) = result {
+        match recover_replacement(&mut fs, directory, &journal) {
+            Ok(Recovery::Committed) => return Ok(()),
+            Ok(Recovery::RolledBack) => return Err(error),
+            Err(recovery) => return Err(io::Error::other(format!("Package write failed ({error}). Recovery requires attention ({recovery}). Journal retained at {}", directory.display()))),
+        }
+    }
+    Ok(())
+}
+
+fn recover_replacement(
+    fs: &mut VfsLock<'_>,
+    directory: &Path,
+    journal: &ReplacementJournal,
+) -> io::Result<Recovery> {
+    validate_replacements(directory, journal)?;
+    validate_replacement_ownership(fs, directory, journal)?;
+    let committed = marker(fs, directory, "commit", COMMIT)?;
+    let rolled_back = marker(fs, directory, "rollback", ROLLBACK)?;
+    if committed && rolled_back {
+        return Err(io::Error::other(
+            "Contradictory replacement journal markers",
+        ));
+    }
+    for (index, entry) in journal.entries.iter().enumerate() {
+        let backup_path = stage(directory, index);
+        let backup = fs.snapshot_tree(&backup_path).with_not_found()?;
+        if backup
+            .as_ref()
+            .is_some_and(|actual| Some(actual) != entry.expected.as_ref())
+            || (committed && backup != entry.expected)
+            || (rolled_back && backup.is_some())
+        {
+            return Err(conflict(&backup_path));
+        }
+        for prefix in ["output", "reclaimed"] {
+            let path = directory.join(format!("{prefix}-{index}"));
+            if let Some(actual) = fs.snapshot_tree(&path).with_not_found()? {
+                if !entry
+                    .desired
+                    .as_ref()
+                    .is_some_and(|desired| output_subset(&actual, desired))
+                {
+                    return Err(conflict(&path));
+                }
+            }
+        }
+    }
+    if committed {
+        fs.sync_path(&directory.join("commit"))?;
+        fs.sync_path(directory)?;
+        return Ok(Recovery::Committed);
+    }
+    if rolled_back {
+        fs.sync_path(&directory.join("rollback"))?;
+        fs.sync_path(directory)?;
+        return Ok(Recovery::RolledBack);
+    }
+    for (index, entry) in journal.entries.iter().enumerate().rev() {
+        let backup = stage(directory, index);
+        let output = directory.join(format!("output-{index}"));
+        let reclaimed = directory.join(format!("reclaimed-{index}"));
+        let staged = fs.snapshot_tree(&backup).with_not_found()?;
+        let at_source = fs.snapshot_tree(&entry.path).with_not_found()?;
+        let output_present = fs.snapshot_tree(&output).with_not_found()?.is_some();
+        let reclaimed_present = fs.snapshot_tree(&reclaimed).with_not_found()?.is_some();
+        if (staged.is_some() || entry.expected.is_none())
+            && at_source.is_some()
+            && !reclaimed_present
+        {
+            if output_present || at_source != entry.desired {
+                return Err(conflict(&entry.path));
+            }
+            transfer(
+                fs,
+                &entry.path,
+                &reclaimed,
+                entry
+                    .desired
+                    .as_ref()
+                    .ok_or_else(|| conflict(&entry.path))?,
+            )?;
+        }
+        if let Some(expected) = &entry.expected {
+            if let Some(staged) = staged {
+                if &staged != expected || fs.snapshot_tree(&entry.path).with_not_found()?.is_some()
+                {
+                    return Err(conflict(&entry.path));
+                }
+                transfer(fs, &backup, &entry.path, expected)?;
+            } else {
+                require_expected(fs, &entry.path, expected)?;
+            }
+        } else if fs.snapshot_tree(&entry.path).with_not_found()?.is_some() {
+            return Err(conflict(&entry.path));
+        }
+    }
+    persist(fs, directory, "rollback", ROLLBACK)?;
+    Ok(Recovery::RolledBack)
+}
+
 fn stage(journal_dir: &Path, index: usize) -> PathBuf {
     journal_dir.join(format!("stage-{index}"))
 }
@@ -567,6 +1154,7 @@ fn commit(
     originals: &[Relocation],
 ) -> io::Result<()> {
     require_absent(fs, absent_paths)?;
+    validate_prepared_structure(fs, journal_dir)?;
     // Existing sources must become vacant after staging and stay vacant until commit.
     // An editor can recreate a sidecar even when it was present during planning.
     for original in originals {
@@ -680,7 +1268,7 @@ pub(crate) fn preparation_is_discardable(vfs: &Vfs, directory: &Path) -> io::Res
         };
         Ok(
             serde_json::to_vec(&journal).map_err(io::Error::other)? == *contents
-                && journal.version == JOURNAL_VERSION
+                && [JOURNAL_VERSION, STRUCTURAL_VERSION].contains(&journal.version)
                 && journal.kind == "promotion"
                 && validate_promotion(&mut fs, directory, &journal.promotion, false).is_ok(),
         )
@@ -690,7 +1278,7 @@ pub(crate) fn preparation_is_discardable(vfs: &Vfs, directory: &Path) -> io::Res
         };
         Ok(
             serde_json::to_vec(&journal).map_err(io::Error::other)? == *contents
-                && journal.version == JOURNAL_VERSION
+                && [JOURNAL_VERSION, STRUCTURAL_VERSION].contains(&journal.version)
                 && validate(&mut fs, directory, &journal.moves, false).is_ok(),
         )
     }
@@ -748,8 +1336,9 @@ fn validate_paths(fs: &mut VfsLock<'_>, paths: &[&Path], check_parents: bool) ->
                 "Cannot relocate filesystem roots",
             )
         })?;
-        // Reject aliases through parent symlinks. The coordinator must canonicalize
-        // paths before planning; otherwise overlap checks could miss the same tree.
+        // Recovery must revalidate ancestors too. A previously canonical path can
+        // point outside the project after an editor replaces a parent with a link.
+        require_canonical_parent(fs, path)?;
         if check_parents && (fs.normalize(parent)? != parent || !fs.metadata(parent)?.is_dir()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -790,6 +1379,1003 @@ mod tests {
         (fs, temp, root)
     }
 
+    fn package_fixture(fs: &Vfs, root: &Path) {
+        let manifest = "[dependencies]\nFoo = \"^src\"\n";
+        let local = "[package]\nname = \"scope/foo\"\nrealm = \"shared\"\n";
+        fs.write(root.join("wally.toml"), manifest).unwrap();
+        fs.write(root.join("src/wally.toml"), local).unwrap();
+        fs.create_dir_all(root.join("Packages")).unwrap();
+        fs.write(root.join("wally.install.json"), serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "manifest_hash": crate::package_sources::sha256(manifest.as_bytes()),
+            "local_manifests": {"src/wally.toml": crate::package_sources::sha256(local.as_bytes())},
+            "package_roots": [{"name": "scope/foo", "kind": "local", "realm": "shared", "install_path": "Packages/_Index/foo/foo", "source_path": "src"}],
+            "generated_paths": ["Packages/Foo.luau"]
+        })).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn new_package_move_and_promotion_journals_persist_ownership() {
+        for promotion in [false, true] {
+            let (fs, _temp, root) = fixture(true);
+            package_fixture(&fs, &root);
+            fs.write(root.join("src/Before.luau"), "before").unwrap();
+            let destination = root.join("src/After");
+            let entry = Relocation {
+                source: root.join("src/Before.luau"),
+                destination: if promotion {
+                    destination.join("init.luau")
+                } else {
+                    destination.clone()
+                },
+                expected: VfsSnapshot::file("before"),
+            };
+            let directory = root.join("cache/tx");
+            if promotion {
+                execute_promotion(
+                    &fs,
+                    &directory,
+                    Promotion {
+                        destination,
+                        originals: vec![entry],
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+            } else {
+                execute(&fs, &directory, vec![entry], Vec::new()).unwrap();
+            }
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs.read(directory.join("intent.json")).unwrap()).unwrap();
+            assert_eq!(saved["version"], STRUCTURAL_VERSION);
+            assert!(saved["ownership"]["authority"].as_array().unwrap().len() >= 3);
+            assert_eq!(recover(&fs, &directory).unwrap(), Recovery::Committed);
+        }
+    }
+
+    #[test]
+    fn package_structural_recovery_checks_evidence_at_every_crash_boundary() {
+        for promotion in [false, true] {
+            // Intent, partial staging, full staging, partial installation, full
+            // installation, and durable commit all have independently recoverable states.
+            for boundary in 0..=5 {
+                for changed in ["none", "root", "local", "provenance", "all", "edited"] {
+                    let (fs, _temp, root) = fixture(true);
+                    package_fixture(&fs, &root);
+                    let directory = root.join("cache/tx");
+                    let destination = root.join("src/After");
+                    let entries: Vec<_> = ["One.luau", "Two.luau"]
+                        .into_iter()
+                        .map(|name| {
+                            let source = root.join("src").join(name);
+                            fs.write(&source, name).unwrap();
+                            Relocation {
+                                source,
+                                destination: if promotion {
+                                    destination.join(name)
+                                } else {
+                                    root.join("src").join(format!("New{name}"))
+                                },
+                                expected: VfsSnapshot::file(name),
+                            }
+                        })
+                        .collect();
+                    let ownership =
+                        capture_structural_ownership(&fs, &directory, &entries).unwrap();
+                    assert!(ownership.is_some());
+                    let plan = Promotion {
+                        destination: destination.clone(),
+                        originals: entries.clone(),
+                    };
+                    let output = if promotion {
+                        Some(validate_promotion(&mut fs.lock(), &directory, &plan, true).unwrap())
+                    } else {
+                        None
+                    };
+                    let bytes = if promotion {
+                        serde_json::to_vec(&PromotionJournal {
+                            version: STRUCTURAL_VERSION,
+                            kind: "promotion".into(),
+                            promotion: plan,
+                            absent_paths: Vec::new(),
+                            ownership,
+                        })
+                        .unwrap()
+                    } else {
+                        serde_json::to_vec(&Journal {
+                            version: STRUCTURAL_VERSION,
+                            moves: entries.clone(),
+                            absent_paths: Vec::new(),
+                            ownership,
+                        })
+                        .unwrap()
+                    };
+                    publish_intent(&mut fs.lock(), &directory, &bytes).unwrap();
+                    if let Some(output) = &output {
+                        materialize(&mut fs.lock(), &directory.join("output"), output).unwrap();
+                    }
+                    for (index, entry) in entries.iter().enumerate().take(boundary.min(2)) {
+                        transfer(
+                            &mut fs.lock(),
+                            &entry.source,
+                            &stage(&directory, index),
+                            &entry.expected,
+                        )
+                        .unwrap();
+                    }
+                    if promotion && boundary >= 3 {
+                        transfer(
+                            &mut fs.lock(),
+                            &directory.join("output"),
+                            &destination,
+                            output.as_ref().unwrap(),
+                        )
+                        .unwrap();
+                    } else if !promotion {
+                        for (index, entry) in entries
+                            .iter()
+                            .enumerate()
+                            .take(boundary.saturating_sub(2).min(2))
+                        {
+                            transfer(
+                                &mut fs.lock(),
+                                &stage(&directory, index),
+                                &entry.destination,
+                                &entry.expected,
+                            )
+                            .unwrap();
+                        }
+                    }
+                    if boundary == 5 {
+                        persist(&mut fs.lock(), &directory, "commit", COMMIT).unwrap();
+                    }
+                    let authority = [
+                        root.join("wally.toml"),
+                        root.join("src/wally.toml"),
+                        root.join("wally.install.json"),
+                    ];
+                    let saved: Vec<_> = authority
+                        .iter()
+                        .map(|path| fs.read(path).unwrap())
+                        .collect();
+                    for (index, path) in authority.iter().enumerate() {
+                        if changed == "all" || changed == ["root", "local", "provenance"][index] {
+                            fs.remove_file(path).unwrap();
+                        }
+                    }
+                    if changed == "edited" {
+                        fs.write(&authority[0], "[dependencies]\n").unwrap();
+                    }
+                    let before = fs.snapshot_tree(&root).unwrap();
+                    let restarted = Vfs::new(StdBackend::new().unwrap());
+                    restarted.set_watch_enabled(false);
+                    if changed != "none" {
+                        assert!(
+                            recover(&restarted, &directory).is_err(),
+                            "{promotion} {boundary} {changed}"
+                        );
+                        assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
+                        for (path, bytes) in authority.iter().zip(saved) {
+                            fs.write(path, bytes.as_slice()).unwrap();
+                        }
+                    }
+                    let expected = if boundary == 5 {
+                        Recovery::Committed
+                    } else {
+                        Recovery::RolledBack
+                    };
+                    assert_eq!(
+                        recover(&restarted, &directory).unwrap(),
+                        expected,
+                        "{promotion} {boundary} {changed}"
+                    );
+                    assert_eq!(recover(&restarted, &directory).unwrap(), expected);
+                    for entry in &entries {
+                        let path = if boundary == 5 {
+                            &entry.destination
+                        } else {
+                            &entry.source
+                        };
+                        assert_eq!(fs.snapshot_tree(path).unwrap(), entry.expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_structural_recovery_rejects_substituted_ancestors_and_resumes() {
+        for (promotion, endpoint) in [false, true].into_iter().flat_map(|promotion| {
+            ["authority", "source", "destination"].map(|endpoint| (promotion, endpoint))
+        }) {
+            let (fs, _temp, root) = fixture(true);
+            package_fixture(&fs, &root);
+            fs.create_dir(root.join("src/input")).unwrap();
+            fs.create_dir(root.join("src/output")).unwrap();
+            let directory = root.join("cache/tx");
+            let source = root.join("src/input/Before.luau");
+            fs.write(&source, "before").unwrap();
+            let destination = root.join("src/output/After");
+            let entry = Relocation {
+                source: source.clone(),
+                destination: if promotion {
+                    destination.join("init.luau")
+                } else {
+                    destination.clone()
+                },
+                expected: VfsSnapshot::file("before"),
+            };
+            let ownership =
+                capture_structural_ownership(&fs, &directory, std::slice::from_ref(&entry))
+                    .unwrap();
+            let bytes = if promotion {
+                serde_json::to_vec(&PromotionJournal {
+                    version: STRUCTURAL_VERSION,
+                    kind: "promotion".into(),
+                    promotion: Promotion {
+                        destination,
+                        originals: vec![entry.clone()],
+                    },
+                    absent_paths: Vec::new(),
+                    ownership,
+                })
+                .unwrap()
+            } else {
+                serde_json::to_vec(&Journal {
+                    version: STRUCTURAL_VERSION,
+                    moves: vec![entry.clone()],
+                    absent_paths: Vec::new(),
+                    ownership,
+                })
+                .unwrap()
+            };
+            publish_intent(&mut fs.lock(), &directory, &bytes).unwrap();
+            transfer(
+                &mut fs.lock(),
+                &source,
+                &stage(&directory, 0),
+                &entry.expected,
+            )
+            .unwrap();
+            let held = root.join("dst/held");
+            let linked = root.join(match endpoint {
+                "source" => "src/input",
+                "destination" => "src/output",
+                _ => "src",
+            });
+            std::fs::rename(&linked, &held).unwrap();
+            std::os::unix::fs::symlink(&held, &linked).unwrap();
+            let before = fs.snapshot_tree(&directory).unwrap();
+            let held_before = fs.snapshot_tree(&held).unwrap();
+            let restarted = Vfs::new(StdBackend::new().unwrap());
+            restarted.set_watch_enabled(false);
+            assert!(recover(&restarted, &directory).is_err());
+            assert_eq!(fs.snapshot_tree(&directory).unwrap(), before);
+            assert_eq!(fs.snapshot_tree(&held).unwrap(), held_before);
+            std::fs::remove_file(&linked).unwrap();
+            std::fs::rename(&held, &linked).unwrap();
+            assert_eq!(
+                recover(&restarted, &directory).unwrap(),
+                Recovery::RolledBack
+            );
+            assert_eq!(fs.snapshot_tree(&source).unwrap(), entry.expected);
+        }
+    }
+
+    #[test]
+    fn package_relayout_recovery_preserves_exact_backups_until_authority_is_restored() {
+        for boundary in 0..=2 {
+            for changed in [
+                "root",
+                "local",
+                "provenance",
+                "all",
+                "edited",
+                "data",
+                "missing",
+            ] {
+                let (fs, _temp, root) = fixture(true);
+                package_fixture(&fs, &root);
+                let project_path = root.join("default.project.json");
+                fs.write(&project_path, r#"{"name":"Test","tree":{"$path":"src"}}"#)
+                    .unwrap();
+                let project = crate::Project::load_exact(&fs, &project_path, Some("Test")).unwrap();
+                let directory =
+                    super::super::relocation::relayout_directory(&project).join("interrupted");
+                fs.create_dir_all(&directory).unwrap();
+                let paths = [root.join("src/One.luau"), root.join("src/Two.luau")];
+                for path in &paths {
+                    fs.write(path, "before").unwrap();
+                }
+                let manifest = super::super::relocation::RelayoutManifest::prepare(
+                    &fs,
+                    &directory,
+                    &paths,
+                    &root.join("src"),
+                )
+                .unwrap();
+                assert!(manifest.package.is_some());
+                fs.write(
+                    directory.join("manifest.json"),
+                    serde_json::to_vec(&manifest).unwrap(),
+                )
+                .unwrap();
+                for (index, path) in paths.iter().enumerate().take(boundary) {
+                    transfer(
+                        &mut fs.lock(),
+                        path,
+                        &directory.join(index.to_string()),
+                        &VfsSnapshot::file("before"),
+                    )
+                    .unwrap();
+                }
+                let authority = [
+                    root.join("wally.toml"),
+                    root.join("src/wally.toml"),
+                    root.join("wally.install.json"),
+                ];
+                let saved: Vec<_> = authority
+                    .iter()
+                    .map(|path| fs.read(path).unwrap())
+                    .collect();
+                for (index, path) in authority.iter().enumerate() {
+                    if changed == "all" || changed == ["root", "local", "provenance"][index] {
+                        fs.remove_file(path).unwrap();
+                    }
+                }
+                if changed == "edited" {
+                    fs.write(&authority[0], "[dependencies]\n").unwrap();
+                }
+                let data_path = if boundary == 0 {
+                    paths[0].clone()
+                } else {
+                    directory.join("0")
+                };
+                if changed == "data" {
+                    fs.write(&data_path, "edited").unwrap();
+                }
+                if changed == "missing" {
+                    fs.remove_file(&data_path).unwrap();
+                }
+                let before = fs.snapshot_tree(&root).unwrap();
+                let restarted = Vfs::new(StdBackend::new().unwrap());
+                restarted.set_watch_enabled(false);
+                assert!(crate::serve_session::ServeSession::new(
+                    Vfs::new(StdBackend::new().unwrap()),
+                    &root
+                )
+                .is_err());
+                assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
+                assert!(super::super::relocation::recover_relayouts(&restarted, &project).is_err());
+                assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
+                for (path, bytes) in authority.iter().zip(saved) {
+                    fs.write(path, bytes.as_slice()).unwrap();
+                }
+                if matches!(changed, "data" | "missing") {
+                    fs.write(&data_path, "before").unwrap();
+                }
+                super::super::relocation::recover_relayouts(&restarted, &project).unwrap();
+                for path in &paths {
+                    assert_eq!(fs.snapshot_tree(path).unwrap(), VfsSnapshot::file("before"));
+                }
+                assert!(!fs.exists(&directory).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn package_structural_execution_refuses_cross_source_moves_before_publication() {
+        for promotion in [false, true] {
+            let (fs, _temp, root) = fixture(false);
+            package_fixture(&fs, &root);
+            let source = root.join("src/Before.luau");
+            fs.write(&source, "before").unwrap();
+            let directory = root.join("cache/tx");
+            let destination = root.join("dst/After");
+            let entry = Relocation {
+                source: source.clone(),
+                destination: if promotion {
+                    destination.join("init.luau")
+                } else {
+                    destination.clone()
+                },
+                expected: VfsSnapshot::file("before"),
+            };
+            let before = fs.snapshot_tree(&root).unwrap();
+            let result = if promotion {
+                execute_promotion(
+                    &fs,
+                    &directory,
+                    Promotion {
+                        destination,
+                        originals: vec![entry],
+                    },
+                    Vec::new(),
+                )
+            } else {
+                execute(&fs, &directory, vec![entry], Vec::new())
+            };
+            assert!(result.is_err());
+            assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_relayout_recovery_rejects_source_and_output_directory_substitutions() {
+        for output in [false, true] {
+            let (fs, _temp, root) = fixture(true);
+            package_fixture(&fs, &root);
+            let project_path = root.join("default.project.json");
+            fs.write(&project_path, r#"{"name":"Test","tree":{"$path":"src"}}"#)
+                .unwrap();
+            let project = crate::Project::load_exact(&fs, &project_path, Some("Test")).unwrap();
+            let directory =
+                super::super::relocation::relayout_directory(&project).join("interrupted");
+            fs.create_dir_all(&directory).unwrap();
+            fs.create_dir(root.join("src/output")).unwrap();
+            let original = root.join("src/Before.luau");
+            fs.write(&original, "before").unwrap();
+            let manifest = super::super::relocation::RelayoutManifest::prepare(
+                &fs,
+                &directory,
+                std::slice::from_ref(&original),
+                &root.join("src/output"),
+            )
+            .unwrap();
+            fs.write(
+                directory.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            transfer(
+                &mut fs.lock(),
+                &original,
+                &directory.join("0"),
+                &VfsSnapshot::file("before"),
+            )
+            .unwrap();
+            let linked = root.join(if output { "src/output" } else { "src" });
+            let outside = tempfile::tempdir().unwrap();
+            let held = outside.path().join("held");
+            std::fs::rename(&linked, &held).unwrap();
+            std::os::unix::fs::symlink(&held, &linked).unwrap();
+            let before = fs.snapshot_tree(&directory).unwrap();
+            let held_before = fs.snapshot_tree(&held).unwrap();
+            let restarted = Vfs::new(StdBackend::new().unwrap());
+            restarted.set_watch_enabled(false);
+            assert!(super::super::relocation::recover_relayouts(&restarted, &project).is_err());
+            assert_eq!(fs.snapshot_tree(&directory).unwrap(), before);
+            assert_eq!(fs.snapshot_tree(&held).unwrap(), held_before);
+            std::fs::remove_file(&linked).unwrap();
+            std::fs::rename(&held, &linked).unwrap();
+            super::super::relocation::recover_relayouts(&restarted, &project).unwrap();
+            assert_eq!(
+                fs.snapshot_tree(&original).unwrap(),
+                VfsSnapshot::file("before")
+            );
+        }
+    }
+
+    #[test]
+    fn generated_package_output_uses_absence_checked_replacements_not_cross_source_moves() {
+        let (fs, _temp, root) = fixture(false);
+        package_fixture(&fs, &root);
+        fs.create_dir_all(root.join(".rojo/staging/new")).unwrap();
+        let source = root.join(".rojo/staging/new/Code.luau");
+        let destination = root.join("src/Code.luau");
+        fs.write(&source, "new").unwrap();
+        let entry = Relocation {
+            source: source.clone(),
+            destination: destination.clone(),
+            expected: VfsSnapshot::file("new"),
+        };
+        let directory = root.join("cache/tx");
+        execute_staged(&fs, &directory, vec![entry.clone()]).unwrap();
+        assert_eq!(fs.snapshot_tree(&source).unwrap(), entry.expected);
+        assert_eq!(fs.snapshot_tree(&destination).unwrap(), entry.expected);
+        assert_eq!(recover(&fs, &directory).unwrap(), Recovery::Committed);
+        let occupied = root.join("cache/occupied");
+        assert!(execute_staged(&fs, &occupied, vec![entry]).is_err());
+        assert!(!fs.exists(&occupied).unwrap());
+        assert_eq!(fs.read(&destination).unwrap().as_slice(), b"new");
+    }
+
+    #[test]
+    fn legacy_package_recovery_preserves_backups_without_ownership() {
+        let (fs, _temp, root) = fixture(false);
+        package_fixture(&fs, &root);
+        let directory = root.join("cache/legacy-package");
+        fs.create_dir(&directory).unwrap();
+        fs.write(stage(&directory, 0), "before").unwrap();
+        fs.write(
+            directory.join("intent.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "kind": "replacement", "entries": [{
+                    "path": root.join("src/source.luau"),
+                    "expected": VfsSnapshot::file("before"),
+                    "desired": VfsSnapshot::file("after")
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = fs.snapshot_tree(&root).unwrap();
+        let error = recover(&fs, &directory).unwrap_err().to_string();
+        assert!(error.contains("no durable ownership evidence"));
+        assert!(error.contains("reconcile manually"));
+        assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
+    }
+
+    #[test]
+    fn ordinary_recovery_in_package_projects_requires_no_package_ownership() {
+        for (package_path, invalid_generation) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let (fs, _temp, root) = fixture(false);
+            package_fixture(&fs, &root);
+            if invalid_generation {
+                fs.write(root.join("wally.install.json"), "invalid generation")
+                    .unwrap();
+            }
+            let folder = if package_path { "src" } else { "dst" };
+            let source = root.join(folder).join("Code.luau");
+            let destination = root.join(folder).join("Renamed.luau");
+            fs.write(&source, "before").unwrap();
+            let expected = fs.snapshot_tree(&source).unwrap();
+            let directory = root.join("cache/ordinary");
+            intent(
+                &fs,
+                &directory,
+                &[Relocation {
+                    source: source.clone(),
+                    destination,
+                    expected: expected.clone(),
+                }],
+            );
+            fs.move_no_replace(&source, &stage(&directory, 0), &expected)
+                .unwrap();
+            let before = fs.snapshot_tree(&root).unwrap();
+            if package_path {
+                assert!(recover(&fs, &directory).is_err());
+                assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
+            } else {
+                assert_eq!(recover(&fs, &directory).unwrap(), Recovery::RolledBack);
+                assert_eq!(fs.snapshot_tree(&source).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn package_recovery_refuses_changed_authority_after_restart() {
+        for authority in ["wally.toml", "src/wally.toml", "wally.install.json"] {
+            let (fs, _temp, root) = fixture(true);
+            package_fixture(&fs, &root);
+            let path = root.join("src/source.luau");
+            let directory = root.join("cache/package-batch");
+            fs.write(&path, "before").unwrap();
+            execute_replacements(
+                &fs,
+                &directory,
+                vec![Replacement {
+                    path: path.clone(),
+                    expected: Some(VfsSnapshot::file("before")),
+                    desired: Some(VfsSnapshot::file("after")),
+                }],
+            )
+            .unwrap();
+            fs.remove_file(directory.join("commit")).unwrap();
+            fs.write(root.join(authority), "changed authority").unwrap();
+            let restarted = Vfs::new(StdBackend::new().unwrap());
+            restarted.set_watch_enabled(false);
+            let before = restarted.snapshot_tree(&root).unwrap();
+            assert!(
+                recover(&restarted, &directory).is_err(),
+                "accepted changed {authority}"
+            );
+            assert_eq!(restarted.snapshot_tree(&root).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn startup_preflights_legacy_relayout_ownership_before_restoring_backups() {
+        for package_path in [false, true] {
+            let (fs, _temp, root) = fixture(true);
+            package_fixture(&fs, &root);
+            fs.write(
+                root.join("default.project.json"),
+                r#"{"name":"Test","tree":{"$path":"src"}}"#,
+            )
+            .unwrap();
+            let directory = root.join(".rojo/relayout/interrupted");
+            fs.create_dir_all(&directory).unwrap();
+            let original = root.join(if package_path {
+                "src/Code.luau"
+            } else {
+                "dst/Code.luau"
+            });
+            fs.write(directory.join("original"), "before").unwrap();
+            fs.write(
+                directory.join("manifest.json"),
+                serde_json::to_vec(&crate::syncback::relocation::RelayoutManifest {
+                    entries: vec![(original.clone(), "original".into())],
+                    package: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let before = fs.snapshot_tree(&root).unwrap();
+            let restarted = Vfs::new(StdBackend::new().unwrap());
+            restarted.set_watch_enabled(false);
+            let result = crate::serve_session::ServeSession::new(restarted, &root);
+            if package_path {
+                assert!(result.is_err());
+                assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(std::fs::read(&original).unwrap(), b"before");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_refuses_relayout_and_cache_symlink_ancestors_without_mutation() {
+        for linked_cache in [false, true] {
+            let (fs, _temp, root) = fixture(true);
+            fs.write(
+                root.join("default.project.json"),
+                r#"{"name":"Test","tree":{"$path":"src"}}"#,
+            )
+            .unwrap();
+            let directory = root.join(".rojo/relayout/interrupted");
+            fs.create_dir_all(&directory).unwrap();
+            let original = root.join("dst/Code.luau");
+            fs.write(directory.join("original"), "before").unwrap();
+            fs.write(
+                directory.join("manifest.json"),
+                serde_json::to_vec(&crate::syncback::relocation::RelayoutManifest {
+                    entries: vec![(original.clone(), "original".into())],
+                    package: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let linked = root.join(if linked_cache { ".rojo" } else { "dst" });
+            let moved = outside.path().join("moved");
+            std::fs::rename(&linked, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &linked).unwrap();
+            let outside_before = fs.snapshot_tree(outside.path()).unwrap();
+            let restarted = Vfs::new(StdBackend::new().unwrap());
+            restarted.set_watch_enabled(false);
+            assert!(crate::serve_session::ServeSession::new(restarted, &root).is_err());
+            assert_eq!(fs.snapshot_tree(outside.path()).unwrap(), outside_before);
+        }
+    }
+
+    #[test]
+    fn startup_preserves_interrupted_package_batch_after_valid_generation_change() {
+        let (fs, _temp, root) = fixture(true);
+        package_fixture(&fs, &root);
+        fs.write(
+            root.join("default.project.json"),
+            r#"{"name":"Test","tree":{"$path":"src"}}"#,
+        )
+        .unwrap();
+        fs.create_dir_all(root.join(".rojo/relocations")).unwrap();
+        let directory = root.join(".rojo/relocations/package-batch");
+        let path = root.join("src/source.luau");
+        fs.write(&path, "before").unwrap();
+        execute_replacements(
+            &fs,
+            &directory,
+            vec![Replacement {
+                path: path.clone(),
+                expected: Some(VfsSnapshot::file("before")),
+                desired: Some(VfsSnapshot::file("after")),
+            }],
+        )
+        .unwrap();
+        fs.remove_file(directory.join("commit")).unwrap();
+        let mut install: serde_json::Value =
+            serde_json::from_slice(&fs.read(root.join("wally.install.json")).unwrap()).unwrap();
+        install["generated_paths"] = serde_json::json!(["Packages/Changed.luau"]);
+        fs.write(
+            root.join("wally.install.json"),
+            serde_json::to_vec(&install).unwrap(),
+        )
+        .unwrap();
+        let restarted = Vfs::new(StdBackend::new().unwrap());
+        restarted.set_watch_enabled(false);
+        let policy = crate::package_sources::PackageSources::load(&restarted, &root)
+            .unwrap()
+            .unwrap();
+        assert!(policy.problem.is_none());
+        let backup = restarted.snapshot_tree(&directory).unwrap();
+        let result = crate::serve_session::ServeSession::new(restarted, &root);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+        assert_eq!(fs.snapshot_tree(&directory).unwrap(), backup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_recovery_refuses_replaced_symlink_ancestor_after_restart() {
+        let (fs, _temp, root) = fixture(true);
+        package_fixture(&fs, &root);
+        fs.create_dir(root.join("src/Nested")).unwrap();
+        let path = root.join("src/Nested/source.luau");
+        let safe = root.join("src/safe.luau");
+        let directory = root.join("cache/package-batch");
+        fs.write(&path, "before").unwrap();
+        fs.write(&safe, "safe before").unwrap();
+        execute_replacements(
+            &fs,
+            &directory,
+            vec![
+                Replacement {
+                    path: path.clone(),
+                    expected: Some(VfsSnapshot::file("before")),
+                    desired: Some(VfsSnapshot::file("after")),
+                },
+                Replacement {
+                    path: safe.clone(),
+                    expected: Some(VfsSnapshot::file("safe before")),
+                    desired: Some(VfsSnapshot::file("safe after")),
+                },
+            ],
+        )
+        .unwrap();
+        fs.remove_file(directory.join("commit")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::rename(root.join("src/Nested"), outside.path().join("Nested")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("Nested"), root.join("src/Nested")).unwrap();
+        let restarted = Vfs::new(StdBackend::new().unwrap());
+        restarted.set_watch_enabled(false);
+        let backup = restarted.snapshot_tree(&directory).unwrap();
+        assert!(recover(&restarted, &directory).is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("Nested/source.luau")).unwrap(),
+            b"after"
+        );
+        assert_eq!(std::fs::read(&safe).unwrap(), b"safe after");
+        assert_eq!(restarted.snapshot_tree(&directory).unwrap(), backup);
+    }
+
+    #[test]
+    fn package_replacement_restart_recovers_every_batch_boundary() {
+        for real in [false, true] {
+            for phase in 0..8 {
+                let (fs, _temp, root) = fixture(real);
+                package_fixture(&fs, &root);
+                let entries = vec![
+                    Replacement {
+                        path: root.join("src/module.luau"),
+                        expected: Some(VfsSnapshot::file("old source")),
+                        desired: Some(VfsSnapshot::file("new source")),
+                    },
+                    Replacement {
+                        path: root.join("src/Tree"),
+                        expected: Some(VfsSnapshot::dir([(
+                            "Before.luau",
+                            VfsSnapshot::file("before"),
+                        )])),
+                        desired: Some(VfsSnapshot::dir([(
+                            "After.luau",
+                            VfsSnapshot::file("after"),
+                        )])),
+                    },
+                    Replacement {
+                        path: root.join("src/Added.luau"),
+                        expected: None,
+                        desired: Some(VfsSnapshot::file("added")),
+                    },
+                    Replacement {
+                        path: root.join("src/Removed.luau"),
+                        expected: Some(VfsSnapshot::file("removed")),
+                        desired: None,
+                    },
+                ];
+                let directory = root.join("cache/package-batch");
+                let journal = ReplacementJournal {
+                    version: JOURNAL_VERSION,
+                    kind: "replacement".into(),
+                    entries,
+                    ownership: Some(ReplacementOwnership::capture(&fs, &directory).unwrap()),
+                };
+                {
+                    let mut lock = fs.lock();
+                    for entry in &journal.entries {
+                        if let Some(expected) = &entry.expected {
+                            materialize(&mut lock, &entry.path, expected).unwrap();
+                        }
+                    }
+                    publish_intent(
+                        &mut lock,
+                        &directory,
+                        &serde_json::to_vec(&journal).unwrap(),
+                    )
+                    .unwrap();
+                    if phase >= 1 {
+                        materialize(
+                            &mut lock,
+                            &directory.join("output-0"),
+                            journal.entries[0].desired.as_ref().unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    if phase >= 2 {
+                        for (index, entry) in journal.entries.iter().enumerate().skip(1) {
+                            if let Some(desired) = &entry.desired {
+                                materialize(
+                                    &mut lock,
+                                    &directory.join(format!("output-{index}")),
+                                    desired,
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                    if phase >= 3 {
+                        transfer(
+                            &mut lock,
+                            &journal.entries[0].path,
+                            &stage(&directory, 0),
+                            journal.entries[0].expected.as_ref().unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    if phase >= 4 {
+                        for (index, entry) in journal.entries.iter().enumerate().skip(1) {
+                            if let Some(expected) = &entry.expected {
+                                transfer(
+                                    &mut lock,
+                                    &entry.path,
+                                    &stage(&directory, index),
+                                    expected,
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                    if phase >= 5 {
+                        transfer(
+                            &mut lock,
+                            &directory.join("output-0"),
+                            &journal.entries[0].path,
+                            journal.entries[0].desired.as_ref().unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    if phase >= 6 {
+                        for (index, entry) in journal.entries.iter().enumerate().skip(1) {
+                            if let Some(desired) = &entry.desired {
+                                transfer(
+                                    &mut lock,
+                                    &directory.join(format!("output-{index}")),
+                                    &entry.path,
+                                    desired,
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                    if phase >= 7 {
+                        persist(&mut lock, &directory, "commit", COMMIT).unwrap();
+                    }
+                }
+                let restarted = if real {
+                    Vfs::new(StdBackend::new().unwrap())
+                } else {
+                    fs
+                };
+                restarted.set_watch_enabled(false);
+                let expected_result = if phase == 7 {
+                    Recovery::Committed
+                } else {
+                    Recovery::RolledBack
+                };
+                assert_eq!(
+                    recover(&restarted, &directory).unwrap(),
+                    expected_result,
+                    "phase {phase}, real {real}"
+                );
+                assert_eq!(recover(&restarted, &directory).unwrap(), expected_result);
+                for entry in &journal.entries {
+                    assert_eq!(
+                        restarted
+                            .snapshot_tree(&entry.path)
+                            .with_not_found()
+                            .unwrap(),
+                        if phase == 7 {
+                            entry.desired.clone()
+                        } else {
+                            entry.expected.clone()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn package_replacement_validates_expected_content_before_publishing() {
+        let (fs, _temp, root) = fixture(false);
+        package_fixture(&fs, &root);
+        let path = root.join("src/source.luau");
+        fs.write(&path, "concurrent edit").unwrap();
+        let directory = root.join("cache/package-batch");
+        assert!(execute_replacements(
+            &fs,
+            &directory,
+            vec![Replacement {
+                path: path.clone(),
+                expected: Some(VfsSnapshot::file("baseline")),
+                desired: Some(VfsSnapshot::file("Studio edit"))
+            }]
+        )
+        .is_err());
+        assert_eq!(&*fs.read(&path).unwrap(), b"concurrent edit");
+        assert!(fs.metadata(&directory).with_not_found().unwrap().is_none());
+    }
+
+    #[test]
+    fn package_recovery_preserves_edited_sources_and_corrupt_backups() {
+        for corrupt_backup in [false, true] {
+            let (fs, _temp, root) = fixture(false);
+            package_fixture(&fs, &root);
+            let path = root.join("src/source.luau");
+            let directory = root.join("cache/package-batch");
+            fs.write(&path, "before").unwrap();
+            execute_replacements(
+                &fs,
+                &directory,
+                vec![Replacement {
+                    path: path.clone(),
+                    expected: Some(VfsSnapshot::file("before")),
+                    desired: Some(VfsSnapshot::file("after")),
+                }],
+            )
+            .unwrap();
+            if corrupt_backup {
+                fs.write(stage(&directory, 0), "edited backup").unwrap();
+            } else {
+                fs.remove_file(directory.join("commit")).unwrap();
+                fs.write(&path, "concurrent source edit").unwrap();
+            }
+            let before = fs.snapshot_tree(&root).unwrap();
+            assert!(recover(&fs, &directory).is_err());
+            assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_replacements_preserve_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (fs, _temp, root) = fixture(true);
+        package_fixture(&fs, &root);
+        let path = root.join("src/source.luau");
+        fs.write(&path, "before").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        execute_replacements(
+            &fs,
+            &root.join("cache/package-batch"),
+            vec![Replacement {
+                path: path.clone(),
+                expected: Some(VfsSnapshot::file("before")),
+                desired: Some(VfsSnapshot::file("after")),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
     fn moves(fs: &Vfs, root: &Path) -> Vec<Relocation> {
         ["script.lua", "script.meta.json"]
             .into_iter()
@@ -815,6 +2401,7 @@ mod tests {
                 version: JOURNAL_VERSION,
                 moves: moves.to_vec(),
                 absent_paths: Vec::new(),
+                ownership: None,
             })
             .unwrap(),
         )
@@ -865,6 +2452,7 @@ mod tests {
                 kind: "promotion".into(),
                 promotion: promotion.clone(),
                 absent_paths: Vec::new(),
+                ownership: None,
             })
             .unwrap(),
         )
@@ -902,6 +2490,7 @@ mod tests {
                             kind: "promotion".into(),
                             promotion: plan.clone(),
                             absent_paths: Vec::new(),
+                            ownership: None,
                         })
                         .unwrap(),
                     )
@@ -917,6 +2506,7 @@ mod tests {
                                     version: JOURNAL_VERSION,
                                     moves: plan.clone(),
                                     absent_paths: Vec::new(),
+                                    ownership: None,
                                 })
                                 .unwrap(),
                             )
@@ -932,6 +2522,7 @@ mod tests {
                                 version: JOURNAL_VERSION,
                                 moves: plan.clone(),
                                 absent_paths: Vec::new(),
+                                ownership: None,
                             })
                             .unwrap();
                             value["external"] = "preserve this edit".into();
@@ -973,6 +2564,7 @@ mod tests {
                 version: JOURNAL_VERSION,
                 moves: plan.clone(),
                 absent_paths: Vec::new(),
+                ownership: None,
             })
             .unwrap();
             assert!(publish_intent(&mut fs.lock(), &journal, &bytes).is_err());
@@ -1370,6 +2962,7 @@ mod tests {
                     version: JOURNAL_VERSION,
                     moves: plan.clone(),
                     absent_paths: Vec::new(),
+                    ownership: None,
                 }
             )
             .is_err());
@@ -1512,6 +3105,7 @@ mod tests {
                         version: JOURNAL_VERSION,
                         moves: plan.clone(),
                         absent_paths: vec![absent.clone()],
+                        ownership: None,
                     };
                     fs.create_dir(&directory).unwrap();
                     persist(
@@ -1578,6 +3172,7 @@ mod tests {
                         kind: "promotion".into(),
                         promotion: plan.clone(),
                         absent_paths: vec![absent.clone()],
+                        ownership: None,
                     };
                     fs.create_dir(&directory).unwrap();
                     persist(

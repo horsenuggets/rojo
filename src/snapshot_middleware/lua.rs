@@ -86,8 +86,8 @@ fn snapshot_lua_source(
 
     let contents = vfs.read_to_string_lf_normalized(path)?;
 
-    // If alias resolution is enabled, resolve .luaurc alias requires
-    // into relative require-by-string paths.
+    // Emit native anchored imports in DataModels and relative imports in models.
+    // Keep the authored source separate so syncback can reverse this lowering.
     let source = if let Some(ref req_ctx) = context.require_context {
         let info = ResolveInfo {
             file_path: path,
@@ -96,7 +96,7 @@ fn snapshot_lua_source(
             project_root: &req_ctx.project_root,
         };
 
-        match luaurc::resolve_requires(&contents, &info) {
+        match luaurc::resolve_requires_in_context(&contents, &info, req_ctx.datamodel) {
             Ok(resolved) => resolved,
             Err(err) => {
                 log::warn!("Failed to resolve requires in {}: {}", path.display(), err);
@@ -117,7 +117,11 @@ fn snapshot_lua_source(
         );
     }
 
-    Ok(InstanceSnapshot::new()
+    let transform = (source != contents.as_str()).then(|| crate::snapshot::SourceTransform {
+        original: contents.to_string(),
+        emitted: source.clone(),
+    });
+    let mut snapshot = InstanceSnapshot::new()
         .name(name)
         .class_name(class_name)
         .properties(properties)
@@ -126,7 +130,9 @@ fn snapshot_lua_source(
                 .instigating_source(path)
                 .relevant_paths(vec![vfs.canonicalize(path)?])
                 .context(context),
-        ))
+        );
+    snapshot.metadata.source_transform = transform;
+    Ok(snapshot)
 }
 
 /// Attempts to snapshot an 'init' Lua script contained inside of a folder with
@@ -175,7 +181,9 @@ pub fn snapshot_lua_init(
                 != Some(init_path)
         })
         .collect();
+    let source_transform = init_snapshot.metadata.source_transform.take();
     init_snapshot.metadata = dir_snapshot.metadata;
+    init_snapshot.metadata.source_transform = source_transform;
     track_init_file(&mut init_snapshot, init_path);
 
     DirectoryMetadata::read_and_apply_all(vfs, folder_path, &mut init_snapshot)?;
@@ -199,7 +207,13 @@ pub fn syncback_lua<'sync>(
     let new_inst = snapshot.new_inst();
 
     let contents = if let Some(Variant::String(source)) = new_inst.properties.get(&ustr("Source")) {
-        source.as_bytes().to_vec()
+        match snapshot
+            .old_inst()
+            .and_then(|old| old.metadata().source_transform.clone())
+        {
+            Some(transform) => luaurc::restore_source(&transform, source)?.into_bytes(),
+            None => source.as_bytes().to_vec(),
+        }
     } else {
         anyhow::bail!("Scripts must have a `Source` property that is a String")
     };
@@ -265,7 +279,13 @@ pub fn syncback_lua_init<'sync>(
     });
 
     let contents = if let Some(Variant::String(source)) = new_inst.properties.get(&ustr("Source")) {
-        source.as_bytes().to_vec()
+        match snapshot
+            .old_inst()
+            .and_then(|old| old.metadata().source_transform.clone())
+        {
+            Some(transform) => luaurc::restore_source(&transform, source)?.into_bytes(),
+            None => source.as_bytes().to_vec(),
+        }
     } else {
         anyhow::bail!("Scripts must have a `Source` property that is a String")
     };
