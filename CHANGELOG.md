@@ -31,6 +31,24 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added a draft `rojo export` command that captures live Studio content through an existing
+  serve port, including unsynced instance subtrees, and writes binary or XML model and
+  place files. Models accept exact slash-separated `--instance` paths or `--selection`.
+  Terrain voxel data, material colors, water settings, and children are included in both
+  binary and XML captures. Whole-place captures require `--allow-incomplete` because some
+  service data is not preserved like native Studio saves. Export does not write back to
+  project files or require two-way sync. The server and plugin must both use protocol
+  version 10.
+* Syncback now stores automatically laid-out Terrain as a binary `.rbxm` subtree, even
+  with `instancesAsDirectories` enabled, preserving voxel data and Terrain children.
+  Existing Terrain directories migrate on syncback, while explicit project sources and
+  ignore rules remain authoritative. Writing a Terrain binary model adds a path-specific
+  Git LFS rule to the consuming project's applicable `.gitattributes`, preserving existing
+  content, accounting for later and nested overrides, and refusing stale or excluded
+  attributes writes. Dry runs do not modify attributes.
+  Consuming clones and CI still need Git LFS installed and configured normally. Continuous
+  voxel-edit capture is separate from this filesystem representation.
+
 ## `7.7.1-horse.1.8`
 
 * Changing `syncbackRules.modelTrees` or `instancesAsDirectories` while serving now moves

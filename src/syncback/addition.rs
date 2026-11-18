@@ -150,6 +150,10 @@ pub fn syncback_new_subtree(
         "Creating an instance cannot remove existing files"
     );
     for path in fs_snapshot.added_paths() {
+        // Shared LFS rules have their own validated project/source-directory scope.
+        if fs_snapshot.is_shared_attributes_path(path) {
+            continue;
+        }
         anyhow::ensure!(
             path != directory && path.starts_with(directory),
             "Creating an instance can only write inside its parent's directory"

@@ -415,7 +415,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
         }
     }
 
-    /// Returns the model middleware a `modelTrees` rule assigns to this
+    /// Returns the model middleware explicit rules or Terrain's default assign to this
     /// snapshot's Instance. Sources named by a project node keep the path and
     /// format the project gives them, and a nested project file stays one.
     pub fn model_tree_middleware(&self) -> Option<Middleware> {
@@ -427,7 +427,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
     }
 
     /// Returns whether the provided Instance in the new tree is stored as a
-    /// model file by a `modelTrees` rule, or has a descendant that is.
+    /// model file by explicit rules or Terrain's default, or has a descendant that is.
     pub fn contains_model_tree(&self, new_ref: Ref) -> bool {
         self.data
             .model_trees

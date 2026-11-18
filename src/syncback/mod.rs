@@ -4,6 +4,7 @@ pub mod from_studio;
 mod fs_snapshot;
 mod hash;
 mod inline;
+pub(crate) mod lfs;
 mod model_trees;
 pub(crate) mod promotion;
 mod property_filter;
@@ -820,6 +821,12 @@ pub fn get_best_middleware(snapshot: &SyncbackSnapshot) -> Middleware {
         return script;
     } else if old_middleware == Some(Middleware::Project) {
         return Middleware::Project;
+    } else if inst.class == "Terrain"
+        && !snapshot
+            .old_inst()
+            .is_some_and(|old| is_project_owned(old.metadata()))
+    {
+        return Middleware::Rbxm;
     } else if instances_as_directories(snapshot.project()) {
         return directory_middleware_for_instance(inst);
     } else if let Some(old_middleware) = old_middleware {

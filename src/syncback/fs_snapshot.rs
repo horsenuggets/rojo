@@ -8,6 +8,8 @@ use memofs::{IoResultExt, Vfs};
 
 use crate::snapshot_middleware::dir_init_files;
 
+use super::lfs::AttributesEdit;
+
 /// A simple representation of a subsection of a file system.
 #[derive(Default)]
 pub struct FsSnapshot {
@@ -19,6 +21,9 @@ pub struct FsSnapshot {
     removed_files: HashSet<PathBuf>,
     /// Paths representing removed directories.
     removed_dirs: HashSet<PathBuf>,
+    /// Shared attributes stay at their real destinations during instance staging.
+    shared_edits: HashMap<PathBuf, AttributesEdit>,
+    shared_error: Option<String>,
 }
 
 impl FsSnapshot {
@@ -29,7 +34,76 @@ impl FsSnapshot {
             added_dirs: HashSet::new(),
             removed_files: HashSet::new(),
             removed_dirs: HashSet::new(),
+            shared_edits: HashMap::new(),
+            shared_error: None,
         }
+    }
+
+    pub(crate) fn plan_terrain_lfs(
+        &mut self,
+        project: &crate::project::Project,
+        vfs: &Vfs,
+        target: &Path,
+    ) -> anyhow::Result<()> {
+        let (path, edit) = super::lfs::plan(project, vfs, target)?;
+        self.merge_shared(HashMap::from([(path, edit)]))
+    }
+
+    fn merge_shared(&mut self, edits: HashMap<PathBuf, AttributesEdit>) -> anyhow::Result<()> {
+        // Validate a copy so a failed merge cannot partly add shared rules.
+        let mut merged = self.shared_edits.clone();
+        for (path, edit) in edits {
+            if let Some(previous) = merged.get_mut(&path) {
+                previous.merge(edit)?;
+            } else {
+                merged.insert(path, edit);
+            }
+        }
+        self.shared_edits = merged;
+        Ok(())
+    }
+
+    fn normal_change_conflicts(&self, base: &Path, path: &Path) -> bool {
+        self.added_files
+            .keys()
+            .chain(self.removed_files.iter())
+            .any(|p| base.join(p) == path)
+            || self.added_dirs.iter().any(|p| base.join(p) == path)
+            || self
+                .removed_dirs
+                .iter()
+                .any(|p| path.starts_with(base.join(p)))
+    }
+
+    fn validate_shared(&self, base: &Path, lock: &mut memofs::VfsLock<'_>) -> io::Result<()> {
+        if let Some(error) = &self.shared_error {
+            return Err(io::Error::other(error.clone()));
+        }
+        for (path, edit) in &self.shared_edits {
+            if self.normal_change_conflicts(base, path) {
+                return Err(io::Error::other(
+                    "LFS attributes conflict with a normal filesystem change",
+                ));
+            }
+            let current = lock.read(path).with_not_found()?;
+            if current.as_ref().map(|bytes| bytes.as_slice()) != edit.expected.as_deref() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "LFS attributes changed before persistence",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn establish_shared(&self, lock: &mut memofs::VfsLock<'_>) -> io::Result<()> {
+        let mut edits: Vec<_> = self.shared_edits.iter().collect();
+        edits.sort_by_key(|(path, _)| *path);
+        for (path, edit) in edits {
+            // Even unchanged rules must be checked against the backend before a model write.
+            lock.write_atomic(path, &edit.contents, edit.expected.as_deref())?;
+        }
+        Ok(())
     }
 
     /// Adds the given path to the `FsSnapshot` as a file with the given
@@ -49,6 +123,10 @@ impl FsSnapshot {
     /// Merges two `FsSnapshot`s together.
     #[inline]
     pub fn merge(&mut self, other: Self) {
+        if let Err(error) = self.merge_shared(other.shared_edits) {
+            self.shared_error = Some(error.to_string());
+        }
+        self.shared_error = self.shared_error.take().or(other.shared_error);
         self.added_files.extend(other.added_files);
         self.added_dirs.extend(other.added_dirs);
         self.removed_files.extend(other.removed_files);
@@ -69,6 +147,9 @@ impl FsSnapshot {
         F: FnMut(&Path) -> bool,
     {
         other.added_files.retain(|path, _| predicate(path));
+        other.added_dirs.retain(|path| predicate(path));
+        other.removed_files.retain(|path| predicate(path));
+        other.removed_dirs.retain(|path| predicate(path));
         for path in other.added_files.keys() {
             anyhow::ensure!(
                 owners.get(path).is_none_or(|previous| *previous == owner),
@@ -76,14 +157,31 @@ impl FsSnapshot {
                 path.display()
             );
         }
+        anyhow::ensure!(
+            self.shared_error.is_none() && other.shared_error.is_none(),
+            "Invalid shared attributes plan"
+        );
+        for path in other.shared_edits.keys() {
+            anyhow::ensure!(
+                predicate(path),
+                "Cannot exclude required LFS attributes {}",
+                path.display()
+            );
+        }
+        for path in self.shared_edits.keys().chain(other.shared_edits.keys()) {
+            anyhow::ensure!(
+                !self.normal_change_conflicts(Path::new(""), path)
+                    && !other.normal_change_conflicts(Path::new(""), path),
+                "LFS attributes conflict with a normal filesystem change at {}",
+                path.display()
+            );
+        }
+        self.merge_shared(other.shared_edits)?;
         owners.extend(other.added_files.keys().cloned().map(|path| (path, owner)));
         self.added_files.extend(other.added_files);
-        self.added_dirs
-            .extend(other.added_dirs.into_iter().filter(|p| predicate(p)));
-        self.removed_files
-            .extend(other.removed_files.into_iter().filter(|p| predicate(p)));
-        self.removed_dirs
-            .extend(other.removed_dirs.into_iter().filter(|p| predicate(p)));
+        self.added_dirs.extend(other.added_dirs);
+        self.removed_files.extend(other.removed_files);
+        self.removed_dirs.extend(other.removed_dirs);
         Ok(())
     }
 
@@ -107,9 +205,10 @@ impl FsSnapshot {
         self.removed_dirs.insert(path.as_ref().to_path_buf());
     }
 
-    /// Moves every added path from inside `from` to the same place inside `to`,
-    /// so new files can be staged somewhere else before they're installed.
-    /// Fails if the snapshot removes anything or adds a path outside `from`.
+    /// Moves instance-owned added paths from `from` to `to` for staging.
+    /// Shared attributes keep their real destinations so Git can apply them before
+    /// staged model files are installed. Their parents must already exist.
+    /// Fails if the snapshot removes anything or adds an owned path outside `from`.
     pub fn rebase(self, from: &Path, to: &Path) -> anyhow::Result<Self> {
         anyhow::ensure!(
             self.removed_files.is_empty() && self.removed_dirs.is_empty(),
@@ -122,6 +221,8 @@ impl FsSnapshot {
             Ok(to.join(suffix))
         };
         let mut rebased = Self::new();
+        rebased.shared_edits = self.shared_edits;
+        rebased.shared_error = self.shared_error;
         for path in self.added_dirs {
             rebased.added_dirs.insert(move_path(path)?);
         }
@@ -139,6 +240,8 @@ impl FsSnapshot {
         let mut lock = vfs.lock();
 
         let base_path = base.as_ref();
+        self.validate_shared(base_path, &mut lock)?;
+        self.establish_shared(&mut lock)?;
         for dir_path in &self.added_dirs {
             match lock.create_dir_all(base_path.join(dir_path)) {
                 Ok(_) => (),
@@ -219,6 +322,7 @@ impl FsSnapshot {
 
     /// Persists a scoped update without allowing partial multi-file writes.
     /// Directory creation and removals require a transaction and are rejected here.
+    /// Shared attributes are checked independently and established before the model.
     pub fn write_single_file_to_vfs<P: AsRef<Path>>(
         &self,
         base: P,
@@ -263,6 +367,8 @@ impl FsSnapshot {
                 "Multi-file updates require transactional persistence and are not supported yet",
             ));
         }
+        self.validate_shared(base, &mut lock)?;
+        self.establish_shared(&mut lock)?;
         if let Some((path, contents, previous)) = changed.pop() {
             lock.write_atomic(&path, contents, previous.as_deref())?;
         }
@@ -270,8 +376,9 @@ impl FsSnapshot {
     }
 
     /// Persists a rewritten model file along with its adjacent metadata, which
-    /// stops setting the properties the model file now holds. Every path must
-    /// be in `expected` and unchanged. The model file is written first, so if
+    /// stops setting the properties the model file now holds. Every owned path must
+    /// be in `expected` and unchanged. Shared attributes carry their own preconditions
+    /// and are established first. The model file precedes metadata, so if
     /// writing stops partway, the metadata still sets the same values as before
     /// and nothing is lost.
     pub fn write_model_file_to_vfs<P: AsRef<Path>>(
@@ -317,6 +424,8 @@ impl FsSnapshot {
             }
             removals.push(path);
         }
+        self.validate_shared(base, &mut lock)?;
+        self.establish_shared(&mut lock)?;
         writes.sort_by_key(|(path, _, _)| path.as_path() != model);
         for (path, contents, previous) in writes {
             lock.write_atomic(&path, contents, previous.as_deref())?;
@@ -335,17 +444,22 @@ impl FsSnapshot {
         expected: &HashMap<PathBuf, Option<Vec<u8>>>,
     ) -> bool {
         let base = base.as_ref();
-        self.added_files.iter().any(|(path, contents)| {
-            expected
-                .get(&base.join(path))
-                .is_none_or(|previous| previous.as_deref() != Some(contents.as_slice()))
-        })
+        self.shared_edits
+            .values()
+            .any(|edit| edit.expected.as_deref() != Some(edit.contents.as_slice()))
+            || self.added_files.iter().any(|(path, contents)| {
+                expected
+                    .get(&base.join(path))
+                    .is_none_or(|previous| previous.as_deref() != Some(contents.as_slice()))
+            })
     }
 
     /// Returns whether this `FsSnapshot` is empty or not.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.added_files.is_empty()
+            && self.shared_edits.is_empty()
+            && self.shared_error.is_none()
             && self.added_dirs.is_empty()
             && self.removed_files.is_empty()
             && self.removed_dirs.is_empty()
@@ -364,6 +478,10 @@ impl FsSnapshot {
         F: FnMut(&Path) -> bool,
     {
         self.added_files.retain(|path, _| predicate(path));
+    }
+
+    pub(crate) fn is_shared_attributes_path(&self, path: &Path) -> bool {
+        self.shared_edits.contains_key(path)
     }
 
     /// Returns a list of paths that would be added by this `FsSnapshot`.
@@ -398,14 +516,20 @@ impl FsSnapshot {
             .iter()
             .filter(|path| !self.added_files.contains_key(*path))
             .map(|path| (path.as_path(), None));
-        written.chain(removed).collect()
+        let shared = self
+            .shared_edits
+            .iter()
+            .map(|(path, edit)| (path.as_path(), Some(edit.contents.as_slice())));
+        written.chain(shared).chain(removed).collect()
     }
 
     /// Returns a list of file paths that would be added by this `FsSnapshot`
     #[inline]
     pub fn added_files(&self) -> Vec<&Path> {
         let mut added_files: Vec<_> = self.added_files.keys().map(PathBuf::as_path).collect();
+        added_files.extend(self.shared_edits.keys().map(PathBuf::as_path));
         added_files.sort_unstable();
+        added_files.dedup();
         added_files
     }
 
@@ -438,6 +562,246 @@ impl FsSnapshot {
 mod tests {
     use super::*;
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    fn shared_snapshot(target: &str, original: Option<Vec<u8>>) -> FsSnapshot {
+        let mut snapshot = FsSnapshot::new().with_added_file(target, b"terrain".to_vec());
+        snapshot.shared_edits.insert(
+            PathBuf::from("/project/.gitattributes"),
+            AttributesEdit::new(
+                original,
+                format!("\"/{target}\" filter=lfs diff=lfs merge=lfs -text"),
+            )
+            .unwrap(),
+        );
+        snapshot
+    }
+
+    fn shared_vfs() -> Vfs {
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot("/project", VfsSnapshot::empty_dir())
+            .unwrap();
+        backend
+            .load_snapshot("/project/Terrain.rbxm", VfsSnapshot::file("old"))
+            .unwrap();
+        Vfs::new(backend)
+    }
+
+    #[test]
+    fn shared_plans_are_visible_without_writes_and_survive_rebase() {
+        let vfs = shared_vfs();
+        let snapshot = shared_snapshot("/project/future/Terrain.rbxm", None);
+        assert!(!snapshot.is_empty());
+        assert!(snapshot.changes_files("/", &HashMap::new()));
+        assert!(snapshot
+            .added_paths()
+            .contains(&Path::new("/project/.gitattributes")));
+        assert!(snapshot.file_changes().iter().any(|(path, contents)| *path
+            == Path::new("/project/.gitattributes")
+            && contents.is_some()));
+        assert!(vfs.read("/project/.gitattributes").is_err());
+        let rebased = snapshot
+            .rebase(Path::new("/project/future"), Path::new("/project/stage"))
+            .unwrap();
+        assert!(rebased
+            .added_files()
+            .contains(&Path::new("/project/.gitattributes")));
+        assert!(rebased
+            .added_files()
+            .contains(&Path::new("/project/stage/Terrain.rbxm")));
+        assert!(!rebased
+            .added_files()
+            .contains(&Path::new("/project/stage/.gitattributes")));
+        rebased.write_to_vfs("/", &vfs).unwrap();
+        // Only staging may create directories. The future relocation destination stays absent.
+        assert!(vfs.read("/project/.gitattributes").is_ok());
+        assert!(vfs.metadata("/project/future").is_err());
+    }
+
+    #[test]
+    fn shared_rules_merge_across_owners_but_inconsistent_preconditions_fail() {
+        let mut snapshot = shared_snapshot("a.rbxm", None);
+        let mut owners = HashMap::new();
+        snapshot
+            .merge_with_filter(
+                shared_snapshot("b.rbxm", None),
+                |_| true,
+                rbx_dom_weak::types::Ref::new(),
+                &mut owners,
+            )
+            .unwrap();
+        let attrs = &snapshot.shared_edits[Path::new("/project/.gitattributes")];
+        let text = std::str::from_utf8(&attrs.contents).unwrap();
+        assert!(text.contains("a.rbxm") && text.contains("b.rbxm"));
+        let previous = attrs.contents.clone();
+        assert!(snapshot
+            .merge_with_filter(
+                shared_snapshot("c.rbxm", Some(b"edited".to_vec())),
+                |_| true,
+                rbx_dom_weak::types::Ref::new(),
+                &mut owners
+            )
+            .is_err());
+        assert_eq!(
+            snapshot.shared_edits[Path::new("/project/.gitattributes")].contents,
+            previous
+        );
+        assert!(!snapshot.added_files.contains_key(Path::new("c.rbxm")));
+    }
+
+    #[test]
+    fn filtered_merge_rejects_normal_writes_to_shared_destinations() {
+        for shared_first in [false, true] {
+            let shared = shared_snapshot("/project/Terrain.rbxm", None);
+            let normal =
+                FsSnapshot::new().with_added_file("/project/.gitattributes", b"normal".to_vec());
+            let (mut staged, incoming) = if shared_first {
+                (shared, normal)
+            } else {
+                (normal, shared)
+            };
+            assert!(staged
+                .merge_with_filter(
+                    incoming,
+                    |_| true,
+                    rbx_dom_weak::types::Ref::new(),
+                    &mut HashMap::new()
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn all_writers_establish_attributes_with_their_own_preconditions() {
+        for writer in 0..3 {
+            let vfs = shared_vfs();
+            let snapshot = shared_snapshot("Terrain.rbxm", None);
+            let expected = HashMap::from([(
+                PathBuf::from("/project/Terrain.rbxm"),
+                Some(b"old".to_vec()),
+            )]);
+            match writer {
+                0 => snapshot.write_to_vfs("/project", &vfs),
+                1 => snapshot.write_single_file_to_vfs("/project", &vfs, &expected),
+                _ => snapshot.write_model_file_to_vfs(
+                    "/project",
+                    &vfs,
+                    &expected,
+                    Path::new("/project/Terrain.rbxm"),
+                ),
+            }
+            .unwrap();
+            assert_eq!(&**vfs.read("/project/Terrain.rbxm").unwrap(), b"terrain");
+            assert_eq!(
+                &**vfs.read("/project/.gitattributes").unwrap(),
+                snapshot.shared_edits[Path::new("/project/.gitattributes")].contents
+            );
+        }
+    }
+
+    #[test]
+    fn stale_shared_edits_and_normal_write_conflicts_never_write_models() {
+        for writer in 0..3 {
+            for conflict in [false, true] {
+                let vfs = shared_vfs();
+                let mut snapshot = shared_snapshot("Terrain.rbxm", None);
+                if conflict {
+                    snapshot.add_file(".gitattributes", b"normal write".to_vec());
+                } else {
+                    vfs.write("/project/.gitattributes", b"user edit").unwrap();
+                }
+                let expected = FsSnapshot::capture_file_contents(
+                    &[
+                        PathBuf::from("/project/Terrain.rbxm"),
+                        PathBuf::from("/project/.gitattributes"),
+                    ],
+                    &vfs,
+                )
+                .unwrap();
+                let result = match writer {
+                    0 => snapshot.write_to_vfs("/project", &vfs),
+                    1 => snapshot.write_single_file_to_vfs("/project", &vfs, &expected),
+                    _ => snapshot.write_model_file_to_vfs(
+                        "/project",
+                        &vfs,
+                        &expected,
+                        Path::new("/project/Terrain.rbxm"),
+                    ),
+                };
+                assert!(result.is_err());
+                assert_eq!(&**vfs.read("/project/Terrain.rbxm").unwrap(), b"old");
+                if !conflict {
+                    assert_eq!(
+                        &**vfs.read("/project/.gitattributes").unwrap(),
+                        b"user edit"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_attributes_edits_are_rejected_by_every_writer() {
+        for writer in 0..3 {
+            for original in [None, Some(b"# original\n".to_vec())] {
+                let directory = tempfile::tempdir().unwrap();
+                let target = directory.path().join("Terrain.rbxm");
+                let attributes = directory.path().join(".gitattributes");
+                std::fs::write(&target, b"old").unwrap();
+                if let Some(bytes) = &original {
+                    std::fs::write(&attributes, bytes).unwrap();
+                }
+                let vfs = Vfs::new_default().unwrap();
+                vfs.set_watch_enabled(false);
+                let mut staged = FsSnapshot::new().with_added_file(&target, b"terrain".to_vec());
+                staged.shared_edits.insert(
+                    attributes.clone(),
+                    AttributesEdit::new(
+                        original,
+                        "\"/Terrain.rbxm\" filter=lfs diff=lfs merge=lfs -text".to_owned(),
+                    )
+                    .unwrap(),
+                );
+                let expected =
+                    FsSnapshot::capture_file_contents(std::slice::from_ref(&target), &vfs).unwrap();
+                std::fs::write(&attributes, b"# user edit\n").unwrap();
+                let result = match writer {
+                    0 => staged.write_to_vfs(directory.path(), &vfs),
+                    1 => staged.write_single_file_to_vfs(directory.path(), &vfs, &expected),
+                    _ => staged.write_model_file_to_vfs(directory.path(), &vfs, &expected, &target),
+                };
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+                assert_eq!(std::fs::read(&target).unwrap(), b"old");
+                assert_eq!(std::fs::read(&attributes).unwrap(), b"# user edit\n");
+            }
+        }
+    }
+
+    #[test]
+    fn real_staging_establishes_attributes_without_creating_the_install_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let destination = directory.path().join("future");
+        let staging = directory.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let attributes = directory.path().join(".gitattributes");
+        let mut staged = FsSnapshot::new()
+            .with_added_file(destination.join("Terrain.rbxm"), b"terrain".to_vec());
+        staged.shared_edits.insert(
+            attributes.clone(),
+            AttributesEdit::new(
+                None,
+                "\"/future/Terrain.rbxm\" filter=lfs diff=lfs merge=lfs -text".to_owned(),
+            )
+            .unwrap(),
+        );
+        let staged = staged.rebase(&destination, &staging).unwrap();
+        staged.write_to_vfs(directory.path(), &vfs).unwrap();
+        assert!(attributes.is_file());
+        assert!(!destination.exists());
+        assert!(staging.join("Terrain.rbxm").is_file());
+    }
 
     #[test]
     fn rebase_moves_added_paths_and_rejects_anything_else() {
