@@ -152,6 +152,52 @@ function StudioExport.serviceProperties(instance, warnings)
 	return properties
 end
 
+const function warnExternalReferences(roots, warnings)
+	const included = {}
+	const pending = table.clone(roots)
+	while #pending > 0 do
+		const instance = table.remove(pending)
+		if instance.Archivable then
+			included[instance] = true
+			for _, child in instance:GetChildren() do
+				table.insert(pending, child)
+			end
+		end
+	end
+	const referenceProperties = {}
+	for instance in included do
+		local names = referenceProperties[instance.ClassName]
+		if names == nil then
+			names = {}
+			local class = ReflectionDatabase.Classes[instance.ClassName]
+			while class ~= nil do
+				for name in class.Properties do
+					const descriptor = RbxDom.findCanonicalPropertyDescriptor(instance.ClassName, name)
+					if descriptor ~= nil and descriptor.dataType == "Ref" and descriptor.name ~= "Parent" then
+						const canonical = ReflectionDatabase.Classes[descriptor.className].Properties[descriptor.name]
+						if canonical.Kind.Canonical.Serialization ~= "DoesNotSerialize" then
+							names[descriptor.name] = true
+						end
+					end
+				end
+				class = ReflectionDatabase.Classes[class.Superclass]
+			end
+			referenceProperties[instance.ClassName] = names
+		end
+		for name in names do
+			const ok, target = pcall(function()
+				return instance[name]
+			end)
+			if ok and target ~= nil and not included[target] then
+				table.insert(
+					warnings,
+					`External reference "{instance:GetFullName()}.{name}" is outside the captured model.`
+				)
+			end
+		end
+	end
+end
+
 -- Dependencies keep capture and transport testable without native serialization.
 function StudioExport.capture(request, dependencies)
 	assert(Types.ExportPacket(request))
@@ -236,7 +282,7 @@ function StudioExport.capture(request, dependencies)
 			addRoot(instance, nil)
 		end
 		assert(#instances > 0, "No archivable model roots remain to export.")
-		table.insert(warnings, "References outside the chosen model roots may be lost during export.")
+		warnExternalReferences(instances, warnings)
 	end
 	const contents = if #instances == 0 then "" else dependencies.serialize(instances)
 	return contents, { roots = roots, services = services, warnings = warnings }

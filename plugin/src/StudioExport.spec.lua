@@ -96,7 +96,7 @@ return function()
 		expect(contents).to.equal("captured")
 		expect(calls).to.equal(1)
 		expect(manifest.roots[1].descendantCount).to.equal(0)
-		expect(#manifest.warnings).to.equal(2)
+		expect(#manifest.warnings).to.equal(1)
 		expect(child.Archivable).to.equal(false)
 		expect(grandchild.Parent).to.equal(child)
 		root:Destroy()
@@ -113,6 +113,53 @@ return function()
 		const _, manifest = StudioExport.capture(body, boundary)
 		expect(#manifest.roots).to.equal(1)
 		expect(manifest.roots[1].descendantCount).to.equal(1)
+		expect(#manifest.warnings).to.equal(0)
+		root:Destroy()
+	end)
+
+	it("only warns for references outside the complete archivable selection", function()
+		for _, selection in { false, true } do
+			for _, external in { false, true } do
+				for _, excluded in { false, true } do
+					const root, model, child = fixture()
+					child.Archivable = not excluded
+					const reference = Instance.new("ObjectValue")
+					reference.Parent = model
+					reference.Value = if external then root else child
+					const boundary = boundaries(root)
+					boundary.selection = function()
+						return { model }
+					end
+					const body = request()
+					body.selection = selection
+					body.paths = if selection then {} else { "Root" }
+					const _, manifest = StudioExport.capture(body, boundary)
+					local references = 0
+					for _, warning in manifest.warnings do
+						if string.find(warning, "External reference", 1, true) then
+							references += 1
+						end
+					end
+					expect(references).to.equal(if external or excluded then 1 else 0)
+					expect(#manifest.warnings).to.equal((if excluded then 1 else 0) + references)
+					root:Destroy()
+				end
+			end
+		end
+	end)
+
+	it("preserves references between separately selected roots without warnings", function()
+		const root, model = fixture()
+		const other = Instance.new("Folder")
+		other.Name = "Other"
+		other.Parent = root
+		const reference = Instance.new("ObjectValue")
+		reference.Parent = model
+		reference.Value = other
+		const body = request()
+		body.paths = { "Root", "Other" }
+		const _, manifest = StudioExport.capture(body, boundaries(root))
+		expect(#manifest.warnings).to.equal(0)
 		root:Destroy()
 	end)
 
