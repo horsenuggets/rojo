@@ -112,6 +112,132 @@ fn package_sources_cli_build_sourcemap_and_round_trip() {
 }
 
 #[test]
+fn package_sources_cli_syncback_preserves_selected_inner_project_file() {
+    package_sources_cli_syncback_preserves_selected_inner_project(
+        "inner.project.json",
+        "Source/Foo",
+    );
+}
+
+#[test]
+fn package_sources_cli_syncback_preserves_selected_inner_project_directory() {
+    package_sources_cli_syncback_preserves_selected_inner_project(
+        "inner/default.project.json",
+        "../Source/Foo",
+    );
+}
+
+#[test]
+fn package_sources_cli_syncback_preserves_selected_inner_project_directory_jsonc() {
+    package_sources_cli_syncback_preserves_selected_inner_project(
+        "inner/default.project.jsonc",
+        "../Source/Foo",
+    );
+}
+
+fn package_sources_cli_syncback_preserves_selected_inner_project(
+    inner_project: &str,
+    inner_source: &str,
+) {
+    use crate::rojo_test::package_sources::{self as fixture, INSTALLED, ORIGINAL};
+    use std::{
+        fs,
+        io::{Read, Seek},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fixture::setup(&root);
+    // Both projects share one instance. The outer project must not replace the
+    // inner project selected during syncback, even on a transparent root.
+    for package in ["Source/ForkedPackages/foo", INSTALLED] {
+        let inner_path = if inner_project.starts_with("inner/") {
+            "inner"
+        } else {
+            inner_project
+        };
+        fs::write(
+            root.join(package).join("default.project.json"),
+            serde_json::json!({"tree": {"$path": inner_path}}).to_string(),
+        )
+        .unwrap();
+        let inner_project = root.join(package).join(inner_project);
+        fs::create_dir_all(inner_project.parent().unwrap()).unwrap();
+        fs::write(
+            inner_project,
+            serde_json::json!({"tree": {"$path": inner_source}}).to_string(),
+        )
+        .unwrap();
+    }
+    let output = temp.path().join("input.rbxl");
+    let result = Command::new(ROJO_PATH)
+        .arg("build")
+        .arg(&root)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut dom = rbx_binary::from_reader(fs::File::open(&output).unwrap()).unwrap();
+    let local = dom
+        .descendants()
+        .find(|inst| inst.name == "foo")
+        .unwrap()
+        .referent();
+    dom.get_by_ref_mut(local).unwrap().properties.insert(
+        ustr("Source"),
+        Variant::String("return { Value = 3 }\n".into()),
+    );
+    rbx_binary::to_writer(
+        fs::File::create(&output).unwrap(),
+        &dom,
+        dom.root().children(),
+    )
+    .unwrap();
+    let mut expected = fixture::files(&root);
+    expected.insert(ORIGINAL.into(), b"return { Value = 3 }\n".to_vec());
+
+    // Capture diagnostics in a file so a looping child cannot fill a pipe and
+    // block the test. Always kill and reap the child before reporting a timeout.
+    let stderr = tempfile::tempfile().unwrap();
+    let mut child = Command::new(ROJO_PATH)
+        .arg("syncback")
+        .arg(&root)
+        .arg("--input")
+        .arg(&output)
+        .arg("--non-interactive")
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("Package syncback exceeded its 10-second deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = stderr;
+    stderr.rewind().unwrap();
+    let mut diagnostics = String::new();
+    stderr.read_to_string(&mut diagnostics).unwrap();
+    assert!(status.success(), "{diagnostics}");
+    // This also pins the unchanged outer/inner projects and all installed bytes.
+    assert_eq!(fixture::files(&root), expected);
+}
+
+#[test]
 fn package_sources_private_aliases_do_not_use_the_consumers_namespace() {
     use crate::rojo_test::package_sources::{self as fixture, ORIGINAL};
     use sha2::{Digest, Sha256};
