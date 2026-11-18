@@ -220,11 +220,96 @@ impl JobThreadContext {
         before_publication: impl FnOnce(&RojoTree, &[AppliedPatchSet]),
     ) -> Vec<AppliedPatchSet> {
         let mut tree = self.tree.lock().unwrap();
-        let applied = self.apply_patches_to_tree(&mut tree, path);
+        let require_context = tree.root().metadata().context.require_context.clone();
+        let applied = if let Some(require_context) = require_context {
+            // Validate the complete candidate mapping before exposing structural
+            // edits or imports. Incremental reads remain shallow on disk.
+            let mut candidate = tree.clone_for_serialization();
+            let mut applied = self.apply_patches_to_tree(&mut candidate, path);
+            match self.refresh_require_context(&mut candidate, &require_context.project_root) {
+                Ok(Some(refresh)) => {
+                    if !refresh.is_empty() {
+                        applied.push(refresh);
+                    }
+                    *tree = candidate;
+                    applied
+                }
+                Ok(None) => {
+                    *tree = candidate;
+                    applied
+                }
+                Err(error) => {
+                    log::error!("Cannot refresh project import mappings. {error:#}");
+                    Vec::new()
+                }
+            }
+        } else {
+            self.apply_patches_to_tree(&mut tree, path)
+        };
         before_publication(&tree, &applied);
         // Readers must not observe the changed DOM before its revision is published.
         self.message_queue.push_messages(&applied);
         applied
+    }
+
+    fn refresh_require_context(
+        &self,
+        tree: &mut RojoTree,
+        project_root: &Path,
+    ) -> anyhow::Result<Option<AppliedPatchSet>> {
+        fn snapshot(tree: &RojoTree, id: Ref) -> InstanceSnapshot {
+            let instance = tree.get_instance(id).unwrap();
+            InstanceSnapshot::new()
+                .snapshot_id(id)
+                .name(instance.name())
+                .class_name(instance.class_name())
+                .properties(instance.properties().clone())
+                .metadata(instance.metadata().clone())
+                .children(
+                    instance
+                        .children()
+                        .iter()
+                        .map(|child| snapshot(tree, *child))
+                        .collect::<Vec<_>>(),
+                )
+        }
+        let root = tree.get_root_id();
+        let mut snapshot = snapshot(tree, root);
+        let context = crate::serve_session::build_require_context(&snapshot, project_root)?;
+        if snapshot.metadata.context.require_context.as_deref() == Some(context.as_ref()) {
+            return Ok(None);
+        }
+        crate::snapshot_middleware::prepare_requires(&mut snapshot, &self.vfs, &context)?;
+        // Mapping and source-transform baselines are server-only. Refresh them
+        // without publishing unchanged client metadata as another revision.
+        let mut applied = AppliedPatchSet::new();
+        let mut pending = vec![&snapshot];
+        while let Some(instance) = pending.pop() {
+            let id = instance.snapshot_id;
+            if let Some(source) = instance.properties.get(&ustr("Source")) {
+                if tree
+                    .get_instance(id)
+                    .unwrap()
+                    .properties()
+                    .get(&ustr("Source"))
+                    != Some(source)
+                {
+                    tree.get_instance_mut(id)
+                        .unwrap()
+                        .properties_mut()
+                        .insert(ustr("Source"), source.clone());
+                    applied.updated.push(AppliedPatchUpdate {
+                        changed_properties: [(ustr("Source"), Some(source.clone()))]
+                            .into_iter()
+                            .collect(),
+                        ..AppliedPatchUpdate::new(id)
+                    });
+                }
+            }
+            tree.update_metadata(id, instance.metadata.clone());
+            pending.extend(&instance.children);
+        }
+        Ok(Some(applied))
     }
 
     fn apply_patches_to_tree(&self, tree: &mut RojoTree, path: PathBuf) -> Vec<AppliedPatchSet> {
@@ -5698,6 +5783,175 @@ mod tests {
         assert!(job.apply_patches(path.clone()).is_empty());
         assert!(job.apply_patches(path).is_empty());
         assert_eq!(job.message_queue.cursor(), published);
+    }
+
+    #[test]
+    fn project_remounts_publish_fresh_imports_and_propagate_watcher_context() {
+        for nested in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::create_dir_all(root.join("Source/Shared")).unwrap();
+            std::fs::write(root.join("Source/Shared/Util.luau"), "return 1\n").unwrap();
+            std::fs::write(root.join("App.luau"), "return require(\"@shared/Util\")\n").unwrap();
+            std::fs::write(
+                root.join(".luaurc"),
+                r#"{"aliases":{"shared":"Source/Shared"}}"#,
+            )
+            .unwrap();
+            let service = serde_json::json!({
+                "$className": "ReplicatedStorage",
+                "Shared": { "$path": "Source/Shared" },
+                "App": { "$path": "App.luau" }
+            });
+            let project = serde_json::json!({
+                "name": "Test",
+                "tree": {
+                    "$className": "DataModel",
+                    "ReplicatedStorage": if nested {
+                        serde_json::json!({ "$path": "inner.project.json" })
+                    } else { service.clone() }
+                }
+            });
+            let root_project = root.join("default.project.json");
+            std::fs::write(&root_project, serde_json::to_vec(&project).unwrap()).unwrap();
+            let changed_project = if nested {
+                let path = root.join("inner.project.json");
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec(&serde_json::json!({ "tree": service })).unwrap(),
+                )
+                .unwrap();
+                path
+            } else {
+                root_project.clone()
+            };
+            let job = disk_job(root);
+            let mut context = crate::snapshot::InstanceContext::default();
+            context.set_reserved_cache_path(job.project().folder_location().join(".rojo"));
+            let mut snapshot = snapshot_from_vfs(&context, &job.vfs, &job.project().file_location)
+                .unwrap()
+                .unwrap();
+            let require_context = crate::serve_session::build_require_context(
+                &snapshot,
+                job.project().folder_location(),
+            )
+            .unwrap();
+            crate::snapshot_middleware::prepare_requires(&mut snapshot, &job.vfs, &require_context)
+                .unwrap();
+            *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+            let app = {
+                let tree = job.tree.lock().unwrap();
+                tree.descendants(tree.get_root_id())
+                    .find(|instance| instance.name() == "App")
+                    .unwrap()
+                    .id()
+            };
+            let changed_project = job.vfs.canonicalize(&changed_project).unwrap();
+            let project_source = job.vfs.read_to_string(&changed_project).unwrap();
+            job.vfs
+                .write(
+                    &changed_project,
+                    project_source.replace("\"Shared\":", "\"RenamedShared\":"),
+                )
+                .unwrap();
+            job.apply_patches_with_publication(changed_project, |tree, messages| {
+                assert_eq!(job.message_queue.cursor(), 0);
+                assert!(tree.descendants(tree.get_root_id()).any(|instance| instance.name() == "RenamedShared"));
+                let source = &tree.get_instance(app).unwrap().properties()[&ustr("Source")];
+                assert!(matches!(source, Variant::String(source) if source.contains("@game/ReplicatedStorage/RenamedShared/Util")), "{source:?}");
+                assert!(messages.iter().any(|message| message.updated.iter().any(|update| {
+                    update.id == app && update.changed_properties.contains_key(&ustr("Source"))
+                })));
+            });
+            assert!(job.message_queue.cursor() > 0);
+            let app_path = job.project().folder_location().join("App.luau");
+            job.vfs
+                .write(&app_path, "return require(\"@shared/Util\"), 2\n")
+                .unwrap();
+            job.apply_patches(app_path);
+            let added = job
+                .project()
+                .folder_location()
+                .join("Source/Shared/Extra.luau");
+            job.vfs
+                .write(&added, "return require(\"@shared/Util\")\n")
+                .unwrap();
+            job.apply_patches(added.clone());
+            {
+                let tree = job.tree.lock().unwrap();
+                for name in ["App", "Extra"] {
+                    let instance = tree
+                        .descendants(tree.get_root_id())
+                        .find(|instance| instance.name() == name)
+                        .unwrap();
+                    let source = &instance.properties()[&ustr("Source")];
+                    assert!(
+                        matches!(source, Variant::String(source) if source.contains("@game/ReplicatedStorage/RenamedShared/Util")),
+                        "{name} {source:?}"
+                    );
+                    let transform = instance.metadata().source_transform.as_ref().unwrap();
+                    assert!(transform.original.contains("@shared/Util"));
+                    assert_eq!(source, &Variant::String(transform.emitted.clone()));
+                    assert_eq!(
+                        instance
+                            .metadata()
+                            .context
+                            .require_context
+                            .as_ref()
+                            .unwrap()
+                            .path_mappings,
+                        tree.root()
+                            .metadata()
+                            .context
+                            .require_context
+                            .as_ref()
+                            .unwrap()
+                            .path_mappings
+                    );
+                }
+            }
+            job.vfs.remove_file(&added).unwrap();
+            job.apply_patches(added);
+            let tree = job.tree.lock().unwrap();
+            assert!(!tree
+                .descendants(tree.get_root_id())
+                .any(|instance| instance.name() == "Extra"));
+        }
+    }
+
+    #[test]
+    fn invalid_package_remount_keeps_the_live_tree_and_revision_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = package_relocation_job(temp.path(), true);
+        let mut context = job.tree.lock().unwrap().root().metadata().context.clone();
+        context.set_reserved_cache_path(job.project().folder_location().join(".rojo"));
+        let path = job.project().file_location.clone();
+        let mut snapshot = snapshot_from_vfs(&context, &job.vfs, &path)
+            .unwrap()
+            .unwrap();
+        let require_context =
+            crate::serve_session::build_require_context(&snapshot, job.project().folder_location())
+                .unwrap();
+        crate::snapshot_middleware::prepare_requires(&mut snapshot, &job.vfs, &require_context)
+            .unwrap();
+        *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+        let before = job.tree.lock().unwrap().clone_for_serialization();
+        job.vfs.write(&path, r#"{"name":"Test","tree":{"$className":"Folder","First":{"$path":"Packages/_Index/First/library"},"Duplicate":{"$path":"Packages/_Index/First/library"}}}"#).unwrap();
+        let applied = job.apply_patches(path);
+        assert!(applied.is_empty());
+        assert_eq!(job.message_queue.cursor(), 0);
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(
+            tree.inner().descendants().count(),
+            before.inner().descendants().count()
+        );
+        for original in before.descendants(before.get_root_id()) {
+            let current = tree.get_instance(original.id()).unwrap();
+            assert_eq!(current.name(), original.name());
+            assert_eq!(current.children(), original.children());
+            assert_eq!(current.properties(), original.properties());
+            assert_eq!(current.metadata(), original.metadata());
+        }
     }
 
     #[test]

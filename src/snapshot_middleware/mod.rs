@@ -75,7 +75,14 @@ pub(crate) fn prepare_requires(
             path.extension()
                 .is_some_and(|ext| ext == "luau" || ext == "lua")
         }) {
-            let original = source.clone();
+            let original = snapshot
+                .metadata
+                .source_transform
+                .take()
+                .map_or_else(|| source.clone(), |transform| transform.original);
+            // A remount must lower the authored import again, not reinterpret a
+            // native path emitted for the previous hierarchy.
+            *source = original.clone();
             let info = luaurc::ResolveInfo {
                 file_path: path,
                 vfs,

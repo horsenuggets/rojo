@@ -39,6 +39,8 @@ Making a new release? Simply add the new header with the version and date undern
   without rewriting authored aliases.
 * Preserved authoritative source paths in sourcemaps and expanded referenced project
   mappings for package-aware import resolution.
+* Refreshed import mappings and authored-source transformations before publishing project
+  remounts or structural watcher changes, without changing unrelated references.
 * Guarded package replacements, moves, promotions, and relayout recovery with exact
   ownership evidence, source-generation checks, and canonical ancestor validation.
 * Kept live properties and ownership metadata intact while serializing package batches,
