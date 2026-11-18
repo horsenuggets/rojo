@@ -190,6 +190,39 @@ fn compute_property_patches(
     let changed_metadata = if &snapshot.metadata == instance.metadata() {
         None
     } else {
+        if cfg!(windows) {
+            let before = instance.metadata();
+            let after = &snapshot.metadata;
+            log::warn!(
+                "Windows metadata revision for \"{}\". Origin {:?} -> {:?}, paths {:?} -> {:?}, context {}, expected {}, installed {}, transform {}, middleware {}, schema {}, identity {}",
+                instance.name(),
+                before.instigating_source.as_ref().map(|source| source.path()),
+                after.instigating_source.as_ref().map(|source| source.path()),
+                before.relevant_paths, after.relevant_paths,
+                before.context != after.context,
+                before.package_file_contents != after.package_file_contents,
+                before.installed_paths != after.installed_paths,
+                before.source_transform != after.source_transform,
+                before.middleware != after.middleware,
+                before.schema != after.schema,
+                before.specified_id != after.specified_id,
+            );
+            if before.context != after.context {
+                log::warn!(
+                    "Windows context revision. Requires {}, project ancestry {:?} -> {:?}, directory ancestry {:?} -> {:?}, mount {:?} -> {:?}, ownership {}, ignores {}, rules {}, cache {}, shallow {}, legacy {}",
+                    before.context.require_context != after.context.require_context,
+                    before.context.active_projects, after.context.active_projects,
+                    before.context.active_directories, after.context.active_directories,
+                    before.context.package_mount, after.context.package_mount,
+                    before.context.package_sources != after.context.package_sources,
+                    before.context.path_ignore_rules != after.context.path_ignore_rules,
+                    before.context.sync_rules != after.context.sync_rules,
+                    before.context.reserved_cache_path() != after.context.reserved_cache_path(),
+                    before.context.shallow != after.context.shallow,
+                    before.context.emit_legacy_scripts != after.context.emit_legacy_scripts,
+                );
+            }
+        }
         Some(take(&mut snapshot.metadata))
     };
 

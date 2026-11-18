@@ -257,8 +257,26 @@ impl TestServeSession {
             .send()
             .expect("Failed to send write request");
         assert_eq!(response.status(), reqwest::StatusCode::OK);
-        deserialize_msgpack(&response.bytes().unwrap())
-            .expect("Server returned malformed write response")
+        let result: WriteResponse = deserialize_msgpack(&response.bytes().unwrap())
+            .expect("Server returned malformed write response");
+        if result
+            .errors
+            .iter()
+            .any(|error| error.message.contains("baseline is stale"))
+        {
+            if let (Some(cursor), Ok(info)) = (request.message_cursor, self.get_api_rojo()) {
+                if self
+                    .get_api_read(info.root_instance_id)
+                    .is_ok_and(|read| read.message_cursor > cursor)
+                {
+                    eprintln!(
+                        "Stale baseline revisions since {cursor}. {:?}",
+                        self.get_api_socket_packet(SocketPacketType::Messages, cursor)
+                    );
+                }
+            }
+        }
+        result
     }
 
     pub fn post_api_serialize(
