@@ -826,13 +826,19 @@ fn set_model_trees(session: &crate::rojo_test::serve_util::TestServeSession, rul
 /// Rewrites the `place_root` project with `instancesAsDirectories` and the
 /// given extra syncback rules.
 fn set_syncback_rules(session: &crate::rojo_test::serve_util::TestServeSession, rules: &str) {
-    fs::write(
-        session.path().join("default.project.json"),
-        format!(
-            r#"{{"name":"place_root","tree":{{"$className":"DataModel","$path":"src"}},"syncbackRules":{{"instancesAsDirectories":true,{rules}}}}}"#
-        ),
+    use std::io::Write;
+
+    // Publish one complete project revision, as an editor's atomic save does,
+    // rather than exposing a truncated project to the native watcher.
+    let mut staged = tempfile::NamedTempFile::new_in(session.path()).unwrap();
+    write!(
+        staged,
+        r#"{{"name":"place_root","tree":{{"$className":"DataModel","$path":"src"}},"syncbackRules":{{"instancesAsDirectories":true,{rules}}}}}"#
     )
     .unwrap();
+    staged
+        .persist(session.path().join("default.project.json"))
+        .unwrap();
 }
 
 /// Waits for an instance named `name` and returns its ID.
@@ -865,36 +871,54 @@ fn parent_of(session: &crate::rojo_test::serve_util::TestServeSession, id: Ref) 
 // ancestor in that file is written out as files, and every ID is kept.
 #[test]
 fn model_tree_rules_reach_instances_stored_in_metadata() {
-    run_serve_test("place_root", |session, _| {
-        let mover_dir = session.path().join("src/ReplicatedStorage/Mover");
+    use crate::rojo_test::serve_util::TestServeSession;
+
+    // Only the rule change belongs to the watcher exercise. Establish the
+    // metadata fixture before startup, not through another live watcher event.
+    let mut session = TestServeSession::with_setup("place_root", |root| {
         fs::write(
-            mover_dir.join("init.meta.json"),
+            root.join("src/ReplicatedStorage/Mover/init.meta.json"),
             r#"{"children":[{"name":"Outer","className":"Folder","children":[{"name":"FX","className":"Folder","children":[{"name":"Spark","className":"Part"}]}]}]}"#,
         )
         .unwrap();
-        let spark = wait_for_instance(&session, "Spark");
-        let fx = wait_for_instance(&session, "FX");
-        let outer = wait_for_instance(&session, "Outer");
-        announce_authority(&session, WriteAuthority::Studio);
-
-        set_model_trees(
-            &session,
-            r#"[{"pattern":"ReplicatedStorage/Mover/Outer/FX"}]"#,
-        );
-        assert!(
-            eventually(|| mover_dir.join("Outer/FX.rbxm").is_file()),
-            "FX never became a model"
-        );
-        // The model is written before the metadata that held it.
-        assert!(eventually(|| !fs::read_to_string(
-            mover_dir.join("init.meta.json")
-        )
-        .unwrap()
-        .contains("Outer")));
-        thread::sleep(Duration::from_millis(1000));
-        assert_eq!(parent_of(&session, fx), Some(outer));
-        assert_eq!(parent_of(&session, spark), Some(fx));
     });
+    session.wait_to_come_online();
+    let mover_dir = session.path().join("src/ReplicatedStorage/Mover");
+    let mover = wait_for_instance(&session, "Mover");
+    let spark = wait_for_instance(&session, "Spark");
+    let fx = wait_for_instance(&session, "FX");
+    let outer = wait_for_instance(&session, "Outer");
+    announce_authority(&session, WriteAuthority::Studio);
+
+    set_model_trees(
+        &session,
+        r#"[{"pattern":"ReplicatedStorage/Mover/Outer/FX"}]"#,
+    );
+    assert!(
+        eventually(|| mover_dir.join("Outer/FX.rbxm").is_file()),
+        "FX never became a model"
+    );
+    // The model is written before the metadata that held it.
+    assert!(eventually(|| !fs::read_to_string(
+        mover_dir.join("init.meta.json")
+    )
+    .unwrap()
+    .contains("Outer")));
+    let model =
+        rbx_binary::from_reader(fs::File::open(mover_dir.join("Outer/FX.rbxm")).unwrap()).unwrap();
+    let root = model.root();
+    assert_eq!(root.children().len(), 1);
+    let model_fx = model.get_by_ref(root.children()[0]).unwrap();
+    assert_eq!(model_fx.name, "FX");
+    assert_eq!(model_fx.class, "Folder");
+    assert_eq!(model_fx.children().len(), 1);
+    let model_spark = model.get_by_ref(model_fx.children()[0]).unwrap();
+    assert_eq!(model_spark.name, "Spark");
+    assert_eq!(model_spark.class, "Part");
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(parent_of(&session, outer), Some(mover));
+    assert_eq!(parent_of(&session, fx), Some(outer));
+    assert_eq!(parent_of(&session, spark), Some(fx));
 }
 
 // Changing the modelTrees rules while serving moves matching instances to
@@ -903,83 +927,79 @@ fn model_tree_rules_reach_instances_stored_in_metadata() {
 // any write says which side wins, the first one decides.
 #[test]
 fn model_tree_rule_changes_relayout_only_under_studio_authority() {
+    use crate::rojo_test::serve_util::TestServeSession;
+
     for case in ["studio", "filesystem", "studio_later"] {
-        run_serve_test("place_root", |session, _| {
-            let storage = session.path().join("src/ReplicatedStorage");
-            let info = session.get_api_rojo().unwrap();
-            let mover = session
-                .get_api_read(info.root_instance_id)
-                .unwrap()
-                .instances
-                .values()
-                .find(|instance| instance.name == "Mover")
-                .unwrap()
-                .id;
-            fs::write(storage.join("Mover/Kid.luau"), "return 'kid'").unwrap();
-            let mut kid = Ref::none();
-            assert!(eventually(|| {
-                let read = session.get_api_read(info.root_instance_id).unwrap();
-                match read.instances.values().find(|i| i.name == "Kid") {
-                    Some(instance) => {
-                        kid = instance.id;
-                        true
-                    }
-                    None => false,
-                }
-            }));
-            let both_kept = || {
-                let read = session.get_api_read(info.root_instance_id).unwrap();
-                read.instances.contains_key(&mover)
-                    && read.instances.get(&kid).is_some_and(|i| i.parent == mover)
-                    && read
-                        .instances
-                        .values()
-                        .filter(|i| i.name == "Mover")
-                        .count()
-                        == 1
-                    && read.instances.values().filter(|i| i.name == "Kid").count() == 1
-            };
-            match case {
-                "studio" => announce_authority(&session, WriteAuthority::Studio),
-                "filesystem" => announce_authority(&session, WriteAuthority::Filesystem),
-                _ => {}
-            }
-
-            set_model_trees(&session, r#"[{"pattern":"ReplicatedStorage/Mover"}]"#);
-            if case == "studio_later" {
-                thread::sleep(Duration::from_millis(1000));
-                assert!(storage.join("Mover").is_dir(), "moved before any write");
-                announce_authority(&session, WriteAuthority::Studio);
-            }
-
-            if case == "filesystem" {
-                thread::sleep(Duration::from_millis(1500));
-                assert!(storage.join("Mover").is_dir(), "{case}");
-                assert!(!storage.join("Mover.rbxm").exists(), "{case}");
-                return;
-            }
-            assert!(
-                eventually(|| storage.join("Mover.rbxm").is_file()),
-                "{case} never wrote the model"
-            );
-            assert!(!storage.join("Mover").exists(), "{case}");
-            thread::sleep(Duration::from_millis(1000));
-            assert!(both_kept(), "{case} lost an ID in the model");
-
-            // Without a rule, instancesAsDirectories turns it back.
-            set_model_trees(&session, "[]");
-            assert!(
-                eventually(|| storage.join("Mover").is_dir()),
-                "{case} never went back"
-            );
-            assert!(!storage.join("Mover.rbxm").exists(), "{case}");
-            assert_eq!(
-                fs::read_to_string(storage.join("Mover/Kid.luau")).unwrap(),
-                "return 'kid'"
-            );
-            thread::sleep(Duration::from_millis(1000));
-            assert!(both_kept(), "{case} lost an ID in the directories");
+        let mut session = TestServeSession::with_setup("place_root", |root| {
+            fs::write(
+                root.join("src/ReplicatedStorage/Mover/Kid.luau"),
+                "return 'kid'",
+            )
+            .unwrap();
         });
+        let info = session.wait_to_come_online();
+        let storage = session.path().join("src/ReplicatedStorage");
+        let mover = session
+            .get_api_read(info.root_instance_id)
+            .unwrap()
+            .instances
+            .values()
+            .find(|instance| instance.name == "Mover")
+            .unwrap()
+            .id;
+        let kid = wait_for_instance(&session, "Kid");
+        let both_kept = || {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            read.instances.contains_key(&mover)
+                && read.instances.get(&kid).is_some_and(|i| i.parent == mover)
+                && read
+                    .instances
+                    .values()
+                    .filter(|i| i.name == "Mover")
+                    .count()
+                    == 1
+                && read.instances.values().filter(|i| i.name == "Kid").count() == 1
+        };
+        match case {
+            "studio" => announce_authority(&session, WriteAuthority::Studio),
+            "filesystem" => announce_authority(&session, WriteAuthority::Filesystem),
+            _ => {}
+        }
+
+        set_model_trees(&session, r#"[{"pattern":"ReplicatedStorage/Mover"}]"#);
+        if case == "studio_later" {
+            thread::sleep(Duration::from_millis(1000));
+            assert!(storage.join("Mover").is_dir(), "moved before any write");
+            announce_authority(&session, WriteAuthority::Studio);
+        }
+
+        if case == "filesystem" {
+            thread::sleep(Duration::from_millis(1500));
+            assert!(storage.join("Mover").is_dir(), "{case}");
+            assert!(!storage.join("Mover.rbxm").exists(), "{case}");
+            continue;
+        }
+        assert!(
+            eventually(|| storage.join("Mover.rbxm").is_file()),
+            "{case} never wrote the model"
+        );
+        assert!(!storage.join("Mover").exists(), "{case}");
+        thread::sleep(Duration::from_millis(1000));
+        assert!(both_kept(), "{case} lost an ID in the model");
+
+        // Without a rule, instancesAsDirectories turns it back.
+        set_model_trees(&session, "[]");
+        assert!(
+            eventually(|| storage.join("Mover").is_dir()),
+            "{case} never went back"
+        );
+        assert!(!storage.join("Mover.rbxm").exists(), "{case}");
+        assert_eq!(
+            fs::read_to_string(storage.join("Mover/Kid.luau")).unwrap(),
+            "return 'kid'"
+        );
+        thread::sleep(Duration::from_millis(1000));
+        assert!(both_kept(), "{case} lost an ID in the directories");
     }
 }
 
