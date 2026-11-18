@@ -82,6 +82,33 @@ impl RojoTree {
         tree
     }
 
+    /// Copies the serialization baseline without sharing mutable state or changing IDs.
+    /// Syncback filters this baseline in place, so it must not be the live tree.
+    pub(crate) fn clone_for_serialization(&self) -> Self {
+        let builder = |id| {
+            let instance = self.inner.get_by_ref(id).unwrap();
+            InstanceBuilder::new(instance.class)
+                .with_name(&instance.name)
+                .with_properties(instance.properties.clone())
+                .with_referent(id)
+        };
+        let root = self.get_root_id();
+        let mut inner = WeakDom::new(builder(root));
+        let mut pending = vec![root];
+        while let Some(parent) = pending.pop() {
+            for &child in self.inner.get_by_ref(parent).unwrap().children() {
+                inner.insert(parent, builder(child));
+                pending.push(child);
+            }
+        }
+        Self {
+            inner,
+            metadata_map: self.metadata_map.clone(),
+            path_to_ids: self.path_to_ids.clone(),
+            specified_id_to_refs: self.specified_id_to_refs.clone(),
+        }
+    }
+
     pub fn inner(&self) -> &WeakDom {
         &self.inner
     }
@@ -539,6 +566,53 @@ mod test {
     };
 
     use super::{RojoTree, SnapshotReferents};
+
+    #[test]
+    fn serialization_clone_preserves_referents_metadata_and_indexes() {
+        let path = std::path::PathBuf::from("shared.luau");
+        let specified = RojoRef::new("shared".into());
+        let mut metadata = InstanceMetadata::new().specified_id(Some(specified.clone()));
+        metadata.relevant_paths.push(path.clone());
+        let mut tree = RojoTree::new(InstanceSnapshot::new().metadata(metadata.clone()));
+        let root = tree.get_root_id();
+        let child = tree.insert_instance(
+            root,
+            InstanceSnapshot::new().name("Child").metadata(metadata),
+        );
+        tree.get_instance_mut(root)
+            .unwrap()
+            .properties_mut()
+            .insert(ustr("Target"), Variant::Ref(child));
+        let mut detached = tree.clone_for_serialization();
+        assert_eq!(detached.get_root_id(), root);
+        for instance in tree.descendants(root) {
+            let copy = detached.get_instance(instance.id()).unwrap();
+            assert_eq!(copy.parent(), instance.parent());
+            assert_eq!(copy.children(), instance.children());
+            assert_eq!(copy.name(), instance.name());
+            assert_eq!(copy.class_name(), instance.class_name());
+            assert_eq!(copy.properties(), instance.properties());
+            assert_eq!(copy.metadata(), instance.metadata());
+        }
+        assert_eq!(detached.get_ids_at_path(&path), [root, child]);
+        assert_eq!(detached.specified_id_holders(&specified), [root, child]);
+        assert_eq!(detached.get_specified_id(&specified), None);
+        detached.remove(child);
+        detached
+            .get_instance_mut(root)
+            .unwrap()
+            .properties_mut()
+            .clear();
+        assert_eq!(detached.get_specified_id(&specified), Some(root));
+        assert_eq!(tree.get_ids_at_path(&path), [root, child]);
+        assert_eq!(tree.specified_id_holders(&specified), [root, child]);
+        assert_eq!(tree.root().children(), [child]);
+        assert_eq!(
+            tree.root().properties()[&ustr("Target")],
+            Variant::Ref(child)
+        );
+        assert!(tree.get_metadata(child).is_some());
+    }
 
     #[test]
     fn inserts_with_chosen_referents_and_fills_the_rest() {

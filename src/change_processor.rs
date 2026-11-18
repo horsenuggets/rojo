@@ -1082,8 +1082,9 @@ impl JobThreadContext {
                         }
                     }
                     let project = self.project();
+                    let mut baseline = tree.clone_for_serialization();
                     let files =
-                        crate::syncback::syncback_loop(&self.vfs, &mut tree, edited, &project)?;
+                        crate::syncback::syncback_loop(&self.vfs, &mut baseline, edited, &project)?;
                     files.write_to_vfs("", &self.vfs)?;
                     let mut owners = HashSet::new();
                     for update in &local_updates {
@@ -5506,6 +5507,131 @@ mod tests {
                 .children(vec![snapshot]),
         );
         job
+    }
+
+    #[test]
+    fn package_batch_serialization_success_preserves_unrelated_live_state() {
+        check_package_batch_serialization_preserves_live_state(false);
+    }
+
+    #[test]
+    fn package_batch_serialization_failure_preserves_live_state() {
+        check_package_batch_serialization_preserves_live_state(true);
+    }
+
+    fn check_package_batch_serialization_preserves_live_state(fail_serialization: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = package_relocation_job(temp.path(), true);
+        // Full-project serialization takes the project root, not the synthetic
+        // outer root used by the relocation fixture.
+        let context = job.tree.lock().unwrap().root().metadata().context.clone();
+        let snapshot = snapshot_from_vfs(
+            &context,
+            &job.vfs,
+            &job.project().folder_location().join("default.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+        *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+        let find_project = |path: &[&str]| {
+            let tree = job.tree.lock().unwrap();
+            let mut current = tree.get_root_id();
+            for name in path {
+                current = *tree
+                    .get_instance(current)
+                    .unwrap()
+                    .children()
+                    .iter()
+                    .find(|child| tree.get_instance(**child).unwrap().name() == *name)
+                    .unwrap();
+            }
+            current
+        };
+        let id = find_project(&["First", "Left", "Code"]);
+        let unrelated = find_project(&["App", "Right", "Target"]);
+        let app = find_project(&["App"]);
+        let specified = crate::RojoRef::new("unrelated".into());
+        let before = {
+            let mut tree = job.tree.lock().unwrap();
+            tree.set_specified_id(unrelated, specified.clone());
+            tree.get_instance_mut(unrelated)
+                .unwrap()
+                .properties_mut()
+                .extend([
+                    (ustr("Archivable"), Variant::Bool(false)),
+                    (ustr("Target"), Variant::Ref(id)),
+                ]);
+            tree.clone_for_serialization()
+        };
+        let mut rules = serde_json::json!({
+            "ignoreProperties": { "ModuleScript": ["Archivable"] }
+        });
+        if fail_serialization {
+            // Model-tree patterns compile after syncback filters both DOMs.
+            rules["modelTrees"] = serde_json::json!([{ "pattern": "Maps/[" }]);
+        }
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules = Some(serde_json::from_value(rules).unwrap());
+        let disk_before = job.vfs.snapshot_tree(temp.path()).unwrap();
+        let patch = property_update(id, "Source", Variant::String("return 42\n".into()));
+        let (accepted, conflicts, errors) = studio_write(&job, patch.clone());
+        assert_eq!(conflicts, PatchSet::new());
+        if fail_serialization {
+            assert_eq!(accepted, PatchSet::new());
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].message.contains("not a valid glob"), "{errors:?}");
+            assert_eq!(job.vfs.snapshot_tree(temp.path()).unwrap(), disk_before);
+            assert_eq!(job.message_queue.cursor(), 0);
+        } else {
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(accepted, patch);
+            assert_eq!(
+                job.vfs
+                    .read_to_string(temp.path().join("Local/First/Left/Code.luau"))
+                    .unwrap()
+                    .as_str(),
+                "return 42\n"
+            );
+            assert_eq!(
+                job.tree.lock().unwrap().get_instance(id).unwrap().name(),
+                "Code"
+            );
+        }
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(tree.get_root_id(), before.get_root_id());
+        // Successful writes refresh the package owner intentionally. Everything
+        // outside that owner, or the whole tree on failure, must stay untouched.
+        let unchanged_root = if fail_serialization {
+            before.get_root_id()
+        } else {
+            app
+        };
+        for original in before.descendants(unchanged_root) {
+            let live = tree.get_instance(original.id()).unwrap();
+            assert_eq!(live.parent(), original.parent());
+            assert_eq!(live.children(), original.children());
+            assert_eq!(live.name(), original.name());
+            assert_eq!(live.class_name(), original.class_name());
+            assert_eq!(live.properties(), original.properties());
+            assert_eq!(live.metadata(), original.metadata());
+            for path in &original.metadata().relevant_paths {
+                assert_eq!(tree.get_ids_at_path(path), before.get_ids_at_path(path));
+            }
+        }
+        assert_eq!(tree.get_specified_id(&specified), Some(unrelated));
+        assert_eq!(tree.specified_id_holders(&specified), [unrelated]);
+        assert_eq!(
+            tree.get_instance(id).unwrap().properties()[&ustr("Source")],
+            Variant::String(
+                if fail_serialization {
+                    "return 1\n"
+                } else {
+                    "return 42\n"
+                }
+                .into()
+            )
+        );
     }
 
     #[test]

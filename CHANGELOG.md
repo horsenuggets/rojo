@@ -41,6 +41,9 @@ Making a new release? Simply add the new header with the version and date undern
   mappings for package-aware import resolution.
 * Guarded package replacements, moves, promotions, and relayout recovery with exact
   ownership evidence, source-generation checks, and canonical ancestor validation.
+* Kept live properties and ownership metadata intact while serializing package batches,
+  and reported whole-tree source conflicts as unsaved writes rather than empty success.
+* Normalized provenance and test comparison keys across Windows, Linux, and macOS.
 * Added interruption, ownership-change, source-conflict, and package round-trip coverage.
 
 ## `7.7.1-horse.1.8`
