@@ -252,6 +252,43 @@ return function()
 		end
 	end)
 
+	it("captures every mapped place service that still has the Service tag", function()
+		for _, className in { "AvatarSettings", "HttpService", "TestService" } do
+			const child = Instance.new("Folder")
+			child.Name = "Persisted"
+			const service = {
+				Archivable = true,
+				ClassName = className,
+				Name = className,
+				GetChildren = function()
+					return { child }
+				end,
+			}
+			const boundary = boundaries({
+				GetChildren = function()
+					return { service }
+				end,
+			})
+			boundary.serialize = function(instances)
+				expect(#instances).to.equal(1)
+				expect(instances[1]).to.equal(child)
+				return "mapped service content"
+			end
+			const body = request("place")
+			body.paths = {}
+			body.allowIncomplete = true
+			const contents, manifest = StudioExport.capture(body, boundary)
+			expect(contents).to.equal("mapped service content")
+			expect(#manifest.services).to.equal(1)
+			expect(manifest.services[1].className).to.equal(className)
+			expect(#manifest.roots).to.equal(1)
+			expect(manifest.roots[1].name).to.equal("Persisted")
+			expect(manifest.roots[1].service).to.equal(className)
+			expect(#manifest.warnings).to.equal(1)
+			child:Destroy()
+		end
+	end)
+
 	it("serializes Terrain and its children alongside other live service children", function()
 		const child = Instance.new("Folder")
 		child.Name = "Live"
