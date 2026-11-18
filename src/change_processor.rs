@@ -210,46 +210,98 @@ impl JobThreadContext {
     /// in the tree.
     /// It then computes and applies changes for each affected instance ID and
     /// returns a vector of applied patch sets.
+    #[cfg(test)]
     fn apply_patches(&self, path: PathBuf) -> Vec<AppliedPatchSet> {
         self.apply_patches_with_publication(path, |_, _| {})
     }
 
+    #[cfg(test)]
     fn apply_patches_with_publication(
         &self,
         path: PathBuf,
         before_publication: impl FnOnce(&RojoTree, &[AppliedPatchSet]),
     ) -> Vec<AppliedPatchSet> {
+        self.try_apply_patches_with_publication(path, before_publication)
+            .unwrap_or_else(|error| {
+                log::error!("Cannot refresh project import mappings. {error:#}");
+                Vec::new()
+            })
+    }
+
+    fn try_apply_patches_with_publication(
+        &self,
+        path: PathBuf,
+        before_publication: impl FnOnce(&RojoTree, &[AppliedPatchSet]),
+    ) -> anyhow::Result<Vec<AppliedPatchSet>> {
         let mut tree = self.tree.lock().unwrap();
-        let require_context = tree.root().metadata().context.require_context.clone();
+        let require_context = tree
+            .root()
+            .metadata()
+            .context
+            .require_context
+            .clone()
+            .filter(|_| !self.is_source_only_event(&tree, &path));
         let applied = if let Some(require_context) = require_context {
             // Validate the complete candidate mapping before exposing structural
             // edits or imports. Incremental reads remain shallow on disk.
             let mut candidate = tree.clone_for_serialization();
             let mut applied = self.apply_patches_to_tree(&mut candidate, path);
-            match self.refresh_require_context(&mut candidate, &require_context.project_root) {
-                Ok(Some(refresh)) => {
-                    if !refresh.is_empty() {
-                        applied.push(refresh);
-                    }
-                    *tree = candidate;
-                    applied
-                }
-                Ok(None) => {
-                    *tree = candidate;
-                    applied
-                }
-                Err(error) => {
-                    log::error!("Cannot refresh project import mappings. {error:#}");
-                    Vec::new()
+            if let Some(refresh) =
+                self.refresh_require_context(&mut candidate, &require_context.project_root)?
+            {
+                if !refresh.is_empty() {
+                    applied.push(refresh);
+                    applied = vec![AppliedPatchSet::combine(applied)];
                 }
             }
+            *tree = candidate;
+            applied
         } else {
             self.apply_patches_to_tree(&mut tree, path)
         };
         before_publication(&tree, &applied);
         // Readers must not observe the changed DOM before its revision is published.
         self.message_queue.push_messages(&applied);
-        applied
+        Ok(applied)
+    }
+
+    fn is_source_only_event(&self, tree: &RojoTree, path: &Path) -> bool {
+        if !path
+            .extension()
+            .is_some_and(|extension| extension == "lua" || extension == "luau")
+            || !self
+                .vfs
+                .metadata(path)
+                .is_ok_and(|metadata| metadata.is_file())
+        {
+            return false;
+        }
+        let ids = tree.get_ids_at_path(path);
+        if !ids.is_empty() {
+            return ids.iter().all(|id| {
+                tree.get_instance(*id).is_some_and(|instance| {
+                    matches!(
+                        instance.class_name().as_str(),
+                        "Script" | "LocalScript" | "ModuleScript"
+                    ) && instance.properties().contains_key(&ustr("Source"))
+                        && (source_file(&instance).as_deref() == Some(path)
+                            || instance
+                                .metadata()
+                                .relevant_paths
+                                .iter()
+                                .find(|candidate| {
+                                    candidate.extension().is_some_and(|extension| {
+                                        extension == "lua" || extension == "luau"
+                                    })
+                                })
+                                .is_some_and(|candidate| candidate == path))
+                })
+            });
+        }
+        // Additions can change other scripts' alias targets, even when their
+        // parent directory already has a mapping. Only existing source saves
+        // are guaranteed not to change the expanded mapping topology.
+        false
     }
 
     fn refresh_require_context(
@@ -280,6 +332,17 @@ impl JobThreadContext {
             return Ok(None);
         }
         crate::snapshot_middleware::prepare_requires(&mut snapshot, &self.vfs, &context)?;
+        let mut pending = vec![&snapshot];
+        while let Some(instance) = pending.pop() {
+            anyhow::ensure!(
+                instance.metadata.context.reserved_cache_path().is_none()
+                    || instance.metadata.context.require_context.as_deref()
+                        == Some(context.as_ref()),
+                "Cannot refresh imports for \"{}\". Keeping the previous project revision",
+                instance.name
+            );
+            pending.extend(&instance.children);
+        }
         // Mapping and source-transform baselines are server-only. Refresh them
         // without publishing unchanged client metadata as another revision.
         let mut applied = AppliedPatchSet::new();
@@ -404,26 +467,35 @@ impl JobThreadContext {
 
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
-        match event {
-            VfsEvent::Create(path) | VfsEvent::Write(path) => {
-                self.apply_patches(canonicalize_or_original(&self.vfs, path))
-            }
+        let applied = match event {
+            VfsEvent::Create(path) | VfsEvent::Write(path) => self
+                .try_apply_patches_with_publication(
+                    canonicalize_or_original(&self.vfs, path),
+                    |_, _| {},
+                ),
             VfsEvent::Remove(path) => match (path.parent(), path.file_name()) {
                 (Some(parent), Some(file_name)) => {
                     let parent_normalized =
                         canonicalize_or_original(&self.vfs, parent.to_path_buf());
-                    self.apply_patches(parent_normalized.join(file_name))
+                    self.try_apply_patches_with_publication(
+                        parent_normalized.join(file_name),
+                        |_, _| {},
+                    )
                 }
                 _ => {
                     log::warn!("Cannot identify the removed path");
-                    Vec::new()
+                    Ok(Vec::new())
                 }
             },
             _ => {
                 log::warn!("Unhandled VFS event: {:?}", event);
-                Vec::new()
+                Ok(Vec::new())
             }
         };
+        if let Err(error) = applied {
+            log::error!("Cannot refresh project import mappings. {error:#}");
+            return;
+        }
 
         if project_file_changed {
             self.reload_project();
@@ -1208,7 +1280,9 @@ impl JobThreadContext {
                             .context("Package instance disappeared")?;
                         for (property, value) in &update.changed_properties {
                             if let Some(value) = value {
-                                instance.properties.insert(*property, value.clone());
+                                instance
+                                    .properties
+                                    .insert(*property, normalize_json_variant(value.clone()));
                             } else {
                                 instance.properties.remove(property);
                             }
@@ -1220,13 +1294,43 @@ impl JobThreadContext {
                         crate::syncback::syncback_loop(&self.vfs, &mut baseline, edited, &project)?;
                     files.write_to_vfs("", &self.vfs)?;
                     let mut owners = HashSet::new();
+                    let mut projects = HashMap::new();
                     for update in &local_updates {
                         let mut owner = update.id;
                         while let Some(instance) = tree.get_instance(owner) {
-                            if instance.metadata().instigating_source.is_some() {
-                                break;
+                            match &instance.metadata().instigating_source {
+                                Some(InstigatingSource::ProjectNode { path, .. }) => {
+                                    // A cached project node predates this write. Refresh
+                                    // its containing project, not that cached node.
+                                    let project_path = path.clone();
+                                    loop {
+                                        let parent = tree
+                                            .get_instance(owner)
+                                            .context("The containing project disappeared")?;
+                                        if parent.metadata().relevant_paths.contains(&project_path)
+                                        {
+                                            break;
+                                        }
+                                        owner = parent.parent();
+                                    }
+                                    // Transparent projects share an owner. Re-enter its
+                                    // outer project so mount-entrance watches survive.
+                                    let entrypoint = tree
+                                        .get_instance(owner)
+                                        .unwrap()
+                                        .metadata()
+                                        .relevant_paths
+                                        .iter()
+                                        .rev()
+                                        .find(|path| Project::is_project_file(path))
+                                        .cloned()
+                                        .unwrap_or(project_path);
+                                    projects.insert(owner, entrypoint);
+                                    break;
+                                }
+                                Some(InstigatingSource::Path(_)) => break,
+                                None => owner = instance.parent(),
                             }
-                            owner = instance.parent();
                         }
                         owners.insert(owner);
                     }
@@ -1234,7 +1338,30 @@ impl JobThreadContext {
                     // watcher events. Refresh the durable result before acknowledging
                     // it, including original/emitted source and expected-byte baselines.
                     for owner in owners {
-                        if let Some(applied) =
+                        if let Some(path) = projects.get(&owner) {
+                            let instance = tree
+                                .get_instance(owner)
+                                .context("The containing project disappeared")?;
+                            let mut context = instance.metadata().context.clone();
+                            // Re-enter this project with its ancestor chain, not
+                            // its own active-project marker. The normal middleware
+                            // also refreshes mount paths and expected file bytes.
+                            if let Some(active) = &mut context.active_projects {
+                                let canonical = self.vfs.canonicalize(path)?;
+                                if let Some(index) =
+                                    active.iter().position(|path| path == &canonical)
+                                {
+                                    Arc::make_mut(active).truncate(index);
+                                }
+                            }
+                            let mut snapshot = snapshot_from_vfs(&context, &self.vfs, path)?
+                                .context("The saved project is no longer visible")?;
+                            snapshot.name = instance.name().to_owned().into();
+                            snapshot.metadata.instigating_source =
+                                instance.metadata().instigating_source.clone();
+                            let patch = compute_patch_set(Some(snapshot), &tree, owner);
+                            messages.push(apply_patch_set(&mut tree, patch));
+                        } else if let Some(applied) =
                             compute_and_apply_changes(&mut tree, &self.vfs, owner, false)
                         {
                             messages.push(applied);
@@ -1255,10 +1382,35 @@ impl JobThreadContext {
                             // Successful serialization can still omit a path or an
                             // unsupported property. Acknowledge only the refreshed
                             // durable value, never merely a successful batch.
+                            let mut corrections = UstrMap::new();
                             update.changed_properties.retain(|property, requested| {
                                 let default = defaults.and_then(|values| values.get(property.as_str()));
-                                let saved = instance.and_then(|instance| instance.properties().get(property)).or(default);
-                                if instance.is_some() && same_value(saved, requested.as_ref().or(default)) {
+                                let saved_property = instance.and_then(|instance| instance.properties().get(property));
+                                let saved = saved_property.or(default);
+                                let intended = requested.clone().map(normalize_json_variant).map(|value| {
+                                    if property == "Source" {
+                                        if let Variant::String(source) = value {
+                                            return Variant::String(source.replace("\r\n", "\n"));
+                                        }
+                                    }
+                                    value
+                                });
+                                let source_matches = property == "Source" && instance
+                                    .and_then(|instance| instance.metadata().source_transform.as_ref())
+                                    .is_some_and(|transform| {
+                                        saved == Some(&Variant::String(transform.emitted.clone()))
+                                            && intended == Some(Variant::String(transform.original.clone()))
+                                    });
+                                if instance.is_some() && (source_matches || same_value(saved, intended.as_ref().or(default))) {
+                                    // Match the ordinary property writer's exact-value
+                                    // correction contract, including omitted defaults.
+                                    if requested.is_some() && requested.as_ref() != saved
+                                        && serde_json::to_value(&requested).expect("Variants must serialize")
+                                            != serde_json::to_value(saved).expect("Variants must serialize")
+                                    {
+                                        corrections.insert(*property, saved_property.cloned());
+                                    }
+                                    *requested = saved_property.cloned();
                                     return true;
                                 }
                                 errors.push(WriteError {
@@ -1268,6 +1420,15 @@ impl JobThreadContext {
                                 });
                                 false
                             });
+                            if !corrections.is_empty() {
+                                messages.push(AppliedPatchSet {
+                                    updated: vec![AppliedPatchUpdate {
+                                        changed_properties: corrections,
+                                        ..AppliedPatchUpdate::new(update.id)
+                                    }],
+                                    ..AppliedPatchSet::new()
+                                });
+                            }
                             if !update.changed_properties.is_empty() {
                                 accepted.updated_instances.push(update);
                             }
@@ -5795,7 +5956,7 @@ mod tests {
             std::fs::write(root.join("App.luau"), "return require(\"@shared/Util\")\n").unwrap();
             std::fs::write(
                 root.join(".luaurc"),
-                r#"{"aliases":{"shared":"Source/Shared"}}"#,
+                r#"{"aliases":{"shared":"Source/Shared","future":"Source/Shared/Extra.luau"}}"#,
             )
             .unwrap();
             let service = serde_json::json!({
@@ -5854,7 +6015,29 @@ mod tests {
                     project_source.replace("\"Shared\":", "\"RenamedShared\":"),
                 )
                 .unwrap();
+            let luaurc = job.project().folder_location().join(".luaurc");
+            job.vfs.write(&luaurc, "{").unwrap();
+            assert!(job
+                .try_apply_patches_with_publication(changed_project.clone(), |_, _| {})
+                .is_err());
+            assert_eq!(job.message_queue.cursor(), 0);
+            {
+                let tree = job.tree.lock().unwrap();
+                assert!(tree
+                    .descendants(tree.get_root_id())
+                    .any(|instance| instance.name() == "Shared"));
+                assert!(
+                    matches!(&tree.get_instance(app).unwrap().properties()[&ustr("Source")], Variant::String(source) if source.contains("@game/ReplicatedStorage/Shared/Util"))
+                );
+            }
+            job.vfs
+                .write(
+                    &luaurc,
+                    r#"{"aliases":{"shared":"Source/Shared","future":"Source/Shared/Extra.luau"}}"#,
+                )
+                .unwrap();
             job.apply_patches_with_publication(changed_project, |tree, messages| {
+                assert_eq!(messages.len(), 1);
                 assert_eq!(job.message_queue.cursor(), 0);
                 assert!(tree.descendants(tree.get_root_id()).any(|instance| instance.name() == "RenamedShared"));
                 let source = &tree.get_instance(app).unwrap().properties()[&ustr("Source")];
@@ -5866,9 +6049,16 @@ mod tests {
             assert!(job.message_queue.cursor() > 0);
             let app_path = job.project().folder_location().join("App.luau");
             job.vfs
-                .write(&app_path, "return require(\"@shared/Util\"), 2\n")
+                .write(
+                    &app_path,
+                    "return require(\"@shared/Util\"), require(\"@future\")\n",
+                )
                 .unwrap();
+            assert!(job.is_source_only_event(&job.tree.lock().unwrap(), &app_path));
             job.apply_patches(app_path);
+            assert!(
+                matches!(&job.tree.lock().unwrap().get_instance(app).unwrap().properties()[&ustr("Source")], Variant::String(source) if source.contains("/Extra.luau"))
+            );
             let added = job
                 .project()
                 .folder_location()
@@ -5876,6 +6066,11 @@ mod tests {
             job.vfs
                 .write(&added, "return require(\"@shared/Util\")\n")
                 .unwrap();
+            assert!(!job.is_source_only_event(&job.tree.lock().unwrap(), &added));
+            assert!(!job.is_source_only_event(
+                &job.tree.lock().unwrap(),
+                &added.with_extension("meta.json")
+            ));
             job.apply_patches(added.clone());
             {
                 let tree = job.tree.lock().unwrap();
@@ -5889,6 +6084,11 @@ mod tests {
                         matches!(source, Variant::String(source) if source.contains("@game/ReplicatedStorage/RenamedShared/Util")),
                         "{name} {source:?}"
                     );
+                    if name == "App" {
+                        assert!(
+                            matches!(source, Variant::String(source) if source.contains("@game/ReplicatedStorage/RenamedShared/Extra\"") && !source.contains("/Extra.luau"))
+                        );
+                    }
                     let transform = instance.metadata().source_transform.as_ref().unwrap();
                     assert!(transform.original.contains("@shared/Util"));
                     assert_eq!(source, &Variant::String(transform.emitted.clone()));
@@ -5936,9 +6136,12 @@ mod tests {
             .unwrap();
         *job.tree.lock().unwrap() = RojoTree::new(snapshot);
         let before = job.tree.lock().unwrap().clone_for_serialization();
-        job.vfs.write(&path, r#"{"name":"Test","tree":{"$className":"Folder","First":{"$path":"Packages/_Index/First/library"},"Duplicate":{"$path":"Packages/_Index/First/library"}}}"#).unwrap();
-        let applied = job.apply_patches(path);
-        assert!(applied.is_empty());
+        job.note_authority(WriteAuthority::Studio);
+        job.vfs.write(&path, r#"{"name":"Test","syncbackRules":{"modelTrees":[{"pattern":"App/Left","format":"rbxm"}]},"tree":{"$className":"Folder","App":{"$path":"App"},"First":{"$path":"Packages/_Index/First/library"},"Duplicate":{"$path":"Packages/_Index/First/library"}}}"#).unwrap();
+        let disk_before = job.vfs.snapshot_tree(temp.path()).unwrap();
+        job.handle_vfs_event(VfsEvent::Write(path));
+        assert!(job.project().syncback_rules.is_none());
+        assert_eq!(job.vfs.snapshot_tree(temp.path()).unwrap(), disk_before);
         assert_eq!(job.message_queue.cursor(), 0);
         let tree = job.tree.lock().unwrap();
         assert_eq!(
@@ -6033,6 +6236,228 @@ mod tests {
                 assert_eq!(errors.len(), 2, "{errors:?}");
             }
             assert_eq!(job.vfs.snapshot_tree(&installed).unwrap(), installed_before);
+        }
+    }
+
+    fn reload_package_property_fixture(job: &JobThreadContext) {
+        let mut context = job.tree.lock().unwrap().root().metadata().context.clone();
+        context.set_reserved_cache_path(job.project().folder_location().join(".rojo"));
+        let mut snapshot = snapshot_from_vfs(
+            &context,
+            &job.vfs,
+            &job.project().folder_location().join("default.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+        let require_context =
+            crate::serve_session::build_require_context(&snapshot, job.project().folder_location())
+                .unwrap();
+        crate::snapshot_middleware::prepare_requires(&mut snapshot, &job.vfs, &require_context)
+            .unwrap();
+        *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+    }
+
+    #[test]
+    fn package_property_batch_refreshes_project_defined_child_from_disk() {
+        for nested in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = package_relocation_job(temp.path(), true);
+            let entry = temp.path().join("Local/First/default.project.json");
+            let project_path = if nested {
+                job.vfs
+                    .write(&entry, r#"{"tree":{"$path":"inner.project.json"}}"#)
+                    .unwrap();
+                temp.path().join("Local/First/inner.project.json")
+            } else {
+                entry
+            };
+            let entrance = job
+                .vfs
+                .canonicalize(temp.path().join("Packages/_Index/First/library"))
+                .unwrap();
+            job.vfs
+            .write(
+                &project_path,
+                r#"{"tree":{"$className":"Folder","Child":{"$className":"Folder","$properties":{"Archivable":false}}}}"#,
+            )
+            .unwrap();
+            let project_path = job.vfs.canonicalize(&project_path).unwrap();
+            reload_package_property_fixture(&job);
+            let id = job
+                .tree
+                .lock()
+                .unwrap()
+                .inner()
+                .descendants()
+                .find(|instance| instance.name == "Child")
+                .unwrap()
+                .referent();
+            let (accepted, conflicts, errors) =
+                studio_write(&job, property_update(id, "Archivable", Variant::Bool(true)));
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(accepted.updated_instances.len(), 1);
+            assert_eq!(
+                accepted.updated_instances[0].changed_properties[&ustr("Archivable")],
+                None
+            );
+            let disk: serde_json::Value =
+                serde_json::from_str(&job.vfs.read_to_string(&project_path).unwrap()).unwrap();
+            assert_ne!(disk["tree"]["Child"]["$properties"]["Archivable"], false);
+            let tree = job.tree.lock().unwrap();
+            assert_ne!(
+                tree.get_instance(id)
+                    .unwrap()
+                    .properties()
+                    .get(&ustr("Archivable")),
+                Some(&Variant::Bool(false))
+            );
+            let owner = tree
+                .get_instance(tree.get_instance(id).unwrap().parent())
+                .unwrap();
+            assert!(
+                tree.get_ids_at_path(&entrance).contains(&owner.id()),
+                "{nested}"
+            );
+            assert_eq!(
+                owner.metadata().package_file_contents.get(&project_path),
+                Some(&Some(job.vfs.read(&project_path).unwrap().to_vec()))
+            );
+            drop(tree);
+            let (_, conflicts, errors) = studio_write(
+                &job,
+                property_update(id, "Archivable", Variant::Bool(false)),
+            );
+            assert_eq!(conflicts, PatchSet::new());
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+    }
+
+    #[test]
+    fn package_property_batch_accepts_canonical_source_and_corrects_studio() {
+        for authored in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = package_relocation_job(temp.path(), true);
+            job.vfs
+                .write(
+                    temp.path().join("Local/First/.luaurc"),
+                    r#"{"aliases":{"lib":"."}}"#,
+                )
+                .unwrap();
+            reload_package_property_fixture(&job);
+            let id = {
+                let tree = job.tree.lock().unwrap();
+                tree.descendants(tree.get_root_id())
+                    .find(|instance| {
+                        instance
+                            .metadata()
+                            .relevant_paths
+                            .iter()
+                            .any(|path| path.ends_with("Local/First/Left/Code.luau"))
+                    })
+                    .unwrap()
+                    .id()
+            };
+            let source = if authored {
+                "return require('@lib/Right/Target')\r\n"
+            } else {
+                "return 42\r\n"
+            };
+            let cursor = job.message_queue.cursor();
+            let (accepted, conflicts, errors) = studio_write(
+                &job,
+                property_update(id, "Source", Variant::String(source.into())),
+            );
+            assert!(errors.is_empty(), "{authored} {errors:?}");
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(accepted.updated_instances.len(), 1);
+            let tree = job.tree.lock().unwrap();
+            let instance = tree.get_instance(id).unwrap();
+            let saved = instance.properties()[&ustr("Source")].clone();
+            assert_ne!(saved, Variant::String(source.into()));
+            if authored {
+                let transform = instance.metadata().source_transform.as_ref().unwrap();
+                assert_eq!(transform.original, source.replace("\r\n", "\n"));
+                assert_eq!(saved, Variant::String(transform.emitted.clone()));
+                assert_ne!(transform.original, transform.emitted);
+            } else {
+                assert_eq!(saved, Variant::String("return 42\n".into()));
+            }
+            assert!(messages_since(&job, cursor)
+                .iter()
+                .flat_map(|message| &message.updated)
+                .any(|update| update.id == id
+                    && update.changed_properties.get(&ustr("Source"))
+                        == Some(&Some(saved.clone()))));
+            assert_eq!(
+                job.vfs
+                    .read_to_string(temp.path().join("Local/First/Left/Code.luau"))
+                    .unwrap()
+                    .as_str(),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn package_property_batch_accepts_numeric_normalization_but_rejects_exclusions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = package_relocation_job(temp.path(), true);
+        job.vfs
+            .write(
+                temp.path().join("Local/First/Part.model.json"),
+                r#"{"ClassName":"Part"}"#,
+            )
+            .unwrap();
+        reload_package_property_fixture(&job);
+        let id = job
+            .tree
+            .lock()
+            .unwrap()
+            .inner()
+            .descendants()
+            .find(|instance| instance.name == "Part")
+            .unwrap()
+            .referent();
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules = Some(
+            serde_json::from_value(serde_json::json!({
+                "ignoreProperties": {"Part": ["Archivable"]}
+            }))
+            .unwrap(),
+        );
+        // The second request already matches disk after rounding, but Studio
+        // still needs a correction even when refreshing the tree changes nothing.
+        for _ in 0..2 {
+            let cursor = job.message_queue.cursor();
+            let mut patch = property_update(id, "Reflectance", Variant::Float32(0.99999994));
+            patch.updated_instances[0]
+                .changed_properties
+                .insert(ustr("Archivable"), Some(Variant::Bool(true)));
+            let (accepted, conflicts, errors) = studio_write(&job, patch);
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].property.as_deref(), Some("Archivable"));
+            assert_eq!(accepted.updated_instances.len(), 1);
+            assert!(!accepted.updated_instances[0]
+                .changed_properties
+                .contains_key(&ustr("Archivable")));
+            assert_eq!(
+                job.tree
+                    .lock()
+                    .unwrap()
+                    .get_instance(id)
+                    .unwrap()
+                    .properties()[&ustr("Reflectance")],
+                Variant::Float32(1.0)
+            );
+            assert!(messages_since(&job, cursor)
+                .iter()
+                .flat_map(|message| &message.updated)
+                .any(|update| update.id == id
+                    && update.changed_properties.get(&ustr("Reflectance"))
+                        == Some(&Some(Variant::Float32(1.0)))));
         }
     }
 
