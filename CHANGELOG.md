@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.1`
+
 * Added a draft `rojo export` command that captures live Studio content through an existing
   serve port, including unsynced instance subtrees, and writes binary or XML model and
   place files. Models accept exact slash-separated `--instance` paths or `--selection`.
