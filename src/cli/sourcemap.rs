@@ -204,8 +204,21 @@ fn recurse_create_node<'a>(
         .metadata()
         .relevant_paths
         .iter()
-        // Not all paths listed as relevant are guaranteed to exist.
+        // Not all physical paths listed as relevant are guaranteed to exist.
         .filter(|path| path.is_file())
+        .chain(instance.metadata().installed_paths.iter().filter(|path| {
+            // New source files have no installed copy until Wally runs again.
+            // Their alternate import paths still identify this logical module.
+            instance
+                .metadata()
+                .context
+                .package_mount
+                .as_ref()
+                .is_some_and(|(source, installed)| {
+                    path.strip_prefix(installed)
+                        .is_ok_and(|suffix| source.join(suffix).is_file())
+                })
+        }))
         .map(|path| path.as_path());
 
     let mut output_file_paths: Vec<Cow<'a, Path>> =

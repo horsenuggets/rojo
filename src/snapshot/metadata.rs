@@ -70,6 +70,18 @@ pub struct InstanceMetadata {
     /// A schema provided via a JSON file, if one exists. Will be `None` for
     /// all non-JSON middleware.
     pub schema: Option<String>,
+
+    /// Physical source and emitted source remain distinct across syncback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_transform: Option<SourceTransform>,
+
+    /// Alternate installed paths point at this same logical instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub installed_paths: Vec<PathBuf>,
+
+    /// Server-only expected bytes protect model files and metadata as well as Source.
+    #[serde(skip)]
+    pub(crate) package_file_contents: std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
 
 impl InstanceMetadata {
@@ -82,7 +94,27 @@ impl InstanceMetadata {
             specified_id: None,
             middleware: None,
             schema: None,
+            source_transform: None,
+            installed_paths: Vec::new(),
+            package_file_contents: std::collections::BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn watch_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.relevant_paths.iter().chain(&self.installed_paths)
+    }
+
+    pub(crate) fn is_package_mount_root(&self) -> bool {
+        self.context
+            .package_mount
+            .as_ref()
+            .is_some_and(|(source, _)| {
+                self.relevant_paths.iter().any(|path| {
+                    path == source
+                        || (path.parent() == Some(source.as_path())
+                            && crate::Project::is_project_file(path))
+                })
+            })
     }
 
     pub fn ignore_unknown_instances(self, ignore_unknown_instances: bool) -> Self {
@@ -139,9 +171,15 @@ impl Default for InstanceMetadata {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceTransform {
+    pub original: String,
+    pub emitted: String,
+}
+
 /// Holds context for `.luaurc` alias resolution. When present on an
 /// `InstanceContext`, alias-based requires will be transformed into
-/// relative require-by-string paths during snapshotting.
+/// runtime require-by-string paths, anchored for DataModel projects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequireContext {
     /// The absolute path of the project root directory (where the
@@ -160,6 +198,7 @@ pub struct RequireContext {
     /// ```
     /// produces: `("Source/Plugin", ["Plugin"])`
     pub path_mappings: Vec<(PathBuf, Vec<String>)>,
+    pub datamodel: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,7 +215,7 @@ pub struct InstanceContext {
     pub sync_rules: Arc<Vec<SyncRule>>,
 
     /// When set, `.luaurc` alias requires will be resolved during
-    /// snapshotting. Only enabled during `rojo build`.
+    /// snapshotting for both build and serve sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub require_context: Option<Arc<RequireContext>>,
 
@@ -193,6 +232,11 @@ pub struct InstanceContext {
     /// snapshot is compared or applied.
     #[serde(skip)]
     pub(crate) shallow: bool,
+
+    #[serde(skip)]
+    pub(crate) package_sources: Option<Arc<crate::package_sources::PackageSources>>,
+    #[serde(skip)]
+    pub(crate) package_mount: Option<(PathBuf, PathBuf)>,
 }
 
 impl InstanceContext {
@@ -206,6 +250,8 @@ impl InstanceContext {
             active_projects: None,
             active_directories: None,
             shallow: false,
+            package_sources: None,
+            package_mount: None,
         }
     }
 

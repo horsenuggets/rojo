@@ -14,6 +14,7 @@ mod json;
 mod lua_ast;
 mod message_queue;
 mod multimap;
+mod package_sources;
 mod path_serializer;
 mod project;
 mod resolution;

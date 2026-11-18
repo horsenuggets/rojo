@@ -210,8 +210,172 @@ impl JobThreadContext {
     /// in the tree.
     /// It then computes and applies changes for each affected instance ID and
     /// returns a vector of applied patch sets.
+    #[cfg(test)]
     fn apply_patches(&self, path: PathBuf) -> Vec<AppliedPatchSet> {
+        self.apply_patches_with_publication(path, |_, _| {})
+    }
+
+    #[cfg(test)]
+    fn apply_patches_with_publication(
+        &self,
+        path: PathBuf,
+        before_publication: impl FnOnce(&RojoTree, &[AppliedPatchSet]),
+    ) -> Vec<AppliedPatchSet> {
+        self.try_apply_patches_with_publication(path, before_publication)
+            .unwrap_or_else(|error| {
+                log::error!("Cannot refresh project import mappings. {error:#}");
+                Vec::new()
+            })
+    }
+
+    fn try_apply_patches_with_publication(
+        &self,
+        path: PathBuf,
+        before_publication: impl FnOnce(&RojoTree, &[AppliedPatchSet]),
+    ) -> anyhow::Result<Vec<AppliedPatchSet>> {
         let mut tree = self.tree.lock().unwrap();
+        let require_context = tree
+            .root()
+            .metadata()
+            .context
+            .require_context
+            .clone()
+            .filter(|_| !self.is_source_only_event(&tree, &path));
+        let applied = if let Some(require_context) = require_context {
+            // Validate the complete candidate mapping before exposing structural
+            // edits or imports. Incremental reads remain shallow on disk.
+            let mut candidate = tree.clone_for_serialization();
+            let mut applied = self.apply_patches_to_tree(&mut candidate, path);
+            if let Some(refresh) =
+                self.refresh_require_context(&mut candidate, &require_context.project_root)?
+            {
+                if !refresh.is_empty() {
+                    applied.push(refresh);
+                    applied = vec![AppliedPatchSet::combine(applied)];
+                }
+            }
+            *tree = candidate;
+            applied
+        } else {
+            self.apply_patches_to_tree(&mut tree, path)
+        };
+        before_publication(&tree, &applied);
+        // Readers must not observe the changed DOM before its revision is published.
+        self.message_queue.push_messages(&applied);
+        Ok(applied)
+    }
+
+    fn is_source_only_event(&self, tree: &RojoTree, path: &Path) -> bool {
+        if !path
+            .extension()
+            .is_some_and(|extension| extension == "lua" || extension == "luau")
+            || !self
+                .vfs
+                .metadata(path)
+                .is_ok_and(|metadata| metadata.is_file())
+        {
+            return false;
+        }
+        let ids = tree.get_ids_at_path(path);
+        if !ids.is_empty() {
+            return ids.iter().all(|id| {
+                tree.get_instance(*id).is_some_and(|instance| {
+                    matches!(
+                        instance.class_name().as_str(),
+                        "Script" | "LocalScript" | "ModuleScript"
+                    ) && instance.properties().contains_key(&ustr("Source"))
+                        && (source_file(&instance).as_deref() == Some(path)
+                            || instance
+                                .metadata()
+                                .relevant_paths
+                                .iter()
+                                .find(|candidate| {
+                                    candidate.extension().is_some_and(|extension| {
+                                        extension == "lua" || extension == "luau"
+                                    })
+                                })
+                                .is_some_and(|candidate| candidate == path))
+                })
+            });
+        }
+        // Additions can change other scripts' alias targets, even when their
+        // parent directory already has a mapping. Only existing source saves
+        // are guaranteed not to change the expanded mapping topology.
+        false
+    }
+
+    fn refresh_require_context(
+        &self,
+        tree: &mut RojoTree,
+        project_root: &Path,
+    ) -> anyhow::Result<Option<AppliedPatchSet>> {
+        fn snapshot(tree: &RojoTree, id: Ref) -> InstanceSnapshot {
+            let instance = tree.get_instance(id).unwrap();
+            InstanceSnapshot::new()
+                .snapshot_id(id)
+                .name(instance.name())
+                .class_name(instance.class_name())
+                .properties(instance.properties().clone())
+                .metadata(instance.metadata().clone())
+                .children(
+                    instance
+                        .children()
+                        .iter()
+                        .map(|child| snapshot(tree, *child))
+                        .collect::<Vec<_>>(),
+                )
+        }
+        let root = tree.get_root_id();
+        let mut snapshot = snapshot(tree, root);
+        let context = crate::serve_session::build_require_context(&snapshot, project_root)?;
+        if snapshot.metadata.context.require_context.as_deref() == Some(context.as_ref()) {
+            return Ok(None);
+        }
+        crate::snapshot_middleware::prepare_requires(&mut snapshot, &self.vfs, &context)?;
+        let mut pending = vec![&snapshot];
+        while let Some(instance) = pending.pop() {
+            anyhow::ensure!(
+                instance.metadata.context.reserved_cache_path().is_none()
+                    || instance.metadata.context.require_context.as_deref()
+                        == Some(context.as_ref()),
+                "Cannot refresh imports for \"{}\". Keeping the previous project revision",
+                instance.name
+            );
+            pending.extend(&instance.children);
+        }
+        // Mapping and source-transform baselines are server-only. Refresh them
+        // without publishing unchanged client metadata as another revision.
+        let mut applied = AppliedPatchSet::new();
+        let mut pending = vec![&snapshot];
+        while let Some(instance) = pending.pop() {
+            let id = instance.snapshot_id;
+            if let Some(source) = instance.properties.get(&ustr("Source")) {
+                if tree
+                    .get_instance(id)
+                    .unwrap()
+                    .properties()
+                    .get(&ustr("Source"))
+                    != Some(source)
+                {
+                    tree.get_instance_mut(id)
+                        .unwrap()
+                        .properties_mut()
+                        .insert(ustr("Source"), source.clone());
+                    applied.updated.push(AppliedPatchUpdate {
+                        changed_properties: [(ustr("Source"), Some(source.clone()))]
+                            .into_iter()
+                            .collect(),
+                        ..AppliedPatchUpdate::new(id)
+                    });
+                }
+            }
+            tree.update_metadata(id, instance.metadata.clone());
+            pending.extend(&instance.children);
+        }
+        Ok(Some(applied))
+    }
+
+    fn apply_patches_to_tree(&self, tree: &mut RojoTree, path: PathBuf) -> Vec<AppliedPatchSet> {
         let mut applied_patches = Vec::new();
 
         // Find the nearest ancestor to this path that has
@@ -240,7 +404,7 @@ impl JobThreadContext {
         // read, instead of the folder's whole subtree.
         if let [id] = affected_ids[..] {
             if current_path != path.as_path() {
-                if let Some(applied) = self.add_new_entry(&mut tree, id, current_path, &path) {
+                if let Some(applied) = self.add_new_entry(tree, id, current_path, &path) {
                     return applied;
                 }
             }
@@ -256,7 +420,7 @@ impl JobThreadContext {
                     .get_metadata(id)
                     .and_then(|metadata| metadata.instigating_source.as_ref())
                     .is_some_and(|source| source.path() != current_path);
-            if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, id, own_file) {
+            if let Some(patch) = compute_and_apply_changes(tree, &self.vfs, id, own_file) {
                 if !patch.is_empty() {
                     applied_patches.push(patch);
                 }
@@ -303,30 +467,35 @@ impl JobThreadContext {
 
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
-        let applied_patches = match event {
-            VfsEvent::Create(path) | VfsEvent::Write(path) => {
-                self.apply_patches(canonicalize_or_original(&self.vfs, path))
-            }
+        let applied = match event {
+            VfsEvent::Create(path) | VfsEvent::Write(path) => self
+                .try_apply_patches_with_publication(
+                    canonicalize_or_original(&self.vfs, path),
+                    |_, _| {},
+                ),
             VfsEvent::Remove(path) => match (path.parent(), path.file_name()) {
                 (Some(parent), Some(file_name)) => {
                     let parent_normalized =
                         canonicalize_or_original(&self.vfs, parent.to_path_buf());
-                    self.apply_patches(parent_normalized.join(file_name))
+                    self.try_apply_patches_with_publication(
+                        parent_normalized.join(file_name),
+                        |_, _| {},
+                    )
                 }
                 _ => {
                     log::warn!("Cannot identify the removed path");
-                    Vec::new()
+                    Ok(Vec::new())
                 }
             },
             _ => {
                 log::warn!("Unhandled VFS event: {:?}", event);
-                Vec::new()
+                Ok(Vec::new())
             }
         };
-
-        // Notify anyone listening to the message queue about the changes we
-        // just made.
-        self.message_queue.push_messages(&applied_patches);
+        if let Err(error) = applied {
+            log::error!("Cannot refresh project import mappings. {error:#}");
+            return;
+        }
 
         if project_file_changed {
             self.reload_project();
@@ -522,6 +691,9 @@ impl JobThreadContext {
     /// the new ones can take their name. If writing fails, or the new files
     /// would lose anything, the old files and the tree are put back.
     fn relayout_instance(&self, tree: &mut RojoTree, id: Ref) -> anyhow::Result<()> {
+        if let Some(reason) = package_write_block(tree, &self.vfs, id, true, false) {
+            anyhow::bail!("{reason}");
+        }
         // Another server's startup recovery must not undo this one midway.
         let _guard = crate::syncback::relocation::lock_relayouts(&self.vfs, &self.project())?;
         *self.project.receipts.lock().unwrap() = Some(WriteReceipts::default());
@@ -620,13 +792,12 @@ impl JobThreadContext {
                 existing.push(entry.clone());
             }
         }
-        let manifest = crate::syncback::relocation::RelayoutManifest {
-            entries: existing
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| (entry.clone(), index.to_string()))
-                .collect(),
-        };
+        let manifest = crate::syncback::relocation::RelayoutManifest::prepare(
+            &self.vfs,
+            &aside,
+            &existing,
+            &self.children_directory(tree, parent)?,
+        )?;
         // Published whole and flushed, with the folders that lead to it, before
         // any source moves, so a power loss can't leave backups without it.
         self.vfs.lock().write_atomic(
@@ -644,15 +815,23 @@ impl JobThreadContext {
         }
         let mut moved = Vec::new();
         let set_aside = (|| -> io::Result<()> {
+            manifest.validate_package(&self.vfs, &aside)?;
             for (index, entry) in existing.iter().enumerate() {
                 let destination = aside.join(index.to_string());
-                let expected = self.vfs.snapshot_tree(entry)?;
+                let expected = match manifest.expected_original(index) {
+                    Some(expected) => expected.clone(),
+                    None => self.vfs.snapshot_tree(entry)?,
+                };
                 self.vfs.move_no_replace(entry, &destination, &expected)?;
                 moved.push((entry.clone(), destination));
             }
             Ok(())
         })();
         let put_back = |moved: &[(PathBuf, PathBuf)]| {
+            if let Err(error) = manifest.validate_package(&self.vfs, &aside) {
+                log::error!("Relayout recovery refused ({error}). Backups retained.");
+                return;
+            }
             for (original, destination) in moved {
                 let restored = self.vfs.snapshot_tree(destination).and_then(|expected| {
                     self.vfs.move_no_replace(destination, original, &expected)
@@ -672,7 +851,9 @@ impl JobThreadContext {
             put_back(&moved);
             return Err(error.into());
         }
+        manifest.validate_package(&self.vfs, &aside)?;
         let result = self.place_subtree(tree, parent, model, &ids, &context, &[id]);
+        manifest.validate_package(&self.vfs, &aside)?;
         let lossless = matches!(&result, Ok(errors) if errors.is_empty());
         self.finish_relayout(tree, id, parent, backup, result, &HashMap::new(), || {
             put_back(&moved);
@@ -855,14 +1036,66 @@ impl JobThreadContext {
         message_cursor: Option<u32>,
         authority: WriteAuthority,
     ) -> WriteResult {
-        self.note_authority(authority);
+        // Reject ownership transfers against the original tree, before authority
+        // selection, additions, or cycle recovery can write files or revert Studio.
+        let ownership_blocks: HashMap<_, _> = {
+            let tree = self.tree.lock().unwrap();
+            patch_set
+                .updated_instances
+                .iter()
+                .filter_map(|update| {
+                    let mut parent = update.changed_parent?;
+                    let mut visited = HashSet::new();
+                    while tree.get_instance(parent).is_none() && visited.insert(parent) {
+                        let Some(addition) = additions.get(&parent) else {
+                            break;
+                        };
+                        parent = addition.parent;
+                    }
+                    package_reparent_block(&tree, update.id, parent)
+                        .map(|reason| (update.id, reason))
+                })
+                .collect()
+        };
+        let only_protected = {
+            let tree = self.tree.lock().unwrap();
+            let mut targets = Vec::new();
+            targets.extend(patch_set.updated_instances.iter().map(|update| {
+                ownership_blocks.get(&update.id).cloned().or_else(|| {
+                    package_write_block(
+                        &tree,
+                        &self.vfs,
+                        update.id,
+                        update.changed_parent.is_some()
+                            || update.changed_name.is_some()
+                            || update.changed_class_name.is_some(),
+                        false,
+                    )
+                    .or_else(|| {
+                        update.changed_parent.and_then(|parent| {
+                            package_write_block(&tree, &self.vfs, parent, false, false)
+                        })
+                    })
+                })
+            }));
+            targets.extend(
+                patch_set
+                    .removed_instances
+                    .iter()
+                    .map(|id| package_write_block(&tree, &self.vfs, *id, true, false)),
+            );
+            targets.extend(additions.values().map(|addition| {
+                package_write_block(&tree, &self.vfs, addition.parent, false, false)
+            }));
+            !targets.is_empty() && targets.iter().all(Option::is_some)
+        };
+        // A warning-only package request must not activate pending filesystem
+        // relayouts as an unrelated side effect of selecting Studio authority.
+        if !only_protected {
+            self.note_authority(authority);
+        }
         // A request is based on the last revision applied before its local batch began.
         // The current server DOM is not a baseline when a watcher has advanced it.
-        let context = WriteContext {
-            stale: message_cursor != Some(self.message_queue.cursor()),
-            authority,
-            batch: &patch_set.updated_instances,
-        };
         log::trace!("Persisting PatchSet from client: {:#?}", patch_set);
         let mut accepted = PatchSet::new();
         let mut conflicts = PatchSet::new();
@@ -870,11 +1103,28 @@ impl JobThreadContext {
         let mut messages = Vec::new();
         let mut deletion_conflicts = Vec::new();
         let mut with_ancestors = Vec::new();
+        let mut tree = self.tree.lock().unwrap();
+        let context = WriteContext {
+            stale: message_cursor != Some(self.message_queue.cursor()),
+            authority,
+            batch: &patch_set.updated_instances,
+        };
         {
-            let mut tree = self.tree.lock().unwrap();
+            let package_block = |tree: &RojoTree, id: Ref, structural: bool| {
+                package_write_block(tree, &self.vfs, id, structural, context.stale)
+            };
             // Created subtrees go first, so the rest of the batch can move
             // existing instances into them.
             for (&id, addition) in additions {
+                if let Some(reason) = package_block(&tree, addition.parent, false) {
+                    log::warn!("Skipping package addition. {reason}. Studio was left unchanged");
+                    errors.push(WriteError {
+                        id,
+                        property: None,
+                        message: reason,
+                    });
+                    continue;
+                }
                 match self.persist_addition(&mut tree, id, addition, &context, &mut messages) {
                     Ok(unsaved) => errors.extend(unsaved),
                     Err(err) => errors.push(WriteError {
@@ -884,12 +1134,31 @@ impl JobThreadContext {
                     }),
                 }
             }
+            let mut updates: Vec<_> = patch_set
+                .updated_instances
+                .iter()
+                .filter_map(|update| {
+                    if let Some(reason) = ownership_blocks.get(&update.id) {
+                        log::warn!(
+                            "Skipping package update for {}. {reason}. Studio was left unchanged",
+                            update.id
+                        );
+                        errors.push(WriteError {
+                            id: update.id,
+                            property: Some("Parent".into()),
+                            message: reason.clone(),
+                        });
+                        None
+                    } else {
+                        Some(update.clone())
+                    }
+                })
+                .collect();
             let order = crate::syncback::relocation::relocation_order(
                 &tree,
-                &patch_set.updated_instances,
+                &updates,
                 &patch_set.removed_instances,
             );
-            let mut updates = patch_set.updated_instances.clone();
             let order = match order {
                 Ok(order) => order,
                 Err(error) => {
@@ -913,9 +1182,297 @@ impl JobThreadContext {
                     (0..updates.len()).collect()
                 }
             };
+            // Package property edits form one durable batch. Reuse full project
+            // serialization so transparent/nested project entrypoints route exactly
+            // as one-shot syncback does, instead of treating them as project-owned.
+            let mut package_updates = HashSet::new();
+            let mut local_updates = Vec::new();
+            for update in &updates {
+                let mut current = Some(update.id);
+                let mut local = false;
+                while let Some(instance) = current.and_then(|id| tree.get_instance(id)) {
+                    if instance.metadata().context.package_mount.is_some() {
+                        local = true;
+                        break;
+                    }
+                    if instance.metadata().instigating_source.is_some() {
+                        break;
+                    }
+                    current = Some(instance.parent());
+                }
+                if !local
+                    || update.changed_name.is_some()
+                    || update.changed_parent.is_some()
+                    || update.changed_class_name.is_some()
+                    || update.changed_metadata.is_some()
+                {
+                    continue;
+                }
+                package_updates.insert(update.id);
+                if let Some(reason) = package_block(&tree, update.id, false) {
+                    log::warn!("Skipping package update. {reason}. Studio was left unchanged");
+                    errors.push(WriteError {
+                        id: update.id,
+                        property: None,
+                        message: reason,
+                    });
+                } else {
+                    let project = self.project();
+                    let instance = tree.get_instance(update.id).unwrap();
+                    let filter_tree = WeakDom::new(InstanceBuilder::new(instance.class_name()));
+                    let ignored =
+                        get_property_filter(&project, filter_tree.root()).unwrap_or_default();
+                    let path = tree.inner().full_path_of(update.id, "/");
+                    let ignored_tree = project.syncback_rules.as_ref().is_some_and(|rules| {
+                        rules
+                            .ignore_trees
+                            .iter()
+                            .any(|ignored| path.starts_with(ignored))
+                    });
+                    let mut allowed = update.clone();
+                    allowed.changed_properties.retain(|property, _| {
+                        let reason = if ignored_tree {
+                            "This instance is excluded by the project's syncback tree rules"
+                        } else if ignored.contains(property) {
+                            "This property is excluded by the project's syncback rules"
+                        } else if !can_write_property(
+                            &project,
+                            instance.class_name().as_str(),
+                            property.as_str(),
+                        ) {
+                            "This property is excluded by reflection serialization rules"
+                        } else {
+                            return true;
+                        };
+                        errors.push(WriteError {
+                            id: update.id,
+                            property: Some(property.to_string()),
+                            message: reason.into(),
+                        });
+                        false
+                    });
+                    if !allowed.changed_properties.is_empty() {
+                        local_updates.push(allowed);
+                    }
+                }
+            }
+            if !local_updates.is_empty() {
+                let result = (|| -> anyhow::Result<()> {
+                    let builder = |id: Ref| {
+                        let instance = tree.get_instance(id).unwrap();
+                        InstanceBuilder::new(instance.class_name())
+                            .with_name(instance.name())
+                            .with_properties(instance.properties().clone())
+                            .with_referent(id)
+                    };
+                    let root = tree.get_root_id();
+                    let mut edited = WeakDom::new(builder(root));
+                    let mut pending = vec![root];
+                    while let Some(parent) = pending.pop() {
+                        for &child in tree.get_instance(parent).unwrap().children() {
+                            edited.insert(parent, builder(child));
+                            pending.push(child);
+                        }
+                    }
+                    for update in &local_updates {
+                        let instance = edited
+                            .get_by_ref_mut(update.id)
+                            .context("Package instance disappeared")?;
+                        for (property, value) in &update.changed_properties {
+                            if let Some(value) = value {
+                                instance
+                                    .properties
+                                    .insert(*property, normalize_json_variant(value.clone()));
+                            } else {
+                                instance.properties.remove(property);
+                            }
+                        }
+                    }
+                    let project = self.project();
+                    let mut baseline = tree.clone_for_serialization();
+                    let files =
+                        crate::syncback::syncback_loop(&self.vfs, &mut baseline, edited, &project)?;
+                    files.write_to_vfs("", &self.vfs)?;
+                    let mut owners = HashSet::new();
+                    let mut projects = HashMap::new();
+                    for update in &local_updates {
+                        let mut owner = update.id;
+                        while let Some(instance) = tree.get_instance(owner) {
+                            match &instance.metadata().instigating_source {
+                                Some(InstigatingSource::ProjectNode { path, .. }) => {
+                                    // A cached project node predates this write. Refresh
+                                    // its containing project, not that cached node.
+                                    let project_path = path.clone();
+                                    loop {
+                                        let parent = tree
+                                            .get_instance(owner)
+                                            .context("The containing project disappeared")?;
+                                        if parent.metadata().relevant_paths.contains(&project_path)
+                                        {
+                                            break;
+                                        }
+                                        owner = parent.parent();
+                                    }
+                                    // Transparent projects share an owner. Re-enter its
+                                    // outer project so mount-entrance watches survive.
+                                    let entrypoint = tree
+                                        .get_instance(owner)
+                                        .unwrap()
+                                        .metadata()
+                                        .relevant_paths
+                                        .iter()
+                                        .rev()
+                                        .find(|path| Project::is_project_file(path))
+                                        .cloned()
+                                        .unwrap_or(project_path);
+                                    projects.insert(owner, entrypoint);
+                                    break;
+                                }
+                                Some(InstigatingSource::Path(_)) => break,
+                                None => owner = instance.parent(),
+                            }
+                        }
+                        owners.insert(owner);
+                    }
+                    // Moving a whole source directory need not produce per-file
+                    // watcher events. Refresh the durable result before acknowledging
+                    // it, including original/emitted source and expected-byte baselines.
+                    for owner in owners {
+                        if let Some(path) = projects.get(&owner) {
+                            let instance = tree
+                                .get_instance(owner)
+                                .context("The containing project disappeared")?;
+                            let mut context = instance.metadata().context.clone();
+                            // Re-enter this project with its ancestor chain, not
+                            // its own active-project marker. The normal middleware
+                            // also refreshes mount paths and expected file bytes.
+                            if let Some(active) = &mut context.active_projects {
+                                let canonical = self.vfs.canonicalize(path)?;
+                                if let Some(index) =
+                                    active.iter().position(|path| path == &canonical)
+                                {
+                                    Arc::make_mut(active).truncate(index);
+                                }
+                            }
+                            let mut snapshot = snapshot_from_vfs(&context, &self.vfs, path)?
+                                .context("The saved project is no longer visible")?;
+                            snapshot.name = instance.name().to_owned().into();
+                            snapshot.metadata.instigating_source =
+                                instance.metadata().instigating_source.clone();
+                            let patch = compute_patch_set(Some(snapshot), &tree, owner);
+                            messages.push(apply_patch_set(&mut tree, patch));
+                        } else if let Some(applied) =
+                            compute_and_apply_changes(&mut tree, &self.vfs, owner, false)
+                        {
+                            messages.push(applied);
+                        }
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        let database = rbx_reflection_database::get().unwrap();
+                        for mut update in local_updates {
+                            let instance = tree.get_instance(update.id);
+                            let defaults = instance
+                                .and_then(|instance| {
+                                    database.classes.get(instance.class_name().as_str())
+                                })
+                                .map(|class| &class.default_properties);
+                            // Successful serialization can still omit a path or an
+                            // unsupported property. Acknowledge only the refreshed
+                            // durable value, never merely a successful batch.
+                            let mut corrections = UstrMap::new();
+                            update.changed_properties.retain(|property, requested| {
+                                let default = defaults.and_then(|values| values.get(property.as_str()));
+                                let saved_property = instance.and_then(|instance| instance.properties().get(property));
+                                let saved = saved_property.or(default);
+                                let intended = requested.clone().map(normalize_json_variant).map(|value| {
+                                    if property == "Source" {
+                                        if let Variant::String(source) = value {
+                                            return Variant::String(source.replace("\r\n", "\n"));
+                                        }
+                                    }
+                                    value
+                                });
+                                let source_matches = property == "Source" && instance
+                                    .and_then(|instance| instance.metadata().source_transform.as_ref())
+                                    .is_some_and(|transform| {
+                                        saved == Some(&Variant::String(transform.emitted.clone()))
+                                            && intended == Some(Variant::String(transform.original.clone()))
+                                    });
+                                if instance.is_some() && (source_matches || same_value(saved, intended.as_ref().or(default))) {
+                                    // Match the ordinary property writer's exact-value
+                                    // correction contract, including omitted defaults.
+                                    if requested.is_some() && requested.as_ref() != saved
+                                        && serde_json::to_value(&requested).expect("Variants must serialize")
+                                            != serde_json::to_value(saved).expect("Variants must serialize")
+                                    {
+                                        corrections.insert(*property, saved_property.cloned());
+                                    }
+                                    *requested = saved_property.cloned();
+                                    return true;
+                                }
+                                errors.push(WriteError {
+                                    id: update.id,
+                                    property: Some(property.to_string()),
+                                    message: "The package property was not saved by the project's syncback rules or file format".into(),
+                                });
+                                false
+                            });
+                            if !corrections.is_empty() {
+                                messages.push(AppliedPatchSet {
+                                    updated: vec![AppliedPatchUpdate {
+                                        changed_properties: corrections,
+                                        ..AppliedPatchUpdate::new(update.id)
+                                    }],
+                                    ..AppliedPatchSet::new()
+                                });
+                            }
+                            if !update.changed_properties.is_empty() {
+                                accepted.updated_instances.push(update);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("Package source batch was not written. {error:#}. Studio was left unchanged");
+                        for update in local_updates {
+                            errors.push(WriteError {
+                                id: update.id,
+                                property: None,
+                                message: format!("Package source batch was not written. {error:#}"),
+                            });
+                        }
+                    }
+                }
+            }
             // Retained descendants must reach their destinations before an old
             // ancestor's filesystem tree can be removed.
             for index in order {
+                if package_updates.contains(&updates[index].id) {
+                    continue;
+                }
+                let update = &updates[index];
+                let structural = update.changed_parent.is_some()
+                    || update.changed_name.is_some()
+                    || update.changed_class_name.is_some();
+                let reason = package_block(&tree, update.id, structural).or_else(|| {
+                    update
+                        .changed_parent
+                        .and_then(|parent| package_block(&tree, parent, false))
+                });
+                if let Some(reason) = reason {
+                    log::warn!(
+                        "Skipping package update for {}. {reason}. Studio was left unchanged",
+                        update.id
+                    );
+                    errors.push(WriteError {
+                        id: update.id,
+                        property: None,
+                        message: reason,
+                    });
+                    continue;
+                }
                 self.persist_update(
                     &mut tree,
                     &updates[index],
@@ -931,6 +1488,17 @@ impl JobThreadContext {
             }
             let removed: HashSet<Ref> = patch_set.removed_instances.iter().copied().collect();
             for &id in &patch_set.removed_instances {
+                if let Some(reason) = package_block(&tree, id, true) {
+                    log::warn!(
+                        "Skipping package removal for {id}. {reason}. Studio was left unchanged"
+                    );
+                    errors.push(WriteError {
+                        id,
+                        property: None,
+                        message: reason,
+                    });
+                    continue;
+                }
                 // Deleting a descendant first, then its ancestor, arrives as one
                 // batch. The ancestor's removal takes the descendant with it, and
                 // removing the descendant first would make the ancestor look
@@ -1167,9 +1735,7 @@ impl JobThreadContext {
         // the batch sees them. Removals wait until here, since a removed parent
         // must still be known while its removed children are handled.
         if !accepted.removed_instances.is_empty() {
-            let mut tree = self.tree.lock().unwrap();
-            // The watcher can see the deleted files and remove an instance first,
-            // and removing an ancestor removes its descendants, so only what's
+            // Removing an ancestor also removes its descendants, so only what's
             // still in the tree is removed here.
             for &id in &accepted.removed_instances {
                 if tree.get_instance(id).is_some() {
@@ -1182,7 +1748,6 @@ impl JobThreadContext {
             }
         }
         if conflicts != PatchSet::new() {
-            let mut tree = self.tree.lock().unwrap();
             // Removals go one at a time for the same reasons as above.
             let mut restorations = conflicts.clone();
             for id in std::mem::take(&mut restorations.removed_instances) {
@@ -1997,6 +2562,11 @@ impl JobThreadContext {
             "Inline instances cannot move across owners"
         );
         let instance = tree.get_instance(id).unwrap();
+        if let Some(reason) =
+            package_reparent_block(tree, id, update.changed_parent.unwrap_or(instance.parent()))
+        {
+            anyhow::bail!(reason);
+        }
         let source = match instance.metadata().instigating_source.as_ref() {
             Some(InstigatingSource::Path(path)) => path.clone(),
             _ => anyhow::bail!("Project-defined sources cannot be relocated"),
@@ -4337,6 +4907,103 @@ fn is_keep_file(path: &Path) -> bool {
     path.file_name() == Some(EMPTY_DIR_KEEP_NAME.as_ref())
 }
 
+/// Compare authoritative source roots, not installed package names or DOM mounts.
+/// Inline instances inherit ownership from their nearest file-backed ancestor.
+fn package_reparent_block(tree: &RojoTree, id: Ref, parent: Ref) -> Option<String> {
+    let packages = tree.root().metadata().context.package_sources.as_ref()?;
+    let owner = |mut id: Ref| {
+        while let Some(instance) = tree.get_instance(id) {
+            let metadata = instance.metadata();
+            let path = match &metadata.instigating_source {
+                Some(InstigatingSource::Path(path)) => Some(path.as_path()),
+                Some(InstigatingSource::ProjectNode { node, .. }) => {
+                    node.path.as_ref().map(|path| path.path())
+                }
+                None => {
+                    id = instance.parent();
+                    continue;
+                }
+            };
+            if let Some(path) = path {
+                return packages.local_source_owner(&packages.original_path(path));
+            }
+            if let Some((source, _)) = &metadata.context.package_mount {
+                return Some(source.clone());
+            }
+            id = instance.parent();
+        }
+        None
+    };
+    let source = owner(id);
+    let destination = owner(parent);
+    if source != destination && (source.is_some() || destination.is_some()) {
+        Some("Reparenting crosses authoritative local package source ownership. Package descendants may only move within the same local source".into())
+    } else {
+        None
+    }
+}
+
+fn package_write_block(
+    tree: &RojoTree,
+    vfs: &Vfs,
+    id: Ref,
+    structural: bool,
+    stale: bool,
+) -> Option<String> {
+    let packages = tree.root().metadata().context.package_sources.as_ref()?;
+    let generation_changed = crate::package_sources::PackageSources::load(vfs, &packages.root)
+        .ok()
+        .flatten()
+        .as_ref()
+        != Some(packages.as_ref());
+    let inspect = |id: Ref| {
+        let mut current = Some(id);
+        while let Some(instance) = current.and_then(|id| tree.get_instance(id)) {
+            let metadata = instance.metadata();
+            if structural && metadata.is_package_mount_root() {
+                return Some("Local package mounts are declared by wally.toml. Change the declaration explicitly instead of moving, renaming, or deleting the mount".into());
+            }
+            for path in &metadata.relevant_paths {
+                if let Some(reason) = packages.blocked(vfs, path, false) {
+                    return Some(reason);
+                }
+            }
+            if metadata.context.package_mount.is_some() && stale {
+                return Some(
+                    "Package source baseline is stale. Filesystem and Studio edits were preserved"
+                        .into(),
+                );
+            }
+            match crate::syncback::package_source_conflict(vfs, tree, instance.id()) {
+                Ok(false) => {},
+                Ok(true) => return Some("Package source changed concurrently. Filesystem and Studio edits were preserved".into()),
+                Err(error) => return Some(format!("Cannot validate package source. {error:#}")),
+            }
+            if metadata.context.package_mount.is_some() && generation_changed {
+                return Some(
+                    "Wally package ownership changed. Restart Rojo after reinstalling".into(),
+                );
+            }
+            if metadata.instigating_source.is_some() {
+                break;
+            }
+            current = Some(instance.parent());
+        }
+        None
+    };
+    if let Some(reason) = inspect(id) {
+        return Some(reason);
+    }
+    if structural {
+        for descendant in tree.descendants(id) {
+            if let Some(reason) = inspect(descendant.id()) {
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
 fn canonicalize_or_original(vfs: &Vfs, path: PathBuf) -> PathBuf {
     match vfs.canonicalize(&path) {
         Ok(canonical) => canonical,
@@ -5089,6 +5756,977 @@ mod tests {
         let left = find(&job, &["Left"]);
         let right = find(&job, &["Right"]);
         (job, root, left, right)
+    }
+
+    fn package_relocation_job(root: &Path, installed: bool) -> JobThreadContext {
+        let manifest = "[package]\nname = \"scope/app\"\nversion = \"1.0.0\"\nrealm = \"shared\"\n[dependencies]\nFirst = \"^Local/First\"\nSecond = \"^Local/Second\"\n";
+        let local_manifest = "[package]\nname = \"scope/library\"\nrealm = \"shared\"\n";
+        let mut local_manifests = serde_json::Map::new();
+        let mut package_roots = Vec::new();
+        for name in ["First", "Second"] {
+            let source = format!("Local/{name}");
+            std::fs::create_dir_all(root.join(&source)).unwrap();
+            std::fs::create_dir_all(root.join(format!("Packages/_Index/{name}/library"))).unwrap();
+            std::fs::write(root.join(&source).join("wally.toml"), local_manifest).unwrap();
+            local_manifests.insert(
+                format!("{source}/wally.toml"),
+                crate::package_sources::sha256(local_manifest.as_bytes()).into(),
+            );
+            package_roots.push(serde_json::json!({
+                "name": "scope/library", "kind": "local", "realm": "shared",
+                "install_path": format!("Packages/_Index/{name}/library"),
+                "source_path": source,
+            }));
+        }
+        for owner in ["App", "Local/First", "Local/Second"] {
+            for folder in ["Left", "Right"] {
+                std::fs::create_dir_all(root.join(owner).join(folder)).unwrap();
+            }
+            std::fs::write(root.join(owner).join("Left/Code.luau"), "return 1\n").unwrap();
+            std::fs::write(root.join(owner).join("Right/Target.luau"), "return 2\n").unwrap();
+        }
+        std::fs::write(root.join("wally.toml"), manifest).unwrap();
+        std::fs::write(
+            root.join("wally.install.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "manifest_hash": crate::package_sources::sha256(manifest.as_bytes()),
+                "local_manifests": local_manifests,
+                "package_roots": package_roots,
+                "generated_paths": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let project = r#"{"name":"Test","tree":{"$className":"Folder","App":{"$path":"App"},"First":{"$path":"Packages/_Index/First/library"},"Second":{"$path":"Packages/_Index/Second/library"}}}"#;
+        let project = if installed {
+            project.to_owned()
+        } else {
+            project
+                .replace("Packages/_Index/First/library", "Local/First")
+                .replace("Packages/_Index/Second/library", "Local/Second")
+        };
+        std::fs::write(root.join("default.project.json"), project).unwrap();
+        let job = disk_job(root);
+        let mut context = crate::snapshot::InstanceContext::default();
+        context.package_sources =
+            crate::package_sources::PackageSources::load(&job.vfs, job.project().folder_location())
+                .unwrap()
+                .map(Arc::new);
+        assert!(context.package_sources.as_ref().unwrap().problem.is_none());
+        let path = job.project().folder_location().join("default.project.json");
+        let snapshot = snapshot_from_vfs(&context, &job.vfs, &path)
+            .unwrap()
+            .unwrap();
+        *job.tree.lock().unwrap() = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Root")
+                .metadata(crate::snapshot::InstanceMetadata::new().context(&context))
+                .children(vec![snapshot]),
+        );
+        job
+    }
+
+    #[test]
+    fn repeated_installed_mount_events_preserve_local_identity_and_cursor() {
+        for redirected in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = package_relocation_job(temp.path(), true);
+            let root = job.project().folder_location().to_path_buf();
+            if redirected {
+                job.vfs
+                    .write(
+                        root.join("Local/First/default.project.json"),
+                        r#"{"tree":{"$path":"Left"}}"#,
+                    )
+                    .unwrap();
+            }
+            let project_path = root.join("default.project.json");
+            job.vfs
+                .write(
+                    &project_path,
+                    r#"{"name":"Test","tree":{"$path":"Packages"}}"#,
+                )
+                .unwrap();
+            let context = job.tree.lock().unwrap().root().metadata().context.clone();
+            let snapshot = snapshot_from_vfs(&context, &job.vfs, &project_path)
+                .unwrap()
+                .unwrap();
+            *job.tree.lock().unwrap() = RojoTree::new(
+                InstanceSnapshot::new()
+                    .name("Root")
+                    .metadata(InstanceMetadata::new().context(&context))
+                    .children(vec![snapshot]),
+            );
+            let id = find(&job, &["_Index", "First", "library"]);
+            let count = job.tree.lock().unwrap().inner().descendants().count();
+            let before = job.message_queue.cursor();
+            let installed = job
+                .vfs
+                .canonicalize(root.join("Packages/_Index/First/library"))
+                .unwrap();
+
+            for event in [
+                VfsEvent::Create(installed.clone()),
+                VfsEvent::Write(installed.clone()),
+                VfsEvent::Create(installed),
+            ] {
+                job.handle_vfs_event(event);
+                assert_eq!(find(&job, &["_Index", "First", "library"]), id);
+                assert_eq!(
+                    job.tree.lock().unwrap().inner().descendants().count(),
+                    count
+                );
+                assert_eq!(job.message_queue.cursor(), before);
+            }
+
+            let source = job
+                .vfs
+                .canonicalize(root.join("Local/First/Left/Code.luau"))
+                .unwrap();
+            let code = job.tree.lock().unwrap().get_ids_at_path(&source)[0];
+            job.vfs.write(&source, "return 91\n").unwrap();
+            job.handle_vfs_event(VfsEvent::Write(source.clone()));
+            assert!(job.message_queue.cursor() > before);
+            assert_eq!(
+                job.tree
+                    .lock()
+                    .unwrap()
+                    .get_instance(code)
+                    .unwrap()
+                    .properties()[&ustr("Source")],
+                Variant::String("return 91\n".into())
+            );
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                property_update(code, "Source", Variant::String("return 92\n".into())),
+                Some(before),
+                WriteAuthority::Filesystem,
+            );
+            assert_eq!(accepted, PatchSet::new());
+            assert_eq!(conflicts, PatchSet::new());
+            assert!(errors
+                .iter()
+                .any(|error| error.message.contains("baseline is stale")));
+            assert_eq!(
+                job.vfs.read_to_string(&source).unwrap().as_str(),
+                "return 91\n"
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_mutations_and_publication_share_the_tree_revision_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = package_relocation_job(temp.path(), true);
+        let path = job
+            .vfs
+            .canonicalize(temp.path().join("Local/First/Left/Code.luau"))
+            .unwrap();
+        let id = job.tree.lock().unwrap().get_ids_at_path(&path)[0];
+        let before = job.message_queue.cursor();
+        job.vfs.write(&path, "return 73\n").unwrap();
+
+        let changes = job.apply_patches_with_publication(path.clone(), |tree, changes| {
+            assert!(!changes.is_empty());
+            assert_eq!(job.message_queue.cursor(), before);
+            assert!(matches!(
+                job.tree.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert_eq!(
+                tree.get_instance(id).unwrap().properties()[&ustr("Source")],
+                Variant::String("return 73\n".into())
+            );
+        });
+
+        assert_eq!(job.message_queue.cursor(), before + changes.len() as u32);
+        let published = job.message_queue.cursor();
+        assert!(job.apply_patches(path.clone()).is_empty());
+        assert!(job.apply_patches(path).is_empty());
+        assert_eq!(job.message_queue.cursor(), published);
+    }
+
+    #[test]
+    fn project_remounts_publish_fresh_imports_and_propagate_watcher_context() {
+        for nested in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::create_dir_all(root.join("Source/Shared")).unwrap();
+            std::fs::write(root.join("Source/Shared/Util.luau"), "return 1\n").unwrap();
+            std::fs::write(root.join("App.luau"), "return require(\"@shared/Util\")\n").unwrap();
+            std::fs::write(
+                root.join(".luaurc"),
+                r#"{"aliases":{"shared":"Source/Shared","future":"Source/Shared/Extra.luau"}}"#,
+            )
+            .unwrap();
+            let service = serde_json::json!({
+                "$className": "ReplicatedStorage",
+                "Shared": { "$path": "Source/Shared" },
+                "App": { "$path": "App.luau" }
+            });
+            let project = serde_json::json!({
+                "name": "Test",
+                "tree": {
+                    "$className": "DataModel",
+                    "ReplicatedStorage": if nested {
+                        serde_json::json!({ "$path": "inner.project.json" })
+                    } else { service.clone() }
+                }
+            });
+            let root_project = root.join("default.project.json");
+            std::fs::write(&root_project, serde_json::to_vec(&project).unwrap()).unwrap();
+            let changed_project = if nested {
+                let path = root.join("inner.project.json");
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec(&serde_json::json!({ "tree": service })).unwrap(),
+                )
+                .unwrap();
+                path
+            } else {
+                root_project.clone()
+            };
+            let job = disk_job(root);
+            let mut context = crate::snapshot::InstanceContext::default();
+            context.set_reserved_cache_path(job.project().folder_location().join(".rojo"));
+            let mut snapshot = snapshot_from_vfs(&context, &job.vfs, &job.project().file_location)
+                .unwrap()
+                .unwrap();
+            let require_context = crate::serve_session::build_require_context(
+                &snapshot,
+                job.project().folder_location(),
+            )
+            .unwrap();
+            crate::snapshot_middleware::prepare_requires(&mut snapshot, &job.vfs, &require_context)
+                .unwrap();
+            *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+            let app = {
+                let tree = job.tree.lock().unwrap();
+                tree.descendants(tree.get_root_id())
+                    .find(|instance| instance.name() == "App")
+                    .unwrap()
+                    .id()
+            };
+            let changed_project = job.vfs.canonicalize(&changed_project).unwrap();
+            let project_source = job.vfs.read_to_string(&changed_project).unwrap();
+            job.vfs
+                .write(
+                    &changed_project,
+                    project_source.replace("\"Shared\":", "\"RenamedShared\":"),
+                )
+                .unwrap();
+            let luaurc = job.project().folder_location().join(".luaurc");
+            job.vfs.write(&luaurc, "{").unwrap();
+            assert!(job
+                .try_apply_patches_with_publication(changed_project.clone(), |_, _| {})
+                .is_err());
+            assert_eq!(job.message_queue.cursor(), 0);
+            {
+                let tree = job.tree.lock().unwrap();
+                assert!(tree
+                    .descendants(tree.get_root_id())
+                    .any(|instance| instance.name() == "Shared"));
+                assert!(
+                    matches!(&tree.get_instance(app).unwrap().properties()[&ustr("Source")], Variant::String(source) if source.contains("@game/ReplicatedStorage/Shared/Util"))
+                );
+            }
+            job.vfs
+                .write(
+                    &luaurc,
+                    r#"{"aliases":{"shared":"Source/Shared","future":"Source/Shared/Extra.luau"}}"#,
+                )
+                .unwrap();
+            job.apply_patches_with_publication(changed_project, |tree, messages| {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(job.message_queue.cursor(), 0);
+                assert!(tree.descendants(tree.get_root_id()).any(|instance| instance.name() == "RenamedShared"));
+                let source = &tree.get_instance(app).unwrap().properties()[&ustr("Source")];
+                assert!(matches!(source, Variant::String(source) if source.contains("@game/ReplicatedStorage/RenamedShared/Util")), "{source:?}");
+                assert!(messages.iter().any(|message| message.updated.iter().any(|update| {
+                    update.id == app && update.changed_properties.contains_key(&ustr("Source"))
+                })));
+            });
+            assert!(job.message_queue.cursor() > 0);
+            let app_path = job.project().folder_location().join("App.luau");
+            job.vfs
+                .write(
+                    &app_path,
+                    "return require(\"@shared/Util\"), require(\"@future\")\n",
+                )
+                .unwrap();
+            assert!(job.is_source_only_event(&job.tree.lock().unwrap(), &app_path));
+            job.apply_patches(app_path);
+            assert!(
+                matches!(&job.tree.lock().unwrap().get_instance(app).unwrap().properties()[&ustr("Source")], Variant::String(source) if source.contains("/Extra.luau"))
+            );
+            let added = job
+                .project()
+                .folder_location()
+                .join("Source/Shared/Extra.luau");
+            job.vfs
+                .write(&added, "return require(\"@shared/Util\")\n")
+                .unwrap();
+            assert!(!job.is_source_only_event(&job.tree.lock().unwrap(), &added));
+            assert!(!job.is_source_only_event(
+                &job.tree.lock().unwrap(),
+                &added.with_extension("meta.json")
+            ));
+            job.apply_patches(added.clone());
+            {
+                let tree = job.tree.lock().unwrap();
+                for name in ["App", "Extra"] {
+                    let instance = tree
+                        .descendants(tree.get_root_id())
+                        .find(|instance| instance.name() == name)
+                        .unwrap();
+                    let source = &instance.properties()[&ustr("Source")];
+                    assert!(
+                        matches!(source, Variant::String(source) if source.contains("@game/ReplicatedStorage/RenamedShared/Util")),
+                        "{name} {source:?}"
+                    );
+                    if name == "App" {
+                        assert!(
+                            matches!(source, Variant::String(source) if source.contains("@game/ReplicatedStorage/RenamedShared/Extra\"") && !source.contains("/Extra.luau"))
+                        );
+                    }
+                    let transform = instance.metadata().source_transform.as_ref().unwrap();
+                    assert!(transform.original.contains("@shared/Util"));
+                    assert_eq!(source, &Variant::String(transform.emitted.clone()));
+                    assert_eq!(
+                        instance
+                            .metadata()
+                            .context
+                            .require_context
+                            .as_ref()
+                            .unwrap()
+                            .path_mappings,
+                        tree.root()
+                            .metadata()
+                            .context
+                            .require_context
+                            .as_ref()
+                            .unwrap()
+                            .path_mappings
+                    );
+                }
+            }
+            job.vfs.remove_file(&added).unwrap();
+            job.apply_patches(added);
+            let tree = job.tree.lock().unwrap();
+            assert!(!tree
+                .descendants(tree.get_root_id())
+                .any(|instance| instance.name() == "Extra"));
+        }
+    }
+
+    #[test]
+    fn invalid_package_remount_keeps_the_live_tree_and_revision_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = package_relocation_job(temp.path(), true);
+        let mut context = job.tree.lock().unwrap().root().metadata().context.clone();
+        context.set_reserved_cache_path(job.project().folder_location().join(".rojo"));
+        let path = job.project().file_location.clone();
+        let mut snapshot = snapshot_from_vfs(&context, &job.vfs, &path)
+            .unwrap()
+            .unwrap();
+        let require_context =
+            crate::serve_session::build_require_context(&snapshot, job.project().folder_location())
+                .unwrap();
+        crate::snapshot_middleware::prepare_requires(&mut snapshot, &job.vfs, &require_context)
+            .unwrap();
+        *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+        let before = job.tree.lock().unwrap().clone_for_serialization();
+        job.note_authority(WriteAuthority::Studio);
+        job.vfs.write(&path, r#"{"name":"Test","syncbackRules":{"modelTrees":[{"pattern":"App/Left","format":"rbxm"}]},"tree":{"$className":"Folder","App":{"$path":"App"},"First":{"$path":"Packages/_Index/First/library"},"Duplicate":{"$path":"Packages/_Index/First/library"}}}"#).unwrap();
+        let disk_before = job.vfs.snapshot_tree(temp.path()).unwrap();
+        job.handle_vfs_event(VfsEvent::Write(path));
+        assert!(job.project().syncback_rules.is_none());
+        assert_eq!(job.vfs.snapshot_tree(temp.path()).unwrap(), disk_before);
+        assert_eq!(job.message_queue.cursor(), 0);
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(
+            tree.inner().descendants().count(),
+            before.inner().descendants().count()
+        );
+        for original in before.descendants(before.get_root_id()) {
+            let current = tree.get_instance(original.id()).unwrap();
+            assert_eq!(current.name(), original.name());
+            assert_eq!(current.children(), original.children());
+            assert_eq!(current.properties(), original.properties());
+            assert_eq!(current.metadata(), original.metadata());
+        }
+    }
+
+    #[test]
+    fn package_batches_report_each_excluded_or_unpersisted_property() {
+        for exclusion in ["property", "tree", "path"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut job = package_relocation_job(temp.path(), true);
+            let context = job.tree.lock().unwrap().root().metadata().context.clone();
+            let snapshot = snapshot_from_vfs(
+                &context,
+                &job.vfs,
+                &job.project().folder_location().join("default.project.json"),
+            )
+            .unwrap()
+            .unwrap();
+            *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+            let id = {
+                let tree = job.tree.lock().unwrap();
+                tree.descendants(tree.get_root_id())
+                    .find(|instance| {
+                        instance.name() == "Code"
+                            && instance
+                                .metadata()
+                                .relevant_paths
+                                .iter()
+                                .any(|path| path.ends_with("Local/First/Left/Code.luau"))
+                    })
+                    .unwrap()
+                    .id()
+            };
+            let rules = match exclusion {
+                "property" => serde_json::json!({
+                    "ignoreProperties": { "ModuleScript": ["Archivable"] }
+                }),
+                "tree" => serde_json::json!({ "ignoreTrees": ["First"] }),
+                "path" => serde_json::json!({ "ignorePaths": ["Local/First"] }),
+                _ => unreachable!(),
+            };
+            Arc::get_mut(job.project.project.get_mut().unwrap())
+                .unwrap()
+                .syncback_rules = Some(serde_json::from_value(rules).unwrap());
+            let source = temp.path().join("Local/First/Left/Code.luau");
+            let installed = temp.path().join("Packages/_Index/First/library");
+            let installed_before = job.vfs.snapshot_tree(&installed).unwrap();
+            let mut patch = property_update(id, "Source", Variant::String("return 42\n".into()));
+            patch.updated_instances[0]
+                .changed_properties
+                .insert(ustr("Archivable"), Some(Variant::Bool(false)));
+            let (accepted, conflicts, errors) = studio_write(&job, patch);
+            assert_eq!(conflicts, PatchSet::new(), "{exclusion}");
+            assert!(
+                errors.iter().any(|error| {
+                    error.id == id && error.property.as_deref() == Some("Archivable")
+                }),
+                "{exclusion} {errors:?}"
+            );
+            if exclusion == "property" {
+                assert_eq!(
+                    accepted,
+                    property_update(id, "Source", Variant::String("return 42\n".into()))
+                );
+                assert_eq!(
+                    job.vfs.read_to_string(&source).unwrap().as_str(),
+                    "return 42\n"
+                );
+                assert_eq!(errors.len(), 1, "{errors:?}");
+            } else {
+                assert_eq!(accepted, PatchSet::new(), "{exclusion}");
+                assert!(
+                    errors.iter().any(|error| {
+                        error.id == id && error.property.as_deref() == Some("Source")
+                    }),
+                    "{exclusion} {errors:?}"
+                );
+                assert_eq!(
+                    job.vfs.read_to_string(&source).unwrap().as_str(),
+                    "return 1\n"
+                );
+                assert_eq!(errors.len(), 2, "{errors:?}");
+            }
+            assert_eq!(job.vfs.snapshot_tree(&installed).unwrap(), installed_before);
+        }
+    }
+
+    fn reload_package_property_fixture(job: &JobThreadContext) {
+        let mut context = job.tree.lock().unwrap().root().metadata().context.clone();
+        context.set_reserved_cache_path(job.project().folder_location().join(".rojo"));
+        let mut snapshot = snapshot_from_vfs(
+            &context,
+            &job.vfs,
+            &job.project().folder_location().join("default.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+        let require_context =
+            crate::serve_session::build_require_context(&snapshot, job.project().folder_location())
+                .unwrap();
+        crate::snapshot_middleware::prepare_requires(&mut snapshot, &job.vfs, &require_context)
+            .unwrap();
+        *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+    }
+
+    #[test]
+    fn package_property_batch_refreshes_project_defined_child_from_disk() {
+        for nested in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = package_relocation_job(temp.path(), true);
+            let entry = temp.path().join("Local/First/default.project.json");
+            let project_path = if nested {
+                job.vfs
+                    .write(&entry, r#"{"tree":{"$path":"inner.project.json"}}"#)
+                    .unwrap();
+                temp.path().join("Local/First/inner.project.json")
+            } else {
+                entry
+            };
+            let entrance = job
+                .vfs
+                .canonicalize(temp.path().join("Packages/_Index/First/library"))
+                .unwrap();
+            job.vfs
+            .write(
+                &project_path,
+                r#"{"tree":{"$className":"Folder","Child":{"$className":"Folder","$properties":{"Archivable":false}}}}"#,
+            )
+            .unwrap();
+            let project_path = job.vfs.canonicalize(&project_path).unwrap();
+            reload_package_property_fixture(&job);
+            let id = job
+                .tree
+                .lock()
+                .unwrap()
+                .inner()
+                .descendants()
+                .find(|instance| instance.name == "Child")
+                .unwrap()
+                .referent();
+            let (accepted, conflicts, errors) =
+                studio_write(&job, property_update(id, "Archivable", Variant::Bool(true)));
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(accepted.updated_instances.len(), 1);
+            assert_eq!(
+                accepted.updated_instances[0].changed_properties[&ustr("Archivable")],
+                None
+            );
+            let disk: serde_json::Value =
+                serde_json::from_str(&job.vfs.read_to_string(&project_path).unwrap()).unwrap();
+            assert_ne!(disk["tree"]["Child"]["$properties"]["Archivable"], false);
+            let tree = job.tree.lock().unwrap();
+            assert_ne!(
+                tree.get_instance(id)
+                    .unwrap()
+                    .properties()
+                    .get(&ustr("Archivable")),
+                Some(&Variant::Bool(false))
+            );
+            let owner = tree
+                .get_instance(tree.get_instance(id).unwrap().parent())
+                .unwrap();
+            assert!(
+                tree.get_ids_at_path(&entrance).contains(&owner.id()),
+                "{nested}"
+            );
+            assert_eq!(
+                owner.metadata().package_file_contents.get(&project_path),
+                Some(&Some(job.vfs.read(&project_path).unwrap().to_vec()))
+            );
+            drop(tree);
+            let (_, conflicts, errors) = studio_write(
+                &job,
+                property_update(id, "Archivable", Variant::Bool(false)),
+            );
+            assert_eq!(conflicts, PatchSet::new());
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+    }
+
+    #[test]
+    fn package_property_batch_accepts_canonical_source_and_corrects_studio() {
+        for authored in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = package_relocation_job(temp.path(), true);
+            job.vfs
+                .write(
+                    temp.path().join("Local/First/.luaurc"),
+                    r#"{"aliases":{"lib":"."}}"#,
+                )
+                .unwrap();
+            reload_package_property_fixture(&job);
+            let id = {
+                let tree = job.tree.lock().unwrap();
+                tree.descendants(tree.get_root_id())
+                    .find(|instance| {
+                        instance
+                            .metadata()
+                            .relevant_paths
+                            .iter()
+                            .any(|path| path.ends_with("Local/First/Left/Code.luau"))
+                    })
+                    .unwrap()
+                    .id()
+            };
+            let source = if authored {
+                "return require('@lib/Right/Target')\r\n"
+            } else {
+                "return 42\r\n"
+            };
+            let cursor = job.message_queue.cursor();
+            let (accepted, conflicts, errors) = studio_write(
+                &job,
+                property_update(id, "Source", Variant::String(source.into())),
+            );
+            assert!(errors.is_empty(), "{authored} {errors:?}");
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(accepted.updated_instances.len(), 1);
+            let tree = job.tree.lock().unwrap();
+            let instance = tree.get_instance(id).unwrap();
+            let saved = instance.properties()[&ustr("Source")].clone();
+            assert_ne!(saved, Variant::String(source.into()));
+            if authored {
+                let transform = instance.metadata().source_transform.as_ref().unwrap();
+                assert_eq!(transform.original, source.replace("\r\n", "\n"));
+                assert_eq!(saved, Variant::String(transform.emitted.clone()));
+                assert_ne!(transform.original, transform.emitted);
+            } else {
+                assert_eq!(saved, Variant::String("return 42\n".into()));
+            }
+            assert!(messages_since(&job, cursor)
+                .iter()
+                .flat_map(|message| &message.updated)
+                .any(|update| update.id == id
+                    && update.changed_properties.get(&ustr("Source"))
+                        == Some(&Some(saved.clone()))));
+            assert_eq!(
+                job.vfs
+                    .read_to_string(temp.path().join("Local/First/Left/Code.luau"))
+                    .unwrap()
+                    .as_str(),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn package_property_batch_accepts_numeric_normalization_but_rejects_exclusions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = package_relocation_job(temp.path(), true);
+        job.vfs
+            .write(
+                temp.path().join("Local/First/Part.model.json"),
+                r#"{"ClassName":"Part"}"#,
+            )
+            .unwrap();
+        reload_package_property_fixture(&job);
+        let id = job
+            .tree
+            .lock()
+            .unwrap()
+            .inner()
+            .descendants()
+            .find(|instance| instance.name == "Part")
+            .unwrap()
+            .referent();
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules = Some(
+            serde_json::from_value(serde_json::json!({
+                "ignoreProperties": {"Part": ["Archivable"]}
+            }))
+            .unwrap(),
+        );
+        // The second request already matches disk after rounding, but Studio
+        // still needs a correction even when refreshing the tree changes nothing.
+        for _ in 0..2 {
+            let cursor = job.message_queue.cursor();
+            let mut patch = property_update(id, "Reflectance", Variant::Float32(0.99999994));
+            patch.updated_instances[0]
+                .changed_properties
+                .insert(ustr("Archivable"), Some(Variant::Bool(true)));
+            let (accepted, conflicts, errors) = studio_write(&job, patch);
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].property.as_deref(), Some("Archivable"));
+            assert_eq!(accepted.updated_instances.len(), 1);
+            assert!(!accepted.updated_instances[0]
+                .changed_properties
+                .contains_key(&ustr("Archivable")));
+            assert_eq!(
+                job.tree
+                    .lock()
+                    .unwrap()
+                    .get_instance(id)
+                    .unwrap()
+                    .properties()[&ustr("Reflectance")],
+                Variant::Float32(1.0)
+            );
+            assert!(messages_since(&job, cursor)
+                .iter()
+                .flat_map(|message| &message.updated)
+                .any(|update| update.id == id
+                    && update.changed_properties.get(&ustr("Reflectance"))
+                        == Some(&Some(Variant::Float32(1.0)))));
+        }
+    }
+
+    #[test]
+    fn package_batch_serialization_success_preserves_unrelated_live_state() {
+        check_package_batch_serialization_preserves_live_state(false);
+    }
+
+    #[test]
+    fn package_batch_serialization_failure_preserves_live_state() {
+        check_package_batch_serialization_preserves_live_state(true);
+    }
+
+    fn check_package_batch_serialization_preserves_live_state(fail_serialization: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = package_relocation_job(temp.path(), true);
+        // Full-project serialization takes the project root, not the synthetic
+        // outer root used by the relocation fixture.
+        let context = job.tree.lock().unwrap().root().metadata().context.clone();
+        let snapshot = snapshot_from_vfs(
+            &context,
+            &job.vfs,
+            &job.project().folder_location().join("default.project.json"),
+        )
+        .unwrap()
+        .unwrap();
+        *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+        let find_project = |path: &[&str]| {
+            let tree = job.tree.lock().unwrap();
+            let mut current = tree.get_root_id();
+            for name in path {
+                current = *tree
+                    .get_instance(current)
+                    .unwrap()
+                    .children()
+                    .iter()
+                    .find(|child| tree.get_instance(**child).unwrap().name() == *name)
+                    .unwrap();
+            }
+            current
+        };
+        let id = find_project(&["First", "Left", "Code"]);
+        let unrelated = find_project(&["App", "Right", "Target"]);
+        let app = find_project(&["App"]);
+        let specified = crate::RojoRef::new("unrelated".into());
+        let before = {
+            let mut tree = job.tree.lock().unwrap();
+            tree.set_specified_id(unrelated, specified.clone());
+            tree.get_instance_mut(unrelated)
+                .unwrap()
+                .properties_mut()
+                .extend([
+                    (ustr("Archivable"), Variant::Bool(false)),
+                    (ustr("Target"), Variant::Ref(id)),
+                ]);
+            tree.clone_for_serialization()
+        };
+        let mut rules = serde_json::json!({
+            "ignoreProperties": { "ModuleScript": ["Archivable"] }
+        });
+        if fail_serialization {
+            // Model-tree patterns compile after syncback filters both DOMs.
+            rules["modelTrees"] = serde_json::json!([{ "pattern": "Maps/[" }]);
+        }
+        Arc::get_mut(job.project.project.get_mut().unwrap())
+            .unwrap()
+            .syncback_rules = Some(serde_json::from_value(rules).unwrap());
+        let disk_before = job.vfs.snapshot_tree(temp.path()).unwrap();
+        let patch = property_update(id, "Source", Variant::String("return 42\n".into()));
+        let (accepted, conflicts, errors) = studio_write(&job, patch.clone());
+        assert_eq!(conflicts, PatchSet::new());
+        if fail_serialization {
+            assert_eq!(accepted, PatchSet::new());
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].message.contains("not a valid glob"), "{errors:?}");
+            assert_eq!(job.vfs.snapshot_tree(temp.path()).unwrap(), disk_before);
+            assert_eq!(job.message_queue.cursor(), 0);
+        } else {
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(accepted, patch);
+            assert_eq!(
+                job.vfs
+                    .read_to_string(temp.path().join("Local/First/Left/Code.luau"))
+                    .unwrap()
+                    .as_str(),
+                "return 42\n"
+            );
+            assert_eq!(
+                job.tree.lock().unwrap().get_instance(id).unwrap().name(),
+                "Code"
+            );
+        }
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(tree.get_root_id(), before.get_root_id());
+        // Successful writes refresh the package owner intentionally. Everything
+        // outside that owner, or the whole tree on failure, must stay untouched.
+        let unchanged_root = if fail_serialization {
+            before.get_root_id()
+        } else {
+            app
+        };
+        for original in before.descendants(unchanged_root) {
+            let live = tree.get_instance(original.id()).unwrap();
+            assert_eq!(live.parent(), original.parent());
+            assert_eq!(live.children(), original.children());
+            assert_eq!(live.name(), original.name());
+            assert_eq!(live.class_name(), original.class_name());
+            assert_eq!(live.properties(), original.properties());
+            assert_eq!(live.metadata(), original.metadata());
+            for path in &original.metadata().relevant_paths {
+                assert_eq!(tree.get_ids_at_path(path), before.get_ids_at_path(path));
+            }
+        }
+        assert_eq!(tree.get_specified_id(&specified), Some(unrelated));
+        assert_eq!(tree.specified_id_holders(&specified), [unrelated]);
+        assert_eq!(
+            tree.get_instance(id).unwrap().properties()[&ustr("Source")],
+            Variant::String(
+                if fail_serialization {
+                    "return 1\n"
+                } else {
+                    "return 42\n"
+                }
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn package_relocation_ownership_matrix() {
+        for installed in [false, true] {
+            check_package_relocation_ownership_matrix(installed);
+        }
+    }
+
+    fn check_package_relocation_ownership_matrix(installed: bool) {
+        for source in ["App", "First", "Second"] {
+            for destination in ["App", "First", "Second"] {
+                for rename in [false, true] {
+                    // Exercise unchanged parents, directories, and script promotion.
+                    for target in ["Left", "Right", "Right/Target"] {
+                        let temp = tempfile::tempdir().unwrap();
+                        let job = package_relocation_job(temp.path(), installed);
+                        let id = find(&job, &[source, "Left", "Code"]);
+                        let destination_path: Vec<_> = std::iter::once(destination)
+                            .chain(target.split('/'))
+                            .collect();
+                        let parent = find(&job, &destination_path);
+                        let before = job.vfs.snapshot_tree(temp.path()).unwrap();
+                        let patch = PatchSet {
+                            updated_instances: vec![PatchUpdate {
+                                changed_name: rename.then(|| "Renamed".into()),
+                                changed_parent: Some(parent),
+                                ..empty_update(id)
+                            }],
+                            ..PatchSet::new()
+                        };
+                        let (accepted, conflicts, errors) = studio_write(&job, patch);
+                        let case = format!("{source} -> {destination}/{target}, rename {rename}");
+                        assert_eq!(conflicts, PatchSet::new(), "{case}");
+                        if source != destination {
+                            assert!(accepted.updated_instances.is_empty(), "{case}");
+                            assert!(
+                                errors
+                                    .iter()
+                                    .any(|error| error.message.contains("ownership")),
+                                "{case} {errors:?}"
+                            );
+                            assert_eq!(
+                                job.vfs.snapshot_tree(temp.path()).unwrap(),
+                                before,
+                                "{case}"
+                            );
+                            assert_eq!(find(&job, &[source, "Left", "Code"]), id, "{case}");
+                            assert_eq!(job.message_queue.cursor(), 0, "{case}");
+                        } else {
+                            assert!(errors.is_empty(), "{case} {errors:?}");
+                            assert_eq!(
+                                accepted.updated_instances.len(),
+                                usize::from(rename || target != "Left"),
+                                "{case}"
+                            );
+                            let mut path = destination_path;
+                            path.push(if rename { "Renamed" } else { "Code" });
+                            assert_eq!(find(&job, &path), id, "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn package_relocation_rejects_cross_ownership_before_stale_conflicts() {
+        for authority in [WriteAuthority::Filesystem, WriteAuthority::Studio] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = package_relocation_job(temp.path(), true);
+            let id = find(&job, &["First", "Left", "Code"]);
+            let parent = find(&job, &["App", "Right"]);
+            let before = job.vfs.snapshot_tree(temp.path()).unwrap();
+            let (accepted, conflicts, errors) =
+                job.handle_tree_event_at_cursor(parent_update(id, parent), None, authority);
+            assert_eq!(accepted, PatchSet::new());
+            assert_eq!(conflicts, PatchSet::new());
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.message.contains("ownership")),
+                "{errors:?}"
+            );
+            assert_eq!(job.vfs.snapshot_tree(temp.path()).unwrap(), before);
+            assert_eq!(job.message_queue.cursor(), 0);
+        }
+    }
+
+    #[test]
+    fn package_relocation_rejects_cross_ownership_cycles_before_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = package_relocation_job(temp.path(), true);
+        let local = find(&job, &["First", "Left"]);
+        let app = find(&job, &["App", "Right"]);
+        let before = job.vfs.snapshot_tree(temp.path()).unwrap();
+        let (accepted, conflicts, errors) = studio_write(
+            &job,
+            PatchSet {
+                updated_instances: vec![
+                    PatchUpdate {
+                        changed_parent: Some(app),
+                        ..empty_update(local)
+                    },
+                    PatchUpdate {
+                        changed_parent: Some(local),
+                        ..empty_update(app)
+                    },
+                ],
+                ..PatchSet::new()
+            },
+        );
+        assert_eq!(accepted, PatchSet::new());
+        assert_eq!(conflicts, PatchSet::new());
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .all(|error| error.message.contains("ownership")));
+        assert_eq!(job.vfs.snapshot_tree(temp.path()).unwrap(), before);
+        assert_eq!(job.message_queue.cursor(), 0);
+    }
+
+    #[test]
+    fn package_relocation_preserves_rename_without_parent_change() {
+        for source in ["App", "First", "Second"] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = package_relocation_job(temp.path(), true);
+            let id = find(&job, &[source, "Left", "Code"]);
+            let (accepted, conflicts, errors) = studio_write(
+                &job,
+                PatchSet {
+                    updated_instances: vec![PatchUpdate {
+                        changed_name: Some("Renamed".into()),
+                        ..empty_update(id)
+                    }],
+                    ..PatchSet::new()
+                },
+            );
+            assert!(errors.is_empty(), "{source} {errors:?}");
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(accepted.updated_instances.len(), 1);
+            assert_eq!(find(&job, &[source, "Left", "Renamed"]), id);
+        }
     }
 
     fn parent_update(id: Ref, parent: Ref) -> PatchSet {

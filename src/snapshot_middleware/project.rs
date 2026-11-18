@@ -350,17 +350,35 @@ pub fn syncback_project<'sync>(
     let old_inst = snapshot
         .old_inst()
         .expect("projects should always exist in both trees");
-    // Generally, the path of a project is the first thing added to the relevant
-    // paths. So, we take the last one.
-    let project_path = old_inst
-        .metadata()
-        .relevant_paths
-        .last()
-        .expect("all projects should have a relevant path");
     let vfs = snapshot.vfs();
-
-    log::debug!("Reloading project {} from vfs", project_path.display(),);
-    let mut project = Project::load_exact(vfs, project_path, None)?;
+    // A referenced project shares its root instance with the referring project.
+    // Its last relevant path therefore still names the outer project. Follow the
+    // current logical snapshot path instead of recursing into that outer project.
+    let project_path = if Project::is_project_file(&snapshot.path) {
+        snapshot.path.clone()
+    } else {
+        let mut found = None;
+        for name in crate::project::DEFAULT_PROJECT_NAMES {
+            let path = snapshot.path.join(name);
+            if vfs.exists(&path)? {
+                found = Some(path);
+                break;
+            }
+        }
+        found
+            .or_else(|| {
+                old_inst
+                    .metadata()
+                    .relevant_paths
+                    .iter()
+                    .rev()
+                    .find(|path| Project::is_project_file(path))
+                    .cloned()
+            })
+            .context("The entrypoint project no longer exists")?
+    };
+    let mut project = Project::load_exact(vfs, &project_path, Some(old_inst.name()))?;
+    log::debug!("Reloading project {} from vfs", project_path.display());
     let base_path = project.folder_location().to_path_buf();
 
     // Sync rules for this project do not have their base rule set but it is
@@ -416,6 +434,15 @@ pub fn syncback_project<'sync>(
             } else {
                 base_path.join(node_path)
             };
+            let full_path = old_inst
+                .metadata()
+                .context
+                .package_sources
+                .as_ref()
+                .map_or_else(
+                    || full_path.clone(),
+                    |packages| packages.original_path(&full_path),
+                );
 
             let middleware = match Middleware::middleware_for_path(
                 snapshot.vfs(),
