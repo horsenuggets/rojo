@@ -5315,6 +5315,79 @@ mod tests {
         }
     }
 
+    // Use the real disk backend, but deliver project events synchronously. A
+    // rejected relayout temporarily sets the model aside, so neither a sleep
+    // nor polling for the original file proves that rollback has completed.
+    #[test]
+    fn model_tree_relayouts_never_touch_excluded_files_or_lose_instances() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let storage = root.join("src/ReplicatedStorage");
+        std::fs::create_dir_all(storage.join("Mover/Dropped")).unwrap();
+        std::fs::write(storage.join("Mover/Keep.luau"), "return 'keep'").unwrap();
+        std::fs::write(storage.join("Mover/Dropped/Code.luau"), "return 1").unwrap();
+        let project_path = root.join("default.project.json");
+        let project = |rules: &str| {
+            format!(
+                r#"{{"name":"Test","tree":{{"$className":"DataModel","$path":"src"}},"syncbackRules":{{"instancesAsDirectories":true,{rules}}}}}"#
+            )
+        };
+        std::fs::write(&project_path, project(r#""modelTrees":[]"#)).unwrap();
+        let job = disk_job(root);
+        job.note_authority(WriteAuthority::Studio);
+        let mover = find(&job, &["ReplicatedStorage", "Mover"]);
+        let keep = find(&job, &["ReplicatedStorage", "Mover", "Keep"]);
+        let dropped = find(&job, &["ReplicatedStorage", "Mover", "Dropped"]);
+        let code = find(&job, &["ReplicatedStorage", "Mover", "Dropped", "Code"]);
+        let set_rules = |rules: &str| {
+            std::fs::write(&project_path, project(rules)).unwrap();
+            // Returning from the handler is the completion barrier for both
+            // successful relayouts and rejected ones, including rollback.
+            job.handle_vfs_event(VfsEvent::Write(
+                job.vfs.canonicalize(&project_path).unwrap(),
+            ));
+            assert_eq!(
+                job.project().syncback_rules,
+                Project::load_exact(&job.vfs, &project_path, Some("Test"))
+                    .unwrap()
+                    .syncback_rules
+            );
+        };
+
+        // disk_job puts the project beneath a stand-in root, so tree paths
+        // include its name, unlike the project-rooted serve integration tests.
+        set_rules(
+            r#""modelTrees":[{"pattern":"Test/ReplicatedStorage/Mover"}],"ignorePaths":["src/ReplicatedStorage/Mover/Keep.luau"]"#,
+        );
+        assert_eq!(
+            std::fs::read_to_string(storage.join("Mover/Keep.luau")).unwrap(),
+            "return 'keep'"
+        );
+        assert!(!storage.join("Mover.rbxm").exists());
+
+        set_rules(r#""modelTrees":[{"pattern":"Test/ReplicatedStorage/Mover"}]"#);
+        let model_before = std::fs::read(storage.join("Mover.rbxm")).unwrap();
+        assert!(!storage.join("Mover").exists());
+
+        // Going back to directories would drop what ignoreTrees excludes.
+        set_rules(r#""modelTrees":[],"ignoreTrees":["Test/ReplicatedStorage/Mover/Dropped"]"#);
+        assert_eq!(
+            std::fs::read(storage.join("Mover.rbxm")).unwrap(),
+            model_before
+        );
+        assert!(!storage.join("Mover").exists());
+        assert_eq!(find(&job, &["ReplicatedStorage", "Mover"]), mover);
+        assert_eq!(find(&job, &["ReplicatedStorage", "Mover", "Keep"]), keep);
+        assert_eq!(
+            find(&job, &["ReplicatedStorage", "Mover", "Dropped"]),
+            dropped
+        );
+        assert_eq!(
+            find(&job, &["ReplicatedStorage", "Mover", "Dropped", "Code"]),
+            code
+        );
+    }
+
     /// A relayout refused because its folder's metadata changed on disk
     /// leaves that change alone, since nothing was written.
     #[test]

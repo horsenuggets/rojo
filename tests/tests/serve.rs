@@ -897,45 +897,6 @@ fn model_tree_rules_reach_instances_stored_in_metadata() {
     });
 }
 
-// Files the syncback rules exclude are never rewritten, so a relayout that
-// would absorb one is refused, and a relayout that would lose an instance
-// is undone, leaving files and IDs as they were.
-#[test]
-fn model_tree_relayouts_never_touch_excluded_files_or_lose_instances() {
-    run_serve_test("place_root", |session, _| {
-        let storage = session.path().join("src/ReplicatedStorage");
-        fs::write(storage.join("Mover/Keep.luau"), "return 'keep'").unwrap();
-        fs::create_dir(storage.join("Mover/Dropped")).unwrap();
-        fs::write(storage.join("Mover/Dropped/Code.luau"), "return 1").unwrap();
-        let keep = wait_for_instance(&session, "Keep");
-        let dropped = wait_for_instance(&session, "Dropped");
-        announce_authority(&session, WriteAuthority::Studio);
-
-        set_syncback_rules(
-            &session,
-            r#""modelTrees":[{"pattern":"ReplicatedStorage/Mover"}],"ignorePaths":["src/ReplicatedStorage/Mover/Keep.luau"]"#,
-        );
-        thread::sleep(Duration::from_millis(1500));
-        assert!(storage.join("Mover/Keep.luau").is_file());
-        assert!(!storage.join("Mover.rbxm").exists());
-
-        // Now it can move, and does.
-        set_model_trees(&session, r#"[{"pattern":"ReplicatedStorage/Mover"}]"#);
-        assert!(eventually(|| storage.join("Mover.rbxm").is_file()));
-
-        // Going back to directories would drop what ignoreTrees excludes.
-        set_syncback_rules(
-            &session,
-            r#""modelTrees":[],"ignoreTrees":["ReplicatedStorage/Mover/Dropped"]"#,
-        );
-        thread::sleep(Duration::from_millis(1500));
-        assert!(storage.join("Mover.rbxm").is_file());
-        assert!(!storage.join("Mover").exists());
-        assert!(parent_of(&session, keep).is_some());
-        assert!(parent_of(&session, dropped).is_some());
-    });
-}
-
 // Changing the modelTrees rules while serving moves matching instances to
 // their new layout when Studio is authoritative, and back when the rule goes,
 // keeping their IDs. Under Filesystem authority, layouts never change. Before
