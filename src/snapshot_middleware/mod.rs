@@ -64,11 +64,7 @@ pub(crate) fn prepare_requires(
     require_context: &std::sync::Arc<crate::snapshot::RequireContext>,
 ) -> anyhow::Result<()> {
     use rbx_dom_weak::{types::Variant, ustr};
-    // Preserve middleware boundaries. Model-file descendants intentionally have
-    // no inherited filesystem context; adding one would produce false disk conflicts.
-    if snapshot.metadata.context.reserved_cache_path().is_some() {
-        snapshot.metadata.context.require_context = Some(require_context.clone());
-    }
+    let mut resolved = true;
     // Model payloads are not filesystem Luau source and retain their native imports.
     if let Some(Variant::String(source)) = snapshot.properties.get_mut(&ustr("Source")) {
         if let Some(path) = snapshot.metadata.relevant_paths.iter().find(|path| {
@@ -78,11 +74,11 @@ pub(crate) fn prepare_requires(
             let original = snapshot
                 .metadata
                 .source_transform
-                .take()
-                .map_or_else(|| source.clone(), |transform| transform.original);
-            // A remount must lower the authored import again, not reinterpret a
-            // native path emitted for the previous hierarchy.
-            *source = original.clone();
+                .as_ref()
+                .filter(|transform| *source == transform.emitted)
+                .map_or_else(|| source.clone(), |transform| transform.original.clone());
+            // Reuse authored imports only while Source still matches our output.
+            // Project properties and adjacent metadata can override the file source.
             let info = luaurc::ResolveInfo {
                 file_path: path,
                 vfs,
@@ -101,15 +97,23 @@ pub(crate) fn prepare_requires(
                 require_context.datamodel,
                 package_dependencies,
             ) {
-                Ok(emitted) if emitted != original => {
+                Ok(emitted) => {
                     *source = emitted.clone();
-                    snapshot.metadata.source_transform =
-                        Some(crate::snapshot::SourceTransform { original, emitted });
+                    snapshot.metadata.source_transform = (emitted != original)
+                        .then_some(crate::snapshot::SourceTransform { original, emitted });
                 }
-                Ok(_) => {}
-                Err(error) => log::warn!("Cannot resolve imports in {}. {error:#}", path.display()),
+                Err(error) => {
+                    resolved = false;
+                    log::warn!("Cannot resolve imports in {}. {error:#}", path.display());
+                }
             }
         }
+    }
+    // Keep the source, transform, and its resolution context together on failure.
+    // Preserve middleware boundaries. Model-file descendants intentionally have
+    // no inherited filesystem context; adding one would produce false disk conflicts.
+    if resolved && snapshot.metadata.context.reserved_cache_path().is_some() {
+        snapshot.metadata.context.require_context = Some(require_context.clone());
     }
     for child in &mut snapshot.children {
         prepare_requires(child, vfs, require_context)?;
@@ -717,6 +721,230 @@ mod test {
 
     use memofs::{InMemoryFs, VfsSnapshot};
     use std::path::Path;
+
+    fn require_fixture() -> (
+        Vfs,
+        InstanceContext,
+        std::sync::Arc<crate::snapshot::RequireContext>,
+    ) {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    ".luaurc",
+                    VfsSnapshot::file(r#"{"aliases":{"packages":"stale"}}"#),
+                ),
+                (
+                    "Source",
+                    VfsSnapshot::dir([(
+                        "Foo",
+                        VfsSnapshot::dir([(
+                            "init.luau",
+                            VfsSnapshot::file("return require('@packages/File')"),
+                        )]),
+                    )]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let require_context = std::sync::Arc::new(crate::snapshot::RequireContext {
+            project_root: PathBuf::from("/project"),
+            path_mappings: vec![
+                (
+                    PathBuf::from("Source/Foo"),
+                    vec![
+                        "ReplicatedStorage".into(),
+                        "Packages".into(),
+                        "_Index".into(),
+                        "Foo".into(),
+                        "foo".into(),
+                    ],
+                ),
+                (
+                    PathBuf::from("Packages/_Index/Foo"),
+                    vec![
+                        "ReplicatedStorage".into(),
+                        "Packages".into(),
+                        "_Index".into(),
+                        "Foo".into(),
+                    ],
+                ),
+            ],
+            datamodel: true,
+        });
+        let mut context = InstanceContext::new();
+        context.set_reserved_cache_path(PathBuf::from("/project/.rojo"));
+        context.require_context = Some(require_context.clone());
+        context.package_mount = Some((
+            PathBuf::from("/project/Source/Foo"),
+            PathBuf::from("/project/Packages/_Index/Foo/foo"),
+        ));
+        (Vfs::new(imfs), context, require_context)
+    }
+
+    fn require_snapshot(context: &InstanceContext, vfs: &Vfs) -> InstanceSnapshot {
+        snapshot_from_vfs(context, vfs, Path::new("/project/Source/Foo"))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn prepare_requires_respects_effective_source_overrides_and_repeated_preparation() {
+        use rbx_dom_weak::{types::Variant, ustr};
+
+        for project_override in [false, true] {
+            let (vfs, context, require_context) = require_fixture();
+            let original = "return require('@PaCkAgEs/Override')";
+            let mut snapshot = if project_override {
+                let node = serde_json::from_value(serde_json::json!({
+                    "$path": "Source/Foo",
+                    "$properties": { "Source": original }
+                }))
+                .unwrap();
+                snapshot_project_node(
+                    &context,
+                    Path::new("/project/default.project.json"),
+                    "Override",
+                    &node,
+                    &vfs,
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+            } else {
+                vfs.write(
+                    "/project/Source/Foo/Code.luau",
+                    "return require('@packages/File')",
+                )
+                .unwrap();
+                vfs.write(
+                    "/project/Source/Foo/Code.meta.json",
+                    serde_json::json!({ "properties": { "Source": original } }).to_string(),
+                )
+                .unwrap();
+                snapshot_from_vfs(&context, &vfs, Path::new("/project/Source/Foo/Code.luau"))
+                    .unwrap()
+                    .unwrap()
+            };
+            // Both override paths retain the transform from the underlying file.
+            assert_eq!(
+                snapshot
+                    .metadata
+                    .source_transform
+                    .as_ref()
+                    .unwrap()
+                    .original,
+                "return require('@packages/File')"
+            );
+            for _ in 0..2 {
+                prepare_requires(&mut snapshot, &vfs, &require_context).unwrap();
+                assert_eq!(
+                    snapshot.properties[&ustr("Source")],
+                    Variant::String(
+                        "return require(\"@game/ReplicatedStorage/Packages/_Index/Foo/Override\")"
+                            .into()
+                    )
+                );
+                assert_eq!(
+                    snapshot
+                        .metadata
+                        .source_transform
+                        .as_ref()
+                        .unwrap()
+                        .original,
+                    original
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_requires_preserves_source_transform_and_context_on_invalid_alias_config() {
+        let (vfs, context, require_context) = require_fixture();
+        let mut snapshot = require_snapshot(&context, &vfs);
+        let properties = snapshot.properties.clone();
+        let transform = snapshot.metadata.source_transform.clone();
+        assert!(transform.is_some());
+        let mut refreshed = (*require_context).clone();
+        refreshed.datamodel = false;
+        vfs.write("/project/.luaurc", "invalid JSON").unwrap();
+        for _ in 0..2 {
+            prepare_requires(&mut snapshot, &vfs, &std::sync::Arc::new(refreshed.clone())).unwrap();
+            assert_eq!(snapshot.properties, properties);
+            assert_eq!(snapshot.metadata.source_transform, transform);
+            assert_eq!(
+                snapshot.metadata.context.require_context,
+                context.require_context
+            );
+        }
+        vfs.write("/project/.luaurc", "{}").unwrap();
+        prepare_requires(&mut snapshot, &vfs, &std::sync::Arc::new(refreshed.clone())).unwrap();
+        assert_eq!(
+            snapshot.properties[&"Source".into()],
+            rbx_dom_weak::types::Variant::String("return require(\"./File\")".into())
+        );
+        assert_eq!(
+            snapshot.metadata.context.require_context.as_deref(),
+            Some(&refreshed)
+        );
+    }
+
+    #[test]
+    fn prepare_requires_clears_obsolete_transforms_after_successful_unchanged_resolution() {
+        use rbx_dom_weak::{types::Variant, ustr};
+
+        for override_source in [false, true] {
+            let (vfs, context, require_context) = require_fixture();
+            let mut snapshot = require_snapshot(&context, &vfs);
+            let original = if override_source {
+                snapshot
+                    .properties
+                    .insert(ustr("Source"), Variant::String("return 42".into()));
+                "return 42".to_owned()
+            } else {
+                snapshot
+                    .metadata
+                    .source_transform
+                    .as_ref()
+                    .unwrap()
+                    .original
+                    .clone()
+            };
+            snapshot.metadata.context.package_mount = None;
+            vfs.write("/project/.luaurc", "{}").unwrap();
+            for _ in 0..2 {
+                prepare_requires(&mut snapshot, &vfs, &require_context).unwrap();
+                assert_eq!(
+                    snapshot.properties[&ustr("Source")],
+                    Variant::String(original.clone())
+                );
+                assert!(snapshot.metadata.source_transform.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_requires_preserves_model_payload_boundaries() {
+        use rbx_dom_weak::{types::Variant, ustr};
+
+        let (vfs, context, require_context) = require_fixture();
+        let payload = InstanceSnapshot::new()
+            .class_name("ModuleScript")
+            .properties(
+                [(
+                    ustr("Source"),
+                    Variant::String("return require('@packages/Native')".into()),
+                )]
+                .into_iter()
+                .collect::<rbx_dom_weak::UstrMap<_>>(),
+            );
+        let mut snapshot = InstanceSnapshot::new()
+            .metadata(crate::snapshot::InstanceMetadata::new().context(&context))
+            .children(vec![payload.clone()]);
+        prepare_requires(&mut snapshot, &vfs, &require_context).unwrap();
+        assert_eq!(snapshot.children[0], payload);
+    }
 
     #[test]
     fn canonical_script_suffixes_preserve_class_and_run_context() {
