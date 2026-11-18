@@ -200,6 +200,58 @@ return function()
 		root:Destroy()
 	end)
 
+	it("excludes runtime players while preserving serializable children of Players", function()
+		for playerCount = 0, 2 do
+			const savedChild = Instance.new("Folder")
+			savedChild.Name = "Player"
+			const children = { savedChild }
+			for index = 1, playerCount do
+				table.insert(children, {
+					Archivable = true,
+					ClassName = "Player",
+					Name = `Transient{index}`,
+					GetFullName = function(self)
+						return `Players.{self.Name}`
+					end,
+					GetChildren = function()
+						error("Runtime player subtrees must not be captured.")
+					end,
+				})
+			end
+			const service = {
+				ClassName = "Players",
+				Name = "Players",
+				GetChildren = function()
+					return children
+				end,
+			}
+			const boundary = boundaries({
+				GetChildren = function()
+					return { service }
+				end,
+			})
+			boundary.serialize = function(instances)
+				expect(#instances).to.equal(1)
+				expect(instances[1]).to.equal(savedChild)
+				return "persistent player-service content"
+			end
+			const body = request("place")
+			body.paths = {}
+			body.allowIncomplete = true
+			const contents, manifest = StudioExport.capture(body, boundary)
+			expect(contents).to.equal("persistent player-service content")
+			expect(#manifest.roots).to.equal(1)
+			expect(manifest.roots[1].name).to.equal("Player")
+			expect(manifest.roots[1].className).to.equal("Folder")
+			expect(manifest.roots[1].service).to.equal("Players")
+			expect(manifest.roots[1].descendantCount).to.equal(0)
+			expect(#manifest.services).to.equal(1)
+			expect(manifest.services[1].className).to.equal("Players")
+			expect(#manifest.warnings).to.equal(1 + playerCount)
+			savedChild:Destroy()
+		end
+	end)
+
 	it("serializes Terrain and its children alongside other live service children", function()
 		const child = Instance.new("Folder")
 		child.Name = "Live"
