@@ -31,6 +31,30 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Preserved native binary capture chunks instead of decoding and rewriting their property
+  values. Binary exports retain opaque Terrain data, metadata, identities, and references;
+  model exports keep Studio's original bytes. Place exports add service containers without
+  changing existing identifiers or shared-string indexes. XML conversion rejects data it
+  cannot preserve instead of silently dropping it.
+* Captured readable read-only service properties, complete backup attributes, and additional
+  native-persisted service containers. Preserved null service references and references to
+  captured roots or services, including `Workspace.CurrentCamera`, using explicit capture
+  identities. The server and plugin now require protocol version 11. Reconstructed collision
+  group data through public PhysicsService APIs while preserving actual group IDs and
+  masks, and captured authored base-material overrides through the public MaterialService
+  getter. Encoded readable security capabilities as exact unsigned 64-bit integers without
+  duplicating deprecated enum aliases. Normal filesystem syncback retains its existing
+  attribute ownership rules.
+* Included readable `Workspace.NextGenerationPhysicsSolver` and
+  `Lighting.LightAttenuationMode` despite older reflection metadata, preserving their current
+  enum values without translating deprecated settings.
+* Distinguished unreadable service fields from unsupported encodings in export warnings.
+  Whole-place exports still require `--allow-incomplete`; protected service state is not
+  inferred, bypassed, or presented as equivalent to native Studio Save As. Explicitly warned
+  that unavailable `Workspace.NeedsPivotMigration` can cause Studio to clear legacy
+  non-descendant `PrimaryPart` references when reopening a draft, even when those references
+  are correctly preserved in the exported binary.
+
 ## `7.7.1-horse.2.3`
 
 * Included AvatarSettings, HttpService, and TestService in whole-place exports. They are

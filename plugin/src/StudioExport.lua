@@ -12,33 +12,75 @@ const Http = require(Packages.Http)
 const Promise = require(Packages.Promise)
 const RbxDom = require(Packages.RbxDom)
 const ReflectionDatabase = require(Packages.RbxDom.database)
-const encodeProperty = require("./ChangeBatcher/encodeProperty")
+const encodeCollisionGroups = require("./encodeCollisionGroups")
+const encodePropertyValue = require("./encodePropertyValue")
 const StudioSyncback = require("./StudioSyncback")
 const Types = require("./Types")
 
 -- Service and NotCreatable tags alone cannot distinguish Lighting from internal
 -- services. Restrict drafts to known place containers, then verify reflection tags.
 const PLACE_SERVICES = {
+	AssetService = true,
 	AvatarSettings = true,
+	CSGDictionaryService = true,
 	Chat = true,
 	CollectionService = true,
+	ConfigureServerService = true,
+	ContextActionService = true,
+	CookiesService = true,
+	Debris = true,
+	GamePassService = true,
+	GuidRegistryService = true,
 	HttpService = true,
+	InsertService = true,
 	Lighting = true,
 	LocalizationService = true,
+	LodDataService = true,
+	LuaWebService = true,
 	MaterialService = true,
+	NonReplicatedCSGDictionaryService = true,
+	Packages = true,
+	PermissionsService = true,
+	PhysicsService = true,
+	PlayerEmulatorService = true,
 	Players = true,
+	ProximityPromptService = true,
 	ReplicatedFirst = true,
 	ReplicatedStorage = true,
+	ScriptService = true,
+	Selection = true,
+	SerializationService = true,
 	ServerScriptService = true,
 	ServerStorage = true,
+	ServiceVisibilityService = true,
 	SoundService = true,
 	StarterGui = true,
 	StarterPack = true,
 	StarterPlayer = true,
+	StudioData = true,
 	Teams = true,
+	TeleportService = true,
 	TestService = true,
 	TextChatService = true,
+	TimerService = true,
+	TouchInputService = true,
+	TweenService = true,
+	UGCAvatarService = true,
+	VRService = true,
+	VideoCaptureService = true,
+	VideoService = true,
+	VoiceChatService = true,
 	Workspace = true,
+}
+const BASE_MATERIAL_PROPERTIES = {}
+for _, material in Enum.Material:GetEnumItems() do
+	BASE_MATERIAL_PROPERTIES[`{material.Name}Name`] = material
+end
+-- These readable persisted properties postdate the pinned reflection database.
+-- Read their current enum values directly, never through deprecated enum aliases.
+const EXTRA_SERVICE_PROPERTIES = {
+	Lighting = { LightAttenuationMode = "Enum" },
+	Workspace = { NextGenerationPhysicsSolver = "Enum" },
 }
 const StudioExport = {}
 
@@ -106,6 +148,10 @@ end
 
 function StudioExport.serviceProperties(instance, warnings)
 	const names = {}
+	const extraProperties = EXTRA_SERVICE_PROPERTIES[instance.ClassName] or {}
+	for name in extraProperties do
+		names[name] = true
+	end
 	local class = ReflectionDatabase.Classes[instance.ClassName]
 	while class ~= nil do
 		for name in class.Properties do
@@ -120,39 +166,105 @@ function StudioExport.serviceProperties(instance, warnings)
 	table.sort(sortedNames)
 	-- Keep even an otherwise empty property map unambiguously a msgpack map.
 	const properties = { Name = { String = instance.Name } }
+	const references = {}
+	const attempted = {}
 	for _, name in sortedNames do
 		if name == "Name" or name == "Parent" then
 			continue
 		end
-		const descriptor = RbxDom.findCanonicalPropertyDescriptor(instance.ClassName, name)
+		local descriptor = RbxDom.findCanonicalPropertyDescriptor(instance.ClassName, name)
+		if descriptor == nil and extraProperties[name] ~= nil then
+			descriptor = {
+				className = instance.ClassName,
+				dataType = extraProperties[name],
+				name = name,
+			}
+		end
 		if descriptor == nil then
 			continue
 		end
-		if properties[descriptor.name] ~= nil then
+		if attempted[descriptor.name] then
 			continue
 		end
+		attempted[descriptor.name] = true
 		const canonical = ReflectionDatabase.Classes[descriptor.className].Properties[descriptor.name]
-		if canonical.Kind.Canonical.Serialization == "DoesNotSerialize" then
+		if canonical ~= nil and canonical.Kind.Canonical.Serialization == "DoesNotSerialize" then
 			continue
 		end
-		if
-			descriptor.dataType == "Ref"
-			or (descriptor.scriptability ~= "ReadWrite" and descriptor.scriptability ~= "Custom")
-		then
+		local readable, raw
+		if instance.ClassName == "MaterialService" and BASE_MATERIAL_PROPERTIES[descriptor.name] ~= nil then
+			-- Serialized override names are hidden, but their public getter returns
+			-- the actual authored names without reading protected property fields.
+			readable, raw = pcall(function()
+				return instance:GetBaseMaterialOverride(BASE_MATERIAL_PROPERTIES[descriptor.name])
+			end)
+		elseif instance.ClassName == "Workspace" and descriptor.name == "CollisionGroupData" then
+			readable, raw = pcall(function()
+				const physics = instance.Parent and instance.Parent:FindFirstChildOfClass("PhysicsService")
+				assert(physics, "Collision-group capture requires an existing PhysicsService.")
+				const groups = {}
+				for _, group in physics:GetRegisteredCollisionGroups() do
+					-- Native parts retain numeric IDs, including gaps. The name-only
+					-- replacement API cannot recover those serialized identities.
+					table.insert(groups, {
+						Id = physics:GetCollisionGroupId(group.name),
+						Mask = group.mask,
+						Name = group.name,
+					})
+				end
+				return encodeCollisionGroups(groups)
+			end)
+		elseif descriptor.scriptability == "Custom" then
+			const ok, success, value = pcall(descriptor.read, descriptor, instance)
+			readable = ok and success
+			raw = if ok then value else success
+		else
+			-- Reflection scriptability can lag Studio. The ordinary getter still
+			-- enforces the caller's permissions, including read-only properties.
+			readable, raw = pcall(function()
+				return instance[descriptor.name]
+			end)
+		end
+		if not readable then
 			table.insert(
 				warnings,
-				`Omitted service property "{instance.Name}.{name}" (reference or inaccessible property).`
+				`Omitted unreadable service property "{instance.Name}.{descriptor.name}". {tostring(raw)}`
+			)
+			if instance.ClassName == "Workspace" and descriptor.name == "NeedsPivotMigration" then
+				table.insert(
+					warnings,
+					'Unavailable "Workspace.NeedsPivotMigration" can cause Studio to clear legacy non-descendant PrimaryPart references when reopening this draft. Its value was not inferred.'
+				)
+			end
+			continue
+		end
+		if descriptor.dataType == "Ref" then
+			if raw == nil then
+				properties[descriptor.name] = { Ref = "00000000000000000000000000000000" }
+			else
+				table.insert(references, { property = descriptor.name, target = raw })
+			end
+			continue
+		end
+		const ok, encoded, value = pcall(encodePropertyValue, raw, descriptor.dataType)
+		if not ok or not encoded then
+			const reason = if ok then value else encoded
+			table.insert(
+				warnings,
+				`Omitted unsupported service property "{instance.Name}.{descriptor.name}". {tostring(reason)}`
 			)
 			continue
 		end
-		const ok, encoded, value = pcall(encodeProperty, instance, descriptor.name, descriptor, nil)
-		if ok and encoded then
-			properties[descriptor.name] = value
-		else
-			table.insert(warnings, `Omitted unreadable or unsupported service property "{instance.Name}.{name}".`)
+		if descriptor.dataType == "Attributes" then
+			for attributeName in raw do
+				if value.Attributes[attributeName] == nil then
+					table.insert(warnings, `Omitted unsupported service attribute "{instance.Name}.{attributeName}".`)
+				end
+			end
 		end
+		properties[descriptor.name] = value
 	end
-	return properties
+	return properties, references
 end
 
 const function warnExternalReferences(roots, warnings)
@@ -209,12 +321,16 @@ function StudioExport.capture(request, dependencies)
 	const instances = {}
 	const roots = {}
 	const services = {}
+	const rootIndices = {}
+	const serviceIndices = {}
+	const pendingReferences = {}
 	const warnings = {}
 	const function addRoot(instance, service)
 		const size = subtreeSize(instance, warnings)
 		if size == 0 then
 			return
 		end
+		rootIndices[instance] = #instances
 		table.insert(instances, instance)
 		table.insert(roots, {
 			name = instance.Name,
@@ -241,10 +357,14 @@ function StudioExport.capture(request, dependencies)
 			if PLACE_SERVICES[service.ClassName] and hasTag(service.ClassName, "Service") then
 				assert(not serviceNames[service.Name], `Duplicate service name "{service.Name}".`)
 				serviceNames[service.Name] = true
+				serviceIndices[service] = #services
+				const properties, references = dependencies.serviceProperties(service, warnings)
+				table.insert(pendingReferences, references or {})
 				table.insert(services, {
 					name = service.Name,
 					className = service.ClassName,
-					properties = dependencies.serviceProperties(service, warnings),
+					properties = properties,
+					references = {},
 				})
 				for _, child in service:GetChildren() do
 					-- Studio omits runtime players even when Archivable is true, so they
@@ -295,6 +415,28 @@ function StudioExport.capture(request, dependencies)
 		end
 		assert(#instances > 0, "No archivable model roots remain to export.")
 		warnExternalReferences(instances, warnings)
+	end
+	-- Resolve only after every service and native root has an identity. Wire indexes are
+	-- zero-based positions, never paths or names that can alias different instances.
+	for serviceIndex, references in pendingReferences do
+		const service = services[serviceIndex]
+		for _, reference in references do
+			const rootIndex = rootIndices[reference.target]
+			const targetServiceIndex = serviceIndices[reference.target]
+			local target
+			if rootIndex ~= nil then
+				target = { kind = "root", index = rootIndex }
+			elseif targetServiceIndex ~= nil then
+				target = { kind = "service", index = targetServiceIndex }
+			else
+				table.insert(
+					warnings,
+					`Omitted service reference property "{service.name}.{reference.property}" (target is not a captured root or service).`
+				)
+				continue
+			end
+			table.insert(service.references, { property = reference.property, target = target })
+		end
 	end
 	const contents = if #instances == 0 then "" else dependencies.serialize(instances)
 	return contents, { roots = roots, services = services, warnings = warnings }
