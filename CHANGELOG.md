@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.4`
+
 * Preserved native binary capture chunks instead of decoding and rewriting their property
   values. Binary exports retain opaque Terrain data, metadata, identities, and references;
   model exports keep Studio's original bytes. Place exports add service containers without
