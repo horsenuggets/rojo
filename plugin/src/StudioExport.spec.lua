@@ -3,6 +3,7 @@ return function()
 	const Packages = script.Parent.Parent.Packages
 	const Http = require(Packages.Http)
 	const Promise = require(Packages.Promise)
+	const RbxDom = require(Packages.RbxDom)
 	const Types = require(script.Parent.Types)
 
 	const function request(scope)
@@ -60,6 +61,46 @@ return function()
 		duplicate.Parent = root
 		expect(pcall(StudioExport.resolvePath, root, "Root/Child")).to.equal(false)
 		root:Destroy()
+	end)
+
+	it("native serialization keeps identical root labels in input order with cross-root references", function()
+		const serializer = game:GetService("SerializationService")
+		const parents = {}
+		const roots = {}
+		for index = 1, 3 do
+			const parent = Instance.new("Folder")
+			const root = Instance.new("Model")
+			root.Name = "Same"
+			root:SetAttribute("CaptureOrder", index)
+			root.Parent = parent
+			parents[index] = parent
+			roots[index] = root
+		end
+		for index, root in roots do
+			const link = Instance.new("ObjectValue")
+			link.Name = "Link"
+			link.Value = roots[index % #roots + 1]
+			link.Parent = root
+		end
+		for _, order in { { 1, 2, 3 }, { 1, 3, 2 }, { 2, 1, 3 }, { 2, 3, 1 }, { 3, 1, 2 }, { 3, 2, 1 } } do
+			const selected = {}
+			for _, index in order do
+				table.insert(selected, roots[index])
+			end
+			const loaded = serializer:DeserializeInstancesAsync(serializer:SerializeInstancesAsync(selected))
+			expect(#loaded).to.equal(#order)
+			for index, root in loaded do
+				expect(root.Name).to.equal("Same")
+				expect(root:GetAttribute("CaptureOrder")).to.equal(order[index])
+				expect(root.Link.Value:GetAttribute("CaptureOrder")).to.equal(order[index] % #roots + 1)
+			end
+			for _, root in loaded do
+				root:Destroy()
+			end
+		end
+		for _, parent in parents do
+			parent:Destroy()
+		end
 	end)
 
 	it("normalizes duplicates and nested roots in stable input order", function()
@@ -252,8 +293,19 @@ return function()
 		end
 	end)
 
-	it("captures every mapped place service that still has the Service tag", function()
-		for _, className in { "AvatarSettings", "HttpService", "TestService" } do
+	it("captures native persisted services and their children when they have the Service tag", function()
+		for _, className in
+			{
+				"AssetService",
+				"AvatarSettings",
+				"HttpService",
+				"InsertService",
+				"PhysicsService",
+				"SerializationService",
+				"TestService",
+				"TweenService",
+			}
+		do
 			const child = Instance.new("Folder")
 			child.Name = "Persisted"
 			const service = {
@@ -336,6 +388,87 @@ return function()
 		child:Destroy()
 	end)
 
+	it("resolves service references by captured identity after collecting every root", function()
+		const camera = Instance.new("Camera")
+		const duplicate = Instance.new("Camera")
+		camera.Name = "Same"
+		duplicate.Name = "Same"
+		const external = Instance.new("Camera")
+		const workspaceService = {
+			Name = "Workspace",
+			ClassName = "Workspace",
+			GetChildren = function()
+				return { duplicate, camera }
+			end,
+		}
+		const lighting = {
+			Name = "Lighting",
+			ClassName = "Lighting",
+			GetChildren = function()
+				return {}
+			end,
+		}
+		const boundary = boundaries({
+			GetChildren = function()
+				return { workspaceService, lighting }
+			end,
+		})
+		boundary.serviceProperties = function(service)
+			return { Name = { String = service.Name } },
+				if service == lighting
+					then {
+						{ property = "LaterRoot", target = camera },
+						{ property = "LaterService", target = workspaceService },
+						{ property = "External", target = external },
+					}
+					else { { property = "CurrentCamera", target = camera } }
+		end
+		const body = request("place")
+		body.paths = {}
+		body.allowIncomplete = true
+		const _, manifest = StudioExport.capture(body, boundary)
+		const before = manifest.services[1].references
+		expect(before[1].property).to.equal("LaterRoot")
+		expect(before[1].target.kind).to.equal("root")
+		expect(before[1].target.index).to.equal(1)
+		expect(before[2].property).to.equal("LaterService")
+		expect(before[2].target.kind).to.equal("service")
+		expect(before[2].target.index).to.equal(1)
+		expect(#before).to.equal(2)
+		const captured = manifest.services[2].references
+		expect(captured[1].property).to.equal("CurrentCamera")
+		expect(captured[1].target.kind).to.equal("root")
+		expect(captured[1].target.index).to.equal(1)
+		expect(#manifest.warnings).to.equal(2)
+		expect(manifest.warnings[2]:find("Lighting.External", 1, true) ~= nil).to.equal(true)
+		expect(camera.Parent).to.equal(nil)
+		camera:Destroy()
+		duplicate:Destroy()
+		external:Destroy()
+	end)
+
+	it("retains readable non-null service references for deferred capture mapping", function()
+		const camera = Instance.new("Camera")
+		const properties, references = StudioExport.serviceProperties({
+			Name = "Workspace",
+			ClassName = "Workspace",
+			CurrentCamera = camera,
+			GetAttributes = function()
+				return {}
+			end,
+		}, {})
+		expect(properties.CurrentCamera).to.equal(nil)
+		local found = false
+		for _, reference in references do
+			if reference.property == "CurrentCamera" then
+				expect(reference.target).to.equal(camera)
+				found = true
+			end
+		end
+		expect(found).to.equal(true)
+		camera:Destroy()
+	end)
+
 	it("encodes live scalar service properties and reports unreadable ones", function()
 		const warnings = {}
 		const properties = StudioExport.serviceProperties({
@@ -353,6 +486,308 @@ return function()
 		expect(properties.AttributesSerialize).to.equal(nil)
 		expect(type(properties.Attributes.Attributes)).to.equal("table")
 		expect(#warnings > 0).to.equal(true)
+	end)
+
+	it("captures readable read-only service properties without requiring write access", function()
+		const properties = StudioExport.serviceProperties({
+			Name = "HttpService",
+			ClassName = "HttpService",
+			HttpEnabled = true,
+			GetAttributes = function()
+				return {}
+			end,
+		}, {})
+		expect(properties.HttpEnabled.Bool).to.equal(true)
+	end)
+
+	it("captures supported service getters when reflection marks them inaccessible", function()
+		const properties = StudioExport.serviceProperties({
+			Name = "Workspace",
+			ClassName = "Workspace",
+			StreamOutBehavior = Enum.StreamOutBehavior.Opportunistic,
+			StreamingIntegrityMode = Enum.StreamingIntegrityMode.PauseOutsideLoadedArea,
+			StreamingTargetRadius = 512,
+			GetAttributes = function()
+				return {}
+			end,
+		}, {})
+		expect(properties.StreamOutBehavior.Enum).to.equal(Enum.StreamOutBehavior.Opportunistic.Value)
+		expect(properties.StreamingIntegrityMode.Enum).to.equal(
+			Enum.StreamingIntegrityMode.PauseOutsideLoadedArea.Value
+		)
+		expect(properties.StreamingTargetRadius.Int32).to.equal(512)
+	end)
+
+	it("captures new service enums directly without translating obsolete reflection enums", function()
+		for _, case in
+			{
+				{ ClassName = "Workspace", Property = "NextGenerationPhysicsSolver", Enum = Enum.RolloutState },
+				{ ClassName = "Lighting", Property = "LightAttenuationMode", Enum = Enum.LightAttenuationMode },
+			}
+		do
+			for _, value in case.Enum:GetEnumItems() do
+				const instance = {
+					ClassName = case.ClassName,
+					Name = case.ClassName,
+					[case.Property] = value,
+					GetAttributes = function()
+						return {}
+					end,
+				}
+				const properties = StudioExport.serviceProperties(instance, {})
+				expect(properties[case.Property].Enum).to.equal(value.Value)
+			end
+		end
+	end)
+
+	it("reports failed getters for new service enums without synthesizing values", function()
+		for _, case in
+			{
+				{ ClassName = "Workspace", Property = "NextGenerationPhysicsSolver" },
+				{ ClassName = "Lighting", Property = "LightAttenuationMode" },
+			}
+		do
+			const warnings = {}
+			const instance = setmetatable({
+				ClassName = case.ClassName,
+				Name = case.ClassName,
+				GetAttributes = function()
+					return {}
+				end,
+			}, {
+				__index = function(_, name)
+					if name == case.Property then
+						error(`New getter unavailable for {name}.`)
+					end
+					return nil
+				end,
+			})
+			const properties = StudioExport.serviceProperties(instance, warnings)
+			expect(properties[case.Property]).to.equal(nil)
+			expect(table.concat(warnings, "\n"):find(`New getter unavailable for {case.Property}.`, 1, true) ~= nil).to.equal(
+				true
+			)
+		end
+	end)
+
+	it("captures material overrides through the public getter without reading hidden name fields", function()
+		const queried = {}
+		local hiddenReads = 0
+		const instance = setmetatable({
+			ClassName = "MaterialService",
+			Name = "MaterialService",
+			GetAttributes = function()
+				return {}
+			end,
+			GetBaseMaterialOverride = function(_, material)
+				expect(material.EnumType).to.equal(Enum.Material)
+				expect(queried[material]).to.equal(nil)
+				queried[material] = true
+				return if material == Enum.Material.Rock then "" else `Custom-{material.Name}`
+			end,
+		}, {
+			__index = function(_, name)
+				if name == "AsphaltName" or name == "GrassName" or name == "RockName" then
+					hiddenReads += 1
+					error("Hidden material names must not be read.")
+				end
+				return nil
+			end,
+		})
+		const properties = StudioExport.serviceProperties(instance, {})
+		expect(hiddenReads).to.equal(0)
+		expect(properties.AsphaltName.String).to.equal("Custom-Asphalt")
+		expect(properties.GrassName.String).to.equal("Custom-Grass")
+		expect(properties.RockName.String).to.equal("")
+		expect(queried[Enum.Material.Asphalt]).to.equal(true)
+		expect(queried[Enum.Material.Grass]).to.equal(true)
+		expect(queried[Enum.Material.Rock]).to.equal(true)
+		expect(queried[Enum.Material.Air]).to.equal(nil)
+	end)
+
+	it("reports failed public material getters without inventing override names", function()
+		const warnings = {}
+		const properties = StudioExport.serviceProperties({
+			ClassName = "MaterialService",
+			Name = "MaterialService",
+			GetAttributes = function()
+				return {}
+			end,
+			GetBaseMaterialOverride = function(_, material)
+				error(`Public material getter failed for {material.Name}.`)
+			end,
+		}, warnings)
+		expect(properties.GrassName).to.equal(nil)
+		const text = table.concat(warnings, "\n")
+		expect(text:find('Omitted unreadable service property "MaterialService.GrassName"', 1, true) ~= nil).to.equal(
+			true
+		)
+		expect(text:find("Public material getter failed for Grass.", 1, true) ~= nil).to.equal(true)
+	end)
+
+	it("captures collision groups through public APIs without reading the hidden property", function()
+		const physics = {
+			GetRegisteredCollisionGroups = function()
+				return { { name = "Later", mask = -4 }, { name = "Default", mask = -1 } }
+			end,
+			GetCollisionGroupId = function(_, name)
+				return if name == "Later" then 7 else 0
+			end,
+		}
+		const instance = setmetatable({
+			ClassName = "Workspace",
+			Name = "Workspace",
+			Parent = {
+				FindFirstChildOfClass = function(_, class)
+					expect(class).to.equal("PhysicsService")
+					return physics
+				end,
+			},
+			GetAttributes = function()
+				return {}
+			end,
+		}, {
+			__index = function(_, name)
+				assert(name ~= "CollisionGroupData", "Hidden collision bytes must not be read.")
+				return nil
+			end,
+		})
+		const properties = StudioExport.serviceProperties(instance, {})
+		const ok, expected = RbxDom.EncodedValue.encode(
+			string.char(1, 2, 0, 4, 255, 255, 255, 255, 7)
+				.. "Default"
+				.. string.char(7, 4, 252, 255, 255, 255, 5)
+				.. "Later",
+			"BinaryString"
+		)
+		expect(ok).to.equal(true)
+		expect(properties.CollisionGroupData.BinaryString).to.equal(expected.BinaryString)
+	end)
+
+	it("reports denied service getters without inventing a property value", function()
+		const instance = setmetatable({
+			Name = "HttpService",
+			ClassName = "HttpService",
+			GetAttributes = function()
+				return {}
+			end,
+		}, {
+			__index = function(_, name)
+				if name == "HttpEnabled" then
+					error("The caller cannot read this property.")
+				end
+				return nil
+			end,
+		})
+		const warnings = {}
+		const properties = StudioExport.serviceProperties(instance, warnings)
+		expect(properties.HttpEnabled).to.equal(nil)
+		local reported = false
+		for _, warning in warnings do
+			if string.find(warning, 'unreadable service property "HttpService.HttpEnabled"', 1, true) then
+				reported = true
+			end
+		end
+		expect(reported).to.equal(true)
+	end)
+
+	it("reports the restore impact of unavailable Workspace pivot migration state without guessing it", function()
+		for _, state in { "denied", false, true } do
+			const warnings = {}
+			const instance = setmetatable({
+				Name = "Workspace",
+				ClassName = "Workspace",
+				GetAttributes = function()
+					return {}
+				end,
+			}, {
+				__index = function(_, name)
+					if name == "NeedsPivotMigration" then
+						if state == "denied" then
+							error("The caller cannot read pivot migration state.")
+						end
+						return state
+					end
+					return nil
+				end,
+			})
+			const properties = StudioExport.serviceProperties(instance, warnings)
+			const warned = table.concat(warnings, "\n"):find("legacy non-descendant PrimaryPart references", 1, true)
+				~= nil
+			if state == "denied" then
+				expect(properties.NeedsPivotMigration).to.equal(nil)
+				expect(warned).to.equal(true)
+			else
+				expect(properties.NeedsPivotMigration.Bool).to.equal(state)
+				expect(warned).to.equal(false)
+			end
+		end
+	end)
+
+	it("distinguishes captured null service references from denied getters", function()
+		for _, denied in { false, true } do
+			const instance = setmetatable({
+				Name = "StarterGui",
+				ClassName = "StarterGui",
+				GetAttributes = function()
+					return {}
+				end,
+			}, {
+				__index = function(_, name)
+					if name == "StudioDefaultStyleSheet" and denied then
+						error("The caller cannot read this reference.")
+					end
+					return nil
+				end,
+			})
+			const properties = StudioExport.serviceProperties(instance, {})
+			if denied then
+				expect(properties.StudioDefaultStyleSheet).to.equal(nil)
+			else
+				expect(properties.StudioDefaultStyleSheet.Ref).to.equal("00000000000000000000000000000000")
+			end
+		end
+	end)
+
+	it("keeps encodable attributes while reporting unsupported entries", function()
+		const warnings = {}
+		const properties = StudioExport.serviceProperties({
+			Name = "Lighting",
+			ClassName = "Lighting",
+			GetAttributes = function()
+				return { Authored = "preserved", Unsupported = function() end }
+			end,
+		}, warnings)
+		expect(properties.Attributes.Attributes.Authored.String).to.equal("preserved")
+		expect(properties.Attributes.Attributes.Unsupported).to.equal(nil)
+		local reported = false
+		for _, warning in warnings do
+			if string.find(warning, 'unsupported service attribute "Lighting.Unsupported"', 1, true) then
+				reported = true
+			end
+		end
+		expect(reported).to.equal(true)
+	end)
+
+	it("preserves engine attributes in a backup without changing the source table", function()
+		const attributes = {
+			Authored = "preserved",
+			RBX_LightingTechnologyUnifiedMigration = true,
+			RBX_OriginalTechnologyOnFileLoad = 3,
+		}
+		const properties = StudioExport.serviceProperties({
+			Name = "Lighting",
+			ClassName = "Lighting",
+			GetAttributes = function()
+				return attributes
+			end,
+		}, {})
+		const encoded = properties.Attributes.Attributes
+		expect(encoded.RBX_OriginalTechnologyOnFileLoad.Float64).to.equal(3)
+		expect(encoded.RBX_LightingTechnologyUnifiedMigration.Bool).to.equal(true)
+		expect(encoded.Authored.String).to.equal("preserved")
+		expect(attributes.RBX_OriginalTechnologyOnFileLoad).to.equal(3)
+		expect(attributes.RBX_LightingTechnologyUnifiedMigration).to.equal(true)
 	end)
 
 	it("uploads bounded binary parts and a msgpack manifest in order", function()
