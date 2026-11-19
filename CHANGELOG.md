@@ -31,6 +31,9 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added opt-in `rojo serve --shutdown-on-stdin-eof` to stop launcher-owned servers when
+  standard input closes, without waiting for active HTTP or WebSocket clients.
+
 ## `7.7.1-horse.2.4`
 
 * Preserved native binary capture chunks instead of decoding and rewriting their property
