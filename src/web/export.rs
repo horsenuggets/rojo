@@ -88,12 +88,28 @@ pub struct CaptureRoot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum CaptureReferenceTarget {
+    Root { index: usize },
+    Service { index: usize },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureReference {
+    pub property: String,
+    pub target: CaptureReferenceTarget,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureService {
     pub name: String,
     pub class_name: String,
     #[serde(deserialize_with = "deserialize_service_properties")]
     pub properties: HashMap<String, Variant>,
+    #[serde(default)]
+    pub references: Vec<CaptureReference>,
 }
 
 fn deserialize_service_properties<'de, D: serde::Deserializer<'de>>(
@@ -436,6 +452,52 @@ mod tests {
     }
 
     #[test]
+    fn service_references_round_trip_typed_capture_positions() {
+        for kind in ["root", "service"] {
+            let value = serde_json::json!({
+                "name": "Workspace", "className": "Workspace", "properties": {},
+                "references": [{"property": "CurrentCamera", "target": {"kind": kind, "index": 0}}],
+            });
+            let service: CaptureService =
+                deserialize_msgpack(&super::super::util::serialize_msgpack(&value).unwrap())
+                    .unwrap();
+            assert_eq!(serde_json::to_value(service).unwrap(), value);
+        }
+        for target in [
+            serde_json::json!({"kind": "root", "index": -1}),
+            serde_json::json!({"kind": "root", "index": 0.5}),
+            serde_json::json!({"kind": "path", "index": 0}),
+            serde_json::json!({"kind": "root", "index": 0, "path": "Camera"}),
+        ] {
+            let value = serde_json::json!({
+                "name": "Workspace", "className": "Workspace", "properties": {},
+                "references": [{"property": "CurrentCamera", "target": target}],
+            });
+            assert!(deserialize_msgpack::<CaptureService>(
+                &super::super::util::serialize_msgpack(value).unwrap(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn service_capabilities_preserve_unsigned_integer_bits_from_msgpack() {
+        for bits in [0, 1 << 31, (1 << 52) | 1, (1 << 63) | 1, u64::MAX] {
+            let value = serde_json::json!({
+                "name": "Workspace",
+                "className": "Workspace",
+                "properties": {"Capabilities": {"SecurityCapabilities": bits}},
+            });
+            let bytes = super::super::util::serialize_msgpack(value).unwrap();
+            let service: CaptureService = deserialize_msgpack(&bytes).unwrap();
+            match service.properties.get("Capabilities") {
+                Some(Variant::SecurityCapabilities(value)) => assert_eq!(value.bits(), bits),
+                value => panic!("Expected security capabilities, got {value:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn selectors_have_exactly_one_mode() {
         for scope in [Scope::Model, Scope::Place] {
             for paths in [false, true] {
@@ -594,6 +656,7 @@ mod tests {
                             name: "Workspace".into(),
                             class_name: "Workspace".into(),
                             properties: HashMap::new(),
+                            references: vec![],
                         }]
                     } else {
                         vec![]

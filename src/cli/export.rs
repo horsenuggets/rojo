@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io::{Read, Write},
     net::IpAddr,
     path::{Path, PathBuf},
@@ -8,7 +7,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use clap::Parser;
-use rbx_dom_weak::{ustr, InstanceBuilder, WeakDom};
+use rbx_dom_weak::WeakDom;
 use reqwest::blocking::{Client, Response};
 
 use crate::web::{
@@ -18,6 +17,8 @@ use crate::web::{
 };
 
 use super::build::{xml_encode_config, OutputKind};
+
+mod binary;
 
 const MAX_RESPONSE_SIZE: u64 = 272 * 1024 * 1024;
 
@@ -103,14 +104,13 @@ impl ExportCommand {
         let capture: CaptureResult =
             deserialize_msgpack(&read_response(response, MAX_RESPONSE_SIZE)?)
                 .context("Could not decode Studio's export response")?;
-        let (dom, warnings) = assemble_capture(capture, scope)?;
+        let (bytes, warnings) = capture_bytes(capture, scope, kind)?;
         for warning in &warnings {
             eprintln!("Warning. {warning}");
         }
         if !warnings.is_empty() && !self.allow_incomplete {
             bail!("Studio reported export limitations. No output was written. Pass --allow-incomplete to accept them.");
         }
-        let bytes = encode_capture(&dom, kind)?;
         write_output(&self.output, &bytes)
             .with_context(|| format!("Could not write export to \"{}\"", self.output.display()))?;
         println!(
@@ -156,73 +156,28 @@ fn read_response(mut response: Response, limit: u64) -> anyhow::Result<Vec<u8>> 
     Ok(bytes)
 }
 
+fn capture_bytes(
+    capture: CaptureResult,
+    scope: Scope,
+    kind: OutputKind,
+) -> anyhow::Result<(Vec<u8>, Vec<String>)> {
+    let (bytes, warnings) = binary::assemble_capture(capture, scope)?;
+    if matches!(kind, OutputKind::Rbxl | OutputKind::Rbxm) {
+        return Ok((bytes, warnings));
+    }
+    binary::ensure_xml_safe(&bytes)?;
+    let dom = rbx_binary::from_reader(bytes.as_slice())
+        .context("Could not decode the validated capture for XML output")?;
+    Ok((encode_capture(&dom, kind)?, warnings))
+}
+
+#[cfg(test)]
 fn assemble_capture(
     capture: CaptureResult,
     scope: Scope,
 ) -> anyhow::Result<(WeakDom, Vec<String>)> {
-    let manifest = capture.manifest;
-    if let Some(error) = manifest.error {
-        bail!("Studio capture failed. {error}");
-    }
-    let mut warnings = manifest.warnings;
-    let mut dom = if capture.model_contents.is_empty() {
-        WeakDom::new(InstanceBuilder::new("DataModel"))
-    } else {
-        rbx_binary::from_reader(capture.model_contents.as_slice())
-            .context("Could not decode the live Studio model")?
-    };
-    let children = dom.root().children().to_vec();
-    if children.len() != manifest.roots.len() {
-        bail!("Studio omitted or added capture roots. The export cannot be safely reconstructed.");
-    }
-    let mut services = HashMap::new();
-    if scope == Scope::Model && !manifest.services.is_empty() {
-        bail!("A model capture unexpectedly contains service containers.");
-    }
-    for service in manifest.services {
-        if services.contains_key(&service.name) {
-            bail!("The capture contains duplicate service names.");
-        }
-        let mut builder = InstanceBuilder::new(service.class_name).with_name(&service.name);
-        for (name, value) in service.properties {
-            if matches!(value, rbx_dom_weak::types::Variant::Ref(_)) {
-                warnings.push(format!("Omitted service reference property \"{}.{}\", which has no capture-relative target.", service.name, name));
-                continue;
-            }
-            builder = builder.with_property(name, value);
-        }
-        let id = dom.insert(dom.root_ref(), builder);
-        services.insert(service.name, id);
-    }
-    for (child_id, root) in children.into_iter().zip(manifest.roots) {
-        let child = dom.get_by_ref(child_id).unwrap();
-        if child.name != root.name || child.class.as_str() != root.class_name {
-            bail!("Studio's capture root order does not match the manifest.");
-        }
-        let mut count = 0;
-        let mut pending = child.children().to_vec();
-        while let Some(id) = pending.pop() {
-            count += 1;
-            pending.extend_from_slice(dom.get_by_ref(id).unwrap().children());
-        }
-        if count != root.descendant_count {
-            warnings.push(format!(
-                "Studio serialized {count} of {} expected descendants of \"{}\".",
-                root.descendant_count, root.name
-            ));
-        }
-        match (scope, root.service) {
-            (Scope::Place, Some(service)) => {
-                let parent = services
-                    .get(&service)
-                    .context("The capture root refers to an unknown service")?;
-                dom.transfer_within(child_id, *parent);
-            }
-            (_, None) => {}
-            _ => bail!("The capture root does not match the requested export scope."),
-        }
-    }
-    dom.root_mut().class = ustr("DataModel");
+    let (bytes, warnings) = binary::assemble_capture(capture, scope)?;
+    let dom = rbx_binary::from_reader(bytes.as_slice())?;
     Ok((dom, warnings))
 }
 
@@ -244,7 +199,8 @@ fn encode_capture(dom: &WeakDom, kind: OutputKind) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::web::export::{CaptureManifest, CaptureRoot, CaptureService};
-    use rbx_dom_weak::types::Variant;
+    use rbx_dom_weak::{types::Variant, ustr, InstanceBuilder};
+    use std::collections::HashMap;
 
     fn capture(scope: Scope) -> CaptureResult {
         let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
@@ -274,6 +230,7 @@ mod tests {
                         name: "Workspace".into(),
                         class_name: "Workspace".into(),
                         properties: HashMap::from([("Gravity".into(), Variant::Float32(123.0))]),
+                        references: vec![],
                     }]
                 } else {
                     vec![]
@@ -310,6 +267,7 @@ mod tests {
                         name: "Workspace".into(),
                         class_name: "Workspace".into(),
                         properties: HashMap::new(),
+                        references: vec![],
                     }],
                     warnings: vec![],
                     error: None,
@@ -428,9 +386,8 @@ mod tests {
             (Scope::Place, OutputKind::Rbxlx),
         ] {
             let binary = matches!(kind, OutputKind::Rbxm | OutputKind::Rbxl);
-            let (dom, warnings) = assemble_capture(capture(scope), scope).unwrap();
+            let (bytes, warnings) = capture_bytes(capture(scope), scope, kind).unwrap();
             assert!(warnings.is_empty());
-            let bytes = encode_capture(&dom, kind).unwrap();
             let decoded = if binary {
                 rbx_binary::from_reader(bytes.as_slice()).unwrap()
             } else {
@@ -531,6 +488,7 @@ mod tests {
             name: "Workspace".into(),
             class_name: "Workspace".into(),
             properties: HashMap::new(),
+            references: vec![],
         });
         let (dom, warnings) = assemble_capture(upload, Scope::Place).unwrap();
         assert!(warnings.is_empty());
@@ -539,6 +497,144 @@ mod tests {
             dom.get_by_ref(dom.root().children()[0]).unwrap().name,
             "Unsynced"
         );
+    }
+
+    #[test]
+    fn public_material_override_names_survive_binary_and_xml_place_output() {
+        let expected = [
+            ("AsphaltName", "AuthoredAsphalt"),
+            ("GrassName", ""),
+            ("WoodName", "AuthoredWood"),
+        ];
+        for kind in [OutputKind::Rbxl, OutputKind::Rbxlx] {
+            let mut upload = capture(Scope::Place);
+            upload.manifest.services.push(CaptureService {
+                name: "MaterialService".into(),
+                class_name: "MaterialService".into(),
+                properties: expected
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), Variant::String(value.to_string())))
+                    .collect(),
+                references: vec![],
+            });
+            let (bytes, warnings) = capture_bytes(upload, Scope::Place, kind).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let decoded = if matches!(kind, OutputKind::Rbxl) {
+                rbx_binary::from_reader(bytes.as_slice()).unwrap()
+            } else {
+                rbx_xml::from_reader(bytes.as_slice(), rbx_xml::DecodeOptions::new()).unwrap()
+            };
+            let service = decoded
+                .descendants()
+                .find(|instance| instance.class == "MaterialService")
+                .unwrap();
+            for (name, value) in expected {
+                assert_eq!(
+                    service.properties.get(&ustr(name)),
+                    Some(&Variant::String(value.into()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_service_enums_preserve_numeric_values_in_binary_and_xml_place_output() {
+        use rbx_dom_weak::types::Enum;
+        for value in 0..=2 {
+            for kind in [OutputKind::Rbxl, OutputKind::Rbxlx] {
+                let expected = Variant::Enum(Enum::from_u32(value));
+                let mut upload = capture(Scope::Place);
+                upload.manifest.services[0]
+                    .properties
+                    .insert("NextGenerationPhysicsSolver".into(), expected.clone());
+                upload.manifest.services.push(CaptureService {
+                    name: "Lighting".into(),
+                    class_name: "Lighting".into(),
+                    properties: HashMap::from([("LightAttenuationMode".into(), expected.clone())]),
+                    references: vec![],
+                });
+                let (bytes, warnings) = capture_bytes(upload, Scope::Place, kind).unwrap();
+                assert!(warnings.is_empty(), "{warnings:?}");
+                let decoded = if matches!(kind, OutputKind::Rbxl) {
+                    rbx_binary::from_reader(bytes.as_slice()).unwrap()
+                } else {
+                    rbx_xml::from_reader(
+                        bytes.as_slice(),
+                        rbx_xml::DecodeOptions::new()
+                            .property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown),
+                    )
+                    .unwrap()
+                };
+                for (class, property) in [
+                    ("Workspace", "NextGenerationPhysicsSolver"),
+                    ("Lighting", "LightAttenuationMode"),
+                ] {
+                    let service = decoded
+                        .descendants()
+                        .find(|instance| instance.class == class)
+                        .unwrap();
+                    assert_eq!(service.properties.get(&ustr(property)), Some(&expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captured_current_camera_identity_survives_binary_and_xml_place_output() {
+        use crate::web::export::{CaptureReference, CaptureReferenceTarget};
+        for kind in [OutputKind::Rbxl, OutputKind::Rbxlx] {
+            let mut source = WeakDom::new(InstanceBuilder::new("DataModel"));
+            for field_of_view in [30.0_f32, 80.0_f32] {
+                source.insert(
+                    source.root_ref(),
+                    InstanceBuilder::new("Camera")
+                        .with_name("Same")
+                        .with_property("FieldOfView", field_of_view),
+                );
+            }
+            let mut upload = capture(Scope::Place);
+            upload.model_contents.clear();
+            rbx_binary::to_writer(
+                &mut upload.model_contents,
+                &source,
+                source.root().children(),
+            )
+            .unwrap();
+            upload.manifest.roots = (0..2)
+                .map(|_| CaptureRoot {
+                    name: "Same".into(),
+                    class_name: "Camera".into(),
+                    service: Some("Workspace".into()),
+                    descendant_count: 0,
+                })
+                .collect();
+            upload.manifest.services[0]
+                .references
+                .push(CaptureReference {
+                    property: "CurrentCamera".into(),
+                    target: CaptureReferenceTarget::Root { index: 1 },
+                });
+            let (bytes, warnings) = capture_bytes(upload, Scope::Place, kind).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let decoded = if matches!(kind, OutputKind::Rbxl) {
+                rbx_binary::from_reader(bytes.as_slice()).unwrap()
+            } else {
+                rbx_xml::from_reader(bytes.as_slice(), rbx_xml::DecodeOptions::new()).unwrap()
+            };
+            let workspace = decoded
+                .descendants()
+                .find(|instance| instance.class == "Workspace")
+                .unwrap();
+            let Variant::Ref(target) = workspace.properties[&ustr("CurrentCamera")] else {
+                panic!("Missing camera reference");
+            };
+            let camera = decoded.get_by_ref(target).unwrap();
+            assert_eq!(camera.name, "Same");
+            assert_eq!(
+                camera.properties.get(&ustr("FieldOfView")),
+                Some(&Variant::Float32(80.0))
+            );
+        }
     }
 
     #[test]

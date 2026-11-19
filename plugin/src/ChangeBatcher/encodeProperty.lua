@@ -1,46 +1,7 @@
 local Packages = script.Parent.Parent.Parent.Packages
 local Log = require(Packages.Log)
-local RbxDom = require(Packages.RbxDom)
-
+local encodePropertyValue = require("../encodePropertyValue")
 local unmanagedAttributes = require(script.Parent.Parent.Reconciler.unmanagedAttributes)
-
-local function vector2(vector)
-	return { vector.X, vector.Y }
-end
-
-local function vector3(vector)
-	return { vector.X, vector.Y, vector.Z }
-end
-
-local function number(value)
-	return value
-end
-
--- rbx_dom_lua stands in a large finite number for infinity in these types,
--- including the vectors inside a Ray or Rect. msgpack holds infinity exactly
--- and the filesystem writes it in a tagged form, so they're encoded from
--- their raw components instead, which is the same encoding for finite values.
-local exactEncoders = {
-	Float32 = number,
-	Float64 = number,
-	Vector2 = vector2,
-	Vector3 = vector3,
-	Ray = function(ray)
-		return { origin = vector3(ray.Origin), direction = vector3(ray.Direction) }
-	end,
-	Rect = function(rect)
-		return { vector2(rect.Min), vector2(rect.Max) }
-	end,
-}
-
-local function encodeExactly(value, encoded)
-	local ty = next(encoded)
-	local encoder = exactEncoders[ty]
-	if encoder == nil then
-		return encoded
-	end
-	return { [ty] = encoder(value) }
-end
 
 return function(instance, propertyName, propertyDescriptor, instanceMap)
 	local readSuccess, readResult = propertyDescriptor:read(instance)
@@ -77,7 +38,7 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 		readResult = managed
 	end
 
-	local callSuccess, encodeSuccess, encodeResult = pcall(RbxDom.EncodedValue.encode, readResult, dataType)
+	local callSuccess, encodeSuccess, encodeResult = pcall(encodePropertyValue, readResult, dataType)
 
 	if not callSuccess then
 		Log.warn("Could not sync back property {:?}.{}: {}", instance, propertyName, encodeSuccess)
@@ -87,18 +48,6 @@ return function(instance, propertyName, propertyDescriptor, instanceMap)
 	if not encodeSuccess then
 		Log.warn("Could not sync back property {:?}.{}: {}", instance, propertyName, encodeResult)
 		return false, nil
-	end
-
-	if dataType == "Attributes" and type(readResult) == "table" then
-		local encodedAttributes = encodeResult.Attributes
-		for name, value in readResult do
-			-- Attributes rbx_dom_lua couldn't encode were already warned about.
-			if encodedAttributes[name] ~= nil then
-				encodedAttributes[name] = encodeExactly(value, encodedAttributes[name])
-			end
-		end
-	else
-		encodeResult = encodeExactly(readResult, encodeResult)
 	end
 
 	return true, encodeResult

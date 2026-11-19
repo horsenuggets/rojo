@@ -34,7 +34,8 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// requests carry the plugin's chosen `WriteAuthority`. Version 8 adds identity-preserving
 /// instance reparenting through `changedParent` updates. Version 9 makes `added` carry
 /// Studio-created subtrees as `InstanceAddition`s. Version 10 adds live Studio export jobs.
-pub const PROTOCOL_VERSION: u64 = 10;
+/// Version 11 adds capture-relative service reference targets to export manifests.
+pub const PROTOCOL_VERSION: u64 = 11;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
@@ -713,7 +714,7 @@ mod tests {
 
     #[test]
     fn structural_protocol_round_trips_json_and_messagepack() {
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
         let id = Ref::new();
         let parent = Ref::new();
         let update = InstanceUpdate {
