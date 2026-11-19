@@ -2617,3 +2617,190 @@ fn forced_parent() {
         assert_snapshot!("forced_parent_serialize_model", model);
     });
 }
+
+mod serve_lifetime {
+    use std::{
+        io::{Read, Write},
+        net::{SocketAddr, TcpStream},
+        path::Path,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use hyper_tungstenite::tungstenite::client;
+
+    use crate::rojo_test::{
+        io_util::{KillOnDrop, ROJO_PATH, SERVE_TESTS_PATH},
+        serve_util::read_server_port,
+    };
+
+    struct LifetimeServer {
+        process: KillOnDrop,
+        port: usize,
+    }
+
+    impl LifetimeServer {
+        fn start(shutdown_on_stdin_eof: bool, stdin: Stdio) -> Self {
+            let mut command = Command::new(ROJO_PATH);
+            command
+                .args(["--color", "never", "serve"])
+                .arg(Path::new(SERVE_TESTS_PATH).join("empty"))
+                .args(["--address", "127.0.0.1", "--port", "0"])
+                .stdin(stdin)
+                .stdout(Stdio::piped());
+            if shutdown_on_stdin_eof {
+                command.arg("--shutdown-on-stdin-eof");
+            }
+            let mut process = KillOnDrop(command.spawn().expect("Could not start Rojo"));
+            let port = read_server_port(process.0.stdout.take().unwrap(), "Port:");
+            Self { process, port }
+        }
+
+        fn assert_serving(&mut self) {
+            assert!(self.process.0.try_wait().unwrap().is_none());
+            let response = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap()
+                .get(format!("http://127.0.0.1:{}/api/rojo", self.port))
+                .send()
+                .expect("Server did not respond");
+            assert!(response.status().is_success());
+            assert!(!response.bytes().unwrap().is_empty());
+        }
+
+        fn close_stdin(&mut self) {
+            drop(self.process.0.stdin.take().expect("Stdin was not piped"));
+        }
+
+        fn assert_exited(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = self.process.0.try_wait().unwrap() {
+                    assert!(status.success(), "Server failed with {status}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Server did not stop after stdin EOF"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            // Check the listener without rebinding a port that may still have TIME_WAIT sockets.
+            let address = SocketAddr::from(([127, 0, 0, 1], self.port as u16));
+            assert!(
+                TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_err(),
+                "Exited server still accepts connections"
+            );
+        }
+
+        fn connect(&self) -> TcpStream {
+            let stream = TcpStream::connect(("127.0.0.1", self.port as u16)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+        }
+    }
+
+    impl Drop for LifetimeServer {
+        fn drop(&mut self) {
+            // Only reap the exact subprocess this test owns, including on assertion failure.
+            let _ = self.process.0.kill();
+            let _ = self.process.0.wait();
+        }
+    }
+
+    fn assert_connection_closed(stream: &mut TcpStream) {
+        let mut bytes = Vec::new();
+        if let Err(error) = stream.read_to_end(&mut bytes) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                "Connection remained open or failed unexpectedly {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_on_stdin_eof_ignores_bytes_until_the_pipe_closes() {
+        let mut server = LifetimeServer::start(true, Stdio::piped());
+        server.assert_serving();
+        let input = server.process.0.stdin.as_mut().unwrap();
+        input.write_all(b"keep running\n\x04\0\xff").unwrap();
+        input.write_all(&[b'x'; 8192]).unwrap();
+        input.flush().unwrap();
+        thread::sleep(Duration::from_millis(250));
+        server.assert_serving();
+
+        server.close_stdin();
+        server.assert_exited();
+    }
+
+    #[test]
+    fn shutdown_on_stdin_eof_handles_initially_closed_stdin() {
+        let mut server = LifetimeServer::start(true, Stdio::null());
+        server.assert_exited();
+    }
+
+    #[test]
+    fn serve_without_shutdown_on_stdin_eof_survives_closed_stdin() {
+        for initially_closed in [false, true] {
+            let mut server = LifetimeServer::start(
+                false,
+                if initially_closed {
+                    Stdio::null()
+                } else {
+                    Stdio::piped()
+                },
+            );
+            server.assert_serving();
+            if !initially_closed {
+                server.close_stdin();
+            }
+            thread::sleep(Duration::from_millis(250));
+            server.assert_serving();
+        }
+    }
+
+    #[test]
+    fn shutdown_on_stdin_eof_drops_active_clients_without_stopping_another_server() {
+        let mut server = LifetimeServer::start(true, Stdio::piped());
+        let mut other = LifetimeServer::start(true, Stdio::piped());
+        server.assert_serving();
+        other.assert_serving();
+        assert_ne!(server.port, other.port);
+
+        let mut http = server.connect();
+        write!(
+            http,
+            "POST /api/write HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 1000000\r\n\r\npartial body",
+            server.port
+        )
+        .unwrap();
+        http.flush().unwrap();
+        let (mut websocket, response) = client(
+            format!("ws://127.0.0.1:{}/api/socket/0", server.port),
+            server.connect(),
+        )
+        .unwrap();
+        assert_eq!(response.status().as_u16(), 101);
+        // A completed request also gives the server time to accept the partial HTTP body.
+        server.assert_serving();
+
+        server.close_stdin();
+        // Keep both clients open through the deadline, with no WebSocket close handshake.
+        server.assert_exited();
+        assert_connection_closed(&mut http);
+        assert_connection_closed(websocket.get_mut());
+        other.assert_serving();
+        other.close_stdin();
+        other.assert_exited();
+    }
+}

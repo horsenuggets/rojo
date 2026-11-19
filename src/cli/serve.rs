@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Write},
+    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, TcpListener},
     path::PathBuf,
     sync::Arc,
@@ -40,6 +40,10 @@ pub struct ServeCommand {
     /// validation for binds where it is otherwise off (such as `0.0.0.0`).
     #[clap(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
+
+    /// Stop the server when standard input closes or encounters a read error.
+    #[clap(long)]
+    pub shutdown_on_stdin_eof: bool,
 }
 
 impl ServeCommand {
@@ -62,9 +66,25 @@ impl ServeCommand {
 
         let server = LiveServer::new(session);
 
-        server.start((ip, port).into(), allowed_hosts, |address| {
+        let on_listening = |address: std::net::SocketAddr| {
             let _ = show_start_message(address.ip(), address.port(), global.color.into());
-        })?;
+        };
+
+        if self.shutdown_on_stdin_eof {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            // Keep blocking stdin reads outside Tokio so runtime teardown never waits for input.
+            std::thread::Builder::new()
+                .name("rojo-stdin-shutdown".into())
+                .spawn(move || {
+                    wait_for_stdin_eof(io::stdin().lock());
+                    let _ = sender.send(());
+                })?;
+            server.start_with_shutdown((ip, port).into(), allowed_hosts, on_listening, async {
+                let _ = receiver.await;
+            })?;
+        } else {
+            server.start((ip, port).into(), allowed_hosts, on_listening)?;
+        }
 
         Ok(())
     }
@@ -88,6 +108,18 @@ pub(super) fn resolve_bind_address(
     };
 
     Ok((ip, port))
+}
+
+fn wait_for_stdin_eof(mut input: impl Read) {
+    let mut buffer = [0; 4096];
+    loop {
+        match input.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 fn find_available_port(ip: IpAddr, starting_port: u16) -> anyhow::Result<u16> {
@@ -165,4 +197,53 @@ fn show_start_message(bind_address: IpAddr, port: u16, color: ColorChoice) -> io
     writer.print(&buffer)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_shutdown_is_opt_in() {
+        assert!(
+            !ServeCommand::try_parse_from(["serve"])
+                .unwrap()
+                .shutdown_on_stdin_eof
+        );
+        assert!(
+            ServeCommand::try_parse_from(["serve", "--shutdown-on-stdin-eof"])
+                .unwrap()
+                .shutdown_on_stdin_eof
+        );
+    }
+
+    #[test]
+    fn stdin_reader_retries_interruptions_and_stops_on_eof_or_error() {
+        struct Input {
+            reads: usize,
+            fail: bool,
+        }
+
+        impl Read for Input {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                match self.reads {
+                    1 => Err(io::ErrorKind::Interrupted.into()),
+                    2 | 3 => {
+                        buffer[0] = b'x';
+                        Ok(1)
+                    }
+                    4 if self.fail => Err(io::ErrorKind::BrokenPipe.into()),
+                    4 => Ok(0),
+                    _ => panic!("Read after stdin ended"),
+                }
+            }
+        }
+
+        for fail in [false, true] {
+            let mut input = Input { reads: 0, fail };
+            wait_for_stdin_eof(&mut input);
+            assert_eq!(input.reads, 4);
+        }
+    }
 }

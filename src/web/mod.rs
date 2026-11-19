@@ -12,10 +12,13 @@ mod ui;
 pub(crate) mod util;
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use futures::future::{pending, select, Either};
 use hyper::{
     server::{conn::AddrStream, Server},
     service::{make_service_fn, service_fn},
@@ -47,6 +50,19 @@ impl LiveServer {
         address: SocketAddr,
         allowed_hosts: Vec<String>,
         on_listening: impl FnOnce(SocketAddr),
+    ) -> anyhow::Result<()> {
+        self.start_with_shutdown(address, allowed_hosts, on_listening, pending())
+    }
+
+    /// Starts the server until it fails or `shutdown` resolves.
+    ///
+    /// Shutdown drops active connections instead of waiting for clients to disconnect.
+    pub fn start_with_shutdown(
+        self,
+        address: SocketAddr,
+        allowed_hosts: Vec<String>,
+        on_listening: impl FnOnce(SocketAddr),
+        shutdown: impl Future<Output = ()>,
     ) -> anyhow::Result<()> {
         let serve_session = Arc::clone(&self.serve_session);
         let rt = Runtime::new().context("Failed to start the async runtime for the web server")?;
@@ -98,9 +114,20 @@ impl LiveServer {
         // Report the actual address, including the OS-selected port for port zero.
         on_listening(address);
 
-        rt.block_on(server)
-            .context("The Rojo+ web server encountered a fatal error")?;
+        let result = rt.block_on(async move {
+            futures::pin_mut!(server, shutdown);
+            match select(server, shutdown).await {
+                Either::Left((result, _)) => {
+                    result.context("The Rojo+ web server encountered a fatal error")
+                }
+                Either::Right(((), _)) => Ok(()),
+            }
+        });
 
-        Ok(())
+        // Cancel connection tasks, including upgraded WebSockets. Blocking API work must
+        // not keep the owning process alive indefinitely after its launcher disconnects.
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_secs(1));
+        result
     }
 }
