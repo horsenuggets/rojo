@@ -77,10 +77,15 @@ for _, material in Enum.Material:GetEnumItems() do
 	BASE_MATERIAL_PROPERTIES[`{material.Name}Name`] = material
 end
 -- These readable persisted properties postdate the pinned reflection database.
--- Read their current enum values directly, never through deprecated enum aliases.
+-- Read their current values directly, never through deprecated enum aliases.
 const EXTRA_SERVICE_PROPERTIES = {
 	Lighting = { LightAttenuationMode = "Enum" },
-	Workspace = { NextGenerationPhysicsSolver = "Enum" },
+	Workspace = {
+		ExplorerIconContent = "Content",
+		NextGenerationPhysicsSolver = "Enum",
+		ReplicationFrequency = "Enum",
+		ReplicationThroughput = "Enum",
+	},
 }
 const StudioExport = {}
 
