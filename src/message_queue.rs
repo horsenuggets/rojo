@@ -77,6 +77,11 @@ impl<T: Clone> MessageQueue<T> {
     pub fn cursor(&self) -> u32 {
         self.messages.read().unwrap().len() as u32
     }
+
+    pub(crate) fn any_since(&self, cursor: u32, predicate: impl FnMut(&T) -> bool) -> Option<bool> {
+        let messages = self.messages.read().unwrap();
+        Some(messages.get(cursor as usize..)?.iter().any(predicate))
+    }
 }
 
 struct Listener<T> {
@@ -96,5 +101,24 @@ fn fire_listener_if_ready<T: Clone>(
         Ok(())
     } else {
         Err(listener)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageQueue;
+
+    #[test]
+    fn history_predicates_respect_cursor_bounds_without_consuming_messages() {
+        let queue = MessageQueue::new();
+        queue.push_messages(&[1, 2, 3]);
+        for _ in 0..2 {
+            assert_eq!(queue.any_since(0, |value| *value == 1), Some(true));
+            assert_eq!(queue.any_since(1, |value| *value == 1), Some(false));
+            assert_eq!(queue.any_since(2, |value| *value == 3), Some(true));
+            assert_eq!(queue.any_since(3, |_| true), Some(false));
+            assert_eq!(queue.any_since(4, |_| true), None);
+            assert_eq!(queue.cursor(), 3);
+        }
     }
 }
