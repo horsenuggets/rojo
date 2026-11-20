@@ -41,12 +41,15 @@ Making a new release? Simply add the new header with the version and date undern
 * Indexed import-path mappings once per refresh instead of scanning every mount for each
   import, preserving mapping precedence and script aliases during structural edits.
 * Restored authored aliases when edited scripts contain generated relative imports.
+  Alias-save bookkeeping no longer triggers false structural conflicts for pending edits.
 * Let ordinary Studio property edits, including interactive scaling and movement, merge
   onto current disk values without false conflicts from earlier writes in the same drag.
   Unrelated disk properties remain intact, while structural and file-payload conflicts
   retain filesystem authority. Delayed server echoes no longer overwrite newer local
   property edits while their batches are pending or in flight, and rejected writes still
-  restore the server value after their announcements arrive.
+  restore the server value after their announcements arrive. Property values are encoded
+  once per batch rather than on each change signal, and omitted encodings release their
+  pending guards.
 * Corrected numeric UI binding interpolation and the development plugin's TestEZ lookup,
   and resolved production Luau analysis diagnostics without changing decoder behavior.
 * Added fine-grained profiling scopes for filesystem refreshes, import mapping validation,

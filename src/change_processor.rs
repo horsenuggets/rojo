@@ -3496,12 +3496,10 @@ impl JobThreadContext {
             || changes_require_context(tree, disk_changes)
             || disk_changes.updated_instances.iter().any(|change| {
                 change.changed_metadata.as_ref().is_some_and(|metadata| {
-                    let previous = tree.get_metadata(change.id).unwrap();
-                    metadata.instigating_source != previous.instigating_source
-                        || metadata.middleware != previous.middleware
-                        || metadata.specified_id != previous.specified_id
-                        || metadata.schema != previous.schema
-                        || metadata.ignore_unknown_instances != previous.ignore_unknown_instances
+                    !tree
+                        .get_metadata(change.id)
+                        .unwrap()
+                        .has_same_structure(metadata)
                 })
             })
         {
@@ -6490,6 +6488,55 @@ mod tests {
                 assert_eq!(job.vfs.read(&path).unwrap(), before);
             }
         }
+    }
+
+    #[test]
+    fn ordinary_properties_survive_alias_save_bookkeeping() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(".luaurc"),
+            r#"{"aliases":{"target":"Source/Unrelated"}}"#,
+        )
+        .unwrap();
+        let job = mapping_refresh_job(temp.path());
+        let path = job.project().folder_location().join("Source/App.luau");
+        let id = job.tree.lock().unwrap().get_ids_at_path(&path)[0];
+        let cursor = job.message_queue.cursor();
+        let authored = "return require(\"@target\")\n";
+        job.vfs.write(&path, authored).unwrap();
+        job.handle_vfs_event(VfsEvent::Write(path.clone()));
+        assert!(job.message_queue.cursor() > cursor);
+        {
+            let tree = job.tree.lock().unwrap();
+            let transform = tree
+                .get_metadata(id)
+                .unwrap()
+                .source_transform
+                .as_ref()
+                .unwrap();
+            assert_eq!(transform.original, authored);
+            assert_ne!(transform.emitted, authored);
+        }
+        let mut attributes = Attributes::new();
+        attributes.insert("Revision".into(), Variant::Float64(2.0));
+        let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+            property_update(id, "Attributes", Variant::Attributes(attributes.clone())),
+            Some(cursor),
+            WriteAuthority::Filesystem,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(conflicts.updated_instances.is_empty(), "{conflicts:?}");
+        assert_eq!(accepted.updated_instances.len(), 1);
+        assert_eq!(
+            job.tree
+                .lock()
+                .unwrap()
+                .get_instance(id)
+                .unwrap()
+                .properties()[&ustr("Attributes")],
+            Variant::Attributes(attributes)
+        );
+        assert_eq!(job.vfs.read(&path).unwrap().as_slice(), authored.as_bytes());
     }
 
     #[test]

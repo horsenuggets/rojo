@@ -291,8 +291,14 @@ fn apply_update_child(context: &mut PatchApplyContext, tree: &mut RojoTree, patc
     applied_patch.changed_parent = patch.changed_parent;
 
     if let Some(metadata) = patch.changed_metadata {
+        let structural = !tree
+            .get_metadata(patch.id)
+            .unwrap()
+            .has_same_structure(&metadata);
         tree.update_metadata(patch.id, metadata.clone());
-        applied_patch.changed_metadata = Some(metadata);
+        if structural {
+            applied_patch.changed_metadata = Some(metadata);
+        }
     }
 
     let mut instance = match tree.get_instance_mut(patch.id) {
@@ -422,6 +428,46 @@ mod test {
     use rbx_dom_weak::{types::Variant, UstrMap};
 
     use super::super::PatchAdd;
+
+    #[test]
+    fn publishes_only_structural_metadata_while_retaining_save_bookkeeping() {
+        for structural in [false, true] {
+            let mut tree = RojoTree::new(InstanceSnapshot::new());
+            let id = tree.get_root_id();
+            let mut metadata = tree.get_metadata(id).unwrap().clone();
+            metadata.source_transform = Some(crate::snapshot::SourceTransform {
+                original: "return require(\"@target\")".into(),
+                emitted: "return require(\"./Target\")".into(),
+            });
+            metadata
+                .package_file_contents
+                .insert("/project/Source".into(), Some(vec![1, 2, 3]));
+            metadata.ignore_unknown_instances = structural;
+            let applied = apply_patch_set(
+                &mut tree,
+                PatchSet {
+                    updated_instances: vec![PatchUpdate {
+                        id,
+                        changed_name: None,
+                        changed_class_name: None,
+                        changed_parent: None,
+                        changed_properties: UstrMap::from_iter([(
+                            ustr("Source"),
+                            Some(Variant::String("return require(\"./Target\")".into())),
+                        )]),
+                        changed_metadata: Some(metadata.clone()),
+                    }],
+                    ..PatchSet::new()
+                },
+            );
+            assert_eq!(tree.get_metadata(id).unwrap(), &metadata);
+            assert_eq!(applied.updated.len(), 1);
+            assert_eq!(applied.updated[0].changed_metadata.is_some(), structural);
+            assert!(applied.updated[0]
+                .changed_properties
+                .contains_key(&ustr("Source")));
+        }
+    }
 
     #[test]
     fn add_from_empty() {

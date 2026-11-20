@@ -100,6 +100,19 @@ impl InstanceMetadata {
         }
     }
 
+    pub(crate) fn has_same_structure(&self, other: &Self) -> bool {
+        // Source transforms and expected bytes are refreshed after ordinary saves.
+        // They do not change the instance's identity, ownership, or storage layout.
+        self.ignore_unknown_instances == other.ignore_unknown_instances
+            && self.instigating_source == other.instigating_source
+            && self.relevant_paths == other.relevant_paths
+            && self.context == other.context
+            && self.specified_id == other.specified_id
+            && self.middleware == other.middleware
+            && self.schema == other.schema
+            && self.installed_paths == other.installed_paths
+    }
+
     pub(crate) fn watch_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.relevant_paths.iter().chain(&self.installed_paths)
     }
@@ -496,6 +509,58 @@ impl SyncRule {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn structural_metadata_classification_ignores_only_save_bookkeeping() {
+        let original = InstanceMetadata::new();
+        for flags in 0..256 {
+            let mut changed = original.clone();
+            if flags & 1 != 0 {
+                changed.ignore_unknown_instances = true;
+            }
+            if flags & 2 != 0 {
+                changed.instigating_source =
+                    Some(InstigatingSource::Path("/project/Source".into()));
+            }
+            if flags & 4 != 0 {
+                changed.relevant_paths.push("/project/Source".into());
+            }
+            if flags & 8 != 0 {
+                changed.context.emit_legacy_scripts = !changed.context.emit_legacy_scripts;
+            }
+            if flags & 16 != 0 {
+                changed.specified_id = Some(RojoRef::new("identity".into()));
+            }
+            if flags & 32 != 0 {
+                changed.middleware = Some(Middleware::Text);
+            }
+            if flags & 64 != 0 {
+                changed.schema = Some("schema".into());
+            }
+            if flags & 128 != 0 {
+                changed.installed_paths.push("/project/Installed".into());
+            }
+            changed.source_transform = Some(SourceTransform {
+                original: "return require(\"@target\")".into(),
+                emitted: "return require(\"./Target\")".into(),
+            });
+            changed
+                .package_file_contents
+                .insert("/project/Source".into(), Some(vec![1, 2, 3]));
+            for _ in 0..2 {
+                assert_eq!(
+                    original.has_same_structure(&changed),
+                    flags == 0,
+                    "flags {flags}"
+                );
+                assert_eq!(
+                    changed.has_same_structure(&original),
+                    flags == 0,
+                    "flags {flags}"
+                );
+            }
+        }
+    }
 
     fn rule(pattern: &str) -> SyncRule {
         SyncRule {
