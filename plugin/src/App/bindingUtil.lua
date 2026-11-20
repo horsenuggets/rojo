@@ -21,16 +21,17 @@ end
 local function mapLerp(binding, value1, value2)
 	local valueType = typeof(value1)
 	if valueType ~= typeof(value2) then
-		Log.error("Type mismatch between values ({}, {}})", valueType, typeof(value2))
+		Log.error("Type mismatch between values ({}, {})", valueType, typeof(value2))
 	end
 
 	return binding:map(function(position)
 		if valueType == "number" then
-			return value1 - (value2 - value1) * position
+			return value1 + (value2 - value1) * position
 		elseif LERP_DATA_TYPES[valueType] then
 			return value1:lerp(value2, position)
 		else
 			Log.error("Unable to interpolate type {}", valueType)
+			return nil
 		end
 	end)
 end

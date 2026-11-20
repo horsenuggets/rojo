@@ -25,8 +25,10 @@ local BATCH_INTERVAL = 0.2
 	anything yields, and whatever it returns is passed to `onChangesFlushed`
 	with that batch. A session uses it to keep the message cursor each batch
 	started from, since later edits start a new batch while one is prepared.
+	`onBatchPrepared` also sees empty batches, or nil on a preparation error, so
+	omitted properties do not leave session guards waiting for a write never sent.
 ]]
-function ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken)
+function ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken, onBatchPrepared)
 	local self
 
 	local renderSteppedConnection = RunService.Heartbeat:Connect(function(dt)
@@ -39,6 +41,7 @@ function ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken)
 		__instanceMap = instanceMap,
 		__onChangesFlushed = onChangesFlushed,
 		__onBatchTaken = onBatchTaken,
+		__onBatchPrepared = onBatchPrepared,
 		__pendingPropertyChanges = {},
 		__pendingAdditions = {},
 		__serialize = serialize,
@@ -102,7 +105,7 @@ function ChangeBatcher:__flush()
 	local changes = self.__pendingPropertyChanges
 	self.__pendingAdditions = {}
 	self.__pendingPropertyChanges = {}
-	local context = if self.__onBatchTaken then self.__onBatchTaken() else nil
+	local context = if self.__onBatchTaken then self.__onBatchTaken(changes) else nil
 
 	-- New instances are known before the other changes are encoded, so moving
 	-- an existing instance into one in the same batch is a move to a known parent.
@@ -119,6 +122,10 @@ function ChangeBatcher:__flush()
 		return batch
 	end)
 	self.__flushing = false
+	-- Even an empty or failed preparation must release guards for omitted properties.
+	if self.__onBatchPrepared then
+		self.__onBatchPrepared(if ok then patch else nil, context)
+	end
 	if not ok then
 		error(patch, 0)
 	end

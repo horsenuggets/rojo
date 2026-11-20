@@ -136,6 +136,7 @@ fn filter_non_scripts(instance: &InstanceWithMeta) -> bool {
     )
 }
 
+#[profiling::function]
 fn patch_set_affects_sourcemap(
     session: &ServeSession,
     patch_set: &[AppliedPatchSet],
@@ -247,6 +248,7 @@ fn recurse_create_node<'a>(
     })
 }
 
+#[profiling::function]
 fn write_sourcemap(
     session: &ServeSession,
     output: Option<&Path>,
@@ -255,14 +257,18 @@ fn write_sourcemap(
 ) -> anyhow::Result<()> {
     let tree = session.tree();
 
-    let root_node = recurse_create_node(
-        &tree,
-        tree.get_root_id(),
-        session.root_dir(),
-        filter,
-        use_absolute_paths,
-    );
+    let root_node = {
+        profiling::scope!("Rojo.BuildSourcemapNodes");
+        recurse_create_node(
+            &tree,
+            tree.get_root_id(),
+            session.root_dir(),
+            filter,
+            use_absolute_paths,
+        )
+    };
 
+    profiling::scope!("Rojo.SerializeSourcemap");
     if let Some(output_path) = output {
         let mut file = BufWriter::new(File::create(output_path)?);
         // Sourcemaps are machine-read and can describe hundreds of thousands of instances,

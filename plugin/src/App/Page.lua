@@ -30,6 +30,7 @@ function Page:init()
 					rendered = rendered,
 				}
 			end
+			return nil
 		end)
 	end)
 end

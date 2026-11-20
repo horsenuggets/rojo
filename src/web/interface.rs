@@ -364,7 +364,9 @@ pub struct ReadResponse<'a> {
 /// Studio hasn't seen yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteAuthority {
-    /// The disk value is restored in Studio and the write is dropped.
+    /// Structural and file-payload conflicts restore the disk value in Studio.
+    /// Ordinary properties merge Studio's values when the target's structural
+    /// baseline is still valid.
     Filesystem,
     /// The server catches up with the disk, then writes every value Studio
     /// changed over it. Disk changes Studio didn't touch are kept.
@@ -419,6 +421,9 @@ pub struct AddedIds {
 #[serde(rename_all = "camelCase")]
 pub struct WriteResponse {
     pub session_id: SessionId,
+    /// Every announcement or restoration produced by this write is published
+    /// at or before this cursor.
+    pub message_cursor: u32,
     pub accepted: PatchSet,
     pub conflicts: PatchSet,
     pub errors: Vec<WriteError>,

@@ -125,6 +125,7 @@ function TouchRipple:render()
 						0
 					)
 				end
+				return nil
 			end),
 
 			Position = self.position:map(function(value)

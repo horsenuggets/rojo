@@ -22,6 +22,242 @@ use librojo::web_api::{
 };
 
 #[test]
+fn interactive_scaling_saves_successive_properties_from_the_same_client_cursor() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir(root.join("src/Part")).unwrap();
+        fs::write(
+            root.join("src/Part/init.meta.json"),
+            r#"{"className":"Part","properties":{"Transparency":0.25}}"#,
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let id = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "Part")
+        .unwrap()
+        .id;
+    let cursor = read.message_cursor;
+    let mut acknowledged_cursor = cursor;
+    for width in [2.0, 3.0, 4.0, 5.0] {
+        let size = Variant::Vector3(Vector3::new(width, 2.0, 2.0));
+        let frame = Variant::CFrame(CFrame::new(
+            Vector3::new(width, 0.0, 0.0),
+            Matrix3::identity(),
+        ));
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(cursor),
+            authority: WriteAuthority::Filesystem,
+            added: Default::default(),
+            removed: Vec::new(),
+            updated: vec![InstanceUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_parent: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::from_iter([
+                    (ustr("Size"), Some(size.clone())),
+                    (ustr("CFrame"), Some(frame.clone())),
+                ]),
+            }],
+        });
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(
+            response.conflicts.updated_instances.is_empty(),
+            "{:?}",
+            response.conflicts
+        );
+        assert_eq!(response.accepted.updated_instances.len(), 1);
+        assert!(response.message_cursor > acknowledged_cursor);
+        acknowledged_cursor = response.message_cursor;
+        let read = session.get_api_read(id).unwrap();
+        assert!(read.message_cursor >= response.message_cursor);
+        assert_eq!(
+            read.instances[&id].properties[&ustr("Size")].as_ref(),
+            &size
+        );
+        assert_eq!(
+            read.instances[&id].properties[&ustr("CFrame")].as_ref(),
+            &frame
+        );
+        assert_eq!(
+            read.instances[&id].properties[&ustr("Transparency")].as_ref(),
+            &Variant::Float32(0.25)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(session.path().join("src/Part/init.meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["properties"]["Size"][0].as_f64(),
+            Some(f64::from(width))
+        );
+    }
+}
+
+#[test]
+fn text_values_sync_in_both_directions_after_filesystem_edits() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::write(root.join("src/Value.txt"), "initial").unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let id = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "Value")
+        .unwrap()
+        .id;
+    let file = session.path().join("src/Value.txt");
+    for iteration in 0..3 {
+        let disk_value = format!("filesystem {iteration}\n");
+        fs::write(&file, &disk_value).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let cursor = loop {
+            let read = session.get_api_read(id).unwrap();
+            if read.instances[&id].properties[&ustr("Value")].as_ref()
+                == &Variant::String(disk_value.clone())
+            {
+                break read.message_cursor;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Filesystem text edit did not reach the server"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let studio_value = format!("studio {iteration}\n");
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(cursor),
+            authority: WriteAuthority::Filesystem,
+            added: Default::default(),
+            removed: Vec::new(),
+            updated: vec![InstanceUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_parent: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::from_iter([(
+                    ustr("Value"),
+                    Some(Variant::String(studio_value.clone())),
+                )]),
+            }],
+        });
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(
+            response.conflicts.updated_instances.is_empty(),
+            "{:?}",
+            response.conflicts
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), studio_value);
+        let read = session.get_api_read(id).unwrap();
+        assert_eq!(
+            read.instances[&id].properties[&ustr("Value")].as_ref(),
+            &Variant::String(studio_value)
+        );
+    }
+}
+
+#[test]
+fn filesystem_module_rename_converges_and_keeps_followup_source_edits() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::write(
+            root.join(".luaurc"),
+            r#"{"aliases":{"target":"src/Target"}}"#,
+        )
+        .unwrap();
+        fs::create_dir(root.join("src/Target")).unwrap();
+        fs::write(root.join("src/Target/init.luau"), "return {}\n").unwrap();
+        for index in 0..256 {
+            fs::write(
+                root.join(format!("src/Consumer{index}.luau")),
+                "return require(\"@target\")\n",
+            )
+            .unwrap();
+        }
+        fs::write(root.join("src/Module.luau"), "return { Revision = 1 }\n").unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let old = session.path().join("src/Module.luau");
+    let renamed = session.path().join("src/Module123.luau");
+    fs::rename(&old, &renamed).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (id, cursor) = loop {
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let module = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "Module123");
+        if !read
+            .instances
+            .values()
+            .any(|instance| instance.name == "Module")
+        {
+            if let Some(module) = module {
+                break (module.id, read.message_cursor);
+            }
+        }
+        assert!(Instant::now() < deadline, "Renamed module did not converge");
+        thread::sleep(Duration::from_millis(20));
+    };
+    let source = "return { Revision = 2 }\n";
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        message_cursor: Some(cursor),
+        authority: WriteAuthority::Filesystem,
+        added: Default::default(),
+        removed: Vec::new(),
+        updated: vec![InstanceUpdate {
+            id,
+            changed_name: None,
+            changed_class_name: None,
+            changed_parent: None,
+            changed_metadata: None,
+            changed_properties: UstrMap::from_iter([(
+                ustr("Source"),
+                Some(Variant::String(source.into())),
+            )]),
+        }],
+    });
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(
+        response.conflicts.updated_instances.is_empty(),
+        "{:?}",
+        response.conflicts
+    );
+    assert_eq!(fs::read_to_string(&renamed).unwrap(), source);
+    let disk_source = "return { Revision = 3 }\n";
+    fs::write(&renamed, disk_source).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        if let Some(module) = read.instances.get(&id) {
+            if module.properties[&ustr("Source")].as_ref() == &Variant::String(disk_source.into()) {
+                assert_eq!(module.name, "Module123");
+                assert!(!old.exists());
+                assert!(renamed.exists());
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Follow-up source edit was lost after rename"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn package_sources_serve_routes_originals_and_watches_without_reinstall() {
     use crate::rojo_test::{package_sources as fixture, serve_util::TestServeSession};
     let mut session = TestServeSession::with_setup("add_folder", fixture::setup);

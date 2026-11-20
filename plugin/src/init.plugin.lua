@@ -26,7 +26,7 @@ plugin.Unloading:Connect(function()
 end)
 
 if Config.isDevBuild then
-	local TestEZ = require(script.Parent.TestEZ)
+	local TestEZ = require(Packages.TestEZ)
 
 	require(script.runTests)(TestEZ)
 end

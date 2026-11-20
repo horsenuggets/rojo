@@ -1,9 +1,7 @@
 local Packages = script.Parent.Parent.Parent.Packages
 local Log = require(Packages.Log)
-local RbxDom = require(Packages.RbxDom)
-local ReflectionDatabase = require(Packages.RbxDom.database)
-
 local encodeProperty = require(script.Parent.encodeProperty)
+local getWritablePropertyDescriptor = require(script.Parent.getWritablePropertyDescriptor)
 
 return function(instance, instanceId, properties, instanceMap)
 	local update = {
@@ -17,23 +15,9 @@ return function(instance, instanceId, properties, instanceMap)
 		elseif propertyName == "Parent" then
 			update.changedParent = instanceMap.fromInstances[instance.Parent]
 		else
-			local descriptor = RbxDom.findCanonicalPropertyDescriptor(instance.ClassName, propertyName)
-
-			if not descriptor then
+			local descriptor = getWritablePropertyDescriptor(instance.ClassName, propertyName)
+			if descriptor == nil then
 				Log.debug("Could not sync back property {:?}.{}", instance, propertyName)
-				continue
-			end
-
-			if
-				descriptor.scriptability == "None"
-				or descriptor.scriptability == "Read"
-				or descriptor.scriptability == "Write"
-			then
-				continue
-			end
-
-			local canonicalProperty = ReflectionDatabase.Classes[descriptor.className].Properties[descriptor.name]
-			if canonicalProperty.Kind.Canonical.Serialization == "DoesNotSerialize" then
 				continue
 			end
 
