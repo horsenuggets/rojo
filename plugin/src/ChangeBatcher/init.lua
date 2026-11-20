@@ -102,7 +102,7 @@ function ChangeBatcher:__flush()
 	local changes = self.__pendingPropertyChanges
 	self.__pendingAdditions = {}
 	self.__pendingPropertyChanges = {}
-	local context = if self.__onBatchTaken then self.__onBatchTaken() else nil
+	local context = if self.__onBatchTaken then self.__onBatchTaken(changes) else nil
 
 	-- New instances are known before the other changes are encoded, so moving
 	-- an existing instance into one in the same batch is a move to a known parent.

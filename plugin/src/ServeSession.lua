@@ -108,14 +108,14 @@ function ServeSession.new(options)
 
 	-- Each batch keeps the cursor it started from, taken before preparing it
 	-- yields, since an edit made meanwhile starts the next batch.
-	local function onBatchTaken()
+	local function onBatchTaken(changes)
 		local cursor = self.__pendingWriteCursor
 		self.__pendingWriteCursor = nil
-		return cursor
+		return { cursor = cursor, properties = self:__takeLocalPropertyEdits(changes) }
 	end
 
-	local function onChangesFlushed(patch, cursor)
-		return self:__writePatch(patch, cursor)
+	local function onChangesFlushed(patch, context)
+		return self:__writePatch(patch, context.cursor, context.properties)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged, onChildAdded)
@@ -148,6 +148,7 @@ function ServeSession.new(options)
 		__connections = connections,
 		__syncResults = {},
 		__syncResultCallback = nil,
+		__localPropertyEdits = {},
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
@@ -372,12 +373,189 @@ function ServeSession:__keepUndoneDeletions(patch)
 	end
 end
 
+function ServeSession:__rememberLocalProperty(instance, propertyName)
+	local instanceMap = self.__instanceMap
+	local id = instanceMap and instanceMap.fromInstances[instance]
+	if
+		id == nil
+		or instance:IsA("DataModel")
+		or propertyName == "Name"
+		or propertyName == "Parent"
+		or propertyName == "Source"
+	then
+		return
+	end
+	-- Value and Contents can be ordinary model fields or file payloads. Buffer their
+	-- echoes until the server decides authority, including any rejected-write restoration.
+	local update = encodePatchUpdate(instance, id, { [propertyName] = true }, instanceMap)
+	local value = update and update.changedProperties[propertyName]
+	if value == nil or next(value) == "Ref" then
+		return
+	end
+	self.__localPropertyEdits = self.__localPropertyEdits or {}
+	local properties = self.__localPropertyEdits[id] or {}
+	self.__localPropertyEdits[id] = properties
+	-- Each entry is a generation token. A previous request cannot release a later edit.
+	properties[propertyName] = {}
+end
+
+function ServeSession:__takeLocalPropertyEdits(changes)
+	local taken = {}
+	for instance, changed in changes do
+		local id = self.__instanceMap.fromInstances[instance]
+		local properties = self.__localPropertyEdits[id]
+		if properties ~= nil then
+			local entries = {}
+			for propertyName in changed do
+				entries[propertyName] = properties[propertyName]
+			end
+			taken[id] = entries
+		end
+	end
+	return taken
+end
+
+function ServeSession:__protectLocalProperties(patch)
+	local edits = self.__localPropertyEdits
+	if edits == nil or next(edits) == nil then
+		return patch
+	end
+	local structural = {}
+	local replaced = {}
+	local removed = {}
+	for id in patch.added do
+		structural[id] = true
+	end
+	for _, id in patch.removed do
+		structural[id] = true
+		replaced[id] = true
+		removed[id] = true
+	end
+	for _, update in patch.updated do
+		if
+			update.changedName ~= nil
+			or update.changedParent ~= nil
+			or update.changedClassName ~= nil
+			or update.changedMetadata ~= nil
+		then
+			structural[update.id] = true
+		end
+		if update.changedClassName ~= nil then
+			replaced[update.id] = true
+		end
+	end
+	local filtered = table.clone(patch)
+	filtered.updated = {}
+	-- Invalidate only the changed subtree. Buffered values must survive unrelated
+	-- structure, and a rename must not discard a newer authoritative property value.
+	if next(structural) ~= nil then
+		local instanceMap = self.__instanceMap
+		for id, properties in edits do
+			local target = instanceMap.fromIds[id]
+			local instance = target
+			local invalidated = false
+			local discarded = replaced[id] == true
+			while instance ~= nil do
+				local ancestorId = instanceMap.fromInstances[instance]
+				invalidated = invalidated or structural[ancestorId] == true
+				-- Class changes retain children, and removals run after moves. Only a
+				-- remove-and-add subtree replacement destroys descendants before updates.
+				if
+					removed[ancestorId]
+					and patch.added[ancestorId] ~= nil
+					and (target == instance or target:IsDescendantOf(instance))
+				then
+					discarded = true
+				end
+				instance = instanceMap.knownParents[instance] or instance.Parent
+			end
+			if invalidated then
+				edits[id] = nil
+				local restored = {}
+				for propertyName, entry in properties do
+					restored[propertyName] = entry.serverValue
+				end
+				if not discarded and next(restored) ~= nil then
+					table.insert(filtered.updated, { id = id, changedProperties = restored })
+				end
+			end
+		end
+	end
+	for _, update in patch.updated do
+		local properties = edits[update.id]
+		if properties == nil then
+			table.insert(filtered.updated, update)
+			continue
+		end
+		local kept = table.clone(update)
+		kept.changedProperties = table.clone(update.changedProperties or {})
+		for propertyName, value in kept.changedProperties do
+			local entry = properties[propertyName]
+			if entry ~= nil then
+				entry.serverValue = value
+				kept.changedProperties[propertyName] = nil
+			end
+		end
+		if next(kept.changedProperties) ~= nil then
+			table.insert(filtered.updated, kept)
+		end
+	end
+	return filtered
+end
+
+function ServeSession:__releaseLocalProperties(cursor)
+	local edits = self.__localPropertyEdits
+	if edits == nil then
+		return
+	end
+	local patch = PatchSet.newEmpty()
+	for id, properties in edits do
+		local released = {}
+		for propertyName, entry in properties do
+			if entry.cursor ~= nil and entry.cursor <= cursor then
+				properties[propertyName] = nil
+				released[propertyName] = entry.serverValue
+			end
+		end
+		if next(properties) == nil then
+			edits[id] = nil
+		end
+		if next(released) ~= nil and self.__instanceMap.fromIds[id] ~= nil then
+			table.insert(patch.updated, { id = id, changedProperties = released })
+		end
+	end
+	if not PatchSet.isEmpty(patch) then
+		self:__applyPatch(patch)
+	end
+end
+
+function ServeSession:__finishLocalProperties(taken, result)
+	if taken == nil or next(taken) == nil or self.__localPropertyEdits == nil then
+		return
+	end
+	local cursor = self.__apiContext:getMessageCursor()
+	for id, entries in taken do
+		local properties = self.__localPropertyEdits[id]
+		if properties == nil then
+			continue
+		end
+		for propertyName, entry in entries do
+			if properties[propertyName] == entry then
+				-- A transport failure or older response cannot leave a permanent guard.
+				entry.cursor = if result and result.messageCursor ~= nil then result.messageCursor else cursor
+			end
+		end
+	end
+	self:__releaseLocalProperties(cursor)
+end
+
 function ServeSession:__queueChange(instance, propertyName)
+	self:__rememberLocalProperty(instance, propertyName)
 	self:__markBatchStart()
 	self.__changeBatcher:add(instance, propertyName)
 end
 
-function ServeSession:__writePatch(patch, messageCursor)
+function ServeSession:__writePatch(patch, messageCursor, localProperties)
 	-- Read when each batch is sent, so changing it applies to the next write
 	-- without reconnecting. A pinned session authority wins over the setting.
 	local authority = self.__twoWaySyncAuthority or Settings:get("twoWaySyncAuthority")
@@ -426,6 +604,7 @@ function ServeSession:__writePatch(patch, messageCursor)
 		end)
 		:andThen(function(result)
 			forgetDeletions()
+			self:__finishLocalProperties(localProperties, result)
 			self:__untrackRejectedAdditions(patch, result)
 			self:__untrackSavedRemovals(result)
 			finish(ServeSession.getWriteStatus(result), result)
@@ -433,6 +612,7 @@ function ServeSession:__writePatch(patch, messageCursor)
 		end)
 		:catch(function(err)
 			forgetDeletions()
+			self:__finishLocalProperties(localProperties, nil)
 			self:__untrackRejectedAdditions(patch, nil)
 			finish("Failed", {
 				errors = {
@@ -560,6 +740,7 @@ function ServeSession:start()
 							self:__applyPatch(message)
 						end
 						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+						self:__releaseLocalProperties(messagesPacket.messageCursor)
 					end,
 				})
 			end)
@@ -609,7 +790,7 @@ function ServeSession:__onActiveScriptChanged(activeScript)
 
 	-- Force-close the script inside Studio... with a small delay in the middle
 	-- to prevent Studio from crashing.
-	spawn(function()
+	task.defer(function()
 		local existingParent = activeScript.Parent
 		activeScript.Parent = nil
 
@@ -796,6 +977,7 @@ end
 
 function ServeSession:__applyPatch(patch)
 	self:__keepUndoneDeletions(patch)
+	patch = self:__protectLocalProperties(patch)
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording =
 		ChangeHistoryService:TryBeginRecording(ServeSession.PATCH_RECORDING_PREFIX .. patchTimestamp)
@@ -992,6 +1174,7 @@ function ServeSession:__initialSync(serverInfo)
 end
 
 function ServeSession:__stopInternal(err)
+	self.__localPropertyEdits = nil
 	self:__setStatus(Status.Disconnected, err)
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()

@@ -42,6 +42,7 @@ fn interactive_scaling_saves_successive_properties_from_the_same_client_cursor()
         .unwrap()
         .id;
     let cursor = read.message_cursor;
+    let mut acknowledged_cursor = cursor;
     for width in [2.0, 3.0, 4.0, 5.0] {
         let size = Variant::Vector3(Vector3::new(width, 2.0, 2.0));
         let frame = Variant::CFrame(CFrame::new(
@@ -73,7 +74,8 @@ fn interactive_scaling_saves_successive_properties_from_the_same_client_cursor()
             response.conflicts
         );
         assert_eq!(response.accepted.updated_instances.len(), 1);
-        assert!(response.message_cursor >= cursor);
+        assert!(response.message_cursor > acknowledged_cursor);
+        acknowledged_cursor = response.message_cursor;
         let read = session.get_api_read(id).unwrap();
         assert!(read.message_cursor >= response.message_cursor);
         assert_eq!(

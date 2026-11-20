@@ -18,6 +18,32 @@ return function()
 		}
 	end
 
+	local function propertySession(className)
+		local control = { cursor = 0, requests = {}, settle = {} }
+		local session = ServeSession.new({
+			twoWaySync = true,
+			apiContext = {
+				getMessageCursor = function()
+					return control.cursor
+				end,
+				disconnect = function() end,
+				write = function(_self, patch)
+					table.insert(control.requests, patch)
+					local index = #control.requests
+					return Promise.new(function(resolve)
+						control.settle[index] = resolve
+					end)
+				end,
+			},
+		})
+		session.__changeBatcher.__renderSteppedConnection:Disconnect()
+		session.__instanceMap.onInstanceChanged = nil
+		session.__deferredChanges = nil
+		local instance = Instance.new(className)
+		session.__instanceMap:insert("EDITED", instance)
+		return session, instance, control
+	end
+
 	it("should keep structural failures out of replacement fallback", function()
 		local InstanceMap = require(script.Parent.InstanceMap)
 		local PatchSet = require(script.Parent.PatchSet)
@@ -335,6 +361,379 @@ return function()
 			settle.second(writeResult())
 			second:await()
 		end
+	end)
+
+	it("should preserve newer local properties across delayed server echoes at every write stage", function()
+		for _, stage in { "pending", "queued", "inflight", "answered" } do
+			local session, part, control = propertySession("Part")
+			local function edit(width)
+				part.Size = Vector3.new(width, 2, 2)
+				session:__queueChange(part, "Size")
+			end
+			local function echo(width)
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = {
+						{ id = "EDITED", changedProperties = { Size = { Vector3 = { width, 2, 2 } } } },
+					},
+				})
+			end
+			local function answer(index, revision)
+				local result = writeResult()
+				result.messageCursor = revision
+				control.settle[index](result)
+			end
+			local success, problem = pcall(function()
+				edit(4)
+				local first = session:flushChanges()
+				edit(5)
+				local second = if stage ~= "pending" then session:flushChanges() else nil
+				if stage == "inflight" or stage == "answered" then
+					answer(1, 1)
+					first:await()
+				end
+				if stage == "answered" then
+					answer(2, 2)
+					second:await()
+				end
+				echo(4)
+				expect(part.Size).to.equal(Vector3.new(5, 2, 2))
+				control.cursor = 1
+				session:__releaseLocalProperties(control.cursor)
+				if stage == "pending" or stage == "queued" then
+					answer(1, 1)
+					first:await()
+				end
+				if second == nil then
+					second = session:flushChanges()
+				end
+				expect(control.requests[2].updated[1].changedProperties.Size.Vector3[1]).to.equal(5)
+				if stage ~= "answered" then
+					answer(2, 2)
+					second:await()
+				end
+				echo(5)
+				control.cursor = 2
+				session:__releaseLocalProperties(control.cursor)
+				expect(part.Size).to.equal(Vector3.new(5, 2, 2))
+				echo(6)
+				expect(part.Size).to.equal(Vector3.new(6, 2, 2))
+			end)
+			session:stop()
+			part:Destroy()
+			assert(success, `{stage} {tostring(problem)}`)
+		end
+	end)
+
+	it("should retain buffered authoritative values across unrelated structural patches", function()
+		local session, part, control = propertySession("Part")
+		local unrelated = Instance.new("Folder")
+		session.__instanceMap:insert("UNRELATED", unrelated)
+		local success, problem = pcall(function()
+			part.Size = Vector3.new(5, 2, 2)
+			session:__queueChange(part, "Size")
+			local write = session:flushChanges()
+			for _, width in { 5, 6 } do
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = { { id = "EDITED", changedProperties = { Size = { Vector3 = { width, 2, 2 } } } } },
+				})
+			end
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = { { id = "UNRELATED", changedName = "ServerName", changedProperties = {} } },
+			})
+			expect(unrelated.Name).to.equal("ServerName")
+			control.cursor = 3
+			local result = writeResult()
+			result.messageCursor = 1
+			control.settle[1](result)
+			write:await()
+			expect(part.Size).to.equal(Vector3.new(6, 2, 2))
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+		session:stop()
+		part:Destroy()
+		unrelated:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should keep pending local properties protected when another instance is renamed", function()
+		local session, part = propertySession("Part")
+		local unrelated = Instance.new("Folder")
+		session.__instanceMap:insert("UNRELATED", unrelated)
+		local success, problem = pcall(function()
+			part.Size = Vector3.new(5, 2, 2)
+			session:__queueChange(part, "Size")
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = {
+					{ id = "UNRELATED", changedName = "ServerName", changedProperties = {} },
+					{ id = "EDITED", changedProperties = { Size = { Vector3 = { 4, 2, 2 } } } },
+				},
+			})
+			expect(part.Size).to.equal(Vector3.new(5, 2, 2))
+		end)
+		session:stop()
+		part:Destroy()
+		unrelated:Destroy()
+		assert(success, problem)
+	end)
+
+	for _, action in { "renamed", "reclassified", "removed" } do
+		it(`should preserve buffered properties on children retained when an ancestor is {action}`, function()
+			local session, part = propertySession("Part")
+			local root = Instance.new("Folder")
+			local parent = Instance.new("Folder")
+			parent.Parent = root
+			part.Parent = parent
+			session.__instanceMap:insert("ROOT", root)
+			session.__instanceMap:insert("PARENT", parent)
+			session.__instanceMap.knownParents[part] = parent
+			local success, problem = pcall(function()
+				part.Size = Vector3.new(5, 2, 2)
+				session:__queueChange(part, "Size")
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = { { id = "EDITED", changedProperties = { Size = { Vector3 = { 6, 2, 2 } } } } },
+				})
+				local update = { id = "PARENT", changedProperties = {} }
+				if action == "renamed" then
+					update.changedName = "ServerName"
+				elseif action == "reclassified" then
+					update.changedClassName = "Model"
+				else
+					update = { id = "EDITED", changedParent = "ROOT", changedProperties = {} }
+				end
+				session:__applyPatch({
+					added = {},
+					removed = if action == "removed" then { "PARENT" } else {},
+					updated = { update },
+				})
+				if action == "renamed" then
+					expect(parent.Name).to.equal("ServerName")
+				elseif action == "reclassified" then
+					expect(part.Parent.ClassName).to.equal("Model")
+				else
+					expect(part.Parent).to.equal(root)
+				end
+				expect(session.__instanceMap.fromIds.EDITED).to.equal(part)
+				expect(part.Size).to.equal(Vector3.new(6, 2, 2))
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+			session:stop()
+			root:Destroy()
+			parent:Destroy()
+			assert(success, problem)
+		end)
+	end
+
+	it("should not replay old buffered values onto a recreated authoritative subtree", function()
+		local session, part = propertySession("Part")
+		local root = Instance.new("Folder")
+		local parent = Instance.new("Folder")
+		parent.Parent = root
+		part.Parent = parent
+		session.__instanceMap:insert("ROOT", root)
+		session.__instanceMap:insert("PARENT", parent)
+		session.__instanceMap.knownParents[part] = parent
+		local success, problem = pcall(function()
+			part.Size = Vector3.new(5, 2, 2)
+			session:__queueChange(part, "Size")
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = { { id = "EDITED", changedProperties = { Size = { Vector3 = { 6, 2, 2 } } } } },
+			})
+			session:__applyPatch({
+				added = {
+					PARENT = {
+						Id = "PARENT",
+						Parent = "ROOT",
+						Name = "Replacement",
+						ClassName = "Model",
+						Properties = {},
+						Children = { "EDITED" },
+					},
+					EDITED = {
+						Id = "EDITED",
+						Parent = "PARENT",
+						Name = "ReplacementPart",
+						ClassName = "Part",
+						Properties = { Size = { Vector3 = { 8, 2, 2 } } },
+						Children = {},
+					},
+				},
+				removed = { "PARENT" },
+				updated = {},
+			})
+			local replacement = session.__instanceMap.fromIds.EDITED
+			expect(replacement == part).to.equal(false)
+			expect(replacement.Size).to.equal(Vector3.new(8, 2, 2))
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+		session:stop()
+		root:Destroy()
+		parent:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should protect ordinary model-backed string values across delayed echoes", function()
+		local session, value, control = propertySession("StringValue")
+		local success, problem = pcall(function()
+			value.Value = "first"
+			session:__queueChange(value, "Value")
+			local first = session:flushChanges()
+			value.Value = "second"
+			session:__queueChange(value, "Value")
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = { { id = "EDITED", changedProperties = { Value = { String = "first" } } } },
+			})
+			expect(value.Value).to.equal("second")
+			local result = writeResult()
+			result.messageCursor = 1
+			control.settle[1](result)
+			first:await()
+			local second = session:flushChanges()
+			expect(control.requests[2].updated[1].changedProperties.Value.String).to.equal("second")
+			result.messageCursor = 2
+			control.settle[2](result)
+			second:await()
+		end)
+		session:stop()
+		value:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should not retain local generations for DataModel changes the batcher ignores", function()
+		local session, unused, control = propertySession("Folder")
+		session.__instanceMap:insert("ROOT", game)
+		local success, problem = pcall(function()
+			session:__queueChange(game, "Attributes")
+			expect(session:flushChanges()).to.equal(nil)
+			expect(#control.requests).to.equal(0)
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+		session:stop()
+		unused:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should apply a refused property's restoration regardless of response ordering", function()
+		for _, responseFirst in { false, true } do
+			local session, part, control = propertySession("Part")
+			local success, problem = pcall(function()
+				part.Size = Vector3.new(5, 2, 2)
+				session:__queueChange(part, "Size")
+				local write = session:flushChanges()
+				local result = writeResult({ { message = "Property is excluded" } })
+				result.messageCursor = 1
+				if responseFirst then
+					control.settle[1](result)
+					write:await()
+				end
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = {
+						{ id = "EDITED", changedProperties = { Size = { Vector3 = { 2, 2, 2 } } } },
+					},
+				})
+				expect(part.Size).to.equal(Vector3.new(5, 2, 2))
+				control.cursor = 1
+				session:__releaseLocalProperties(control.cursor)
+				if not responseFirst then
+					control.settle[1](result)
+					write:await()
+				end
+				expect(part.Size).to.equal(Vector3.new(2, 2, 2))
+				expect(session:getSyncResults()[1].status).to.equal("Failed")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+			session:stop()
+			part:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should never suppress structural authority", function()
+		local session, part = propertySession("Part")
+		local success, problem = pcall(function()
+			part.Size = Vector3.new(5, 2, 2)
+			session:__queueChange(part, "Size")
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = {
+					{
+						id = "EDITED",
+						changedName = "ServerName",
+						changedProperties = { Size = { Vector3 = { 2, 2, 2 } } },
+					},
+				},
+			})
+			expect(part.Size).to.equal(Vector3.new(2, 2, 2))
+			expect(part.Name).to.equal("ServerName")
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+		session:stop()
+		part:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should preserve filesystem payload authority regardless of response ordering", function()
+		for _, responseFirst in { false, true } do
+			local session, value, control = propertySession("StringValue")
+			local success, problem = pcall(function()
+				value.Value = "Studio text"
+				session:__queueChange(value, "Value")
+				local write = session:flushChanges()
+				local result = writeResult(nil, {
+					removed_instances = {},
+					added_instances = {},
+					updated_instances = { { id = "EDITED" } },
+				})
+				result.messageCursor = 1
+				if responseFirst then
+					control.settle[1](result)
+					write:await()
+				end
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = { { id = "EDITED", changedProperties = { Value = { String = "Filesystem text" } } } },
+				})
+				control.cursor = 1
+				session:__releaseLocalProperties(control.cursor)
+				if not responseFirst then
+					control.settle[1](result)
+					write:await()
+				end
+				expect(value.Value).to.equal("Filesystem text")
+				expect(session:getSyncResults()[1].status).to.equal("Conflicted")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+			session:stop()
+			value:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should discard pending property generations when a session stops", function()
+		local session, part = propertySession("Part")
+		part.Size = Vector3.new(5, 2, 2)
+		session:__queueChange(part, "Size")
+		expect(next(session.__localPropertyEdits) ~= nil).to.equal(true)
+		session:stop()
+		expect(session.__localPropertyEdits).to.equal(nil)
+		part:Destroy()
 	end)
 
 	it("should retain the first local change cursor until the batch is flushed", function()
