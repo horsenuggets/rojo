@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn reflection_missing_workspace_content_and_enums_survive_binary_place_output() {
+    fn reflection_missing_workspace_content_and_enums_survive_binary_and_xml_place_output() {
         use rbx_dom_weak::types::{Content, Enum};
         let database = rbx_reflection_database::get().unwrap();
         let workspace = &database.classes["Workspace"];
@@ -607,18 +607,28 @@ mod tests {
                         Variant::Enum(Enum::from_u32(throughput)),
                     ),
                 ]);
-                let mut upload = capture(Scope::Place);
-                upload.manifest.services[0].properties = expected.clone();
-                let (bytes, warnings) =
-                    capture_bytes(upload, Scope::Place, OutputKind::Rbxl).unwrap();
-                assert!(warnings.is_empty(), "{warnings:?}");
-                let reopened = rbx_binary::from_reader(bytes.as_slice()).unwrap();
-                let workspace = reopened
-                    .descendants()
-                    .find(|instance| instance.class == "Workspace")
-                    .unwrap();
-                for (name, value) in expected {
-                    assert_eq!(workspace.properties.get(&ustr(&name)), Some(&value));
+                for kind in [OutputKind::Rbxl, OutputKind::Rbxlx] {
+                    let mut upload = capture(Scope::Place);
+                    upload.manifest.services[0].properties = expected.clone();
+                    let (bytes, warnings) = capture_bytes(upload, Scope::Place, kind).unwrap();
+                    assert!(warnings.is_empty(), "{warnings:?}");
+                    let reopened = if matches!(kind, OutputKind::Rbxl) {
+                        rbx_binary::from_reader(bytes.as_slice()).unwrap()
+                    } else {
+                        rbx_xml::from_reader(
+                            bytes.as_slice(),
+                            rbx_xml::DecodeOptions::new()
+                                .property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown),
+                        )
+                        .unwrap()
+                    };
+                    let workspace = reopened
+                        .descendants()
+                        .find(|instance| instance.class == "Workspace")
+                        .unwrap();
+                    for (name, value) in &expected {
+                        assert_eq!(workspace.properties.get(&ustr(name)), Some(value));
+                    }
                 }
             }
         }
