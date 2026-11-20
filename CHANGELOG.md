@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.6`
+
 * Preserved readable `Workspace.ExplorerIconContent`, `Workspace.ReplicationFrequency`,
   and `Workspace.ReplicationThroughput` in whole-place exports despite older reflection
   metadata. Captures read current values and retain explicit warnings for unreadable or
