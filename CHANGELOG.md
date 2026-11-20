@@ -31,6 +31,32 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.7`
+
+* Avoided full-project copies and import-mapping rebuilds for unchanged filesystem events
+  and ordinary property or script edits. Structural changes still validate atomically,
+  and bidirectional synchronization retains filesystem-authoritative conflict handling.
+* Fixed Studio writeback for text values and localization CSV contents, including empty
+  text, while preserving unrelated adjacent metadata and filesystem-authoritative conflicts.
+* Indexed import-path mappings once per refresh instead of scanning every mount for each
+  import, preserving mapping precedence and script aliases during structural edits.
+* Restored authored aliases when edited scripts contain generated relative imports.
+  Alias-save bookkeeping no longer triggers false structural conflicts for pending edits.
+* Let ordinary Studio property edits, including interactive scaling and movement, merge
+  onto current disk values without false conflicts from earlier writes in the same drag.
+  Unrelated disk properties remain intact, while structural and file-payload conflicts
+  retain filesystem authority. Delayed server echoes no longer overwrite newer local
+  property edits while their batches are pending or in flight, and rejected writes still
+  restore the server value after their announcements arrive. Property values are encoded
+  once per batch rather than on each change signal, and omitted encodings release their
+  pending guards.
+* Corrected numeric UI binding interpolation and the development plugin's TestEZ lookup,
+  and resolved production Luau analysis diagnostics without changing decoder behavior.
+* Added fine-grained profiling scopes for filesystem refreshes, import mapping validation,
+  Studio writeback, and sourcemap generation using the existing Tracy profiling feature.
+  Studio timing labels now appear in MicroProfiler independently of console timing logs,
+  with coroutine-local nesting and balanced scopes when patch application fails.
+
 ## `7.7.1-horse.2.6`
 
 * Preserved readable `Workspace.ExplorerIconContent`, `Workspace.ReplicationFrequency`,

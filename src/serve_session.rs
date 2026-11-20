@@ -392,6 +392,7 @@ pub enum ServeSessionError {
     },
 }
 
+#[profiling::function]
 pub(crate) fn build_require_context(
     snapshot: &InstanceSnapshot,
     root: &Path,
@@ -400,6 +401,48 @@ pub(crate) fn build_require_context(
         project_root: root.to_path_buf(),
         path_mappings: extract_path_mappings(snapshot, root)?,
         datamodel: snapshot.class_name == "DataModel",
+    }))
+}
+
+#[profiling::function]
+pub(crate) fn build_require_context_from_tree(
+    tree: &RojoTree,
+    root: &Path,
+) -> anyhow::Result<Arc<RequireContext>> {
+    fn walk(
+        tree: &RojoTree,
+        id: rbx_dom_weak::types::Ref,
+        root: &Path,
+        dm: &mut Vec<String>,
+        mappings: &mut Vec<(PathBuf, Vec<String>)>,
+    ) {
+        let instance = tree.get_instance(id).unwrap();
+        for path in instance.metadata().watch_paths() {
+            if let Ok(relative) = path.strip_prefix(root) {
+                mappings.push((relative.to_path_buf(), dm.clone()));
+            }
+        }
+        for child in instance.children() {
+            dm.push(tree.get_instance(*child).unwrap().name().to_owned());
+            walk(tree, *child, root, dm, mappings);
+            dm.pop();
+        }
+    }
+    let mut mappings = Vec::new();
+    {
+        profiling::scope!("Rojo require mappings tree traversal");
+        walk(
+            tree,
+            tree.get_root_id(),
+            root,
+            &mut Vec::new(),
+            &mut mappings,
+        );
+    }
+    Ok(Arc::new(RequireContext {
+        project_root: root.to_path_buf(),
+        path_mappings: normalize_path_mappings(mappings, root, &tree.root().metadata().context)?,
+        datamodel: tree.root().class_name() == "DataModel",
     }))
 }
 
@@ -423,26 +466,33 @@ fn extract_path_mappings(
     fn walk(
         snapshot: &InstanceSnapshot,
         root: &Path,
-        dm: &[String],
+        dm: &mut Vec<String>,
         mappings: &mut Vec<(PathBuf, Vec<String>)>,
     ) {
-        for path in snapshot
-            .metadata
-            .relevant_paths
-            .iter()
-            .chain(&snapshot.metadata.installed_paths)
-        {
+        for path in snapshot.metadata.watch_paths() {
             if let Ok(relative) = path.strip_prefix(root) {
-                mappings.push((relative.to_path_buf(), dm.to_vec()));
+                mappings.push((relative.to_path_buf(), dm.clone()));
             }
         }
         for child in &snapshot.children {
-            let mut path = dm.to_vec();
-            path.push(child.name.to_string());
-            walk(child, root, &path, mappings);
+            dm.push(child.name.to_string());
+            walk(child, root, dm, mappings);
+            dm.pop();
         }
     }
-    walk(snapshot, root, &[], &mut mappings);
+    {
+        profiling::scope!("Rojo require mappings snapshot traversal");
+        walk(snapshot, root, &mut Vec::new(), &mut mappings);
+    }
+    normalize_path_mappings(mappings, root, &snapshot.metadata.context)
+}
+
+fn normalize_path_mappings(
+    mut mappings: Vec<(PathBuf, Vec<String>)>,
+    root: &Path,
+    context: &InstanceContext,
+) -> anyhow::Result<Vec<(PathBuf, Vec<String>)>> {
+    profiling::scope!("Rojo require mappings normalization");
     mappings.sort_by(|a, b| {
         b.0.components()
             .count()
@@ -450,7 +500,7 @@ fn extract_path_mappings(
             .then(a.0.cmp(&b.0))
     });
     mappings.dedup();
-    if let Some(packages) = &snapshot.metadata.context.package_sources {
+    if let Some(packages) = &context.package_sources {
         for pair in mappings.windows(2) {
             if pair[0].0 == pair[1].0 && packages.is_local_source(&root.join(&pair[0].0)) {
                 anyhow::bail!("Local package source {} is mounted more than once. Remove the duplicate source mount instead of creating divergent module identities", pair[0].0.display());
@@ -465,6 +515,133 @@ mod test {
     use super::*;
 
     use memofs::StdBackend;
+
+    #[test]
+    fn borrowed_require_context_matches_snapshot_mappings() {
+        use crate::snapshot::InstanceMetadata;
+
+        for class_name in ["DataModel", "Folder", "ModuleScript"] {
+            let root = Path::new("/root");
+            let mut util_metadata = InstanceMetadata::new().relevant_paths(vec![
+                root.join("Source/Shared/Util.luau"),
+                root.join("Source/Shared/Util.meta.json"),
+                PathBuf::from("/outside/Util.luau"),
+            ]);
+            util_metadata.installed_paths = vec![
+                root.join("Packages/Util.luau"),
+                root.join("Packages/Util.luau"),
+            ];
+            let snapshot = InstanceSnapshot::new()
+                .name("RootNameIsNotAMappingSegment")
+                .class_name(class_name)
+                .metadata(
+                    InstanceMetadata::new().relevant_paths(vec![root.join("default.project.json")]),
+                )
+                .children(vec![
+                    InstanceSnapshot::new()
+                        .name("Shared")
+                        .class_name("Folder")
+                        .metadata(
+                            InstanceMetadata::new()
+                                .relevant_paths(vec![root.join("Source/Shared")]),
+                        )
+                        .children(vec![InstanceSnapshot::new()
+                            .name("Util")
+                            .class_name("ModuleScript")
+                            .metadata(util_metadata)
+                            .property("Source", "return 42")]),
+                    InstanceSnapshot::new()
+                        .name("Other")
+                        .class_name("Folder")
+                        .metadata(InstanceMetadata::new().relevant_paths(vec![root.join("Other")])),
+                ]);
+            let expected = build_require_context(&snapshot, root).unwrap();
+            let tree = RojoTree::new(snapshot);
+            let actual = build_require_context_from_tree(&tree, root).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.datamodel, class_name == "DataModel");
+            assert_eq!(actual.project_root, root);
+            assert_eq!(
+                actual.path_mappings,
+                vec![
+                    (
+                        "Source/Shared/Util.luau".into(),
+                        vec!["Shared".into(), "Util".into()]
+                    ),
+                    (
+                        "Source/Shared/Util.meta.json".into(),
+                        vec!["Shared".into(), "Util".into()]
+                    ),
+                    (
+                        "Packages/Util.luau".into(),
+                        vec!["Shared".into(), "Util".into()]
+                    ),
+                    ("Source/Shared".into(), vec!["Shared".into()]),
+                    ("Other".into(), vec!["Other".into()]),
+                    ("default.project.json".into(), vec![]),
+                ]
+            );
+            assert_eq!(
+                build_require_context_from_tree(&tree, root).unwrap(),
+                actual
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_require_context_rejects_duplicate_local_package_mappings() {
+        use crate::{package_sources::PackageSources, snapshot::InstanceMetadata};
+        use memofs::{InMemoryFs, VfsSnapshot};
+
+        let root = Path::new("/root");
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot(
+                root,
+                VfsSnapshot::dir([
+                    (
+                        "wally.toml",
+                        VfsSnapshot::file("[dependencies]\nLibrary = \"^Local/Library\"\n"),
+                    ),
+                    (
+                        "Local",
+                        VfsSnapshot::dir([(
+                            "Library",
+                            VfsSnapshot::dir([("wally.toml", VfsSnapshot::file(""))]),
+                        )]),
+                    ),
+                ]),
+            )
+            .unwrap();
+        let packages = PackageSources::load(&Vfs::new(backend), root)
+            .unwrap()
+            .unwrap();
+        assert!(packages.is_local_source(&root.join("Local/Library")));
+        let mut metadata = InstanceMetadata::new();
+        metadata.context.package_sources = Some(Arc::new(packages));
+        let snapshot = InstanceSnapshot::new()
+            .class_name("Folder")
+            .metadata(metadata)
+            .children(
+                ["First", "Second"]
+                    .into_iter()
+                    .map(|name| {
+                        InstanceSnapshot::new()
+                            .name(name)
+                            .class_name("Folder")
+                            .metadata(
+                                InstanceMetadata::new()
+                                    .relevant_paths(vec![root.join("Local/Library")]),
+                            )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        let expected = build_require_context(&snapshot, root).unwrap_err();
+        let tree = RojoTree::new(snapshot);
+        let actual = build_require_context_from_tree(&tree, root).unwrap_err();
+        assert_eq!(actual.to_string(), expected.to_string());
+        assert!(actual.to_string().contains("mounted more than once"));
+    }
 
     fn root_mapping_with_reserved_cache() -> memofs::InMemoryFs {
         use memofs::{InMemoryFs, VfsSnapshot};

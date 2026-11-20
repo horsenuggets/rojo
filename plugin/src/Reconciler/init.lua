@@ -27,9 +27,12 @@ end
 function Reconciler:applyPatch(patch)
 	Timer.start("Reconciler:applyPatch")
 
-	local unappliedPatch = applyPatch(self.__instanceMap, patch)
+	local ok, unappliedPatch = pcall(applyPatch, self.__instanceMap, patch)
 
 	Timer.stop()
+	if not ok then
+		error(unappliedPatch, 0)
+	end
 	return unappliedPatch
 end
 

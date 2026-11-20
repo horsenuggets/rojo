@@ -63,6 +63,17 @@ pub(crate) fn prepare_requires(
     vfs: &Vfs,
     require_context: &std::sync::Arc<crate::snapshot::RequireContext>,
 ) -> anyhow::Result<()> {
+    profiling::scope!("Rojo.PrepareProjectImports");
+    let mappings = luaurc::PathMappingIndex::new(&require_context.path_mappings);
+    prepare_requires_with_index(snapshot, vfs, require_context, &mappings)
+}
+
+fn prepare_requires_with_index(
+    snapshot: &mut InstanceSnapshot,
+    vfs: &Vfs,
+    require_context: &std::sync::Arc<crate::snapshot::RequireContext>,
+    mappings: &luaurc::PathMappingIndex,
+) -> anyhow::Result<()> {
     use rbx_dom_weak::{types::Variant, ustr};
     let mut resolved = true;
     // Model payloads are not filesystem Luau source and retain their native imports.
@@ -91,11 +102,12 @@ pub(crate) fn prepare_requires(
                 .package_mount
                 .as_ref()
                 .and_then(|(_, installed)| installed.parent());
-            match luaurc::resolve_requires_with_package_dependencies(
+            match luaurc::resolve_requires_with_mapping_index(
                 &original,
                 &info,
                 require_context.datamodel,
                 package_dependencies,
+                Some(mappings),
             ) {
                 Ok(emitted) => {
                     *source = emitted.clone();
@@ -116,7 +128,7 @@ pub(crate) fn prepare_requires(
         snapshot.metadata.context.require_context = Some(require_context.clone());
     }
     for child in &mut snapshot.children {
-        prepare_requires(child, vfs, require_context)?;
+        prepare_requires_with_index(child, vfs, require_context, mappings)?;
     }
     Ok(())
 }

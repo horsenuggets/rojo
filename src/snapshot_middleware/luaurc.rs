@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
@@ -67,6 +68,86 @@ pub struct ResolveInfo<'a> {
     pub project_root: &'a Path,
 }
 
+/// A refresh resolves many imports against one immutable mapping list. Remember the
+/// original ordinal so indexed lookup preserves first-match semantics, even for
+/// unsorted mappings or a script's extensionless alias colliding with another mount.
+pub(super) struct PathMappingIndex<'a> {
+    mappings: &'a [(PathBuf, Vec<String>)],
+    prefixes: HashMap<Cow<'a, Path>, usize>,
+}
+
+impl<'a> PathMappingIndex<'a> {
+    pub(super) fn new(mappings: &'a [(PathBuf, Vec<String>)]) -> Self {
+        profiling::scope!("Rojo.BuildImportMappingIndex");
+        let mut prefixes = HashMap::with_capacity(mappings.len());
+        for (ordinal, (path, _)) in mappings.iter().enumerate() {
+            prefixes
+                .entry(Cow::Borrowed(path.as_path()))
+                .or_insert(ordinal);
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "lua" || extension == "luau")
+            {
+                prefixes
+                    .entry(Cow::Owned(path.with_extension("")))
+                    .or_insert(ordinal);
+            }
+        }
+        Self { mappings, prefixes }
+    }
+
+    fn matching_prefix<'p>(&self, relative: &'p Path) -> (Option<(usize, &'p Path)>, usize) {
+        let mut selected = None;
+        let mut candidates = 0;
+        for prefix in relative.ancestors().chain(std::iter::once(Path::new(""))) {
+            candidates += 1;
+            if let Some(&ordinal) = self.prefixes.get(prefix) {
+                if selected.is_none_or(|(previous, _)| ordinal < previous) {
+                    selected = Some((ordinal, prefix));
+                }
+            }
+        }
+        (selected, candidates)
+    }
+
+    fn resolve(&self, fs_path: &Path, root: &Path) -> Vec<String> {
+        let normalized = crate::package_sources::normalize(fs_path);
+        let relative = normalized.strip_prefix(root).unwrap_or(&normalized);
+        if let Some((ordinal, prefix)) = self.matching_prefix(relative).0 {
+            let mut result = self.mappings[ordinal].1.clone();
+            result.extend(
+                relative
+                    .strip_prefix(prefix)
+                    .unwrap()
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned()),
+            );
+            result
+        } else {
+            relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PathMappings<'a> {
+    paths: &'a [(PathBuf, Vec<String>)],
+    root: &'a Path,
+    index: Option<&'a PathMappingIndex<'a>>,
+}
+
+impl PathMappings<'_> {
+    fn resolve(self, path: &Path) -> Vec<String> {
+        match self.index {
+            Some(index) => index.resolve(path, self.root),
+            None => to_datamodel_path(path, self.paths, self.root),
+        }
+    }
+}
+
 /// Resolve `.luaurc` alias-based requires in the given Luau source
 /// code. Transforms `require("@alias/path")` into relative
 /// require-by-string paths like `require("../../Packages/path")`.
@@ -91,6 +172,21 @@ pub(crate) fn resolve_requires_with_package_dependencies(
     datamodel: bool,
     package_dependencies: Option<&Path>,
 ) -> anyhow::Result<String> {
+    resolve_requires_with_mapping_index(source, info, datamodel, package_dependencies, None)
+}
+
+pub(super) fn resolve_requires_with_mapping_index(
+    source: &str,
+    info: &ResolveInfo,
+    datamodel: bool,
+    package_dependencies: Option<&Path>,
+    index: Option<&PathMappingIndex>,
+) -> anyhow::Result<String> {
+    let mappings = PathMappings {
+        paths: info.path_mappings,
+        root: info.project_root,
+        index,
+    };
     let file_dir = info
         .file_path
         .parent()
@@ -144,14 +240,8 @@ pub(crate) fn resolve_requires_with_package_dependencies(
         .map(|s| s.starts_with("init."))
         .unwrap_or(false);
 
-    let replacements = find_require_replacements(
-        source,
-        file_dir,
-        &aliases,
-        luaurc_dir,
-        info.path_mappings,
-        info.project_root,
-        is_init,
+    let replacements = find_require_replacements_with_mappings(
+        source, file_dir, &aliases, luaurc_dir, mappings, is_init,
     )?;
 
     if replacements.is_empty() {
@@ -170,7 +260,7 @@ pub(crate) fn resolve_requires_with_package_dependencies(
                 .strip_prefix("require(\"")
                 .and_then(|s| s.strip_suffix("\")"))
             {
-                let mut target = to_datamodel_path(file_dir, info.path_mappings, info.project_root);
+                let mut target = mappings.resolve(file_dir);
                 if is_init {
                     target.pop();
                 }
@@ -261,6 +351,7 @@ struct Replacement {
 /// relative path. This accounts for project tree remappings like
 /// `"Plugin": { "$path": "Source/Plugin" }` where the filesystem
 /// has an extra directory level that doesn't exist in the DataModel.
+#[cfg(test)]
 fn compute_relative_require(
     script_dir: &Path,
     alias_target: &Path,
@@ -269,9 +360,29 @@ fn compute_relative_require(
     project_root: &Path,
     is_init: bool,
 ) -> String {
+    compute_relative_require_with_mappings(
+        script_dir,
+        alias_target,
+        sub_path,
+        PathMappings {
+            paths: path_mappings,
+            root: project_root,
+            index: None,
+        },
+        is_init,
+    )
+}
+
+fn compute_relative_require_with_mappings(
+    script_dir: &Path,
+    alias_target: &Path,
+    sub_path: Option<&str>,
+    mappings: PathMappings,
+    is_init: bool,
+) -> String {
     let target = sub_path.map_or_else(|| alias_target.to_path_buf(), |sub| alias_target.join(sub));
-    if !path_mappings.is_empty() {
-        compute_datamodel_relative(script_dir, &target, path_mappings, project_root, is_init)
+    if !mappings.paths.is_empty() {
+        compute_datamodel_relative(script_dir, &target, mappings, is_init)
     } else {
         compute_filesystem_relative(script_dir, &target)
     }
@@ -282,12 +393,11 @@ fn compute_relative_require(
 fn compute_datamodel_relative(
     script_dir: &Path,
     alias_target: &Path,
-    path_mappings: &[(PathBuf, Vec<String>)],
-    project_root: &Path,
+    mappings: PathMappings,
     is_init: bool,
 ) -> String {
-    let mut script_dm = to_datamodel_path(script_dir, path_mappings, project_root);
-    let target_dm = to_datamodel_path(alias_target, path_mappings, project_root);
+    let mut script_dm = mappings.resolve(script_dir);
+    let target_dm = mappings.resolve(alias_target);
 
     // Init scripts usurp their parent folder. The script IS the
     // folder, so its "current directory" for require-by-string is
@@ -416,6 +526,7 @@ fn diff_paths(target: &Path, base: &Path) -> Option<PathBuf> {
 
 /// Scan the source for `require("@...")` calls and compute
 /// replacements using the full_moon AST.
+#[cfg(test)]
 fn find_require_replacements(
     source: &str,
     script_dir: &Path,
@@ -423,6 +534,28 @@ fn find_require_replacements(
     luaurc_dir: &Path,
     path_mappings: &[(PathBuf, Vec<String>)],
     project_root: &Path,
+    is_init: bool,
+) -> anyhow::Result<Vec<Replacement>> {
+    find_require_replacements_with_mappings(
+        source,
+        script_dir,
+        aliases,
+        luaurc_dir,
+        PathMappings {
+            paths: path_mappings,
+            root: project_root,
+            index: None,
+        },
+        is_init,
+    )
+}
+
+fn find_require_replacements_with_mappings(
+    source: &str,
+    script_dir: &Path,
+    aliases: &HashMap<String, String>,
+    luaurc_dir: &Path,
+    mappings: PathMappings,
     is_init: bool,
 ) -> anyhow::Result<Vec<Replacement>> {
     let ast = full_moon::parse(source)
@@ -440,8 +573,7 @@ fn find_require_replacements(
             script_dir,
             aliases,
             luaurc_dir,
-            path_mappings,
-            project_root,
+            mappings,
             is_init,
         ) {
             replacements.push(replacement);
@@ -632,9 +764,9 @@ fn visit_expr(expr: &Expression, callback: &mut dyn FnMut(Range<usize>, String))
     }
 }
 
-/// Check if a chain starts with `require("@...")` and if so, invoke the callback with the
-/// byte range of just that call (not anything chained after it, like `.Field`) and the
-/// string content.
+/// Check if a chain starts with a literal string require and invoke the callback with
+/// the byte range of just that call (not anything chained after it, like `.Field`).
+/// Include generated relative imports so syncback can match them to authored aliases.
 fn check_require_call(
     prefix: &Prefix,
     first_suffix: &Suffix,
@@ -666,10 +798,8 @@ fn check_require_call(
     };
 
     if let Some(content) = content {
-        if content.starts_with('@') {
-            let start = name.token().start_position().bytes();
-            callback(start..func_args_byte_end(args), content);
-        }
+        let start = name.token().start_position().bytes();
+        callback(start..func_args_byte_end(args), content);
     }
 }
 
@@ -711,8 +841,7 @@ fn resolve_alias_require(
     script_dir: &Path,
     aliases: &HashMap<String, String>,
     luaurc_dir: &Path,
-    path_mappings: &[(PathBuf, Vec<String>)],
-    project_root: &Path,
+    mappings: PathMappings,
     is_init: bool,
 ) -> Option<Replacement> {
     let (alias_path, call_range) = call;
@@ -746,12 +875,11 @@ fn resolve_alias_require(
 
         let alias_fs_path = luaurc_dir.join(alias_target);
 
-        let require_path = compute_relative_require(
+        let require_path = compute_relative_require_with_mappings(
             script_dir,
             &alias_fs_path,
             sub_path,
-            path_mappings,
-            project_root,
+            mappings,
             is_init,
         );
 
@@ -769,6 +897,146 @@ fn resolve_alias_require(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn indexed_mapping_lookup_matches_linear_first_match_semantics() {
+        let entries = [
+            ("Source", "Broad"),
+            ("Source/Shared", "Nested"),
+            ("Source/Shared/Thing.luau", "Script"),
+            ("Source/Shared/Thing", "ExtensionlessCollision"),
+            ("Source/Shared/Thing.luau", "Duplicate"),
+            ("Source/Worker.server.luau", "Worker"),
+            ("Source/Legacy.lua", "Legacy"),
+            ("", "EmptyPrefix"),
+            ("/outside", "Absolute"),
+            ("Source/Shared/./Other", "ComponentNormalization"),
+        ];
+        let queries = [
+            "/root",
+            "/root/Source",
+            "/root/Source/Shared",
+            "/root/Source/Shared/Thing",
+            "/root/Source/Shared/Thing.luau",
+            "/root/Source/Shared/Thing/Child",
+            "/root/Source/Shared/Thing.luau/Child",
+            "/root/Source/Worker.server",
+            "/root/Source/Worker.server.luau",
+            "/root/Source/Legacy",
+            "/root/Source/Legacy.lua",
+            "/root/Source/Shared/Other",
+            "/root/Source/Shared/../Shared/Thing",
+            "/root/Unmapped/Code",
+            "/outside/Code",
+            "relative/Unmapped",
+        ];
+        let root = Path::new("/root");
+        for length in 0..=entries.len() {
+            let mut mappings = entries[..length]
+                .iter()
+                .map(|(path, target)| (PathBuf::from(path), vec![target.to_string()]))
+                .collect::<Vec<_>>();
+            for reversed in [false, true] {
+                if reversed {
+                    mappings.reverse();
+                }
+                for _ in 0..length.max(1) {
+                    let index = PathMappingIndex::new(&mappings);
+                    for query in queries {
+                        assert_eq!(
+                            index.resolve(Path::new(query), root),
+                            to_datamodel_path(Path::new(query), &mappings, root),
+                            "query {query}, mappings {mappings:?}"
+                        );
+                    }
+                    if !mappings.is_empty() {
+                        mappings.rotate_left(1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_lookup_work_is_bounded_by_path_depth_not_mapping_count() {
+        let root = Path::new("/root");
+        let query = Path::new("Source/Shared/Target/Child");
+        let expected_probes = query.ancestors().count() + 1;
+        for count in [0, 10, 10_000] {
+            let mut mappings = (0..count)
+                .map(|index| {
+                    (
+                        PathBuf::from(format!("Other/Module{index}.luau")),
+                        vec![format!("Module{index}")],
+                    )
+                })
+                .collect::<Vec<_>>();
+            mappings.push(("Source/Shared/Target.luau".into(), vec!["Mapped".into()]));
+            let index = PathMappingIndex::new(&mappings);
+            assert_eq!(index.matching_prefix(query).1, expected_probes);
+            assert_eq!(index.resolve(&root.join(query), root), ["Mapped", "Child"]);
+        }
+    }
+
+    #[test]
+    fn indexed_resolution_preserves_import_output_and_reversal() {
+        let mut memory = memofs::InMemoryFs::new();
+        memory
+            .load_snapshot(
+                "/root/.luaurc",
+                memofs::VfsSnapshot::file(r#"{"aliases":{"shared":"Source/Shared"}}"#),
+            )
+            .unwrap();
+        let vfs = Vfs::new(memory);
+        let mappings = vec![
+            (
+                "Source/Shared/Util.luau".into(),
+                vec!["ReplicatedStorage".into(), "RenamedUtil".into()],
+            ),
+            (
+                "Source/Shared".into(),
+                vec!["ReplicatedStorage".into(), "Shared".into()],
+            ),
+            (
+                "Source/App".into(),
+                vec!["ServerScriptService".into(), "App".into()],
+            ),
+        ];
+        let index = PathMappingIndex::new(&mappings);
+        let source = "return require(\"@shared/Util\"), 1\n";
+        for datamodel in [false, true] {
+            for path in ["/root/Source/App/Code.luau", "/root/Source/App/init.luau"] {
+                let info = ResolveInfo {
+                    file_path: Path::new(path),
+                    vfs: &vfs,
+                    path_mappings: &mappings,
+                    project_root: Path::new("/root"),
+                };
+                let emitted = resolve_requires_with_mapping_index(
+                    source,
+                    &info,
+                    datamodel,
+                    None,
+                    Some(&index),
+                )
+                .unwrap();
+                assert_eq!(
+                    emitted,
+                    resolve_requires_with_package_dependencies(source, &info, datamodel, None)
+                        .unwrap()
+                );
+                let transform = crate::snapshot::SourceTransform {
+                    original: source.into(),
+                    emitted: emitted.clone(),
+                };
+                let edited = emitted.replace(", 1", ", 2");
+                assert_eq!(
+                    restore_source(&transform, &edited).unwrap(),
+                    source.replace(", 1", ", 2")
+                );
+            }
+        }
+    }
 
     #[test]
     fn package_dependency_aliases_work_without_authored_config_in_places_and_models() {
@@ -817,6 +1085,35 @@ mod test {
                 .unwrap(),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn relative_import_round_trip_preserves_native_edits_and_rejects_ambiguous_changes() {
+        let transform = crate::snapshot::SourceTransform {
+            original: "local Lib = require('@packages/Foo')\nlocal Native = require('./Native')\nreturn Lib.Value\n".into(),
+            emitted: "local Lib = require(\"../../Packages/Foo\")\nlocal Native = require('./Native')\nreturn Lib.Value\n".into(),
+        };
+        let edited = transform
+            .emitted
+            .replace("'./Native'", "'./Other'")
+            .replace("Lib.Value", "Lib.OtherValue");
+        assert_eq!(
+            restore_source(&transform, &edited).unwrap(),
+            transform
+                .original
+                .replace("'./Native'", "'./Other'")
+                .replace("Lib.Value", "Lib.OtherValue")
+        );
+        for edited in [
+            transform.emitted.replace("Packages/Foo", "Packages/Bar"),
+            transform
+                .emitted
+                .replace("require(", "require(-- comment\n"),
+            format!("{}\nrequire('./Extra')", transform.emitted),
+            transform.emitted.replace("require('./Native')", "nil"),
+        ] {
+            assert!(restore_source(&transform, &edited).is_err());
         }
     }
 
@@ -1121,6 +1418,42 @@ mod test {
 
         let result = resolve_requires(source, &info).unwrap();
         assert_eq!(result, source);
+    }
+
+    #[test]
+    fn mixed_alias_imports_preserve_empty_unicode_and_nonalias_requires() {
+        let vfs = make_test_vfs(&[("/project/.luaurc", r#"{"aliases":{"packages":"Packages"}}"#)]);
+        let info = ResolveInfo {
+            file_path: Path::new("/project/Source/Plugin/init.plugin.luau"),
+            path_mappings: &[],
+            project_root: Path::new("/project"),
+            vfs: &vfs,
+        };
+        let index = PathMappingIndex::new(info.path_mappings);
+        for ordinary in [
+            "",
+            "é",
+            "./Foo",
+            "../Foo",
+            "xpackages/Fusion",
+            "packages/Fusion",
+        ] {
+            let literal = serde_json::to_string(ordinary).unwrap();
+            for call in [format!("require({literal})"), format!("require {literal}")] {
+                let source =
+                    format!(r#"local Alias = require("@packages/Fusion"); local Other = {call}"#);
+                let expected = source.replace(
+                    r#"require("@packages/Fusion")"#,
+                    r#"require("../../Packages/Fusion")"#,
+                );
+                for mappings in [None, Some(&index)] {
+                    let actual =
+                        resolve_requires_with_mapping_index(&source, &info, false, None, mappings)
+                            .unwrap();
+                    assert_eq!(actual, expected, "{call}");
+                }
+            }
+        }
     }
 
     #[test]

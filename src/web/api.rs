@@ -241,6 +241,7 @@ impl ApiService {
         errors.extend(write_errors);
         let response = WriteResponse {
             session_id,
+            message_cursor: self.serve_session.message_queue().cursor(),
             accepted,
             conflicts,
             errors,
