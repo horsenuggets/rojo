@@ -6,6 +6,31 @@ return function()
 
 	local container = Instance.new("Folder")
 
+	it("should close its profiling scope when applying a patch throws", function()
+		local Reconciler = require(script.Parent)
+		local Timer = require(script.Parent.Parent.Timer)
+		local instanceMap = InstanceMap.new()
+		local reconciler = Reconciler.new(instanceMap)
+		local worker = coroutine.create(function()
+			Timer.start("ApplyPatchTest.Outer")
+			local ok = pcall(reconciler.applyPatch, reconciler, nil)
+			local entries = Timer._entries[coroutine.running()]
+			local count = #entries
+			local label = entries[1].Label
+			while Timer._entries[coroutine.running()] do
+				Timer.stop()
+			end
+			return ok, count, label
+		end)
+		local resumed, applied, count, label = coroutine.resume(worker)
+		instanceMap:stop()
+		assert(resumed, applied)
+		expect(applied).to.equal(false)
+		expect(count).to.equal(1)
+		expect(label).to.equal("ApplyPatchTest.Outer")
+		expect(Timer._entries[worker]).to.equal(nil)
+	end)
+
 	-- The server announces a subtree Studio created. Studio already holds the
 	-- root, so only a child that exists on disk alone may be created.
 	it("should add only unknown children under an announced subtree Studio already has", function()
