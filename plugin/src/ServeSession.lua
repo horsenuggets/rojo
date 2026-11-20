@@ -13,6 +13,7 @@ local Timer = require(script.Parent.Timer)
 
 local ChangeBatcher = require(script.Parent.ChangeBatcher)
 local encodePatchUpdate = require(script.Parent.ChangeBatcher.encodePatchUpdate)
+local getWritablePropertyDescriptor = require(script.Parent.ChangeBatcher.getWritablePropertyDescriptor)
 local InstanceMap = require(script.Parent.InstanceMap)
 local PatchSet = require(script.Parent.PatchSet)
 local Reconciler = require(script.Parent.Reconciler)
@@ -114,12 +115,16 @@ function ServeSession.new(options)
 		return { cursor = cursor, properties = self:__takeLocalPropertyEdits(changes) }
 	end
 
+	local function onBatchPrepared(patch, context)
+		self:__finishOmittedLocalProperties(patch, context.properties)
+	end
+
 	local function onChangesFlushed(patch, context)
 		return self:__writePatch(patch, context.cursor, context.properties)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged, onChildAdded)
-	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken)
+	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken, onBatchPrepared)
 	local reconciler = Reconciler.new(instanceMap)
 
 	local connections = {}
@@ -387,9 +392,8 @@ function ServeSession:__rememberLocalProperty(instance, propertyName)
 	end
 	-- Value and Contents can be ordinary model fields or file payloads. Buffer their
 	-- echoes until the server decides authority, including any rejected-write restoration.
-	local update = encodePatchUpdate(instance, id, { [propertyName] = true }, instanceMap)
-	local value = update and update.changedProperties[propertyName]
-	if value == nil or next(value) == "Ref" then
+	local descriptor = getWritablePropertyDescriptor(instance.ClassName, propertyName)
+	if descriptor == nil or descriptor.dataType == "Ref" then
 		return
 	end
 	self.__localPropertyEdits = self.__localPropertyEdits or {}
@@ -413,6 +417,26 @@ function ServeSession:__takeLocalPropertyEdits(changes)
 		end
 	end
 	return taken
+end
+
+function ServeSession:__finishOmittedLocalProperties(patch, taken)
+	local emitted = {}
+	if patch ~= nil then
+		for _, update in patch.updated do
+			emitted[update.id] = update.changedProperties
+		end
+	end
+	local omitted = {}
+	for id, entries in taken do
+		local properties = emitted[id]
+		for propertyName, entry in entries do
+			if properties == nil or properties[propertyName] == nil then
+				omitted[id] = omitted[id] or {}
+				omitted[id][propertyName] = entry
+			end
+		end
+	end
+	self:__finishLocalProperties(omitted, nil)
 end
 
 function ServeSession:__protectLocalProperties(patch)

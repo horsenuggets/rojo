@@ -363,6 +363,89 @@ return function()
 		end
 	end)
 
+	it("should read a batched attribute map only when the batch is encoded", function()
+		local session, part, control = propertySession("Part")
+		local RbxDom = require(script.Parent.Parent.Packages.RbxDom)
+		local original = RbxDom.findCanonicalPropertyDescriptor
+		local reads = 0
+		RbxDom.findCanonicalPropertyDescriptor = function(className, propertyName)
+			local descriptor = original(className, propertyName)
+			if descriptor and propertyName == "Attributes" then
+				local observed = table.clone(descriptor)
+				observed.read = function(_self, instance)
+					reads += 1
+					return descriptor:read(instance)
+				end
+				return observed
+			end
+			return descriptor
+		end
+		local success, problem = pcall(function()
+			for index = 1, 64 do
+				part:SetAttribute(`Key{index}`, index)
+				session:__queueChange(part, "Attributes")
+			end
+			expect(reads).to.equal(0)
+			local write = session:flushChanges()
+			expect(reads).to.equal(1)
+			local encoded = control.requests[1].updated[1].changedProperties.Attributes.Attributes
+			expect(encoded.Key64 ~= nil).to.equal(true)
+			local result = writeResult()
+			result.messageCursor = 0
+			control.settle[1](result)
+			write:await()
+		end)
+		RbxDom.findCanonicalPropertyDescriptor = original
+		session:stop()
+		part:Destroy()
+		assert(success, problem)
+	end)
+
+	for _, mixed in { false, true } do
+		it(`should release an omitted property's guard in a mixed batch "{mixed}"`, function()
+			local session, part, control = propertySession("Part")
+			local RbxDom = require(script.Parent.Parent.Packages.RbxDom)
+			local original = RbxDom.findCanonicalPropertyDescriptor
+			part.Transparency = 0.5
+			session:__queueChange(part, "Transparency")
+			if mixed then
+				part.Size = Vector3.new(5, 2, 2)
+				session:__queueChange(part, "Size")
+			end
+			RbxDom.findCanonicalPropertyDescriptor = function(className, propertyName)
+				local descriptor = original(className, propertyName)
+				if descriptor and propertyName == "Transparency" then
+					local unreadable = table.clone(descriptor)
+					unreadable.read = function()
+						return false, "The property cannot be read."
+					end
+					return unreadable
+				end
+				return descriptor
+			end
+			local success, problem = pcall(function()
+				local write = session:flushChanges()
+				local pending = session.__localPropertyEdits.EDITED
+				expect(pending == nil or pending.Transparency == nil).to.equal(true)
+				if mixed then
+					expect(pending.Size ~= nil).to.equal(true)
+					local result = writeResult()
+					result.messageCursor = 0
+					control.settle[1](result)
+					write:await()
+				else
+					expect(write).to.equal(nil)
+					expect(#control.requests).to.equal(0)
+				end
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+			RbxDom.findCanonicalPropertyDescriptor = original
+			session:stop()
+			part:Destroy()
+			assert(success, problem)
+		end)
+	end
+
 	it("should preserve newer local properties across delayed server echoes at every write stage", function()
 		for _, stage in { "pending", "queued", "inflight", "answered" } do
 			local session, part, control = propertySession("Part")
