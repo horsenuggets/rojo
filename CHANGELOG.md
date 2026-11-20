@@ -31,6 +31,13 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.6`
+
+* Preserved readable `Workspace.ExplorerIconContent`, `Workspace.ReplicationFrequency`,
+  and `Workspace.ReplicationThroughput` in whole-place exports despite older reflection
+  metadata. Captures read current values and retain explicit warnings for unreadable or
+  unsupported values without inventing defaults.
+
 ## `7.7.1-horse.2.5`
 
 * Added opt-in `rojo serve --shutdown-on-stdin-eof` to stop launcher-owned servers when

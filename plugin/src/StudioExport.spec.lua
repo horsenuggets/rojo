@@ -540,6 +540,105 @@ return function()
 		end
 	end)
 
+	it("captures reflection-missing Workspace Content and enums from each current getter", function()
+		const fields = { "ExplorerIconContent", "ReplicationFrequency", "ReplicationThroughput" }
+		for _, name in fields do
+			expect(RbxDom.findCanonicalPropertyDescriptor("Workspace", name)).to.equal(nil)
+		end
+		expect(Enum.ReplicationMode.Automatic.Value).to.equal(0)
+		const values = {}
+		const instance = setmetatable({
+			ClassName = "Workspace",
+			Name = "Workspace",
+			GetAttributes = function()
+				return {}
+			end,
+		}, {
+			__index = function(_, name)
+				return values[name]
+			end,
+		})
+		for _, content in { Content.none, Content.fromUri("rbxassetid://123"), Content.none } do
+			for _, frequency in Enum.ReplicationMode:GetEnumItems() do
+				for _, throughput in Enum.ReplicationMode:GetEnumItems() do
+					values.ExplorerIconContent = content
+					values.ReplicationFrequency = frequency
+					values.ReplicationThroughput = throughput
+					const warnings = {}
+					const properties = StudioExport.serviceProperties(instance, warnings)
+					if content == Content.none then
+						expect(properties.ExplorerIconContent.Content).to.equal("None")
+					else
+						expect(properties.ExplorerIconContent.Content.Uri).to.equal(content.Uri)
+					end
+					expect(properties.ReplicationFrequency.Enum).to.equal(frequency.Value)
+					expect(properties.ReplicationThroughput.Enum).to.equal(throughput.Value)
+					for _, warning in warnings do
+						for _, name in fields do
+							expect(warning:find(`"Workspace.{name}"`, 1, true)).to.equal(nil)
+						end
+					end
+				end
+			end
+		end
+	end)
+
+	it("reports missing and denied supplemental Workspace getters without inventing values", function()
+		for _, name in { "ExplorerIconContent", "ReplicationFrequency", "ReplicationThroughput" } do
+			for _, reason in { "Invalid member", "Permission denied" } do
+				const warnings = {}
+				const instance = setmetatable({
+					ClassName = "Workspace",
+					Name = "Workspace",
+					GetAttributes = function()
+						return {}
+					end,
+				}, {
+					__index = function(_, property)
+						if property == name then
+							error(`{reason} for {name}.`)
+						end
+						return nil
+					end,
+				})
+				const properties = StudioExport.serviceProperties(instance, warnings)
+				expect(properties[name]).to.equal(nil)
+				local reported = 0
+				for _, warning in warnings do
+					if warning:find(`Omitted unreadable service property "Workspace.{name}".`, 1, true) then
+						expect(warning:find(`{reason} for {name}.`, 1, true) ~= nil).to.equal(true)
+						reported += 1
+					end
+				end
+				expect(reported).to.equal(1)
+			end
+		end
+	end)
+
+	it("reports invalid supplemental Workspace values through the existing encoder warnings", function()
+		const warnings = {}
+		const properties = StudioExport.serviceProperties({
+			ClassName = "Workspace",
+			ExplorerIconContent = true,
+			Name = "Workspace",
+			ReplicationFrequency = true,
+			ReplicationThroughput = true,
+			GetAttributes = function()
+				return {}
+			end,
+		}, warnings)
+		for _, name in { "ExplorerIconContent", "ReplicationFrequency", "ReplicationThroughput" } do
+			expect(properties[name]).to.equal(nil)
+			local reported = 0
+			for _, warning in warnings do
+				if warning:find(`Omitted unsupported service property "Workspace.{name}".`, 1, true) then
+					reported += 1
+				end
+			end
+			expect(reported).to.equal(1)
+		end
+	end)
+
 	it("reports failed getters for new service enums without synthesizing values", function()
 		for _, case in
 			{
