@@ -4,7 +4,7 @@ use std::{
 };
 
 use futures::channel::oneshot;
-use rbx_dom_weak::types::Ref;
+use rbx_dom_weak::{types::Ref, Ustr};
 
 use crate::snapshot::AppliedPatchSet;
 
@@ -19,6 +19,28 @@ pub struct MessageQueue {
 struct History {
     messages: Vec<AppliedPatchSet>,
     structural_revisions: HashMap<Ref, u32>,
+    filesystem_property_revisions: HashMap<(Ref, Ustr), u32>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum MessageOrigin {
+    Filesystem,
+    Studio,
+}
+
+pub(crate) fn structural_targets(patch: &AppliedPatchSet) -> impl Iterator<Item = Ref> + '_ {
+    patch
+        .removed
+        .iter()
+        .chain(&patch.added)
+        .copied()
+        .chain(patch.updated.iter().filter_map(|update| {
+            (update.changed_name.is_some()
+                || update.changed_parent.is_some()
+                || update.changed_class_name.is_some()
+                || update.changed_metadata.is_some())
+            .then_some(update.id)
+        }))
 }
 
 impl MessageQueue {
@@ -27,22 +49,53 @@ impl MessageQueue {
     }
 
     pub fn push_messages(&self, new_messages: &[AppliedPatchSet]) {
+        self.push_messages_with_origins(
+            new_messages
+                .iter()
+                .map(|patch| (patch, MessageOrigin::Filesystem)),
+            &[],
+            &[],
+        );
+    }
+
+    pub(crate) fn push_messages_with_origins<'a>(
+        &self,
+        new_messages: impl IntoIterator<Item = (&'a AppliedPatchSet, MessageOrigin)>,
+        filesystem_properties: &[(Ref, Ustr)],
+        structural_changes: &[Ref],
+    ) {
         let mut message_listeners = self.message_listeners.lock().unwrap();
         let mut history = self.history.write().unwrap();
-        for patch in new_messages {
+        let previous_cursor = history.messages.len();
+        for (patch, origin) in new_messages {
             let revision = history.messages.len() as u32 + 1;
-            for id in patch.removed.iter().chain(&patch.added).copied().chain(
-                patch.updated.iter().filter_map(|update| {
-                    (update.changed_name.is_some()
-                        || update.changed_parent.is_some()
-                        || update.changed_class_name.is_some()
-                        || update.changed_metadata.is_some())
-                    .then_some(update.id)
-                }),
-            ) {
+            for id in structural_targets(patch) {
                 history.structural_revisions.insert(id, revision);
             }
+            if matches!(origin, MessageOrigin::Filesystem) {
+                for update in &patch.updated {
+                    for property in update.changed_properties.keys() {
+                        history
+                            .filesystem_property_revisions
+                            .insert((update.id, *property), revision);
+                    }
+                }
+            }
             history.messages.push(patch.clone());
+        }
+        // Catchups can hide fields a later Studio write replaces. Their provenance must
+        // survive even though those intermediate values are never sent back to Studio.
+        if (!filesystem_properties.is_empty() || !structural_changes.is_empty())
+            && history.messages.len() == previous_cursor
+        {
+            history.messages.push(AppliedPatchSet::new());
+        }
+        let revision = history.messages.len() as u32;
+        for key in filesystem_properties {
+            history.filesystem_property_revisions.insert(*key, revision);
+        }
+        for id in structural_changes {
+            history.structural_revisions.insert(*id, revision);
         }
 
         let mut remaining_listeners = Vec::new();
@@ -79,6 +132,24 @@ impl MessageQueue {
 
     pub fn cursor(&self) -> u32 {
         self.history.read().unwrap().messages.len() as u32
+    }
+
+    pub(crate) fn has_filesystem_property_changes_since(
+        &self,
+        cursor: u32,
+        id: Ref,
+        properties: impl IntoIterator<Item = Ustr>,
+    ) -> Option<bool> {
+        let history = self.history.read().unwrap();
+        if cursor as usize > history.messages.len() {
+            return None;
+        }
+        Some(properties.into_iter().any(|property| {
+            history
+                .filesystem_property_revisions
+                .get(&(id, property))
+                .is_some_and(|revision| *revision > cursor)
+        }))
     }
 
     pub(crate) fn has_structural_changes_since(
@@ -208,6 +279,144 @@ mod tests {
         assert_eq!(cursor, 7);
         assert_eq!(messages.len(), 7);
         assert_eq!(queue.cursor(), 7);
+    }
+
+    #[test]
+    fn filesystem_property_index_matches_mixed_origin_history() {
+        let queue = MessageQueue::new();
+        let ids = [Ref::new(), Ref::new()];
+        let properties = [ustr("Source"), ustr("Value"), ustr("Unchanged")];
+        let mut publications = Vec::new();
+        for index in 0..12 {
+            let mut update = AppliedPatchUpdate::new(ids[index % 2]);
+            update.changed_properties.insert(
+                properties[(index / 2) % 2],
+                Some(Variant::String(index.to_string())),
+            );
+            let patch = AppliedPatchSet {
+                updated: vec![update],
+                ..AppliedPatchSet::new()
+            };
+            let origin = if index % 3 == 0 {
+                MessageOrigin::Filesystem
+            } else {
+                MessageOrigin::Studio
+            };
+            publications.push((patch, origin));
+        }
+        queue.push_messages_with_origins(
+            publications.iter().map(|(patch, origin)| (patch, *origin)),
+            &[],
+            &[],
+        );
+        for cursor in 0..=publications.len() as u32 {
+            for id in ids {
+                for mask in 0..8 {
+                    let targets: Vec<_> = properties
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, property)| {
+                            (mask & (1 << index) != 0).then_some(*property)
+                        })
+                        .collect();
+                    let expected = publications[cursor as usize..]
+                        .iter()
+                        .any(|(patch, origin)| {
+                            matches!(origin, MessageOrigin::Filesystem)
+                                && patch.updated.iter().any(|update| {
+                                    update.id == id
+                                        && update
+                                            .changed_properties
+                                            .keys()
+                                            .any(|property| targets.contains(property))
+                                })
+                        });
+                    assert_eq!(
+                        queue.has_filesystem_property_changes_since(cursor, id, targets),
+                        Some(expected)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            queue.has_filesystem_property_changes_since(13, ids[0], properties),
+            None
+        );
+        let (_, wire) = queue.subscribe(0).try_recv().unwrap().unwrap();
+        assert_eq!(wire.len(), publications.len());
+        for (actual, (expected, _)) in wire.iter().zip(&publications) {
+            assert_eq!(actual.added, expected.added);
+            assert_eq!(actual.removed, expected.removed);
+            assert_eq!(actual.updated.len(), expected.updated.len());
+            for (actual, expected) in actual.updated.iter().zip(&expected.updated) {
+                assert_eq!(actual.id, expected.id);
+                assert_eq!(actual.changed_properties, expected.changed_properties);
+            }
+        }
+    }
+
+    #[test]
+    fn own_writes_do_not_grow_filesystem_property_index() {
+        let queue = MessageQueue::new();
+        let id = Ref::new();
+        let property = ustr("Source");
+        for value in 0..4096 {
+            let mut update = AppliedPatchUpdate::new(id);
+            update
+                .changed_properties
+                .insert(property, Some(Variant::String(value.to_string())));
+            let patch = AppliedPatchSet {
+                updated: vec![update],
+                ..AppliedPatchSet::new()
+            };
+            queue.push_messages_with_origins([(&patch, MessageOrigin::Studio)], &[], &[]);
+            assert_eq!(
+                queue.has_filesystem_property_changes_since(0, id, [property]),
+                Some(false)
+            );
+        }
+        assert!(queue
+            .history
+            .read()
+            .unwrap()
+            .filesystem_property_revisions
+            .is_empty());
+        for _ in 0..8 {
+            queue.push_messages_with_origins([], &[(id, property)], &[]);
+        }
+        assert_eq!(
+            queue
+                .history
+                .read()
+                .unwrap()
+                .filesystem_property_revisions
+                .len(),
+            1
+        );
+        assert_eq!(
+            queue.has_filesystem_property_changes_since(4096, id, [property]),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn hidden_catchups_advance_revision_without_exposing_payloads() {
+        let queue = MessageQueue::new();
+        let id = Ref::new();
+        queue.push_messages_with_origins([], &[(id, ustr("Source"))], &[id]);
+        assert_eq!(queue.cursor(), 1);
+        assert_eq!(queue.has_structural_changes_since(0, [id]), Some(true));
+        assert_eq!(
+            queue.has_filesystem_property_changes_since(0, id, [ustr("Source")]),
+            Some(true)
+        );
+        assert_eq!(
+            queue.has_filesystem_property_changes_since(1, id, [ustr("Source")]),
+            Some(false)
+        );
+        let (_, wire) = queue.subscribe(0).try_recv().unwrap().unwrap();
+        assert_eq!(wire.len(), 1);
+        assert!(wire[0].is_empty());
     }
 
     #[test]

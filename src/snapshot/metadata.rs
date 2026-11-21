@@ -216,7 +216,7 @@ pub struct RequireContext {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceContext {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_ignore_rules: Arc<Vec<PathIgnoreRule>>,
     pub emit_legacy_scripts: bool,
     // Server-owned cache state cannot be re-included by project ignore rules.
@@ -224,7 +224,7 @@ pub struct InstanceContext {
     reserved_cache_path: Option<PathBuf>,
     // Every instance's metadata keeps a context, and cloning a rule's compiled
     // glob regex allocates a fresh match cache pool, so the list is shared.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sync_rules: Arc<Vec<SyncRule>>,
 
     /// When set, `.luaurc` alias requires will be resolved during
@@ -456,7 +456,7 @@ pub struct SyncRule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Glob>,
     /// The middleware specified by the user for this SyncRule
-    #[serde(rename = "use")]
+    #[serde(rename = "use", deserialize_with = "SyncRule::deserialize_middleware")]
     pub middleware: Middleware,
     /// A suffix to trim off of file names, including the file extension.
     /// If not specified, the file extension is the only thing cut off.
@@ -469,6 +469,18 @@ pub struct SyncRule {
 }
 
 impl SyncRule {
+    fn deserialize_middleware<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Middleware, D::Error> {
+        let middleware = Middleware::deserialize(deserializer)?;
+        if middleware.is_dir() {
+            return Err(serde::de::Error::custom(
+                "Directory middleware cannot be selected by a file sync rule",
+            ));
+        }
+        Ok(middleware)
+    }
+
     /// Returns whether the given path matches this rule.
     pub fn matches(&self, path: &Path) -> bool {
         match path.strip_prefix(&self.base_path) {
@@ -509,6 +521,54 @@ impl SyncRule {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn compact_instance_context_round_trips_omitted_empty_rules() {
+        let context = InstanceContext::default();
+        let json = serde_json::to_vec(&context).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<InstanceContext>(&json).unwrap(),
+            context
+        );
+        let msgpack = rmp_serde::to_vec_named(&context).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<InstanceContext>(&msgpack).unwrap(),
+            context
+        );
+    }
+
+    #[test]
+    fn directory_middleware_round_trips_in_metadata_but_not_file_rules() {
+        for middleware in [
+            Middleware::Dir,
+            Middleware::ServerScriptDir,
+            Middleware::ClientScriptDir,
+            Middleware::LegacyServerScriptDir,
+            Middleware::LegacyClientScriptDir,
+            Middleware::PluginScriptDir,
+            Middleware::ModuleScriptDir,
+            Middleware::CsvDir,
+            Middleware::ModuleScript,
+        ] {
+            let mut metadata = InstanceMetadata::new();
+            metadata.middleware = Some(middleware);
+            let json = serde_json::to_vec(&metadata).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<InstanceMetadata>(&json).unwrap(),
+                metadata
+            );
+            let msgpack = rmp_serde::to_vec_named(&metadata).unwrap();
+            assert_eq!(
+                rmp_serde::from_slice::<InstanceMetadata>(&msgpack).unwrap(),
+                metadata
+            );
+            let rule = serde_json::json!({"pattern":"*", "use":middleware});
+            assert_eq!(
+                serde_json::from_value::<SyncRule>(rule).is_err(),
+                middleware.is_dir()
+            );
+        }
+    }
 
     #[test]
     fn structural_metadata_classification_ignores_only_save_bookkeeping() {

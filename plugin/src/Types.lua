@@ -90,6 +90,7 @@ local ApiWritePatch = t.interface({
 
 local ApiWriteError = t.interface({
 	id = RbxId,
+	kind = t.optional(t.literal("sourceSerializationDeferred")),
 	property = t.optional(t.string),
 	message = t.string,
 })

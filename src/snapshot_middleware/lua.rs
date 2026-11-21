@@ -213,14 +213,17 @@ pub(super) fn track_init_file(snapshot: &mut InstanceSnapshot, init_path: &Path)
 pub fn syncback_lua<'sync>(
     snapshot: &SyncbackSnapshot<'sync>,
 ) -> anyhow::Result<SyncbackReturn<'sync>> {
+    profiling::scope!("Rojo.SerializeScriptWrite");
     let new_inst = snapshot.new_inst();
 
     let contents = if let Some(Variant::String(source)) = new_inst.properties.get(&ustr("Source")) {
         match snapshot
             .old_inst()
-            .and_then(|old| old.metadata().source_transform.clone())
+            .and_then(|old| old.metadata().source_transform.as_ref())
         {
-            Some(transform) => luaurc::restore_source(&transform, source)?.into_bytes(),
+            Some(transform) => luaurc::restore_source(transform, source)
+                .context(luaurc::SourceSerializationDeferred)?
+                .into_bytes(),
             None => source.as_bytes().to_vec(),
         }
     } else {
@@ -290,9 +293,11 @@ pub fn syncback_lua_init<'sync>(
     let contents = if let Some(Variant::String(source)) = new_inst.properties.get(&ustr("Source")) {
         match snapshot
             .old_inst()
-            .and_then(|old| old.metadata().source_transform.clone())
+            .and_then(|old| old.metadata().source_transform.as_ref())
         {
-            Some(transform) => luaurc::restore_source(&transform, source)?.into_bytes(),
+            Some(transform) => luaurc::restore_source(transform, source)
+                .context(luaurc::SourceSerializationDeferred)?
+                .into_bytes(),
             None => source.as_bytes().to_vec(),
         }
     } else {

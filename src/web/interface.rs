@@ -431,9 +431,17 @@ pub struct WriteResponse {
     pub errors: Vec<WriteError>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WriteErrorKind {
+    SourceSerializationDeferred,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<WriteErrorKind>,
     pub id: Ref,
     pub property: Option<String>,
     pub message: String,

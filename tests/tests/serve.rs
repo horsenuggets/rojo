@@ -200,7 +200,7 @@ fn property_writes_validate_authored_path_aliases() {
     for storage in ["model", "script"] {
         for authored in ["src", "src/../src", "absolute"]
             .into_iter()
-            .chain(if cfg\!(unix) { Some("linked") } else { None })
+            .chain(if cfg!(unix) { Some("linked") } else { None })
         {
             let mut session = TestServeSession::with_setup("add_folder", |root| {
                 #[cfg(unix)]
@@ -214,7 +214,7 @@ fn property_writes_validate_authored_path_aliases() {
                 };
                 fs::write(
                     root.join("default.project.json"),
-                    serde_json::to_vec(&serde_json::json\!({
+                    serde_json::to_vec(&serde_json::json!({
                         "name": "Test",
                         "tree": {"$className": "Folder", "Owned": {"$path": source}},
                     }))
@@ -250,7 +250,7 @@ fn property_writes_validate_authored_path_aliases() {
                 authority: WriteAuthority::Filesystem,
                 added: Default::default(),
                 removed: Vec::new(),
-                updated: vec\![InstanceUpdate {
+                updated: vec![InstanceUpdate {
                     id,
                     changed_name: None,
                     changed_class_name: None,
@@ -259,29 +259,175 @@ fn property_writes_validate_authored_path_aliases() {
                     changed_properties: UstrMap::from_iter([(property, Some(value.clone()))]),
                 }],
             });
-            assert\!(
+            assert!(
                 response.errors.is_empty(),
                 "{storage}, {authored}, {response:?}"
             );
-            assert\!(
+            assert!(
                 response.conflicts.updated_instances.is_empty(),
                 "{response:?}"
             );
             let latest = session.get_api_read(id).unwrap();
-            assert_eq\!(latest.instances[&id].properties[&property].as_ref(), &value);
+            assert_eq!(latest.instances[&id].properties[&property].as_ref(), &value);
             if storage == "model" {
                 let model: serde_json::Value = serde_json::from_str(
                     &fs::read_to_string(session.path().join("src/Target.model.json")).unwrap(),
                 )
                 .unwrap();
-                assert_eq\!(model["properties"]["Transparency"], 0.5);
+                assert_eq!(model["properties"]["Transparency"], 0.5);
             } else {
-                assert_eq\!(
+                assert_eq!(
                     fs::read_to_string(session.path().join("src/Target.luau")).unwrap(),
                     "return 'saved'\n",
                 );
             }
         }
+    }
+}
+
+#[test]
+fn successive_script_writes_do_not_conflict_with_prior_studio_saves() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::write(root.join("src/Typing.luau"), "return 'initial'\n").unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let id = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "Typing")
+        .unwrap()
+        .id;
+    for source in ["return 'a'\n", "return 'ab'\n", "return 'abc'\n"] {
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(read.message_cursor),
+            authority: WriteAuthority::Filesystem,
+            added: Default::default(),
+            removed: Vec::new(),
+            updated: vec![InstanceUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_parent: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::from_iter([(
+                    ustr("Source"),
+                    Some(Variant::String(source.into())),
+                )]),
+            }],
+        });
+        assert!(response.errors.is_empty(), "{source}, {response:?}");
+        assert!(
+            response.conflicts.updated_instances.is_empty(),
+            "An earlier Studio save is not an external filesystem conflict. {source}, {response:?}"
+        );
+        assert_eq!(response.accepted.updated_instances.len(), 1);
+        assert_eq!(
+            fs::read_to_string(session.path().join("src/Typing.luau")).unwrap(),
+            source
+        );
+        let latest = session.get_api_read(id).unwrap();
+        assert_eq!(
+            latest.instances[&id].properties[&ustr("Source")].as_ref(),
+            &Variant::String(source.into())
+        );
+    }
+}
+
+#[test]
+fn transformed_script_serialization_errors_do_not_restore_editor_drafts() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use librojo::web_api::WriteErrorKind;
+    let original = "local Library = require('@shared/Library')\nreturn Library\n";
+    for source_path in ["src/Typing.luau", "src/Typing/init.luau"] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fs::write(root.join(".luaurc"), r#"{"aliases":{"shared":"src"}}"#).unwrap();
+            fs::create_dir_all(root.join(source_path).parent().unwrap()).unwrap();
+            fs::write(root.join(source_path), original).unwrap();
+            fs::write(root.join("src/Library.luau"), "return {}\n").unwrap();
+        });
+        let info = session.wait_to_come_online();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let instance = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "Typing")
+            .unwrap();
+        let id = instance.id;
+        let emitted = match instance.properties[&ustr("Source")].as_ref() {
+            Variant::String(source) => source,
+            _ => panic!("Missing source"),
+        };
+        assert_ne!(emitted, original);
+        let request = |source: String| WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(read.message_cursor),
+            authority: WriteAuthority::Filesystem,
+            added: Default::default(),
+            removed: Vec::new(),
+            updated: vec![InstanceUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_parent: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::from_iter([(
+                    ustr("Source"),
+                    Some(Variant::String(source)),
+                )]),
+            }],
+        };
+        for draft in [
+            emitted.replace("return Library", "local value ="),
+            emitted.replace("Library\")", "Other\")"),
+        ] {
+            assert_ne!(&draft, emitted);
+            let response = session.post_api_write(&request(draft));
+            assert_eq!(response.errors.len(), 1, "{response:?}");
+            assert_eq!(
+                response.errors[0].kind,
+                Some(WriteErrorKind::SourceSerializationDeferred)
+            );
+            assert_eq!(response.errors[0].property.as_deref(), Some("Source"));
+            assert_eq!(response.accepted, Default::default());
+            assert_eq!(
+                response.conflicts,
+                Default::default(),
+                "A serialization refusal must not replace the unsaved draft. {response:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(session.path().join(source_path)).unwrap(),
+                original
+            );
+            assert_eq!(response.message_cursor, read.message_cursor);
+        }
+        let response = session.post_api_write(&request(
+            emitted.replace("return Library", "return Library.Value"),
+        ));
+        assert!(response.errors.is_empty(), "{response:?}");
+        assert_eq!(response.accepted.updated_instances.len(), 1);
+        assert_eq!(
+            fs::read_to_string(session.path().join(source_path)).unwrap(),
+            original.replace("return Library", "return Library.Value")
+        );
+        let external = original.replace("return Library", "return 'external'");
+        fs::write(session.path().join(source_path), &external).unwrap();
+        let response =
+            session.post_api_write(&request(emitted.replace("return Library", "local value =")));
+        assert!(
+            !response.conflicts.updated_instances.is_empty(),
+            "{response:?}"
+        );
+        assert!(
+            response.errors.iter().all(|error| error.kind.is_none()),
+            "{response:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(session.path().join(source_path)).unwrap(),
+            external
+        );
     }
 }
 

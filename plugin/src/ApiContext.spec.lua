@@ -315,6 +315,8 @@ return function()
 					{ errors = { false } },
 					{ errors = { { message = "No identity" } } },
 					{ errors = { { id = "INSTANCE", message = false } } },
+					{ errors = { { id = "INSTANCE", message = "Rejected", kind = false } } },
+					{ errors = { { id = "INSTANCE", message = "Rejected", kind = "unrecognized" } } },
 				}
 			do
 				local response = writeResponse("current-session", 100)
@@ -422,10 +424,13 @@ return function()
 	it("should retain valid server-reported write errors without closing the context", function()
 		local originalPost = Http.post
 		local success, problem = pcall(function()
-			for _, propertyError in { false, true } do
+			for _, propertyError in { false, true, "deferred" } do
 				local response = writeResponse("current-session", 100)
 				response.errors = { { id = "INSTANCE", message = "The write was rejected." } }
-				if propertyError then
+				if propertyError == "deferred" then
+					response.errors[1].kind = "sourceSerializationDeferred"
+					response.errors[1].property = "Source"
+				elseif propertyError then
 					response.errors[1].property = "Transparency"
 				end
 				Http.post = function()
@@ -437,6 +442,7 @@ return function()
 					context:write({ added = {}, removed = {}, updated = {} }, 0, "Filesystem"):await()
 				expect(accepted).to.equal(true)
 				expect(result.errors[1].message).to.equal("The write was rejected.")
+				expect(result.errors[1].kind).to.equal(response.errors[1].kind)
 				expect(context.__connected).to.equal(true)
 			end
 		end)

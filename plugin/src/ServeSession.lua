@@ -87,6 +87,46 @@ function ServeSession.getWriteStatus(result)
 	return "Saved"
 end
 
+function ServeSession.shouldPreserveFailedProperty(result, id, propertyName)
+	assert(t.table(result))
+	assert(t.string(id))
+	assert(t.string(propertyName))
+
+	if propertyName ~= "Source" then
+		return false
+	end
+	local deferred = false
+	for _, err in result.errors do
+		if err.id == id and err.kind == "sourceSerializationDeferred" and err.property == "Source" then
+			deferred = true
+			break
+		end
+	end
+	if not deferred then
+		return false
+	end
+	for _, update in result.conflicts.updated_instances do
+		if
+			update.id == id
+			and (
+				update.changed_properties.Source ~= nil
+				or update.changed_name ~= nil
+				or update.changedParent ~= nil
+				or update.changed_class_name ~= nil
+				or update.changed_metadata ~= nil
+			)
+		then
+			return false
+		end
+	end
+	for _, removedId in result.conflicts.removed_instances do
+		if removedId == id then
+			return false
+		end
+	end
+	return true
+end
+
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
@@ -382,17 +422,11 @@ end
 function ServeSession:__rememberLocalProperty(instance, propertyName)
 	local instanceMap = self.__instanceMap
 	local id = instanceMap and instanceMap.fromInstances[instance]
-	if
-		id == nil
-		or instance:IsA("DataModel")
-		or propertyName == "Name"
-		or propertyName == "Parent"
-		or propertyName == "Source"
-	then
+	if id == nil or instance:IsA("DataModel") or propertyName == "Name" or propertyName == "Parent" then
 		return
 	end
-	-- Value and Contents can be ordinary model fields or file payloads. Buffer their
-	-- echoes until the server decides authority, including any rejected-write restoration.
+	-- Source, Value, and Contents can be file payloads. Buffer their echoes until the
+	-- server decides authority, including any rejected-write restoration.
 	local descriptor = getWritablePropertyDescriptor(instance.ClassName, propertyName)
 	if descriptor == nil or descriptor.dataType == "Ref" then
 		return
@@ -443,7 +477,7 @@ function ServeSession:__finishOmittedLocalProperties(patch, taken)
 	self:__finishLocalProperties(omitted, nil)
 end
 
-function ServeSession:__protectLocalProperties(patch)
+function ServeSession:__protectLocalProperties(patch, publicationCursor)
 	local edits = self.__localPropertyEdits
 	if edits == nil or next(edits) == nil then
 		return patch
@@ -523,6 +557,7 @@ function ServeSession:__protectLocalProperties(patch)
 			local entry = properties[if descriptor ~= nil then descriptor.name else propertyName]
 			if entry ~= nil then
 				entry.serverValue = value
+				entry.serverCursor = publicationCursor
 				kept.changedProperties[propertyName] = nil
 			end
 		end
@@ -544,7 +579,9 @@ function ServeSession:__releaseLocalProperties(cursor)
 		for propertyName, entry in properties do
 			if entry.cursor ~= nil and entry.cursor <= cursor then
 				properties[propertyName] = nil
-				released[propertyName] = entry.serverValue
+				if not entry.preserveLocal or (entry.serverCursor ~= nil and entry.serverCursor > entry.cursor) then
+					released[propertyName] = entry.serverValue
+				end
 			end
 		end
 		if next(properties) == nil then
@@ -571,6 +608,10 @@ function ServeSession:__finishLocalProperties(taken, result)
 		end
 		for propertyName, entry in entries do
 			if properties[propertyName] == entry then
+				-- A failed serialization leaves an unsaved draft, not a disk conflict. Drain
+				-- older echoes through the response cursor without replaying them over it.
+				entry.preserveLocal = result ~= nil
+					and ServeSession.shouldPreserveFailedProperty(result, id, propertyName)
 				-- A transport failure or older response cannot leave a permanent guard.
 				entry.cursor = if result and result.messageCursor ~= nil then result.messageCursor else cursor
 			end
@@ -775,8 +816,9 @@ function ServeSession:start()
 
 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
-						for _, message in messagesPacket.messages do
-							self:__applyPatch(message)
+						for index, message in messagesPacket.messages do
+							local publicationCursor = messagesPacket.messageCursor - #messagesPacket.messages + index
+							self:__applyPatch(message, publicationCursor)
 						end
 						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
 						self:__releaseLocalProperties(messagesPacket.messageCursor)
@@ -1014,9 +1056,9 @@ function ServeSession:__replaceInstances(idList)
 	end
 end
 
-function ServeSession:__applyPatch(patch)
+function ServeSession:__applyPatch(patch, publicationCursor)
 	self:__keepUndoneDeletions(patch)
-	patch = self:__protectLocalProperties(patch)
+	patch = self:__protectLocalProperties(patch, publicationCursor)
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording =
 		ChangeHistoryService:TryBeginRecording(ServeSession.PATCH_RECORDING_PREFIX .. patchTimestamp)
@@ -1025,7 +1067,7 @@ function ServeSession:__applyPatch(patch)
 		Log.debug("Failed to begin history recording for " .. patchTimestamp .. ". Another recording is in progress.")
 	end
 
-	Timer.start("precommitCallbacks")
+	Timer.start("precommitCallbacks", "wall")
 	-- Precommit callbacks must be serial in order to obey the contract that
 	-- they execute before commit
 	for _, callback in self.__precommitCallbacks do
@@ -1057,14 +1099,22 @@ function ServeSession:__applyPatch(patch)
 		local updatedIdList = PatchSet.updatedIdList(unappliedPatch)
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.added)")
-		Timer.start("ServeSession:__replaceInstances(unappliedPatch.added)")
-		local addSuccess, unappliedAddedRefs = self:__replaceInstances(addedIdList)
-		Timer.stop()
+		local addSuccess, unappliedAddedRefs = Timer.measure(
+			"ServeSession:__replaceInstances(unappliedPatch.added)",
+			"wall",
+			self.__replaceInstances,
+			self,
+			addedIdList
+		)
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.updated)")
-		Timer.start("ServeSession:__replaceInstances(unappliedPatch.updated)")
-		local updateSuccess, unappliedUpdateRefs = self:__replaceInstances(updatedIdList)
-		Timer.stop()
+		local updateSuccess, unappliedUpdateRefs = Timer.measure(
+			"ServeSession:__replaceInstances(unappliedPatch.updated)",
+			"wall",
+			self.__replaceInstances,
+			self,
+			updatedIdList
+		)
 
 		-- Update the unapplied patch to reflect which Instances were replaced successfully
 		if addSuccess then
