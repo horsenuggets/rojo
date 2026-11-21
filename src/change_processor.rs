@@ -3484,7 +3484,7 @@ impl JobThreadContext {
             ),
         };
         let authority = property_update.map_or(context.authority, |update| {
-            self.property_write_authority(tree, update, context, &disk_patch)
+            self.property_write_authority(tree, update, context, &disk_patch, messages)
         });
         let stale = (context.stale
             || property_update.is_some_and(|update| messages.invalidates(tree, update, false)))
@@ -3511,6 +3511,7 @@ impl JobThreadContext {
         update: &PatchUpdate,
         context: &WriteContext,
         disk_changes: &PatchSet,
+        messages: &WriteMessages,
     ) -> WriteAuthority {
         let Some(instance) = tree.get_instance(update.id) else {
             return context.authority;
@@ -3540,6 +3541,14 @@ impl JobThreadContext {
             tree.get_instance(instance.parent())
         })
         .map(|instance| instance.id());
+        // Catchups publish after the batch, but later siblings already share the
+        // filesystem structure discovered by an earlier write in this batch.
+        if targets
+            .clone()
+            .any(|id| messages.filesystem_structural_changes.contains(&id))
+        {
+            return context.authority;
+        }
         let structural = self
             .message_queue
             .has_structural_changes_since(cursor, targets);
@@ -3721,7 +3730,8 @@ impl JobThreadContext {
         let disk_changes = compute_shallow_patch_set(snapshot.clone(), tree, owner_id);
         // A drag keeps its original cursor across several writes. Only unseen structural
         // changes invalidate that target; ordinary fields merge onto current disk values.
-        let authority = self.property_write_authority(tree, update, context, &disk_changes);
+        let authority =
+            self.property_write_authority(tree, update, context, &disk_changes, messages);
         let stale = (context.stale || messages.invalidates(tree, update, false))
             && !self.payload_baseline_is_current(tree, update, context, &disk_changes, messages);
         if stale || disk_changes != PatchSet::new() {
@@ -7395,7 +7405,13 @@ mod tests {
             ));
         }
         assert_eq!(
-            job.property_write_authority(&tree, update, &context(Some(0)), &PatchSet::new()),
+            job.property_write_authority(
+                &tree,
+                update,
+                &context(Some(0)),
+                &PatchSet::new(),
+                &pending
+            ),
             WriteAuthority::Filesystem
         );
         assert_eq!(
@@ -10805,6 +10821,195 @@ mod tests {
             }],
             ..PatchSet::new()
         }
+    }
+
+    fn assert_pending_model_structure_rejects_sibling_properties(
+        class_name: &str,
+        property: &str,
+        initial: serde_json::Value,
+        edited: Variant,
+    ) {
+        let mut model = serde_json::json!({
+            "className": "Folder",
+            "id": "extra-id",
+            "children": [
+                {
+                    "className": class_name,
+                    "id": "first-id",
+                    "name": "First",
+                    "properties": {property: initial.clone()}
+                },
+                {
+                    "className": class_name,
+                    "id": "second-id",
+                    "name": "Second",
+                    "properties": {property: initial}
+                }
+            ]
+        });
+        let (job, _) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([(
+                    "Extra.model.json",
+                    VfsSnapshot::file(serde_json::to_vec(&model).unwrap()),
+                )]),
+            )],
+            "/project/src",
+        );
+        let root = find(&job, &["Extra"]);
+        let first = find(&job, &["Extra", "First"]);
+        let second = find(&job, &["Extra", "Second"]);
+        let cursor = job.message_queue.cursor();
+        model["className"] = serde_json::json!("Model");
+        let disk = serde_json::to_vec(&model).unwrap();
+        job.vfs
+            .write("/project/src/Extra.model.json", &disk)
+            .unwrap();
+        let mut batch = property_update(first, property, edited.clone());
+        batch
+            .updated_instances
+            .extend(property_update(second, property, edited).updated_instances);
+
+        let (accepted, conflicts, errors) =
+            job.handle_tree_event_at_cursor(batch, Some(cursor), WriteAuthority::Filesystem);
+        assert!(errors.is_empty(), "{class_name}, {errors:?}");
+        assert_eq!(
+            job.tree
+                .lock()
+                .unwrap()
+                .get_instance(root)
+                .unwrap()
+                .class_name(),
+            "Model"
+        );
+        assert_eq!(
+            (
+                accepted
+                    .updated_instances
+                    .iter()
+                    .map(|update| update.id)
+                    .collect::<Vec<_>>(),
+                conflicts
+                    .updated_instances
+                    .iter()
+                    .map(|update| update.id)
+                    .collect::<Vec<_>>(),
+                job.vfs
+                    .read("/project/src/Extra.model.json")
+                    .unwrap()
+                    .as_slice()
+                    == disk,
+            ),
+            (Vec::<Ref>::new(), vec![first, second], true),
+            "{class_name} sibling writes must share the invalidated ancestral baseline"
+        );
+    }
+
+    #[test]
+    fn ordinary_property_authority_checks_only_pending_filesystem_ancestry() {
+        let (job, _) = script_job(
+            vec![(
+                "src",
+                VfsSnapshot::dir([
+                    (
+                        "Extra.model.json",
+                        VfsSnapshot::file(
+                            r#"{"className":"Folder","children":[{"className":"Part","name":"Child"}]}"#,
+                        ),
+                    ),
+                    (
+                        "Unrelated.model.json",
+                        VfsSnapshot::file(r#"{"className":"Folder"}"#),
+                    ),
+                ]),
+            )],
+            "/project/src",
+        );
+        let model = find(&job, &["Extra"]);
+        let child = find(&job, &["Extra", "Child"]);
+        let unrelated = find(&job, &["Unrelated"]);
+        let patch = property_update(child, "Transparency", Variant::Float32(0.75));
+        let update = &patch.updated_instances[0];
+        let tree = job.tree.lock().unwrap();
+        let context = WriteContext {
+            cursor: Some(job.message_queue.cursor()),
+            stale: false,
+            authority: WriteAuthority::Filesystem,
+            batch: &patch.updated_instances,
+        };
+        for target in [child, model, tree.get_root_id(), unrelated, Ref::new()] {
+            for filesystem_structure in [false, true] {
+                for filesystem_property in [false, true] {
+                    for studio_structure in [false, true] {
+                        let mut pending = WriteMessages::default();
+                        if filesystem_structure {
+                            pending.filesystem_structural_changes.insert(target);
+                        }
+                        if filesystem_property {
+                            pending
+                                .filesystem_properties
+                                .insert((child, ustr("Transparency")));
+                        }
+                        if studio_structure {
+                            pending.structural_changes.insert(target);
+                        }
+                        let expected = if filesystem_structure
+                            && target != unrelated
+                            && tree.get_instance(target).is_some()
+                        {
+                            WriteAuthority::Filesystem
+                        } else {
+                            WriteAuthority::Studio
+                        };
+                        assert_eq!(
+                            job.property_write_authority(
+                                &tree,
+                                update,
+                                &context,
+                                &PatchSet::new(),
+                                &pending
+                            ),
+                            expected,
+                            "{target:?}, {filesystem_structure}, {filesystem_property}, {studio_structure}"
+                        );
+                        assert_eq!(
+                            job.property_write_authority(
+                                &tree,
+                                update,
+                                &WriteContext {
+                                    authority: WriteAuthority::Studio,
+                                    ..context
+                                },
+                                &PatchSet::new(),
+                                &pending
+                            ),
+                            WriteAuthority::Studio
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_model_structure_rejects_all_sibling_part_properties() {
+        assert_pending_model_structure_rejects_sibling_properties(
+            "Part",
+            "Transparency",
+            serde_json::json!(0.25),
+            Variant::Float32(0.75),
+        );
+    }
+
+    #[test]
+    fn pending_model_structure_rejects_all_sibling_script_sources() {
+        assert_pending_model_structure_rejects_sibling_properties(
+            "ModuleScript",
+            "Source",
+            serde_json::json!("return 0"),
+            Variant::String("return 1".into()),
+        );
     }
 
     #[test]

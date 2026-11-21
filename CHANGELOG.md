@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.8`
+
+* Preserved filesystem authority for every affected sibling write when an earlier write
+  in the same batch discovers a structural change in their shared model. Ordinary
+  property edits still favor Studio when their ancestry has not changed.
+
 ## `7.7.1-horse.2.7`
 
 * Avoided full-project copies and import-mapping rebuilds for unchanged filesystem events
