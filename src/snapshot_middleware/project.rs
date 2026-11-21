@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use memofs::Vfs;
+use memofs::{IoResultExt, Vfs};
 use rayon::prelude::*;
 use rbx_dom_weak::{
     types::{Attributes, Ref, Variant},
@@ -16,7 +16,7 @@ use rbx_reflection::ClassTag;
 
 use crate::{
     project::{PathNode, Project, ProjectNode},
-    resolution::UnresolvedValue,
+    resolution::{canonical_property_name, normalize_property_names, UnresolvedValue},
     snapshot::{
         InstanceContext, InstanceMetadata, InstanceSnapshot, InstanceWithMeta, InstigatingSource,
         PathIgnoreRule, SyncRule,
@@ -134,6 +134,13 @@ pub fn snapshot_project_node(
             Cow::Owned(project_folder.join(path))
         } else {
             Cow::Borrowed(path)
+        };
+
+        // Keep authored mount sources aligned with canonical validation paths. Otherwise
+        // parent components or filesystem aliases give the same file two storage keys.
+        let full_path = match vfs.canonicalize(&full_path).with_not_found()? {
+            Some(canonical) => Cow::Owned(canonical),
+            None => full_path,
         };
 
         if let Some(snapshot) = snapshot_from_vfs(context, vfs, &full_path)? {
@@ -264,10 +271,15 @@ pub fn snapshot_project_node(
         };
     children.extend(project_children.into_iter().flatten());
 
-    for (key, unresolved) in &node.properties {
+    // A Folder path may acquire its concrete class from this project node.
+    properties = normalize_property_names(&class_name, properties).collect();
+    for (key, unresolved) in normalize_property_names(
+        &class_name,
+        node.properties.iter().map(|(&key, value)| (key, value)),
+    ) {
         let value = unresolved
             .clone()
-            .resolve(&class_name, key)
+            .resolve(&class_name, &key)
             .with_context(|| {
                 format!(
                     "Unresolvable property in project at path {}",
@@ -289,7 +301,7 @@ pub fn snapshot_project_node(
             _ => {}
         }
 
-        properties.insert(*key, value);
+        properties.insert(key, value);
     }
 
     if !node.attributes.is_empty() {
@@ -396,11 +408,8 @@ pub fn syncback_project<'sync>(
     let mut new_child_map = HashMap::new();
 
     let mut node_changed_map = Vec::new();
-    // Tracks whether any stale default-valued properties were removed from
-    // project nodes. If so, we must reserialize even if
-    // project_node_should_reserialize wouldn't otherwise detect a change
-    // (it only compares node properties forward, not in reverse).
-    let mut removed_stale_properties = false;
+    // Value comparisons alone miss removed defaults and alias-only key changes.
+    let mut normalized_node_properties = false;
     let mut node_queue = VecDeque::with_capacity(1);
     node_queue.push_back((&mut project.tree, old_inst, snapshot.new_inst()));
 
@@ -466,13 +475,27 @@ pub fn syncback_project<'sync>(
 
             ref_to_path_map.insert(new_inst.referent(), full_path);
 
-            // We only want to set properties if it needs it.
             if !middleware.handles_own_properties() {
-                removed_stale_properties |=
+                normalized_node_properties |=
                     project_node_property_syncback_path(snapshot, new_inst, node);
+            } else if !node.properties.is_empty() || !node.attributes.is_empty() {
+                // The model stores its own values, but existing project overrides still
+                // win on reload. Reconcile only those overrides, not every model field.
+                let overridden: UstrSet = node
+                    .properties
+                    .keys()
+                    .map(|name| ustr(canonical_property_name(&new_inst.class, name.as_str())))
+                    .collect();
+                let mut filtered = filter_properties(snapshot.project(), new_inst);
+                filtered.retain(|name, _| {
+                    overridden.contains(name)
+                        || (*name == ustr("Attributes") && !node.attributes.is_empty())
+                });
+                normalized_node_properties |=
+                    project_node_property_syncback(snapshot, filtered, new_inst, node);
             }
         } else {
-            removed_stale_properties |=
+            normalized_node_properties |=
                 project_node_property_syncback_no_path(snapshot, new_inst, node);
         }
 
@@ -588,7 +611,7 @@ pub fn syncback_project<'sync>(
     }
     let mut fs_snapshot = FsSnapshot::new();
 
-    let mut needs_reserialize = removed_stale_properties;
+    let mut needs_reserialize = normalized_node_properties;
     if !needs_reserialize {
         for (node_properties, node_attributes, old_inst) in node_changed_map {
             if project_node_should_reserialize(node_properties, node_attributes, old_inst)? {
@@ -609,14 +632,23 @@ pub fn syncback_project<'sync>(
 }
 
 /// Syncs properties from the new instance into the project node.
-/// Returns `true` if any stale properties were removed (i.e. properties
-/// that existed in the project node but are now at their engine default).
+/// Returns `true` if authored keys were normalized or stale properties removed,
+/// even when the resulting values match the old instance.
 fn project_node_property_syncback(
     snapshot: &SyncbackSnapshot,
     filtered_properties: UstrMap<&Variant>,
     new_inst: &Instance,
     node: &mut ProjectNode,
 ) -> bool {
+    let normalized_aliases = node
+        .properties
+        .keys()
+        .any(|key| canonical_property_name(&new_inst.class, key.as_str()) != key.as_str());
+    if normalized_aliases {
+        node.properties =
+            normalize_property_names(&new_inst.class, std::mem::take(&mut node.properties))
+                .collect();
+    }
     let properties = &mut node.properties;
     let mut attributes = BTreeMap::new();
     for (&name, &value) in &filtered_properties {
@@ -682,7 +714,7 @@ fn project_node_property_syncback(
     let removed_stale = properties.len() < len_before;
 
     node.attributes = attributes;
-    removed_stale
+    normalized_aliases || removed_stale
 }
 
 /// Returns whether a project `$properties` entry is stale and should be

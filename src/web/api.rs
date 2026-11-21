@@ -1,7 +1,18 @@
 //! Defines Rojo's HTTP API, all under /api. These endpoints generally return
 //! JSON.
 
-use std::{collections::HashMap, fs, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use futures::{sink::SinkExt, stream::StreamExt};
 use hyper::{body, Body, Method, Request, Response, StatusCode};
@@ -30,6 +41,8 @@ use crate::{
         InstanceUpdate, RefPatchRequest, RefPatchResponse, SerializeRequest, SerializeResponse,
     },
 };
+
+static NEXT_WRITE_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn call(
     serve_session: Arc<ServeSession>,
@@ -76,6 +89,35 @@ pub async fn call(
             StatusCode::NOT_FOUND,
         ),
     }
+}
+
+// Keep diagnostics scalar-only. Debug-printing a response leaks script text, values,
+// paths and error details, and formats potentially large conflict snapshots.
+fn write_response_summary(response: &WriteResponse) -> String {
+    format!(
+        "result cursor {}, accepted additions {}, removals {}, updates {}, properties {}, \
+         conflict additions {}, removals {}, updates {}, properties {}, errors {}",
+        response.message_cursor,
+        response.accepted.added_instances.len(),
+        response.accepted.removed_instances.len(),
+        response.accepted.updated_instances.len(),
+        response
+            .accepted
+            .updated_instances
+            .iter()
+            .map(|update| update.changed_properties.len())
+            .sum::<usize>(),
+        response.conflicts.added_instances.len(),
+        response.conflicts.removed_instances.len(),
+        response.conflicts.updated_instances.len(),
+        response
+            .conflicts
+            .updated_instances
+            .iter()
+            .map(|update| update.changed_properties.len())
+            .sum::<usize>(),
+        response.errors.len(),
+    )
 }
 
 pub struct ApiService {
@@ -151,6 +193,10 @@ impl ApiService {
         let session_id = self.serve_session.session_id();
         let tree_mutation_sender = self.serve_session.tree_mutation_sender();
 
+        let diagnostics = log::log_enabled!(log::Level::Debug);
+        let started = diagnostics.then(Instant::now);
+        let diagnostic_id =
+            diagnostics.then(|| NEXT_WRITE_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed));
         let body = body::to_bytes(request.into_body()).await.unwrap();
 
         let request: WriteRequest = match deserialize_msgpack(&body) {
@@ -170,11 +216,26 @@ impl ApiService {
             );
         }
 
+        let submitted_cursor = request.message_cursor;
+        let authority = request.authority;
+        if let Some(diagnostic_id) = diagnostic_id {
+            log::debug!(
+                "Write {diagnostic_id} submitted. Session {session_id}, cursor {submitted_cursor:?}, authority \
+                 {authority:?}, bytes {}, queued {}, additions {}, removals {}, updates {}, properties {}.",
+                body.len(),
+                tree_mutation_sender.len(),
+                request.added.len(),
+                request.removed.len(),
+                request.updated.len(),
+                request.updated.iter().map(|update| update.changed_properties.len()).sum::<usize>(),
+            );
+        }
         let mut errors: Vec<_> = request
             .updated
             .iter()
             .filter(|update| update.changed_metadata.is_some())
             .map(|update| WriteError {
+                kind: None,
                 id: update.id,
                 property: Some("metadata".into()),
                 message: "Changing metadata through two-way sync is not supported".into(),
@@ -208,6 +269,7 @@ impl ApiService {
         };
 
         let (result_sender, result_receiver) = crossbeam_channel::bounded(1);
+        let submitted = diagnostics.then(Instant::now);
         tree_mutation_sender
             .send(TreeMutation {
                 message_cursor: request.message_cursor,
@@ -221,7 +283,7 @@ impl ApiService {
                 result_sender,
             })
             .unwrap();
-        let (accepted, conflicts, write_errors) =
+        let ((accepted, conflicts, write_errors), message_cursor) =
             match tokio::task::spawn_blocking(move || result_receiver.recv()).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(err)) => {
@@ -241,12 +303,22 @@ impl ApiService {
         errors.extend(write_errors);
         let response = WriteResponse {
             session_id,
-            message_cursor: self.serve_session.message_queue().cursor(),
+            message_cursor,
             accepted,
             conflicts,
             errors,
         };
-        log::info!("Write response {response:?}");
+        if let (Some(diagnostic_id), Some(started), Some(submitted)) =
+            (diagnostic_id, started, submitted)
+        {
+            log::debug!(
+                "Write {diagnostic_id} completed. Session {session_id}, submitted cursor {submitted_cursor:?}, \
+                 {}, receive-to-result {:.3} ms, queue-and-processing {:.3} ms.",
+                write_response_summary(&response),
+                started.elapsed().as_secs_f64() * 1000.0,
+                submitted.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
         msgpack_ok(response)
     }
 
@@ -682,4 +754,58 @@ fn parent_requirements(class: &str) -> Option<&str> {
         "BaseWrap" | "WrapLayer" | "WrapTarget" | "WrapDeformer" => "MeshPart",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_id::SessionId;
+
+    #[test]
+    fn write_diagnostics_report_counts_without_payloads() {
+        let update = PatchUpdate {
+            id: Ref::new(),
+            changed_name: Some("PrivateScriptName".into()),
+            changed_class_name: None,
+            changed_parent: None,
+            changed_properties: UstrMap::from_iter([
+                (
+                    ustr("Source"),
+                    Some(Variant::String("private script text".into())),
+                ),
+                (ustr("PrivateProperty"), None),
+            ]),
+            changed_metadata: None,
+        };
+        let response = WriteResponse {
+            session_id: SessionId::new(),
+            message_cursor: 42,
+            accepted: PatchSet {
+                removed_instances: vec![Ref::new()],
+                added_instances: Vec::new(),
+                updated_instances: vec![update.clone()],
+            },
+            conflicts: PatchSet {
+                removed_instances: vec![Ref::new(), Ref::new()],
+                added_instances: Vec::new(),
+                updated_instances: vec![update],
+            },
+            errors: vec![WriteError {
+                kind: None,
+                id: Ref::new(),
+                property: Some("PrivateProperty".into()),
+                message: "Private path and error details".into(),
+            }],
+        };
+        let summary = write_response_summary(&response);
+        assert_eq!(summary, write_response_summary(&response));
+        assert_eq!(
+            summary,
+            "result cursor 42, accepted additions 0, removals 1, updates 1, properties 2, \
+             conflict additions 0, removals 2, updates 1, properties 2, errors 1"
+        );
+        for payload in ["Private", "private script text", "Source", "Variant"] {
+            assert!(!summary.contains(payload));
+        }
+    }
 }

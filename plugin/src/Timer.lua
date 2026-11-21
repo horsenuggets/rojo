@@ -5,11 +5,27 @@ local clock = os.clock
 local Timer = {
 	-- Hydration can yield, so another coroutine must not consume its active scopes.
 	_entries = setmetatable({}, { __mode = "k" }),
+	_profiler = {
+		Begin = debug.profilebegin,
+		End = debug.profileend,
+	},
 }
 
-function Timer._start(label)
+-- CPU scopes must not yield, including through nested wall-only spans. Wall spans
+-- retain logical nesting and optional elapsed-time logs without opening an annotation.
+function Timer._start(label, mode)
 	if type(label) ~= "string" then
 		error("[Rojo+ Timer] Timer.start requires a label.", 2)
+	end
+
+	if mode ~= nil and mode ~= "cpu" and mode ~= "wall" then
+		error('[Rojo+ Timer] Timer.start requires mode "cpu" or "wall".', 2)
+	end
+
+	local enabled = Settings:get("timingLogsEnabled")
+	local profiled = mode ~= "wall"
+	if profiled then
+		Timer._profiler.Begin("Rojo." .. label)
 	end
 
 	local thread = coroutine.running()
@@ -19,10 +35,9 @@ function Timer._start(label)
 		Timer._entries[thread] = entries
 	end
 
-	local enabled = Settings:get("timingLogsEnabled")
-	debug.profilebegin("Rojo." .. label)
 	table.insert(entries, {
 		Label = label,
+		Profiled = profiled,
 		Start = if enabled then clock() else nil,
 	})
 end
@@ -35,7 +50,9 @@ function Timer._stop()
 	end
 
 	local entry = table.remove(entries)
-	debug.profileend()
+	if entry.Profiled then
+		Timer._profiler.End()
+	end
 	if #entries == 0 then
 		Timer._entries[thread] = nil
 	end
@@ -57,6 +74,19 @@ function Timer._stop()
 	end
 
 	print(string.format("[Rojo+ Timer] %s took %.3f ms", label, duration * 1000))
+end
+
+function Timer.measure(label, mode, callback, ...)
+	if type(callback) ~= "function" then
+		error("[Rojo+ Timer] Timer.measure requires a callback.", 2)
+	end
+	Timer._start(label, mode)
+	local results = table.pack(pcall(callback, ...))
+	Timer._stop()
+	if not results[1] then
+		error(results[2], 0)
+	end
+	return table.unpack(results, 2, results.n)
 end
 
 Timer.start = Timer._start

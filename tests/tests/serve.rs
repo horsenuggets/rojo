@@ -102,6 +102,336 @@ fn interactive_scaling_saves_successive_properties_from_the_same_client_cursor()
 }
 
 #[test]
+fn canonical_sound_writes_replace_authored_aliases_on_disk() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    for storage in ["model", "directory", "inline"] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            let source = match storage {
+                "model" => root.join("src/Sound.model.json"),
+                "directory" => {
+                    fs::create_dir(root.join("src/Sound")).unwrap();
+                    root.join("src/Sound/init.meta.json")
+                }
+                "inline" => {
+                    fs::create_dir(root.join("src/Container")).unwrap();
+                    root.join("src/Container/init.meta.json")
+                }
+                _ => unreachable!(),
+            };
+            let sound = r#"{"name":"Sound","className":"Sound","properties":{"EmitterSize":5}}"#;
+            let contents = if storage == "inline" {
+                format!(r#"{{"children":[{sound}]}}"#)
+            } else {
+                sound.to_owned()
+            };
+            fs::write(source, contents).unwrap();
+        });
+        let info = session.wait_to_come_online();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let sound = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "Sound")
+            .unwrap();
+        let id = sound.id;
+        assert!(!sound.properties.contains_key(&ustr("EmitterSize")));
+        assert_eq!(
+            sound.properties[&ustr("RollOffMinDistance")].as_ref(),
+            &Variant::Float32(5.0)
+        );
+        let source = session.path().join(match storage {
+            "model" => "src/Sound.model.json",
+            "directory" => "src/Sound/init.meta.json",
+            "inline" => "src/Container/init.meta.json",
+            _ => unreachable!(),
+        });
+        for value in [10.0, 7.0] {
+            let response = session.post_api_write(&WriteRequest {
+                session_id: info.session_id,
+                message_cursor: Some(read.message_cursor),
+                authority: WriteAuthority::Filesystem,
+                added: Default::default(),
+                removed: Vec::new(),
+                updated: vec![InstanceUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_parent: None,
+                    changed_metadata: None,
+                    changed_properties: UstrMap::from_iter([(
+                        ustr("RollOffMinDistance"),
+                        Some(Variant::Float32(value)),
+                    )]),
+                }],
+            });
+            assert!(response.errors.is_empty(), "{storage}, {response:?}");
+            assert!(
+                response.conflicts.updated_instances.is_empty(),
+                "{storage}, {response:?}"
+            );
+            assert_eq!(response.accepted.updated_instances.len(), 1, "{storage}");
+            let contents = fs::read_to_string(&source).unwrap();
+            assert!(!contents.contains("EmitterSize"), "{storage}, {contents}");
+            let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            let properties = if storage == "inline" {
+                &json["children"][0]["properties"]
+            } else {
+                &json["properties"]
+            };
+            if value == 10.0 {
+                assert!(properties.get("RollOffMinDistance").is_none(), "{contents}");
+            } else {
+                assert_eq!(properties["RollOffMinDistance"], value, "{contents}");
+            }
+            let readback = session.get_api_read(id).unwrap();
+            let actual = readback.instances[&id]
+                .properties
+                .get(&ustr("RollOffMinDistance"))
+                .map(|value| value.as_ref().clone())
+                .unwrap_or(Variant::Float32(10.0));
+            assert_eq!(actual, Variant::Float32(value), "{storage}");
+        }
+    }
+}
+
+#[test]
+fn property_writes_validate_authored_path_aliases() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    for storage in ["model", "script"] {
+        for authored in ["src", "src/../src", "absolute"]
+            .into_iter()
+            .chain(if cfg!(unix) { Some("linked") } else { None })
+        {
+            let mut session = TestServeSession::with_setup("add_folder", |root| {
+                #[cfg(unix)]
+                if authored == "linked" {
+                    std::os::unix::fs::symlink(root.join("src"), root.join("linked")).unwrap();
+                }
+                let source = if authored == "absolute" {
+                    root.join("src/../src")
+                } else {
+                    authored.into()
+                };
+                fs::write(
+                    root.join("default.project.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "Test",
+                        "tree": {"$className": "Folder", "Owned": {"$path": source}},
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                if storage == "model" {
+                    fs::write(
+                        root.join("src/Target.model.json"),
+                        r#"{"className":"Part"}"#,
+                    )
+                    .unwrap();
+                } else {
+                    fs::write(root.join("src/Target.luau"), "return 'initial'\n").unwrap();
+                }
+            });
+            let info = session.wait_to_come_online();
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            let id = read
+                .instances
+                .values()
+                .find(|instance| instance.name == "Target")
+                .unwrap()
+                .id;
+            let (property, value) = if storage == "model" {
+                (ustr("Transparency"), Variant::Float32(0.5))
+            } else {
+                (ustr("Source"), Variant::String("return 'saved'\n".into()))
+            };
+            let response = session.post_api_write(&WriteRequest {
+                session_id: info.session_id,
+                message_cursor: Some(read.message_cursor),
+                authority: WriteAuthority::Filesystem,
+                added: Default::default(),
+                removed: Vec::new(),
+                updated: vec![InstanceUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_parent: None,
+                    changed_metadata: None,
+                    changed_properties: UstrMap::from_iter([(property, Some(value.clone()))]),
+                }],
+            });
+            assert!(
+                response.errors.is_empty(),
+                "{storage}, {authored}, {response:?}"
+            );
+            assert!(
+                response.conflicts.updated_instances.is_empty(),
+                "{response:?}"
+            );
+            let latest = session.get_api_read(id).unwrap();
+            assert_eq!(latest.instances[&id].properties[&property].as_ref(), &value);
+            if storage == "model" {
+                let model: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(session.path().join("src/Target.model.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(model["properties"]["Transparency"], 0.5);
+            } else {
+                assert_eq!(
+                    fs::read_to_string(session.path().join("src/Target.luau")).unwrap(),
+                    "return 'saved'\n",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn successive_script_writes_do_not_conflict_with_prior_studio_saves() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::write(root.join("src/Typing.luau"), "return 'initial'\n").unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let read = session.get_api_read(info.root_instance_id).unwrap();
+    let id = read
+        .instances
+        .values()
+        .find(|instance| instance.name == "Typing")
+        .unwrap()
+        .id;
+    for source in ["return 'a'\n", "return 'ab'\n", "return 'abc'\n"] {
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(read.message_cursor),
+            authority: WriteAuthority::Filesystem,
+            added: Default::default(),
+            removed: Vec::new(),
+            updated: vec![InstanceUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_parent: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::from_iter([(
+                    ustr("Source"),
+                    Some(Variant::String(source.into())),
+                )]),
+            }],
+        });
+        assert!(response.errors.is_empty(), "{source}, {response:?}");
+        assert!(
+            response.conflicts.updated_instances.is_empty(),
+            "An earlier Studio save is not an external filesystem conflict. {source}, {response:?}"
+        );
+        assert_eq!(response.accepted.updated_instances.len(), 1);
+        assert_eq!(
+            fs::read_to_string(session.path().join("src/Typing.luau")).unwrap(),
+            source
+        );
+        let latest = session.get_api_read(id).unwrap();
+        assert_eq!(
+            latest.instances[&id].properties[&ustr("Source")].as_ref(),
+            &Variant::String(source.into())
+        );
+    }
+}
+
+#[test]
+fn transformed_script_serialization_errors_do_not_restore_editor_drafts() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use librojo::web_api::WriteErrorKind;
+    let original = "local Library = require('@shared/Library')\nreturn Library\n";
+    for source_path in ["src/Typing.luau", "src/Typing/init.luau"] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fs::write(root.join(".luaurc"), r#"{"aliases":{"shared":"src"}}"#).unwrap();
+            fs::create_dir_all(root.join(source_path).parent().unwrap()).unwrap();
+            fs::write(root.join(source_path), original).unwrap();
+            fs::write(root.join("src/Library.luau"), "return {}\n").unwrap();
+        });
+        let info = session.wait_to_come_online();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let instance = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "Typing")
+            .unwrap();
+        let id = instance.id;
+        let emitted = match instance.properties[&ustr("Source")].as_ref() {
+            Variant::String(source) => source,
+            _ => panic!("Missing source"),
+        };
+        assert_ne!(emitted, original);
+        let request = |source: String| WriteRequest {
+            session_id: info.session_id,
+            message_cursor: Some(read.message_cursor),
+            authority: WriteAuthority::Filesystem,
+            added: Default::default(),
+            removed: Vec::new(),
+            updated: vec![InstanceUpdate {
+                id,
+                changed_name: None,
+                changed_class_name: None,
+                changed_parent: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::from_iter([(
+                    ustr("Source"),
+                    Some(Variant::String(source)),
+                )]),
+            }],
+        };
+        for draft in [
+            emitted.replace("return Library", "local value ="),
+            emitted.replace("Library\")", "Other\")"),
+        ] {
+            assert_ne!(&draft, emitted);
+            let response = session.post_api_write(&request(draft));
+            assert_eq!(response.errors.len(), 1, "{response:?}");
+            assert_eq!(
+                response.errors[0].kind,
+                Some(WriteErrorKind::SourceSerializationDeferred)
+            );
+            assert_eq!(response.errors[0].property.as_deref(), Some("Source"));
+            assert_eq!(response.accepted, Default::default());
+            assert_eq!(
+                response.conflicts,
+                Default::default(),
+                "A serialization refusal must not replace the unsaved draft. {response:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(session.path().join(source_path)).unwrap(),
+                original
+            );
+            assert_eq!(response.message_cursor, read.message_cursor);
+        }
+        let response = session.post_api_write(&request(
+            emitted.replace("return Library", "return Library.Value"),
+        ));
+        assert!(response.errors.is_empty(), "{response:?}");
+        assert_eq!(response.accepted.updated_instances.len(), 1);
+        assert_eq!(
+            fs::read_to_string(session.path().join(source_path)).unwrap(),
+            original.replace("return Library", "return Library.Value")
+        );
+        let external = original.replace("return Library", "return 'external'");
+        fs::write(session.path().join(source_path), &external).unwrap();
+        let response =
+            session.post_api_write(&request(emitted.replace("return Library", "local value =")));
+        assert!(
+            !response.conflicts.updated_instances.is_empty(),
+            "{response:?}"
+        );
+        assert!(
+            response.errors.iter().all(|error| error.kind.is_none()),
+            "{response:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(session.path().join(source_path)).unwrap(),
+            external
+        );
+    }
+}
+
+#[test]
 fn text_values_sync_in_both_directions_after_filesystem_edits() {
     use crate::rojo_test::serve_util::TestServeSession;
     let mut session = TestServeSession::with_setup("add_folder", |root| {

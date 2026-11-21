@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     json,
-    resolution::{normalize_json_variant, AmbiguousValue, UnresolvedValue},
+    resolution::{
+        normalize_json_variant, normalize_property_names, AmbiguousValue, UnresolvedValue,
+    },
     snapshot::{InstanceMetadata, InstanceSnapshot},
     syncback::SyncbackSnapshot,
     variant_eq::variant_eq,
@@ -250,7 +252,7 @@ impl InlineInstance {
         let name = self.name.unwrap_or_else(|| class_name.to_string());
 
         let mut properties = rbx_dom_weak::UstrMap::default();
-        for (key, unresolved) in self.properties {
+        for (key, unresolved) in normalize_property_names(&class_name, self.properties) {
             let value = unresolved
                 .resolve(&class_name, &key)
                 .with_context(|| format!("error applying meta file {}", path.display()))?;
@@ -438,10 +440,9 @@ impl AdjacentMetadata {
     pub fn apply_properties(&mut self, snapshot: &mut InstanceSnapshot) -> anyhow::Result<()> {
         let path = &self.path;
 
-        // BTreeMaps don't have an equivalent to HashMap::drain, so the next
-        // best option is to take ownership of the entire map. Not free, but
-        // very cheap.
-        for (key, unresolved) in std::mem::take(&mut self.properties) {
+        for (key, unresolved) in
+            normalize_property_names(&snapshot.class_name, std::mem::take(&mut self.properties))
+        {
             let value = unresolved
                 .resolve(&snapshot.class_name, &key)
                 .with_context(|| format!("error applying meta file {}", path.display()))?;
@@ -740,7 +741,9 @@ impl DirectoryMetadata {
     fn apply_properties(&mut self, snapshot: &mut InstanceSnapshot) -> anyhow::Result<()> {
         let path = &self.path;
 
-        for (key, unresolved) in std::mem::take(&mut self.properties) {
+        for (key, unresolved) in
+            normalize_property_names(&snapshot.class_name, std::mem::take(&mut self.properties))
+        {
             let value = unresolved
                 .resolve(&snapshot.class_name, &key)
                 .with_context(|| format!("error applying meta file {}", path.display()))?;

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     json,
-    resolution::UnresolvedValue,
+    resolution::{normalize_property_names, UnresolvedValue},
     snapshot::{InstanceContext, InstanceSnapshot},
     snapshot_middleware::meta_file::serialize_values,
     syncback::{filter_json_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
@@ -167,7 +167,7 @@ impl JsonModel {
         }
 
         let mut properties = UstrMap::with_capacity(self.properties.len());
-        for (key, unresolved) in self.properties {
+        for (key, unresolved) in normalize_property_names(&class_name, self.properties) {
             let value = unresolved.resolve(&class_name, &key)?;
             properties.insert(key, value);
         }
