@@ -59,6 +59,8 @@ Making a new release? Simply add the new header with the version and date undern
   the session and queued writes without replaying older values or leaving a disconnected
   context tracking Studio edits. Property guards release only after result processing
   and callbacks succeed.
+* Kept recursive filesystem watching active when atomic saves remove unregistered temporary
+  paths, avoiding native watcher restarts that could lose concurrent external edits.
 * Corrected numeric UI binding interpolation and the development plugin's TestEZ lookup,
   and resolved production Luau analysis diagnostics without changing decoder behavior.
 * Added fine-grained profiling scopes for filesystem refreshes, import mapping validation,
