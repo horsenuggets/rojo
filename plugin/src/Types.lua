@@ -50,9 +50,24 @@ local ApiReadResponse = t.interface({
 	instances = t.map(RbxId, ApiInstance),
 })
 
+local ApiWritePatch = t.interface({
+	removed_instances = t.array(RbxId),
+	added_instances = t.array(t.table),
+	updated_instances = t.array(t.table),
+})
+
+local ApiWriteError = t.interface({
+	id = RbxId,
+	property = t.optional(t.string),
+	message = t.string,
+})
+
 local ApiWriteResponse = t.interface({
 	sessionId = t.string,
 	messageCursor = t.intersection(t.integer, t.numberConstrained(0, 4294967295)),
+	accepted = ApiWritePatch,
+	conflicts = ApiWritePatch,
+	errors = t.array(ApiWriteError),
 })
 
 local SocketPacketType = t.union(t.literal("messages"), t.literal("export"))

@@ -3,6 +3,16 @@ return function()
 	local Http = require(script.Parent.Parent.Packages.Http)
 	local Promise = require(script.Parent.Parent.Packages.Promise)
 
+	local function writeResponse(sessionId, cursor)
+		return {
+			sessionId = sessionId,
+			messageCursor = cursor,
+			accepted = { removed_instances = {}, added_instances = {}, updated_instances = {} },
+			conflicts = { removed_instances = {}, added_instances = {}, updated_instances = {} },
+			errors = {},
+		}
+	end
+
 	it("should round-trip parent updates with and without other changes", function()
 		local Types = require(script.Parent.Types)
 		local originalPost = Http.post
@@ -16,7 +26,7 @@ return function()
 				expect(updates[2].changedProperties.Value.String).to.equal("value")
 				return Promise.resolve({
 					code = 200,
-					body = Http.msgpackEncode({ sessionId = "session", messageCursor = 0 }),
+					body = Http.msgpackEncode(writeResponse("session", 0)),
 				})
 			end
 			local updates = {
@@ -48,7 +58,7 @@ return function()
 					sentCursor = Http.msgpackDecode(body).messageCursor
 					return Promise.resolve({
 						code = 200,
-						body = Http.msgpackEncode({ sessionId = "current-session", messageCursor = 0 }),
+						body = Http.msgpackEncode(writeResponse("current-session", 0)),
 					})
 				end
 				local context = ApiContext.new("http://localhost")
@@ -72,7 +82,7 @@ return function()
 					sentAuthority = Http.msgpackDecode(body).authority
 					return Promise.resolve({
 						code = 200,
-						body = Http.msgpackEncode({ sessionId = "current-session", messageCursor = 0 }),
+						body = Http.msgpackEncode(writeResponse("current-session", 0)),
 					})
 				end
 				local context = ApiContext.new("http://localhost")
@@ -106,7 +116,7 @@ return function()
 			Http.post = function()
 				return Promise.resolve({
 					code = 200,
-					body = Http.msgpackEncode({ sessionId = "current-session", messageCursor = 0 }),
+					body = Http.msgpackEncode(writeResponse("current-session", 0)),
 				})
 			end
 			local context = ApiContext.new("http://localhost")
@@ -125,11 +135,7 @@ return function()
 		local originalPost = Http.post
 		local success, err = pcall(function()
 			for _, matches in { true, false } do
-				local response = {
-					sessionId = if matches then "current-session" else "previous-session",
-					messageCursor = 0,
-					errors = {},
-				}
+				local response = writeResponse(if matches then "current-session" else "previous-session", 0)
 				Http.post = function()
 					return Promise.resolve({ code = 200, body = Http.msgpackEncode(response) })
 				end
@@ -141,7 +147,8 @@ return function()
 				if matches then
 					expect(result.sessionId).to.equal("current-session")
 				else
-					expect(result).to.equal("Server changed ID")
+					expect(tostring(result):find("Server changed ID", 1, true)).to.be.ok()
+					expect(context.__connected).to.equal(false)
 				end
 			end
 		end)
@@ -171,18 +178,18 @@ return function()
 					{ messageCursor = 0 / 0 },
 				}
 			do
-				response.sessionId = "current-session"
+				local body = writeResponse("current-session", response.messageCursor)
 				local requests = 0
 				Http.post = function()
 					requests += 1
-					return Promise.resolve({ code = 200, body = Http.msgpackEncode(response) })
+					return Promise.resolve({ code = 200, body = Http.msgpackEncode(body) })
 				end
 				local context = ApiContext.new("http://localhost")
 				context.__sessionId = "current-session"
 				local patch = { added = {}, removed = {}, updated = {} }
 				local accepted, message = context:write(patch, 0, "Filesystem"):await()
 				expect(accepted).to.equal(false)
-				expect(message:find("acknowledgement cursor", 1, true)).to.be.ok()
+				expect(tostring(message):find("write acknowledgement", 1, true)).to.be.ok()
 				expect(context.__connected).to.equal(false)
 				expect(context:write(patch, 0, "Filesystem"):await()).to.equal(false)
 				expect(requests).to.equal(1)
@@ -193,6 +200,108 @@ return function()
 		assert(success, err)
 	end)
 
+	it("should close the context when an acknowledgement cannot be decoded", function()
+		local originalPost = Http.post
+		local success, problem = pcall(function()
+			for _, body in { string.char(0x81), string.char(0xD9) } do
+				Http.post = function()
+					return Promise.resolve({ code = 200, body = body })
+				end
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "current-session"
+				expect(context:write({ added = {}, removed = {}, updated = {} }, 0, "Filesystem"):await()).to.equal(
+					false
+				)
+				expect(context.__connected).to.equal(false)
+			end
+		end)
+		Http.post = originalPost
+		assert(success, problem)
+	end)
+
+	it("should require every acknowledgement result field before accepting a future cursor", function()
+		local originalPost = Http.post
+		local success, problem = pcall(function()
+			for mask = 0, 6 do
+				local response = writeResponse("current-session", 100)
+				for index, name in { "accepted", "conflicts", "errors" } do
+					if bit32.band(mask, bit32.lshift(1, index - 1)) == 0 then
+						response[name] = nil
+					end
+				end
+				Http.post = function()
+					return Promise.resolve({ code = 200, body = Http.msgpackEncode(response) })
+				end
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "current-session"
+				expect(context:write({ added = {}, removed = {}, updated = {} }, 0, "Filesystem"):await()).to.equal(
+					false
+				)
+				expect(context.__connected).to.equal(false)
+			end
+		end)
+		Http.post = originalPost
+		assert(success, problem)
+	end)
+
+	it("should reject malformed nested acknowledgement results", function()
+		local originalPost = Http.post
+		local success, problem = pcall(function()
+			for _, changes in
+				{
+					{ accepted = false },
+					{ accepted = { removed_instances = {}, added_instances = {} } },
+					{ accepted = { removed_instances = { false }, added_instances = {}, updated_instances = {} } },
+					{ conflicts = { removed_instances = {}, added_instances = {}, updated_instances = { false } } },
+					{ errors = { false } },
+					{ errors = { { message = "No identity" } } },
+					{ errors = { { id = "INSTANCE", message = false } } },
+				}
+			do
+				local response = writeResponse("current-session", 100)
+				for key, value in changes do
+					response[key] = value
+				end
+				Http.post = function()
+					return Promise.resolve({ code = 200, body = Http.msgpackEncode(response) })
+				end
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "current-session"
+				expect(context:write({ added = {}, removed = {}, updated = {} }, 0, "Filesystem"):await()).to.equal(
+					false
+				)
+				expect(context.__connected).to.equal(false)
+			end
+		end)
+		Http.post = originalPost
+		assert(success, problem)
+	end)
+
+	it("should retain valid server-reported write errors without closing the context", function()
+		local originalPost = Http.post
+		local success, problem = pcall(function()
+			for _, propertyError in { false, true } do
+				local response = writeResponse("current-session", 100)
+				response.errors = { { id = "INSTANCE", message = "The write was rejected." } }
+				if propertyError then
+					response.errors[1].property = "Transparency"
+				end
+				Http.post = function()
+					return Promise.resolve({ code = 200, body = Http.msgpackEncode(response) })
+				end
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "current-session"
+				local accepted, result =
+					context:write({ added = {}, removed = {}, updated = {} }, 0, "Filesystem"):await()
+				expect(accepted).to.equal(true)
+				expect(result.errors[1].message).to.equal("The write was rejected.")
+				expect(context.__connected).to.equal(true)
+			end
+		end)
+		Http.post = originalPost
+		assert(success, problem)
+	end)
+
 	it("should preserve valid acknowledgement cursors at both protocol bounds", function()
 		local originalPost = Http.post
 		local success, err = pcall(function()
@@ -200,7 +309,7 @@ return function()
 				Http.post = function()
 					return Promise.resolve({
 						code = 200,
-						body = Http.msgpackEncode({ sessionId = "current-session", messageCursor = cursor }),
+						body = Http.msgpackEncode(writeResponse("current-session", cursor)),
 					})
 				end
 				local context = ApiContext.new("http://localhost")

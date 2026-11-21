@@ -44,6 +44,142 @@ return function()
 		return session, instance, control
 	end
 
+	it("should finish shutdown before notifying reentrant or throwing status callbacks", function()
+		for _, reenter in { false, true } do
+			local session, part = propertySession("Part")
+			session.__status = ServeSession.Status.Connected
+			local disconnected = false
+			session.__apiContext.disconnect = function()
+				disconnected = true
+			end
+			local notifications = 0
+			local cleanedUp = false
+			session:onStatusChanged(function(status)
+				notifications += 1
+				cleanedUp = status == ServeSession.Status.Disconnected
+					and disconnected
+					and session.__changeBatcher.__stopped
+					and session.__instanceMap:size() == 0
+					and session.__localPropertyEdits == nil
+					and #session.__connections == 0
+				if reenter and notifications == 1 then
+					session:stop()
+				else
+					error("The disconnected status callback failed.")
+				end
+			end)
+			local success, problem = pcall(function()
+				expect(pcall(function()
+					session:stop()
+				end)).to.equal(true)
+				expect(cleanedUp).to.equal(true)
+				expect(notifications).to.equal(1)
+				session:stop()
+				expect(notifications).to.equal(1)
+			end)
+			session:onStatusChanged(nil)
+			session:stop()
+			part:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should stop tracking and queued writes after a fatal acknowledgement without replaying old values", function()
+		local ApiContext = require(script.Parent.ApiContext)
+		local Http = require(script.Parent.Parent.Packages.Http)
+		local originalPost = Http.post
+		for _, body in { string.char(0x81), Http.msgpackEncode({ sessionId = "session", messageCursor = 100 }) } do
+			local session, part = propertySession("Part")
+			local context = ApiContext.new("http://localhost")
+			context.__sessionId = "session"
+			context:setMessageCursor(0)
+			session.__apiContext = context
+			session.__status = ServeSession.Status.Connected
+			local requests = 0
+			local settle
+			Http.post = function()
+				requests += 1
+				if requests == 1 then
+					return Promise.new(function(resolve)
+						settle = resolve
+					end)
+				end
+				return Promise.resolve({ code = 200, body = body })
+			end
+			local success, problem = pcall(function()
+				part.Transparency = 0.4
+				session:__queueChange(part, "Transparency")
+				local first = session:flushChanges()
+				part.Transparency = 0.7
+				local latest = part.Transparency
+				session:__queueChange(part, "Transparency")
+				local second = session:flushChanges()
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = { { id = "EDITED", changedProperties = { Transparency = { Float32 = 0.2 } } } },
+				})
+				settle({ code = 200, body = body })
+				first:await()
+				second:await()
+				expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+				expect(session.__changeBatcher.__stopped).to.equal(true)
+				expect(session.__instanceMap:size()).to.equal(0)
+				expect(session.__localPropertyEdits).to.equal(nil)
+				expect(part.Transparency).to.equal(latest)
+				expect(requests).to.equal(1)
+				for _, result in session:getSyncResults() do
+					expect(result.status).to.equal("Failed")
+				end
+			end)
+			Http.post = originalPost
+			session:stop()
+			part:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should stop after acknowledgement processing fails without treating it as a transport failure", function()
+		local session, part, control = propertySession("Part")
+		session.__status = ServeSession.Status.Connected
+		local transportFailures = 0
+		session.__untrackRejectedAdditions = function(_self, _patch, result)
+			if result ~= nil then
+				error("Acknowledgement processing failed.")
+			end
+			transportFailures += 1
+		end
+		local success, problem = pcall(function()
+			part.Transparency = 0.7
+			local latest = part.Transparency
+			session:__queueChange(part, "Transparency")
+			local first = session:flushChanges()
+			local second = session:__writePatch({ added = {}, removed = {}, updated = {} }, 0, {})
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = { { id = "EDITED", changedProperties = { Transparency = { Float32 = 0.2 } } } },
+			})
+			local result = writeResult()
+			result.messageCursor = 100
+			control.settle[1](result)
+			first:await()
+			second:await()
+			expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(session.__changeBatcher.__stopped).to.equal(true)
+			expect(session.__localPropertyEdits).to.equal(nil)
+			expect(part.Transparency).to.equal(latest)
+			expect(#control.requests).to.equal(1)
+			expect(transportFailures).to.equal(1)
+			for _, record in session:getSyncResults() do
+				expect(record.status).to.equal("Failed")
+			end
+		end)
+		session:stop()
+		part:Destroy()
+		assert(success, problem)
+	end)
+
 	it("should keep structural failures out of replacement fallback", function()
 		local InstanceMap = require(script.Parent.InstanceMap)
 		local PatchSet = require(script.Parent.PatchSet)

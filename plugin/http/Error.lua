@@ -12,6 +12,9 @@ Error.Kind = {
 		message = "Couldn't connect to the Rojo+ server.\n"
 			.. "Make sure the server is running — use 'rojo serve' to run it!",
 	},
+	Protocol = {
+		message = "Invalid Rojo+ server response. {{message}}",
+	},
 	Timeout = {
 		message = "HTTP request timed out.",
 	},
