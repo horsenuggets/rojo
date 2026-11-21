@@ -13,6 +13,8 @@ local validateApiRead = Types.ifEnabled(Types.ApiReadResponse)
 local validateApiSocketPacket = Types.ifEnabled(Types.ApiSocketPacket)
 local validateApiSerialize = Types.ifEnabled(Types.ApiSerializeResponse)
 local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
+-- Acknowledgement ordering is a wire contract, not an optional debug check.
+local validateApiWrite = Types.ApiWriteResponse
 
 local function rejectFailedRequests(response)
 	if response.code >= 400 then
@@ -205,6 +207,9 @@ end
 
 function ApiContext:write(patch, messageCursor, authority)
 	assert(authority == "Filesystem" or authority == "Studio", "Write authority must be Filesystem or Studio")
+	if not self.__connected then
+		return Promise.reject("The connection is closed.")
+	end
 	local url = ("%s/api/write"):format(self.__baseUrl)
 
 	local updated = {}
@@ -245,6 +250,10 @@ function ApiContext:write(patch, messageCursor, authority)
 		:andThen(rejectFailedRequests)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(responseBody)
+			if not validateApiWrite(responseBody) then
+				self:disconnect()
+				return Promise.reject("The server write response has no valid acknowledgement cursor.")
+			end
 			if responseBody.sessionId ~= self.__sessionId then
 				return Promise.reject("Server changed ID")
 			end

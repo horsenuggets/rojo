@@ -50,6 +50,11 @@ local ApiReadResponse = t.interface({
 	instances = t.map(RbxId, ApiInstance),
 })
 
+local ApiWriteResponse = t.interface({
+	sessionId = t.string,
+	messageCursor = t.intersection(t.integer, t.numberConstrained(0, 4294967295)),
+})
+
 local SocketPacketType = t.union(t.literal("messages"), t.literal("export"))
 
 local ExportPacket = t.interface({
@@ -104,6 +109,7 @@ return strict("Types", {
 
 	ApiInfoResponse = ApiInfoResponse,
 	ApiReadResponse = ApiReadResponse,
+	ApiWriteResponse = ApiWriteResponse,
 	ApiSocketPacket = ApiSocketPacket,
 	ExportPacket = ExportPacket,
 	ApiError = ApiError,
