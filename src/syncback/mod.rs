@@ -1322,6 +1322,79 @@ mod test {
     }
 
     #[test]
+    fn model_backed_project_overrides_do_not_restore_stale_sound_aliases() {
+        use rbx_dom_weak::InstanceBuilder;
+        for storage in ["model.json", "project.json"] {
+            for value in [7.0, 10.0] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let path = root.join("default.project.json");
+                let source = format!("Sound.{storage}");
+                let vfs = Vfs::new_default().unwrap();
+                vfs.set_watch_enabled(false);
+                vfs.write(
+                    root.join(&source),
+                    if storage == "model.json" {
+                        r#"{"className":"Sound","properties":{"RollOffMinDistance":2}}"#
+                    } else {
+                        r#"{"name":"Sound","tree":{"$className":"Sound","$properties":{"RollOffMinDistance":2}}}"#
+                    },
+                ).unwrap();
+                vfs.write(&path, format!(
+                    r#"{{"name":"Test","tree":{{"$className":"Folder","Sound":{{"$path":"{source}","$properties":{{"EmitterSize":5}}}}}}}}"#
+                )).unwrap();
+                let project = Project::load_exact(&vfs, &path, Some("Test")).unwrap();
+                let old =
+                    crate::snapshot_middleware::snapshot_from_vfs(&Default::default(), &vfs, &path)
+                        .unwrap()
+                        .unwrap();
+                let mut tree = RojoTree::new(old);
+                let input = WeakDom::new(
+                    InstanceBuilder::new("Folder").with_name("Test").with_child(
+                        InstanceBuilder::new("Sound")
+                            .with_name("Sound")
+                            .with_property("RollOffMinDistance", Variant::Float32(value))
+                            .with_property("Volume", Variant::Float32(0.25)),
+                    ),
+                );
+                let saved = syncback_loop(&vfs, &mut tree, input, &project).unwrap();
+                saved.write_to_vfs(root, &vfs).unwrap();
+                let contents = vfs.read_to_string(&path).unwrap();
+                assert!(
+                    !contents.contains("EmitterSize"),
+                    "{storage}, {value}, {contents}"
+                );
+                let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+                let overrides = &json["tree"]["Sound"]["$properties"];
+                assert!(overrides.get("Volume").is_none(), "{contents}");
+                if value == 10.0 {
+                    assert!(overrides.get("RollOffMinDistance").is_none(), "{contents}");
+                } else {
+                    assert_eq!(overrides["RollOffMinDistance"], value, "{contents}");
+                }
+                let reloaded =
+                    crate::snapshot_middleware::snapshot_from_vfs(&Default::default(), &vfs, &path)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(
+                    reloaded.children[0]
+                        .properties
+                        .get(&ustr("RollOffMinDistance"))
+                        .cloned()
+                        .unwrap_or(Variant::Float32(10.0)),
+                    Variant::Float32(value),
+                    "{storage}, {value}, {contents}",
+                );
+                assert_eq!(
+                    reloaded.children[0].properties.get(&ustr("Volume")),
+                    Some(&Variant::Float32(0.25)),
+                    "{storage}, {value}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sound_alias_filter_retains_configured_and_concrete_canonical_names() {
         let temp = tempfile::tempdir().unwrap();
         let vfs = Vfs::new_default().unwrap();

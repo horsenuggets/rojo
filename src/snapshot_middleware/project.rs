@@ -468,10 +468,24 @@ pub fn syncback_project<'sync>(
 
             ref_to_path_map.insert(new_inst.referent(), full_path);
 
-            // We only want to set properties if it needs it.
             if !middleware.handles_own_properties() {
                 normalized_node_properties |=
                     project_node_property_syncback_path(snapshot, new_inst, node);
+            } else if !node.properties.is_empty() || !node.attributes.is_empty() {
+                // The model stores its own values, but existing project overrides still
+                // win on reload. Reconcile only those overrides, not every model field.
+                let overridden: UstrSet = node
+                    .properties
+                    .keys()
+                    .map(|name| ustr(canonical_property_name(&new_inst.class, name.as_str())))
+                    .collect();
+                let mut filtered = filter_properties(snapshot.project(), new_inst);
+                filtered.retain(|name, _| {
+                    overridden.contains(name)
+                        || (*name == ustr("Attributes") && !node.attributes.is_empty())
+                });
+                normalized_node_properties |=
+                    project_node_property_syncback(snapshot, filtered, new_inst, node);
             }
         } else {
             normalized_node_properties |=
