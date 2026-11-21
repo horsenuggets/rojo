@@ -92,6 +92,9 @@ Making a new release? Simply add the new header with the version and date undern
   Opt-in write diagnostics correlate request identities, cursors, queue depth, patch
   counts, byte sizes, and wall timings without formatting script payloads.
 
+* Matched automated release tags to the exact unprefixed version and built commit while
+  rejecting duplicate versions under either current or historical tag spelling.
+
 ## `7.7.1-horse.2.6`
 
 * Preserved readable `Workspace.ExplorerIconContent`, `Workspace.ReplicationFrequency`,
