@@ -49,7 +49,12 @@ Making a new release? Simply add the new header with the version and date undern
   property edits while their batches are pending or in flight, and rejected writes still
   restore the server value after their announcements arrive. Property values are encoded
   once per batch rather than on each change signal, and omitted encodings release their
-  pending guards.
+  pending guards. Structural revisions are indexed per instance so repeated writes with
+  an older cursor do not repeatedly scan intervening ordinary-property announcements.
+  Property aliases share canonical guards and batch encodings.
+* Required protocol version 12 and a validated publication cursor in every write response.
+  Older peers are rejected before syncing, and malformed acknowledgements close the
+  connection instead of releasing guards ahead of delayed announcements.
 * Corrected numeric UI binding interpolation and the development plugin's TestEZ lookup,
   and resolved production Luau analysis diagnostics without changing decoder behavior.
 * Added fine-grained profiling scopes for filesystem refreshes, import mapping validation,

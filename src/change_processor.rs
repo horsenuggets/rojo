@@ -81,7 +81,7 @@ impl ChangeProcessor {
     pub fn start(
         tree: Arc<Mutex<RojoTree>>,
         vfs: Arc<Vfs>,
-        message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+        message_queue: Arc<MessageQueue>,
         tree_mutation_receiver: Receiver<TreeMutation>,
         pool: Option<Arc<rayon::ThreadPool>>,
         project: Arc<Project>,
@@ -156,7 +156,7 @@ struct JobThreadContext {
 
     /// Whenever changes are applied to the DOM, we should push those changes
     /// into this message queue to inform any connected clients.
-    message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+    message_queue: Arc<MessageQueue>,
 
     /// The project's serialization and filtering rules, read again whenever
     /// the project file changes.
@@ -3508,26 +3508,13 @@ impl JobThreadContext {
         let Some(cursor) = context.cursor else {
             return context.authority;
         };
-        let mut targets = HashSet::new();
-        let mut current = Some(update.id);
-        while let Some(instance) = current.and_then(|id| tree.get_instance(id)) {
-            targets.insert(instance.id());
-            current = Some(instance.parent());
-        }
-        let structural = self.message_queue.any_since(cursor, |patch| {
-            patch
-                .removed
-                .iter()
-                .chain(&patch.added)
-                .any(|id| targets.contains(id))
-                || patch.updated.iter().any(|change| {
-                    targets.contains(&change.id)
-                        && (change.changed_name.is_some()
-                            || change.changed_parent.is_some()
-                            || change.changed_class_name.is_some()
-                            || change.changed_metadata.is_some())
-                })
-        });
+        let targets = std::iter::successors(tree.get_instance(update.id), |instance| {
+            tree.get_instance(instance.parent())
+        })
+        .map(|instance| instance.id());
+        let structural = self
+            .message_queue
+            .has_structural_changes_since(cursor, targets);
         if structural == Some(false) {
             WriteAuthority::Studio
         } else {
