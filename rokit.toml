@@ -1,5 +1,5 @@
 [tools]
-rojo = "horsenuggets/rojo@7.7.1-horse.2.7"
+rojo = "horsenuggets/rojo@7.7.1-horse.2.8"
 selene = "kampfkarren/selene@0.32.0"
 stylua = "johnnymorganz/stylua@2.6.0"
 run-in-roblox = "rojo-rbx/run-in-roblox@0.3.0"
