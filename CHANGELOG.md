@@ -52,10 +52,13 @@ Making a new release? Simply add the new header with the version and date undern
   pending guards. Structural revisions are indexed per instance so repeated writes with
   an older cursor do not repeatedly scan intervening ordinary-property announcements.
   Property aliases share canonical guards and batch encodings.
-* Required protocol version 12 and validated publication cursors and result fields in
-  every write response. Older peers are rejected before syncing. Unreadable, incomplete,
-  or unprocessed acknowledgements stop the session and queued writes without replaying
-  older values or leaving a disconnected context tracking Studio edits.
+* Required protocol version 12 and validated publication cursors and nested patch fields
+  in every write response. Acknowledgements cannot predate progress known at dispatch,
+  but subscription progress can advance while a response is in flight. Older peers are
+  rejected before syncing. Unreadable, incomplete, or unprocessed acknowledgements stop
+  the session and queued writes without replaying older values or leaving a disconnected
+  context tracking Studio edits. Property guards release only after result processing
+  and callbacks succeed.
 * Corrected numeric UI binding interpolation and the development plugin's TestEZ lookup,
   and resolved production Luau analysis diagnostics without changing decoder behavior.
 * Added fine-grained profiling scopes for filesystem refreshes, import mapping validation,

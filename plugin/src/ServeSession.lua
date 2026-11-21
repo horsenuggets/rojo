@@ -636,10 +636,11 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties)
 		:andThen(function(result)
 			acknowledged = true
 			forgetDeletions()
-			self:__finishLocalProperties(localProperties, result)
 			self:__untrackRejectedAdditions(patch, result)
 			self:__untrackSavedRemovals(result)
 			finish(ServeSession.getWriteStatus(result), result)
+			-- Handlers and callbacks must succeed before buffered values can replay.
+			self:__finishLocalProperties(localProperties, result)
 			return result
 		end)
 		:catch(function(err)

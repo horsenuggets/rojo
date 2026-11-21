@@ -180,6 +180,55 @@ return function()
 		assert(success, problem)
 	end)
 
+	it("should retain local values until all acknowledgement processing succeeds", function()
+		for _, caughtUp in { false, true } do
+			for _, callbackFails in { false, true } do
+				local session, part, control = propertySession("Part")
+				session.__status = ServeSession.Status.Connected
+				if callbackFails then
+					session:setSyncResultCallback(function(status)
+						if status == "Saved" then
+							error("The result callback failed.")
+						end
+					end)
+				else
+					session.__untrackRejectedAdditions = function(_self, _patch, result)
+						if result ~= nil then
+							error("Acknowledgement processing failed.")
+						end
+					end
+				end
+				local success, problem = pcall(function()
+					part.Transparency = 0.7
+					local latest = part.Transparency
+					session:__queueChange(part, "Transparency")
+					local first = session:flushChanges()
+					local second = session:__writePatch({ added = {}, removed = {}, updated = {} }, 0, {})
+					session:__applyPatch({
+						added = {},
+						removed = {},
+						updated = { { id = "EDITED", changedProperties = { Transparency = { Float32 = 0.2 } } } },
+					})
+					control.cursor = if caughtUp then 100 else 0
+					local result = writeResult()
+					result.messageCursor = 100
+					control.settle[1](result)
+					first:await()
+					second:await()
+					expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+					expect(part.Transparency).to.equal(latest)
+					expect(#control.requests).to.equal(1)
+					for _, record in session:getSyncResults() do
+						expect(record.status).to.equal("Failed")
+					end
+				end)
+				session:stop()
+				part:Destroy()
+				assert(success, problem)
+			end
+		end
+	end)
+
 	it("should keep structural failures out of replacement fallback", function()
 		local InstanceMap = require(script.Parent.InstanceMap)
 		local PatchSet = require(script.Parent.PatchSet)

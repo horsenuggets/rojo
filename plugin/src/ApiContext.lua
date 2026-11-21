@@ -128,6 +128,7 @@ function ApiContext.new(baseUrl)
 		__baseUrl = baseUrl,
 		__sessionId = nil,
 		__messageCursor = -1,
+		__writeCursor = 0,
 		__wsClient = nil,
 		__connected = true,
 		__activeRequests = {},
@@ -191,6 +192,7 @@ function ApiContext:connect()
 		:andThen(rejectWrongPlaceId)
 		:andThen(function(body)
 			self.__sessionId = body.sessionId
+			self.__writeCursor = 0
 
 			return body
 		end)
@@ -249,6 +251,9 @@ function ApiContext:write(patch, messageCursor, authority)
 		added = added,
 	}
 
+	-- Subscription progress may advance while HTTP is in flight. Only progress
+	-- already known at dispatch constrains this response's publication cursor.
+	local minimumCursor = math.max(body.messageCursor, self.__messageCursor, self.__writeCursor)
 	body = Http.msgpackEncode(body)
 
 	return Http.post(url, body):andThen(rejectFailedRequests):andThen(function(response)
@@ -262,6 +267,10 @@ function ApiContext:write(patch, messageCursor, authority)
 		if responseBody.sessionId ~= self.__sessionId then
 			return rejectInvalidAcknowledgement(self, "Server changed ID")
 		end
+		if responseBody.messageCursor < minimumCursor then
+			return rejectInvalidAcknowledgement(self, "The write acknowledgement predates known publication progress.")
+		end
+		self.__writeCursor = math.max(self.__writeCursor, responseBody.messageCursor)
 		return responseBody
 	end)
 end
