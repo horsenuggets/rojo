@@ -180,6 +180,55 @@ return function()
 		assert(success, problem)
 	end)
 
+	it("should retain local values until all acknowledgement processing succeeds", function()
+		for _, caughtUp in { false, true } do
+			for _, callbackFails in { false, true } do
+				local session, part, control = propertySession("Part")
+				session.__status = ServeSession.Status.Connected
+				if callbackFails then
+					session:setSyncResultCallback(function(status)
+						if status == "Saved" then
+							error("The result callback failed.")
+						end
+					end)
+				else
+					session.__untrackRejectedAdditions = function(_self, _patch, result)
+						if result ~= nil then
+							error("Acknowledgement processing failed.")
+						end
+					end
+				end
+				local success, problem = pcall(function()
+					part.Transparency = 0.7
+					local latest = part.Transparency
+					session:__queueChange(part, "Transparency")
+					local first = session:flushChanges()
+					local second = session:__writePatch({ added = {}, removed = {}, updated = {} }, 0, {})
+					session:__applyPatch({
+						added = {},
+						removed = {},
+						updated = { { id = "EDITED", changedProperties = { Transparency = { Float32 = 0.2 } } } },
+					})
+					control.cursor = if caughtUp then 100 else 0
+					local result = writeResult()
+					result.messageCursor = 100
+					control.settle[1](result)
+					first:await()
+					second:await()
+					expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+					expect(part.Transparency).to.equal(latest)
+					expect(#control.requests).to.equal(1)
+					for _, record in session:getSyncResults() do
+						expect(record.status).to.equal("Failed")
+					end
+				end)
+				session:stop()
+				part:Destroy()
+				assert(success, problem)
+			end
+		end
+	end)
+
 	it("should keep structural failures out of replacement fallback", function()
 		local InstanceMap = require(script.Parent.InstanceMap)
 		local PatchSet = require(script.Parent.PatchSet)
@@ -717,6 +766,302 @@ return function()
 		session:stop()
 		sound:Destroy()
 		assert(success, problem)
+	end)
+
+	it("should preserve newer script text across delayed Source echoes at every write stage", function()
+		for _, className in { "ModuleScript", "Script", "LocalScript" } do
+			for _, stage in { "pending", "queued", "inflight", "answered" } do
+				local session, instance, control = propertySession(className)
+				session.__applyPatch = function(_, patch)
+					for _, update in patch.updated do
+						if update.changedProperties.Source then
+							instance.Source = update.changedProperties.Source.String
+						end
+					end
+				end
+				local function edit(text)
+					instance.Source = text
+					session:__queueChange(instance, "Source")
+				end
+				local function filter(text)
+					return session:__protectLocalProperties({
+						added = {},
+						removed = {},
+						updated = { { id = "EDITED", changedProperties = { Source = { String = text } } } },
+					})
+				end
+				local function answer(index, revision)
+					local result = writeResult()
+					result.messageCursor = revision
+					control.settle[index](result)
+				end
+				local success, problem = pcall(function()
+					edit("return 'a'")
+					local first = session:flushChanges()
+					edit("return 'ab'")
+					local second = if stage ~= "pending" then session:flushChanges() else nil
+					if stage == "inflight" or stage == "answered" then
+						answer(1, 1)
+						first:await()
+					end
+					if stage == "answered" then
+						answer(2, 2)
+						second:await()
+					end
+					expect(#filter("return 'a'").updated).to.equal(0)
+					control.cursor = 1
+					session:__releaseLocalProperties(control.cursor)
+					if stage == "pending" or stage == "queued" then
+						answer(1, 1)
+						first:await()
+					end
+					if second == nil then
+						second = session:flushChanges()
+					end
+					expect(control.requests[2].updated[1].changedProperties.Source.String).to.equal("return 'ab'")
+					if stage ~= "answered" then
+						answer(2, 2)
+						second:await()
+					end
+					filter("return 'ab'")
+					control.cursor = 2
+					session:__releaseLocalProperties(control.cursor)
+					local external = filter("return 'filesystem'")
+					expect(external.updated[1].changedProperties.Source.String).to.equal("return 'filesystem'")
+				end)
+				session:stop()
+				instance:Destroy()
+				assert(success, `{className} {stage} {tostring(problem)}`)
+			end
+		end
+	end)
+
+	it("should preserve only failed properties without an authoritative conflict", function()
+		for _, errorId in { "EDITED", "OTHER" } do
+			for _, property in { false, "Source", "Transparency" } do
+				for _, conflictId in { false, "EDITED", "OTHER" } do
+					for _, removed in { false, true } do
+						local result = writeResult({
+							{
+								id = errorId,
+								property = if property then property else nil,
+								kind = "sourceSerializationDeferred",
+								message = "The write could not be serialized",
+							},
+						})
+						if conflictId then
+							if removed then
+								table.insert(result.conflicts.removed_instances, conflictId)
+							else
+								table.insert(result.conflicts.updated_instances, {
+									id = conflictId,
+									changed_properties = { Source = { String = "return 'disk'" } },
+								})
+							end
+						end
+						local expected = errorId == "EDITED" and property == "Source" and conflictId ~= "EDITED"
+						expect(ServeSession.shouldPreserveFailedProperty(result, "EDITED", "Source")).to.equal(expected)
+						expect(ServeSession.shouldPreserveFailedProperty(result, "EDITED", "Source")).to.equal(expected)
+						result.errors[1].kind = nil
+						expect(ServeSession.shouldPreserveFailedProperty(result, "EDITED", "Source")).to.equal(false)
+					end
+				end
+			end
+		end
+	end)
+
+	it("should preserve a deferred Source independently of another conflicted property", function()
+		local result = writeResult({
+			{
+				id = "EDITED",
+				kind = "sourceSerializationDeferred",
+				property = "Source",
+				message = "Unsaved draft",
+			},
+		})
+		result.conflicts.updated_instances =
+			{ { id = "EDITED", changed_properties = { Archivable = { Bool = true } } } }
+		expect(ServeSession.shouldPreserveFailedProperty(result, "EDITED", "Source")).to.equal(true)
+		result.conflicts.updated_instances[1].changed_properties.Source = { String = "return 'disk'" }
+		expect(ServeSession.shouldPreserveFailedProperty(result, "EDITED", "Source")).to.equal(false)
+	end)
+
+	it("should retain an unsaved script draft after a serialization error without hiding later disk edits", function()
+		for _, className in { "ModuleScript", "Script", "LocalScript" } do
+			for _, responseFirst in { false, true } do
+				local session, instance, control = propertySession(className)
+				session.__applyPatch = function(_, patch)
+					for _, update in patch.updated do
+						if update.changedProperties.Source then
+							instance.Source = update.changedProperties.Source.String
+						end
+					end
+				end
+				local success, problem = pcall(function()
+					instance.Source = "local value ="
+					session:__queueChange(instance, "Source")
+					local write = session:flushChanges()
+					local result = writeResult({
+						{
+							id = "EDITED",
+							kind = "sourceSerializationDeferred",
+							property = "Source",
+							message = "Cannot safely reverse imports in incomplete source",
+						},
+					})
+					result.messageCursor = 1
+					if responseFirst then
+						control.settle[1](result)
+						write:await()
+					end
+					local filtered = session:__protectLocalProperties({
+						added = {},
+						removed = {},
+						updated = {
+							{ id = "EDITED", changedProperties = { Source = { String = "return 'previous save'" } } },
+						},
+					})
+					expect(#filtered.updated).to.equal(0)
+					control.cursor = 1
+					session:__releaseLocalProperties(control.cursor)
+					if not responseFirst then
+						control.settle[1](result)
+						write:await()
+					end
+					expect(instance.Source).to.equal("local value =")
+					expect(session:getSyncResults()[1].status).to.equal("Failed")
+					expect(next(session.__localPropertyEdits)).to.equal(nil)
+					local external = session:__protectLocalProperties({
+						added = {},
+						removed = {},
+						updated = {
+							{ id = "EDITED", changedProperties = { Source = { String = "return 'external edit'" } } },
+						},
+					})
+					expect(external.updated[1].changedProperties.Source.String).to.equal("return 'external edit'")
+				end)
+				session:stop()
+				instance:Destroy()
+				assert(success, `{className} {tostring(responseFirst)} {tostring(problem)}`)
+			end
+		end
+	end)
+
+	it(
+		"should distinguish later filesystem Source from earlier echoes while a deferred response is in flight",
+		function()
+			for _, responseFirst in { false, true } do
+				for _, laterSource in { false, true } do
+					local session, instance, control = propertySession("ModuleScript")
+					session.__applyPatch = function(_, patch)
+						for _, update in patch.updated do
+							if update.changedProperties.Source then
+								instance.Source = update.changedProperties.Source.String
+							end
+						end
+					end
+					local success, problem = pcall(function()
+						instance.Source = "local value ="
+						session:__queueChange(instance, "Source")
+						local write = session:flushChanges()
+						local result = writeResult({
+							{
+								id = "EDITED",
+								kind = "sourceSerializationDeferred",
+								property = "Source",
+								message = "The draft remains unsaved",
+							},
+						})
+						result.messageCursor = 1
+						if responseFirst then
+							control.settle[1](result)
+							write:await()
+						end
+						session:__protectLocalProperties({
+							added = {},
+							removed = {},
+							updated = {
+								{
+									id = "EDITED",
+									changedProperties = { Source = { String = "return 'previous save'" } },
+								},
+							},
+						}, 1)
+						session:__protectLocalProperties({
+							added = {},
+							removed = {},
+							updated = {
+								{
+									id = if laterSource then "EDITED" else "OTHER",
+									changedProperties = { Source = { String = "return 'external edit'" } },
+								},
+							},
+						}, 2)
+						control.cursor = 2
+						session:__releaseLocalProperties(control.cursor)
+						if not responseFirst then
+							control.settle[1](result)
+							write:await()
+						end
+						expect(instance.Source).to.equal(
+							if laterSource then "return 'external edit'" else "local value ="
+						)
+						expect(session:getSyncResults()[1].status).to.equal("Failed")
+						expect(next(session.__localPropertyEdits)).to.equal(nil)
+					end)
+					session:stop()
+					instance:Destroy()
+					assert(success, problem)
+				end
+			end
+		end
+	)
+
+	it("should retain filesystem Source authority until a conflicted write is fully acknowledged", function()
+		for _, responseFirst in { false, true } do
+			local session, instance, control = propertySession("ModuleScript")
+			session.__applyPatch = function(_, patch)
+				for _, update in patch.updated do
+					if update.changedProperties.Source then
+						instance.Source = update.changedProperties.Source.String
+					end
+				end
+			end
+			local success, problem = pcall(function()
+				instance.Source = "return 'Studio'"
+				session:__queueChange(instance, "Source")
+				local write = session:flushChanges()
+				local result = writeResult(nil, {
+					removed_instances = {},
+					added_instances = {},
+					updated_instances = { { id = "EDITED" } },
+				})
+				result.messageCursor = 1
+				if responseFirst then
+					control.settle[1](result)
+					write:await()
+				end
+				local filtered = session:__protectLocalProperties({
+					added = {},
+					removed = {},
+					updated = { { id = "EDITED", changedProperties = { Source = { String = "return 'Filesystem'" } } } },
+				})
+				expect(#filtered.updated).to.equal(0)
+				expect(instance.Source).to.equal("return 'Studio'")
+				control.cursor = 1
+				session:__releaseLocalProperties(control.cursor)
+				if not responseFirst then
+					control.settle[1](result)
+					write:await()
+				end
+				expect(instance.Source).to.equal("return 'Filesystem'")
+				expect(session:getSyncResults()[1].status).to.equal("Conflicted")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+		end
 	end)
 
 	it("should preserve newer local properties across delayed server echoes at every write stage", function()

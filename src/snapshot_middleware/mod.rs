@@ -20,6 +20,8 @@ mod txt;
 mod util;
 mod yaml;
 
+pub(crate) use luaurc::SourceSerializationDeferred;
+
 use std::{
     path::{Component, Path, PathBuf},
     sync::OnceLock,
@@ -397,21 +399,13 @@ pub enum Middleware {
     Yaml,
     Ignore,
 
-    #[serde(skip_deserializing)]
     Dir,
-    #[serde(skip_deserializing)]
     ServerScriptDir,
-    #[serde(skip_deserializing)]
     ClientScriptDir,
-    #[serde(skip_deserializing)]
     LegacyServerScriptDir,
-    #[serde(skip_deserializing)]
     LegacyClientScriptDir,
-    #[serde(skip_deserializing)]
     PluginScriptDir,
-    #[serde(skip_deserializing)]
     ModuleScriptDir,
-    #[serde(skip_deserializing)]
     CsvDir,
 }
 

@@ -7,7 +7,8 @@ use rbx_dom_weak::types::{
     NumberSequence, NumberSequenceKeypoint, PhysicalProperties, Ray, Rect, Region3, Tags, UDim,
     UDim2, Variant, VariantType, Vector2, Vector3,
 };
-use rbx_reflection::{DataType, PropertyDescriptor};
+use rbx_dom_weak::Ustr;
+use rbx_reflection::{DataType, PropertyDescriptor, PropertyKind};
 use serde::{Deserialize, Serialize};
 
 use crate::REF_POINTER_ATTRIBUTE_PREFIX;
@@ -643,6 +644,46 @@ impl AmbiguousValue {
     }
 }
 
+/// Resolves API aliases, including inherited ones, without changing serialization
+/// spellings or applying value migrations. Unknown properties keep their authored name.
+pub(crate) fn canonical_property_name<'a>(class_name: &str, mut name: &'a str) -> &'a str {
+    while let Some(descriptor) = find_descriptor(class_name, name) {
+        match &descriptor.kind {
+            PropertyKind::Alias { alias_for } => name = alias_for,
+            _ => break,
+        }
+    }
+    name
+}
+
+/// Normalizes one authored map before it overlays another source. An explicit
+/// canonical key wins within this map; otherwise the alphabetically first alias
+/// wins, independently of hash or input order. Later source maps still override it.
+pub(crate) fn normalize_property_names<T>(
+    class_name: &str,
+    properties: impl IntoIterator<Item = (Ustr, T)>,
+) -> impl Iterator<Item = (Ustr, T)> {
+    let mut entries: Vec<_> = properties
+        .into_iter()
+        .map(|(name, value)| {
+            let canonical = Ustr::from(canonical_property_name(class_name, name.as_str()));
+            (canonical, name, value)
+        })
+        .collect();
+    if entries.iter().any(|(canonical, name, _)| canonical != name) {
+        entries.sort_unstable_by(|(a, original_a, _), (b, original_b, _)| {
+            a.as_str()
+                .cmp(b.as_str())
+                .then_with(|| (a != original_a).cmp(&(b != original_b)))
+                .then_with(|| original_a.as_str().cmp(original_b.as_str()))
+        });
+        entries.dedup_by(|a, b| a.0 == b.0);
+    }
+    entries
+        .into_iter()
+        .map(|(canonical, _, value)| (canonical, value))
+}
+
 fn find_descriptor(
     class_name: &str,
     prop_name: &str,
@@ -702,6 +743,107 @@ mod test {
     fn resolve_unambiguous(json_value: &str) -> Variant {
         let unresolved: UnresolvedValue = json::from_str(json_value).unwrap();
         unresolved.resolve_unambiguous().unwrap()
+    }
+
+    #[test]
+    fn property_alias_names_preserve_unknowns_serialization_and_migrations() {
+        use rbx_reflection::PropertySerialization;
+        assert_eq!(
+            canonical_property_name("Sound", "EmitterSize"),
+            "RollOffMinDistance"
+        );
+        assert_eq!(canonical_property_name("Part", "archivable"), "Archivable");
+        assert_eq!(
+            canonical_property_name("UnknownClass", "EmitterSize"),
+            "EmitterSize"
+        );
+        assert_eq!(
+            canonical_property_name("Sound", "UnknownProperty"),
+            "UnknownProperty"
+        );
+        let database = rbx_reflection_database::get().unwrap();
+        let mut serialized_as = 0;
+        let mut migrations = 0;
+        for class in database.classes.values() {
+            for property in class.properties.values() {
+                if let PropertyKind::Canonical { serialization } = &property.kind {
+                    assert_eq!(
+                        canonical_property_name(class.name, property.name),
+                        property.name
+                    );
+                    match serialization {
+                        PropertySerialization::SerializesAs(_) => serialized_as += 1,
+                        PropertySerialization::Migrate(_) => migrations += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(serialized_as > 0);
+        assert!(migrations > 0);
+    }
+
+    #[test]
+    fn property_alias_maps_have_deterministic_precedence() {
+        use std::collections::BTreeMap;
+        let database = rbx_reflection_database::get().unwrap();
+        let mut aliases_checked = 0;
+        let mut duplicate_aliases_checked = 0;
+        for class in database.classes.values() {
+            let mut aliases: BTreeMap<&str, Vec<Ustr>> = BTreeMap::new();
+            for property in class.properties.values() {
+                if let PropertyKind::Alias { .. } = &property.kind {
+                    aliases
+                        .entry(canonical_property_name(class.name, property.name))
+                        .or_default()
+                        .push(Ustr::from(property.name));
+                }
+            }
+            for (canonical, mut names) in aliases {
+                names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                for name in &names {
+                    for reverse in [false, true] {
+                        let mut input = vec![
+                            (*name, 1),
+                            (Ustr::from(canonical), 2),
+                            (Ustr::from("UnknownProperty"), 3),
+                        ];
+                        if reverse {
+                            input.reverse();
+                        }
+                        let actual: BTreeMap<_, _> =
+                            normalize_property_names(class.name, input).collect();
+                        assert_eq!(
+                            actual,
+                            BTreeMap::from([
+                                (Ustr::from(canonical), 2),
+                                (Ustr::from("UnknownProperty"), 3)
+                            ])
+                        );
+                        let again: BTreeMap<_, _> =
+                            normalize_property_names(class.name, actual.clone()).collect();
+                        assert_eq!(again, actual);
+                    }
+                    aliases_checked += 1;
+                }
+                if names.len() > 1 {
+                    let mut input: Vec<_> = names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| (*name, index))
+                        .collect();
+                    let forward: Vec<_> =
+                        normalize_property_names(class.name, input.clone()).collect();
+                    input.reverse();
+                    let reverse: Vec<_> = normalize_property_names(class.name, input).collect();
+                    assert_eq!(forward, vec![(Ustr::from(canonical), 0)]);
+                    assert_eq!(reverse, forward);
+                    duplicate_aliases_checked += 1;
+                }
+            }
+        }
+        assert!(aliases_checked > 0);
+        assert!(duplicate_aliases_checked > 0);
     }
 
     #[test]

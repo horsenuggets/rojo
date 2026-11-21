@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    message_queue::MessageQueue,
+    message_queue::{structural_targets, MessageOrigin, MessageQueue},
     project::Project,
     resolution::normalize_json_variant,
     rojo_ref::merge_link_attributes,
@@ -45,7 +45,7 @@ pub(crate) struct TreeMutation {
     pub patch_set: PatchSet,
     /// Subtrees created in Studio, keyed by the id of each root.
     pub additions: HashMap<Ref, InstanceAddition>,
-    pub result_sender: Sender<WriteResult>,
+    pub result_sender: Sender<(WriteResult, u32)>,
 }
 
 /// Processes file change events, updates the DOM, and sends those updates
@@ -117,7 +117,10 @@ impl ChangeProcessor {
                                 mutation.message_cursor,
                                 mutation.authority,
                             );
-                            let _ = mutation.result_sender.send(result);
+                            // Stamp completion before this worker handles another disk
+                            // event or write. Later publications are not this result's echoes.
+                            let cursor = task.message_queue.cursor();
+                            let _ = mutation.result_sender.send((result, cursor));
                         },
                         recv(shutdown_receiver) -> _ => {
                             log::trace!("ChangeProcessor shutdown signal received...");
@@ -1119,7 +1122,7 @@ impl JobThreadContext {
         let mut accepted = PatchSet::new();
         let mut conflicts = PatchSet::new();
         let mut errors = Vec::new();
-        let mut messages = Vec::new();
+        let mut messages = WriteMessages::default();
         let mut deletion_conflicts = Vec::new();
         let mut with_ancestors = Vec::new();
         let mut tree = self.tree.lock().unwrap();
@@ -1139,6 +1142,7 @@ impl JobThreadContext {
                 if let Some(reason) = package_block(&tree, addition.parent, false) {
                     log::warn!("Skipping package addition. {reason}. Studio was left unchanged");
                     errors.push(WriteError {
+                        kind: None,
                         id,
                         property: None,
                         message: reason,
@@ -1148,6 +1152,7 @@ impl JobThreadContext {
                 match self.persist_addition(&mut tree, id, addition, &context, &mut messages) {
                     Ok(unsaved) => errors.extend(unsaved),
                     Err(err) => errors.push(WriteError {
+                        kind: None,
                         id,
                         property: None,
                         message: format!("Could not create this instance on disk: {err:#}"),
@@ -1164,6 +1169,7 @@ impl JobThreadContext {
                             update.id
                         );
                         errors.push(WriteError {
+                            kind: None,
                             id: update.id,
                             property: Some("Parent".into()),
                             message: reason.clone(),
@@ -1186,6 +1192,7 @@ impl JobThreadContext {
                     for update in &mut updates {
                         if update.changed_parent.take().is_some() {
                             errors.push(WriteError {
+                                kind: None,
                                 id: update.id,
                                 property: Some("Parent".into()),
                                 message: format!("{error:#}"),
@@ -1232,6 +1239,7 @@ impl JobThreadContext {
                 if let Some(reason) = package_block(&tree, update.id, false) {
                     log::warn!("Skipping package update. {reason}. Studio was left unchanged");
                     errors.push(WriteError {
+                        kind: None,
                         id: update.id,
                         property: None,
                         message: reason,
@@ -1265,6 +1273,7 @@ impl JobThreadContext {
                             return true;
                         };
                         errors.push(WriteError {
+                            kind: None,
                             id: update.id,
                             property: Some(property.to_string()),
                             message: reason.into(),
@@ -1434,6 +1443,7 @@ impl JobThreadContext {
                                     return true;
                                 }
                                 errors.push(WriteError {
+                        kind: None,
                                     id: update.id,
                                     property: Some(property.to_string()),
                                     message: "The package property was not saved by the project's syncback rules or file format".into(),
@@ -1458,6 +1468,7 @@ impl JobThreadContext {
                         log::warn!("Package source batch was not written. {error:#}. Studio was left unchanged");
                         for update in local_updates {
                             errors.push(WriteError {
+                                kind: None,
                                 id: update.id,
                                 property: None,
                                 message: format!("Package source batch was not written. {error:#}"),
@@ -1487,6 +1498,7 @@ impl JobThreadContext {
                         update.id
                     );
                     errors.push(WriteError {
+                        kind: None,
                         id: update.id,
                         property: None,
                         message: reason,
@@ -1513,6 +1525,7 @@ impl JobThreadContext {
                         "Skipping package removal for {id}. {reason}. Studio was left unchanged"
                     );
                     errors.push(WriteError {
+                        kind: None,
                         id,
                         property: None,
                         message: reason,
@@ -1556,6 +1569,7 @@ impl JobThreadContext {
                         });
                     }
                     errors.push(WriteError {
+                        kind: None,
                         id,
                         property: None,
                         message: "Cannot remove an ancestor while a retained descendant's move is unapplied".into(),
@@ -1605,6 +1619,7 @@ impl JobThreadContext {
                         Ok(false) => true,
                         Err(err) => {
                             errors.push(WriteError {
+                                kind: None,
                                 id,
                                 property: None,
                                 message: format!("{err:#}"),
@@ -1638,6 +1653,7 @@ impl JobThreadContext {
                         Ok(InlineRemoval::Restore(latest)) => *latest,
                         Err(err) => {
                             errors.push(WriteError {
+                                kind: None,
                                 id,
                                 property: None,
                                 message: format!("{err:#}"),
@@ -1646,6 +1662,7 @@ impl JobThreadContext {
                                 Ok(latest) => latest,
                                 Err(error) => {
                                     errors.push(WriteError {
+                                        kind: None,
                                         id,
                                         property: None,
                                         message: format!(
@@ -1663,7 +1680,7 @@ impl JobThreadContext {
                     let disk_patch = compute_shallow_patch_set(latest, &tree, owner);
                     let applied = apply_patch_set(&mut tree, disk_patch);
                     if !applied.is_empty() {
-                        messages.push(applied);
+                        messages.push_filesystem(applied);
                     }
                     if let Some(instance) = tree.get_instance(id) {
                         deletion_conflicts.push(PatchAdd {
@@ -1710,6 +1727,7 @@ impl JobThreadContext {
                     }
                     Err(err) => {
                         errors.push(WriteError {
+                            kind: None,
                             id,
                             property: None,
                             message: format!("{err:#}"),
@@ -1782,13 +1800,13 @@ impl JobThreadContext {
                         removed_instances: vec![id],
                         ..PatchSet::new()
                     };
-                    messages.push(apply_patch_set(&mut tree, removal));
+                    messages.push_filesystem(apply_patch_set(&mut tree, removal));
                 }
             }
-            messages.push(apply_patch_set(&mut tree, restorations));
+            messages.push_filesystem(apply_patch_set(&mut tree, restorations));
         }
         conflicts.added_instances.extend(deletion_conflicts);
-        self.message_queue.push_messages(&messages);
+        messages.publish(&self.message_queue);
         (accepted, conflicts, errors)
     }
 
@@ -1802,7 +1820,7 @@ impl JobThreadContext {
         root_id: Ref,
         addition: &InstanceAddition,
         context: &WriteContext,
-        messages: &mut Vec<AppliedPatchSet>,
+        messages: &mut WriteMessages,
     ) -> anyhow::Result<Vec<WriteError>> {
         anyhow::ensure!(
             addition.ids.id == root_id,
@@ -2158,7 +2176,7 @@ impl JobThreadContext {
                 changed_parent: Some(parent),
                 ..empty_update(ids.id)
             };
-            let mut messages = Vec::new();
+            let mut messages = WriteMessages::default();
             let failure = match self.relocate_instance(tree, &move_in, &mut messages, context) {
                 Ok(RelocationOutcome::Moved) => return Ok(errors),
                 Ok(RelocationOutcome::Restore(_)) => {
@@ -2429,7 +2447,7 @@ impl JobThreadContext {
         id: Ref,
         owner: Ref,
         context: &WriteContext,
-        messages: &mut Vec<AppliedPatchSet>,
+        messages: &mut WriteMessages,
     ) -> anyhow::Result<InlineRemoval> {
         let authority = context.authority;
         for _ in 0..STUDIO_WRITE_ATTEMPTS {
@@ -2530,6 +2548,7 @@ impl JobThreadContext {
             }
             Err(error) => {
                 outcome.errors.push(WriteError {
+                    kind: None,
                     id: update.id,
                     property: Some(
                         if update.changed_parent.is_some() {
@@ -2573,7 +2592,7 @@ impl JobThreadContext {
         &self,
         tree: &mut RojoTree,
         update: &PatchUpdate,
-        messages: &mut Vec<AppliedPatchSet>,
+        messages: &mut WriteMessages,
         context: &WriteContext,
     ) -> anyhow::Result<RelocationOutcome> {
         use crate::syncback::{
@@ -3230,6 +3249,7 @@ impl JobThreadContext {
                 }
                 Err(error) => {
                     outcome.errors.push(WriteError {
+                        kind: None,
                         id,
                         property: Some("Parent".into()),
                         message: format!("Could not read a shared file: {error:#}"),
@@ -3261,6 +3281,7 @@ impl JobThreadContext {
             }
             Err(error) => {
                 outcome.errors.push(WriteError {
+                    kind: None,
                     id,
                     property: Some("Parent".into()),
                     message: format!("{error:#}"),
@@ -3310,6 +3331,7 @@ impl JobThreadContext {
             }
             Err(error) => {
                 outcome.errors.push(WriteError {
+                    kind: None,
                     id,
                     property: None,
                     message: format!("Could not read the model file: {error:#}"),
@@ -3340,6 +3362,7 @@ impl JobThreadContext {
                 return true;
             };
             outcome.errors.push(WriteError {
+                kind: None,
                 id,
                 property: Some(key.to_string()),
                 message: message.into(),
@@ -3413,6 +3436,7 @@ impl JobThreadContext {
             }
             Err(error) => {
                 outcome.errors.push(WriteError {
+                    kind: None,
                     id,
                     property: None,
                     message: format!("{error:#}"),
@@ -3430,10 +3454,13 @@ impl JobThreadContext {
         tree: &mut RojoTree,
         stored: StoredIn,
         context: &WriteContext,
-        messages: &mut Vec<AppliedPatchSet>,
+        messages: &mut WriteMessages,
         property_update: Option<&PatchUpdate>,
     ) -> anyhow::Result<bool> {
-        if !context.stale && self.stored_matches_disk(tree, stored)? {
+        if !context.stale
+            && !property_update.is_some_and(|update| messages.invalidates(tree, update, false))
+            && self.stored_matches_disk(tree, stored)?
+        {
             return Ok(true);
         }
         let owner = stored.owner();
@@ -3459,14 +3486,15 @@ impl JobThreadContext {
         let authority = property_update.map_or(context.authority, |update| {
             self.property_write_authority(tree, update, context, &disk_patch)
         });
-        // A global cursor can be old because of an earlier drag update, not a disk
-        // conflict. Structural and payload writes still require the original baseline.
-        if authority == WriteAuthority::Filesystem
-            && (context.stale || disk_patch != PatchSet::new())
-        {
+        let stale = (context.stale
+            || property_update.is_some_and(|update| messages.invalidates(tree, update, false)))
+            && !property_update.is_some_and(|update| {
+                self.payload_baseline_is_current(tree, update, context, &disk_patch, messages)
+            });
+        if authority == WriteAuthority::Filesystem && (stale || disk_patch != PatchSet::new()) {
             let applied = apply_patch_set(tree, disk_patch);
             if !applied.is_empty() {
-                messages.push(applied);
+                messages.push_filesystem(applied);
             }
             return Ok(false);
         }
@@ -3522,6 +3550,53 @@ impl JobThreadContext {
         }
     }
 
+    // Earlier Studio saves aren't external payload conflicts. Only relax the cursor
+    // rejection here; expected-byte checks still run under filesystem authority.
+    fn payload_baseline_is_current(
+        &self,
+        tree: &RojoTree,
+        update: &PatchUpdate,
+        context: &WriteContext,
+        disk_changes: &PatchSet,
+        messages: &WriteMessages,
+    ) -> bool {
+        let (Some(cursor), Some(instance)) = (context.cursor, tree.get_instance(update.id)) else {
+            return false;
+        };
+        let payload = file_payload_property(
+            instance.class_name().as_str(),
+            instance.metadata().middleware,
+        );
+        if disk_changes != &PatchSet::new()
+            || update.changed_name.is_some()
+            || update.changed_parent.is_some()
+            || update.changed_class_name.is_some()
+            || update.changed_metadata.is_some()
+            || !payload.is_some_and(|property| update.changed_properties.contains_key(&property))
+            || messages.invalidates(tree, update, true)
+            || update.changed_properties.iter().any(|(property, value)| {
+                matches!(value, Some(Variant::Ref(_)))
+                    || (value.is_none()
+                        && (matches!(instance.properties().get(property), Some(Variant::Ref(_)))
+                            || is_reference_property(instance.class_name().as_str(), *property)))
+            })
+        {
+            return false;
+        }
+        let targets = std::iter::successors(Some(instance), |instance| {
+            tree.get_instance(instance.parent())
+        })
+        .map(|instance| instance.id());
+        self.message_queue
+            .has_structural_changes_since(cursor, targets)
+            == Some(false)
+            && self.message_queue.has_filesystem_property_changes_since(
+                cursor,
+                update.id,
+                update.changed_properties.keys().copied(),
+            ) == Some(false)
+    }
+
     fn persist_property_update(
         &self,
         tree: &mut RojoTree,
@@ -3565,6 +3640,7 @@ impl JobThreadContext {
         let id = update.id;
         if tree.get_instance(id).is_none() {
             errors.push(WriteError {
+                kind: None,
                 id,
                 property: None,
                 message: "Cannot update an unknown instance".into(),
@@ -3586,6 +3662,7 @@ impl JobThreadContext {
             }
             _ => {
                 errors.push(WriteError {
+                    kind: None,
                     id,
                     property: None,
                     message: "Project-defined nodes cannot be edited through two-way sync".into(),
@@ -3599,6 +3676,7 @@ impl JobThreadContext {
         ] {
             if property {
                 errors.push(WriteError {
+                    kind: None,
                     id,
                     property: Some(label.into()),
                     message: format!("Changing {label} is not supported by two-way sync"),
@@ -3610,6 +3688,7 @@ impl JobThreadContext {
                 Ok(expected) => expected,
                 Err(error) => {
                     errors.push(WriteError {
+                        kind: None,
                         id,
                         property: None,
                         message: format!("Could not validate filesystem sources: {error:#}"),
@@ -3623,6 +3702,7 @@ impl JobThreadContext {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 errors.push(WriteError {
+                    kind: None,
                     id,
                     property: None,
                     message: format!("Could not read current filesystem state: {err:#}"),
@@ -3642,7 +3722,9 @@ impl JobThreadContext {
         // A drag keeps its original cursor across several writes. Only unseen structural
         // changes invalidate that target; ordinary fields merge onto current disk values.
         let authority = self.property_write_authority(tree, update, context, &disk_changes);
-        if context.stale || disk_changes != PatchSet::new() {
+        let stale = (context.stale || messages.invalidates(tree, update, false))
+            && !self.payload_baseline_is_current(tree, update, context, &disk_changes, messages);
+        if stale || disk_changes != PatchSet::new() {
             if authority == WriteAuthority::Filesystem {
                 let disk_patch = disk_restoration(tree, owner_id, update, snapshot);
                 conflicts
@@ -3676,6 +3758,7 @@ impl JobThreadContext {
             Some(Middleware::Rbxm | Middleware::Rbxmx | Middleware::JsonModel)
         ) {
             errors.push(WriteError {
+                kind: None,
                 id,
                 property: None,
                 message:
@@ -3775,6 +3858,7 @@ impl JobThreadContext {
                         key.as_str(),
                     ) {
                         errors.push(WriteError {
+                            kind: None,
                             id,
                             property: Some(key.to_string()),
                             message: "This property is excluded by reflection serialization rules"
@@ -3783,6 +3867,7 @@ impl JobThreadContext {
                         conflict_properties.insert(*key, disk_value.cloned());
                     } else if matches!(studio_value, Some(Variant::Ref(_) | Variant::UniqueId(_))) {
                         errors.push(WriteError {
+                            kind: None,
                             id,
                             property: Some(key.to_string()),
                             message: "This reference cannot be serialized in this file format"
@@ -3790,6 +3875,7 @@ impl JobThreadContext {
                         });
                     } else if key == "Source" && !matches!(studio_value, Some(Variant::String(_))) {
                         errors.push(WriteError {
+                            kind: None,
                             id,
                             property: Some(key.to_string()),
                             message: "Script source must be a string".into(),
@@ -3805,6 +3891,7 @@ impl JobThreadContext {
             accepted_properties.retain(|key, _| {
                 if ignored.contains(key) {
                     errors.push(WriteError {
+                        kind: None,
                         id,
                         property: Some(key.to_string()),
                         message: "This property is excluded by the project's syncback rules".into(),
@@ -3877,11 +3964,53 @@ impl JobThreadContext {
             match syncback_instance(&self.vfs, tree, &self.project(), owner_id, new_tree) {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
+                    let source_deferred = err
+                        .is::<crate::snapshot_middleware::SourceSerializationDeferred>(
+                    ) && accepted_properties.contains_key(&ustr("Source"))
+                        && update.changed_name.is_none()
+                        && update.changed_parent.is_none()
+                        && update.changed_class_name.is_none()
+                        && update.changed_metadata.is_none();
                     errors.push(WriteError {
+                        kind: source_deferred.then_some(
+                            crate::web::interface::WriteErrorKind::SourceSerializationDeferred,
+                        ),
                         id,
-                        property: None,
+                        property: source_deferred.then(|| "Source".to_owned()),
                         message: format!("Failed to serialize changes: {err:#}"),
                     });
+                    if source_deferred {
+                        // Refusing to guess imports is not an independent filesystem edit.
+                        // A real disk value held for an overwrite that never happened must
+                        // still reach this editor and every other subscriber.
+                        if let Some(value) =
+                            messages.hidden_properties.remove(&(id, ustr("Source")))
+                        {
+                            let mut restoration = empty_update(id);
+                            restoration
+                                .changed_properties
+                                .insert(ustr("Source"), value.clone());
+                            conflicts.updated_instances.push(restoration);
+                            let mut publication = AppliedPatchUpdate::new(id);
+                            publication.changed_properties.insert(ustr("Source"), value);
+                            messages.push_filesystem(AppliedPatchSet {
+                                updated: vec![publication],
+                                ..AppliedPatchSet::new()
+                            });
+                        }
+                        // Other accepted fields are independent of the unsaved Source.
+                        // Persist them against the current durable Source instead of
+                        // silently leaving the editor and disk on different values.
+                        let mut remaining = empty_update(id);
+                        remaining.changed_properties = accepted_properties;
+                        remaining.changed_properties.remove(&ustr("Source"));
+                        if !remaining.changed_properties.is_empty() {
+                            self.persist_property_update(
+                                tree, &remaining, outcome, context, attempt,
+                            );
+                        }
+                        return;
+                    }
                     conflicts.updated_instances.retain(|patch| patch.id != id);
                     conflicts.updated_instances.extend(
                         disk_restoration(tree, owner_id, update, snapshot).updated_instances,
@@ -3933,6 +4062,7 @@ impl JobThreadContext {
         }
         if let Err(err) = validate_write_targets(&self.project(), &staged) {
             errors.push(WriteError {
+                kind: None,
                 id,
                 property: None,
                 message: format!("{err:#}"),
@@ -3947,6 +4077,7 @@ impl JobThreadContext {
         // file means the edit can't be represented and must not report Saved.
         if !staged.changes_files(self.project().folder_location(), &expected) {
             errors.push(WriteError {
+                kind: None,
                 id,
                 property: None,
                 message: "These changes cannot be represented on disk".into(),
@@ -3961,6 +4092,7 @@ impl JobThreadContext {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 errors.push(WriteError {
+                    kind: None,
                     id,
                     property: None,
                     message: format!("Could not revalidate filesystem state: {err:#}"),
@@ -4005,6 +4137,7 @@ impl JobThreadContext {
                         Ok(snapshot) => snapshot,
                         Err(err) => {
                             errors.push(WriteError {
+                                kind: None,
                                 id,
                                 property: None,
                                 message: format!("Could not read saved filesystem state: {err:#}"),
@@ -4025,6 +4158,7 @@ impl JobThreadContext {
                     || err.kind() != io::ErrorKind::WouldBlock =>
             {
                 errors.push(WriteError {
+                    kind: None,
                     id,
                     property: None,
                     message: format!("Failed to persist changes: {err:#}"),
@@ -4050,6 +4184,7 @@ impl JobThreadContext {
                     );
                 }
                 ChangedDuringWrite::GiveUp => errors.push(WriteError {
+                    kind: None,
                     id,
                     property: None,
                     message: "The file kept changing on disk while this edit was being saved"
@@ -4073,6 +4208,7 @@ impl JobThreadContext {
                     .extend(restoration.updated_instances);
             }
             Err(error) => errors.push(WriteError {
+                kind: None,
                 id,
                 property: None,
                 message: format!("Could not restore filesystem state: {error:#}"),
@@ -4271,11 +4407,13 @@ fn saved_change_message(tree: &RojoTree, update: &PatchUpdate) -> AppliedPatchSe
 /// the round trip through their files, and references that leave them.
 fn unsaved_errors(unstored: Vec<Ref>, outside: Vec<(Ref, Ustr)>) -> Vec<WriteError> {
     let instances = unstored.into_iter().map(|id| WriteError {
+        kind: None,
         id,
         property: None,
         message: "This instance could not be stored on disk".into(),
     });
     let references = outside.into_iter().map(|(id, property)| WriteError {
+        kind: None,
         id,
         property: Some(property.to_string()),
         message: "This reference points at an instance in another file that has no Rojo_Id, \
@@ -4397,12 +4535,92 @@ fn changed_during_write(authority: WriteAuthority, attempt: u32) -> ChangedDurin
     }
 }
 
+#[derive(Default)]
+struct WriteMessages {
+    entries: Vec<(AppliedPatchSet, MessageOrigin)>,
+    filesystem_properties: HashSet<(Ref, Ustr)>,
+    hidden_properties: HashMap<(Ref, Ustr), Option<Variant>>,
+    filesystem_structural_changes: HashSet<Ref>,
+    structural_changes: HashSet<Ref>,
+}
+
+impl WriteMessages {
+    fn push(&mut self, patch: AppliedPatchSet) {
+        for update in &patch.updated {
+            for property in update.changed_properties.keys() {
+                self.hidden_properties.remove(&(update.id, *property));
+            }
+        }
+        self.structural_changes.extend(structural_targets(&patch));
+        self.entries.push((patch, MessageOrigin::Studio));
+    }
+
+    fn push_filesystem(&mut self, patch: AppliedPatchSet) {
+        for update in &patch.updated {
+            for property in update.changed_properties.keys() {
+                self.hidden_properties.remove(&(update.id, *property));
+            }
+        }
+        self.observe_filesystem(&patch);
+        self.entries.push((patch, MessageOrigin::Filesystem));
+    }
+
+    fn observe_filesystem(&mut self, patch: &AppliedPatchSet) {
+        self.structural_changes.extend(structural_targets(patch));
+        self.filesystem_structural_changes
+            .extend(structural_targets(patch));
+        for update in &patch.updated {
+            self.filesystem_properties.extend(
+                update
+                    .changed_properties
+                    .keys()
+                    .map(|property| (update.id, *property)),
+            );
+        }
+    }
+
+    fn invalidates(
+        &self,
+        tree: &RojoTree,
+        update: &PatchUpdate,
+        include_studio_structure: bool,
+    ) -> bool {
+        // A current batch can intentionally promote or move its own ancestors before
+        // editing Source. Rebasing an older cursor must also exclude those changes.
+        let structural = if include_studio_structure {
+            &self.structural_changes
+        } else {
+            &self.filesystem_structural_changes
+        };
+        update
+            .changed_properties
+            .keys()
+            .any(|property| self.filesystem_properties.contains(&(update.id, *property)))
+            || std::iter::successors(tree.get_instance(update.id), |instance| {
+                tree.get_instance(instance.parent())
+            })
+            .any(|instance| structural.contains(&instance.id()))
+    }
+
+    fn publish(&self, queue: &MessageQueue) {
+        queue.push_messages_with_origins(
+            self.entries.iter().map(|(patch, origin)| (patch, *origin)),
+            &self
+                .filesystem_properties
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            &self.structural_changes.iter().copied().collect::<Vec<_>>(),
+        );
+    }
+}
+
 /// What a batch of Studio writes has produced so far.
 struct WriteOutcome<'a> {
     accepted: &'a mut PatchSet,
     conflicts: &'a mut PatchSet,
     errors: &'a mut Vec<WriteError>,
-    messages: &'a mut Vec<AppliedPatchSet>,
+    messages: &'a mut WriteMessages,
 }
 
 /// What every write in a batch is checked against.
@@ -4425,6 +4643,23 @@ fn file_payload_property(class: &str, middleware: Option<Middleware>) -> Option<
     }
 }
 
+fn is_reference_property(class: &str, property: Ustr) -> bool {
+    let database = rbx_reflection_database::get().unwrap();
+    let mut class = database.classes.get(class);
+    while let Some(descriptor) = class {
+        if let Some(property) = descriptor.properties.get(property.as_str()) {
+            return matches!(
+                property.data_type,
+                rbx_reflection::DataType::Value(rbx_dom_weak::types::VariantType::Ref)
+            );
+        }
+        class = descriptor
+            .superclass
+            .and_then(|name| database.classes.get(name));
+    }
+    false
+}
+
 fn is_ordinary_property_update(
     update: &PatchUpdate,
     class: &str,
@@ -4444,6 +4679,7 @@ fn is_ordinary_property_update(
 
 fn removed_on_disk(id: Ref) -> WriteError {
     WriteError {
+        kind: None,
         id,
         property: None,
         message: "This instance was removed on disk, and two-way sync can't recreate it".into(),
@@ -4500,14 +4736,22 @@ fn catch_up(
     tree: &mut RojoTree,
     disk_changes: PatchSet,
     batch: &[PatchUpdate],
-    messages: &mut Vec<AppliedPatchSet>,
+    messages: &mut WriteMessages,
 ) {
     let (to_studio, overwritten) = split_studio_edits(disk_changes, batch);
     let applied = apply_patch_set(tree, to_studio);
     if !applied.is_empty() {
-        messages.push(applied);
+        messages.push_filesystem(applied);
     }
-    apply_patch_set(tree, overwritten);
+    let hidden = apply_patch_set(tree, overwritten);
+    messages.observe_filesystem(&hidden);
+    for update in hidden.updated {
+        for (property, value) in update.changed_properties {
+            messages
+                .hidden_properties
+                .insert((update.id, property), value);
+        }
+    }
 }
 
 /// Returns whether the disk changed between two reads of the same source.
@@ -5770,6 +6014,236 @@ mod tests {
         }
     }
 
+    fn sound_alias_job(
+        storage: &str,
+        properties: &str,
+    ) -> (JobThreadContext, Ref, &'static str, &'static str) {
+        let model = format!(r#"{{"className":"Sound","properties":{{{properties}}}}}"#);
+        let (job, id, source, disk) = match storage {
+            "project" | "project-path" => {
+                let path = if storage == "project-path" {
+                    r#""$path":"Sound","#
+                } else {
+                    r#""$className":"Sound","#
+                };
+                let files = if storage == "project-path" {
+                    vec![(
+                        "Sound",
+                        VfsSnapshot::dir([(
+                            "init.meta.json",
+                            VfsSnapshot::file(
+                                r#"{"className":"Sound","properties":{"RollOffMinDistance":3}}"#,
+                            ),
+                        )]),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                let job = project_job(
+                    "default.project.json",
+                    &format!(
+                        r#"{{"name":"Test","tree":{{"$className":"Folder","Sound":{{{path}"$properties":{{{properties}}}}}}}}}"#
+                    ),
+                    files,
+                );
+                let id = find(&job, &["Sound"]);
+                (
+                    job,
+                    id,
+                    "/project/default.project.json",
+                    "/project/default.project.json",
+                )
+            }
+            "directory" | "inline" => {
+                let metadata = if storage == "inline" {
+                    format!(
+                        r#"{{"children":[{{"name":"Sound","className":"Sound","properties":{{{properties}}}}}]}}"#
+                    )
+                } else {
+                    model.clone()
+                };
+                let (job, owner) = script_job(
+                    vec![(
+                        "Sound",
+                        VfsSnapshot::dir([("init.meta.json", VfsSnapshot::file(metadata))]),
+                    )],
+                    "/project/Sound",
+                );
+                let id = if storage == "inline" {
+                    job.tree
+                        .lock()
+                        .unwrap()
+                        .get_instance(owner)
+                        .unwrap()
+                        .children()[0]
+                } else {
+                    owner
+                };
+                (job, id, "/project/Sound", "/project/Sound/init.meta.json")
+            }
+            "model" | "adjacent" => {
+                let files = if storage == "adjacent" {
+                    vec![
+                        (
+                            "Sound.rbxmx",
+                            VfsSnapshot::file(
+                                r#"<roblox version="4"><Item class="Sound" referent="0"><Properties><float name="RollOffMinDistance">3</float></Properties></Item></roblox>"#,
+                            ),
+                        ),
+                        (
+                            "Sound.meta.json",
+                            VfsSnapshot::file(format!(r#"{{"properties":{{{properties}}}}}"#)),
+                        ),
+                    ]
+                } else {
+                    vec![("Sound.model.json", VfsSnapshot::file(model))]
+                };
+                let source = if storage == "adjacent" {
+                    "/project/Sound.rbxmx"
+                } else {
+                    "/project/Sound.model.json"
+                };
+                let (job, id) = script_job(files, source);
+                let disk = if storage == "adjacent" {
+                    "/project/Sound.meta.json"
+                } else {
+                    "/project/Sound.model.json"
+                };
+                (job, id, source, disk)
+            }
+            _ => panic!("Unknown test storage {storage}"),
+        };
+        (job, id, source, disk)
+    }
+
+    #[test]
+    fn sound_alias_ingestion_is_canonical_before_each_overlay() {
+        for storage in [
+            "model",
+            "directory",
+            "inline",
+            "project",
+            "adjacent",
+            "project-path",
+        ] {
+            for (properties, expected) in [
+                (r#""EmitterSize":5"#, 5.0),
+                (r#""EmitterSize":5,"RollOffMinDistance":7"#, 7.0),
+                (r#""RollOffMinDistance":7,"EmitterSize":5"#, 7.0),
+            ] {
+                let (job, id, _, _) = sound_alias_job(storage, properties);
+                let tree = job.tree.lock().unwrap();
+                let sound = tree.get_instance(id).unwrap();
+                assert_eq!(
+                    sound.properties().get(&ustr("EmitterSize")),
+                    None,
+                    "{storage}, {properties}"
+                );
+                assert_eq!(
+                    sound.properties().get(&ustr("RollOffMinDistance")),
+                    Some(&Variant::Float32(expected)),
+                    "{storage}, {properties}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sound_alias_canonical_writes_reload_without_stale_keys() {
+        // Project nodes intentionally refuse two-way writes. Their serialization is
+        // covered through full syncback instead, without changing that authority policy.
+        for storage in ["model", "directory", "inline", "adjacent"] {
+            for value in [10.0, 7.0] {
+                let (job, id, source, disk) = sound_alias_job(storage, r#""EmitterSize":5"#);
+                let (accepted, conflicts, errors) = job.handle_tree_event(property_update(
+                    id,
+                    "RollOffMinDistance",
+                    Variant::Float32(value),
+                ));
+                assert!(errors.is_empty(), "{storage}, {value}, {errors:?}");
+                assert_eq!(conflicts, PatchSet::new(), "{storage}, {value}");
+                assert_eq!(accepted.updated_instances.len(), 1, "{storage}, {value}");
+                if storage == "adjacent" {
+                    // Native models absorb sidecar properties and remove the empty
+                    // sidecar, so it cannot reapply the old alias on the next load.
+                    assert!(job.vfs.read(disk).with_not_found().unwrap().is_none());
+                } else {
+                    let text = job.vfs.read_to_string(disk).unwrap();
+                    assert!(!text.contains("EmitterSize"), "{storage}, {value}, {text}");
+                }
+                let reloaded =
+                    snapshot_from_vfs(&Default::default(), &job.vfs, Path::new(source)).unwrap();
+                let tree = job.tree.lock().unwrap();
+                let owner = tree.root().children()[0];
+                assert_eq!(
+                    compute_patch_set(reloaded, &tree, owner),
+                    PatchSet::new(),
+                    "{storage}, {value}"
+                );
+                let sound = tree.get_instance(id).unwrap();
+                assert!(!sound.properties().contains_key(&ustr("EmitterSize")));
+                assert_eq!(
+                    sound
+                        .properties()
+                        .get(&ustr("RollOffMinDistance"))
+                        .cloned()
+                        .unwrap_or(Variant::Float32(10.0)),
+                    Variant::Float32(value),
+                    "{storage}, {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sound_alias_exclusions_refuse_writes_without_disk_mutation() {
+        for storage in [
+            "model",
+            "directory",
+            "inline",
+            "project",
+            "project-path",
+            "adjacent",
+        ] {
+            for class in ["Sound", "Instance"] {
+                for ignored in ["EmitterSize", "RollOffMinDistance"] {
+                    let (mut job, id, source, disk) =
+                        sound_alias_job(storage, r#""EmitterSize":5"#);
+                    Arc::get_mut(job.project.project.get_mut().unwrap())
+                        .unwrap()
+                        .syncback_rules = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "ignoreProperties": {class: [ignored]}
+                        }))
+                        .unwrap(),
+                    );
+                    let before = job.vfs.read(disk).unwrap();
+                    let source_before = job.vfs.read(source).ok();
+                    let (accepted, _, errors) = job.handle_tree_event(property_update(
+                        id,
+                        "RollOffMinDistance",
+                        Variant::Float32(7.0),
+                    ));
+                    assert!(
+                        accepted.updated_instances.is_empty(),
+                        "{storage}, {class}, {ignored}"
+                    );
+                    assert!(!errors.is_empty(), "{storage}, {class}, {ignored}");
+                    assert_eq!(
+                        job.vfs.read(disk).unwrap(),
+                        before,
+                        "{storage}, {class}, {ignored}"
+                    );
+                    assert_eq!(
+                        job.vfs.read(source).ok(),
+                        source_before,
+                        "{storage}, {class}, {ignored}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn rounded_defaults_do_not_conflict_with_the_next_update_in_a_batch() {
         let (job, id) = part_job();
@@ -6637,6 +7111,602 @@ mod tests {
                 assert_eq!(instance.properties()[&ustr("CFrame")], frame);
             }
         }
+    }
+
+    fn transformed_source_job() -> (JobThreadContext, Ref) {
+        let (job, _) = script_job(
+            vec![
+                (
+                    "Code.server.luau",
+                    VfsSnapshot::file(
+                        "local Library = require('@shared/Library')\nreturn Library\n",
+                    ),
+                ),
+                (
+                    ".luaurc",
+                    VfsSnapshot::file(r#"{"aliases":{"shared":"Shared"}}"#),
+                ),
+            ],
+            "/project/Code.server.luau",
+        );
+        let mut context = crate::snapshot::InstanceContext::default();
+        context.require_context = Some(Arc::new(crate::snapshot::RequireContext {
+            project_root: "/project".into(),
+            path_mappings: Vec::new(),
+            datamodel: false,
+        }));
+        let child = snapshot_from_vfs(&context, &job.vfs, Path::new("/project/Code.server.luau"))
+            .unwrap()
+            .unwrap();
+        let tree = RojoTree::new(InstanceSnapshot::new().name("Root").children(vec![child]));
+        let id = tree.root().children()[0];
+        *job.tree.lock().unwrap() = tree;
+        (job, id)
+    }
+
+    #[test]
+    fn deferred_source_does_not_abandon_other_accepted_properties() {
+        let (job, id) = transformed_source_job();
+        let source = job
+            .tree
+            .lock()
+            .unwrap()
+            .get_instance(id)
+            .unwrap()
+            .properties()[&ustr("Source")]
+            .clone();
+        let Variant::String(source) = source else {
+            panic!("Missing source")
+        };
+        let mut patch = property_update(
+            id,
+            "Source",
+            Variant::String(source.replace("return Library", "local value =")),
+        );
+        patch.updated_instances[0]
+            .changed_properties
+            .insert(ustr("Disabled"), Some(Variant::Bool(true)));
+        let (accepted, conflicts, errors) = job.handle_tree_event(patch);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(conflicts.updated_instances.is_empty(), "{conflicts:?}");
+        assert!(
+            accepted
+                .updated_instances
+                .iter()
+                .any(|update| update.id == id
+                    && update.changed_properties.get(&ustr("Disabled"))
+                        == Some(&Some(Variant::Bool(true)))),
+            "{accepted:?}"
+        );
+        assert_eq!(
+            job.tree
+                .lock()
+                .unwrap()
+                .get_instance(id)
+                .unwrap()
+                .properties()
+                .get(&ustr("Disabled")),
+            Some(&Variant::Bool(true))
+        );
+        assert!(job
+            .vfs
+            .read_to_string(Path::new("/project/Code.meta.json"))
+            .unwrap()
+            .contains("Disabled"));
+    }
+
+    #[test]
+    fn deferred_source_releases_a_hidden_filesystem_catchup_to_other_subscribers() {
+        let (job, id) = transformed_source_job();
+        let path = Path::new("/project/Code.server.luau");
+        let source = job
+            .tree
+            .lock()
+            .unwrap()
+            .get_instance(id)
+            .unwrap()
+            .properties()[&ustr("Source")]
+            .clone();
+        let Variant::String(source) = source else {
+            panic!("Missing source")
+        };
+        let cursor = job.message_queue.cursor();
+        let subscriber = job.message_queue.subscribe(cursor);
+        job.vfs
+            .write(
+                path,
+                "local Library = require('@shared/Library')\nreturn 'external'\n",
+            )
+            .unwrap();
+        let (accepted, _conflicts, errors) = job.handle_tree_event_at_cursor(
+            property_update(
+                id,
+                "Source",
+                Variant::String(source.replace("return Library", "local value =")),
+            ),
+            Some(cursor),
+            WriteAuthority::Studio,
+        );
+        assert!(accepted.updated_instances.is_empty());
+        assert_eq!(errors.len(), 1);
+        let (_, messages) = futures::executor::block_on(subscriber).unwrap();
+        assert!(
+            messages
+                .iter()
+                .flat_map(|patch| &patch.updated)
+                .any(|update| update.id == id
+                    && update.changed_properties.get(&ustr("Source"))
+                        == Some(&Some(Variant::String(
+                            source.replace("return Library", "return 'external'")
+                        )))),
+            "The external Source must reach other subscribers. {messages:?}"
+        );
+        let published = job.message_queue.cursor();
+        job.handle_vfs_event(VfsEvent::Write(path.to_owned()));
+        assert_eq!(job.message_queue.cursor(), published);
+    }
+
+    #[test]
+    fn successive_payload_writes_ignore_only_own_publications() {
+        let (script, script_id) = script_job(
+            vec![("Code.luau", VfsSnapshot::file("return 0\n"))],
+            "/project/Code.luau",
+        );
+        let (model, model_id) = script_job(
+            vec![(
+                "Code.model.json",
+                VfsSnapshot::file(
+                    r#"{"className":"ModuleScript","properties":{"Source":"return 0"}}"#,
+                ),
+            )],
+            "/project/Code.model.json",
+        );
+        let (inline, _) = inline_job();
+        let inline_id = find(&inline, &["InlineModule"]);
+        let (text, text_id) = script_job(
+            vec![("Note.txt", VfsSnapshot::file("initial"))],
+            "/project/Note.txt",
+        );
+        let (csv, csv_id) = script_job(
+            vec![(
+                "Words.csv",
+                VfsSnapshot::file("Key,Source\nHello,Initial\n"),
+            )],
+            "/project/Words.csv",
+        );
+        for (job, id, property) in [
+            (script, script_id, "Source"),
+            (model, model_id, "Source"),
+            (inline, inline_id, "Source"),
+            (text, text_id, "Value"),
+            (csv, csv_id, "Contents"),
+        ] {
+            let cursor = job.message_queue.cursor();
+            for value in 1..=3 {
+                let text = if property == "Contents" {
+                    format!(r#"[{{"key":"Hello","source":"Value {value}","values":{{}}}}]"#)
+                } else {
+                    format!("return {value}\n")
+                };
+                let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                    property_update(id, property, Variant::String(text.clone())),
+                    Some(cursor),
+                    WriteAuthority::Filesystem,
+                );
+                assert!(errors.is_empty(), "{property}, {errors:?}");
+                assert_eq!(conflicts, PatchSet::new(), "{property}");
+                assert_eq!(accepted.updated_instances.len(), 1, "{property}");
+                assert_eq!(
+                    job.tree
+                        .lock()
+                        .unwrap()
+                        .get_instance(id)
+                        .unwrap()
+                        .properties()[&ustr(property)],
+                    Variant::String(text)
+                );
+            }
+            assert_eq!(
+                job.message_queue.has_filesystem_property_changes_since(
+                    cursor,
+                    id,
+                    [ustr(property)]
+                ),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn transformed_source_saves_do_not_become_filesystem_revisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = mapping_refresh_job(temp.path());
+        let path = job.project().folder_location().join("Source/App.luau");
+        let id = job.tree.lock().unwrap().get_ids_at_path(&path)[0];
+        let cursor = job.message_queue.cursor();
+        for source in ["return 2\n", "return 3\n", "return 4\n"] {
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                property_update(id, "Source", Variant::String(source.into())),
+                Some(cursor),
+                WriteAuthority::Filesystem,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(accepted.updated_instances.len(), 1);
+            assert_eq!(job.vfs.read_to_string(&path).unwrap().as_str(), source);
+            job.handle_vfs_event(VfsEvent::Write(path.clone()));
+        }
+        assert_eq!(
+            job.message_queue
+                .has_filesystem_property_changes_since(cursor, id, [ustr("Source")]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn payload_baselines_require_valid_cursors_and_unchanged_target_ancestry() {
+        let (job, id) = script_job(
+            vec![("Code.luau", VfsSnapshot::file("return 0\n"))],
+            "/project/Code.luau",
+        );
+        let patch = property_update(id, "Source", Variant::String("return 1\n".into()));
+        let update = &patch.updated_instances[0];
+        let tree = job.tree.lock().unwrap();
+        let context = |cursor| WriteContext {
+            cursor,
+            stale: true,
+            authority: WriteAuthority::Filesystem,
+            batch: &patch.updated_instances,
+        };
+        let pending = WriteMessages::default();
+        assert!(job.payload_baseline_is_current(
+            &tree,
+            update,
+            &context(Some(0)),
+            &PatchSet::new(),
+            &pending
+        ));
+        for cursor in [None, Some(1)] {
+            assert!(!job.payload_baseline_is_current(
+                &tree,
+                update,
+                &context(cursor),
+                &PatchSet::new(),
+                &pending
+            ));
+        }
+        assert!(!job.payload_baseline_is_current(
+            &tree,
+            update,
+            &context(Some(0)),
+            &patch,
+            &pending
+        ));
+        // A Source edit mixed with a reference set or reset never gets rebased.
+        for value in [Some(Variant::Ref(Ref::new())), None] {
+            let mut reference = update.clone();
+            reference.changed_properties.insert(ustr("Parent"), value);
+            assert!(!job.payload_baseline_is_current(
+                &tree,
+                &reference,
+                &context(Some(0)),
+                &PatchSet::new(),
+                &pending
+            ));
+        }
+        assert_eq!(
+            job.property_write_authority(&tree, update, &context(Some(0)), &PatchSet::new()),
+            WriteAuthority::Filesystem
+        );
+        assert_eq!(
+            changed_during_write(WriteAuthority::Filesystem, 1),
+            ChangedDuringWrite::Restore
+        );
+        for field in 0..4 {
+            let mut structural = update.clone();
+            match field {
+                0 => structural.changed_name = Some("Renamed".into()),
+                1 => structural.changed_parent = Some(tree.get_root_id()),
+                2 => structural.changed_class_name = Some(ustr("Script")),
+                _ => structural.changed_metadata = Some(tree.get_metadata(id).unwrap().clone()),
+            }
+            assert!(!job.payload_baseline_is_current(
+                &tree,
+                &structural,
+                &context(Some(0)),
+                &PatchSet::new(),
+                &pending
+            ));
+        }
+        for target in [id, tree.get_root_id()] {
+            let mut structural = AppliedPatchUpdate::new(target);
+            structural.changed_name = Some("Renamed".into());
+            let mut pending = WriteMessages::default();
+            pending.push(AppliedPatchSet {
+                updated: vec![structural.clone()],
+                ..AppliedPatchSet::new()
+            });
+            assert!(!job.payload_baseline_is_current(
+                &tree,
+                update,
+                &context(Some(0)),
+                &PatchSet::new(),
+                &pending
+            ));
+            job.message_queue.push_messages(&[AppliedPatchSet {
+                updated: vec![structural],
+                ..AppliedPatchSet::new()
+            }]);
+            assert!(!job.payload_baseline_is_current(
+                &tree,
+                update,
+                &context(Some(0)),
+                &PatchSet::new(),
+                &WriteMessages::default()
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_payload_cursors_do_not_use_own_save_rebasing() {
+        for cursor in [None, Some(u32::MAX)] {
+            let (job, id) = script_job(
+                vec![("Code.luau", VfsSnapshot::file("return 0\n"))],
+                "/project/Code.luau",
+            );
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                property_update(id, "Source", Variant::String("return 1\n".into())),
+                Some(0),
+                WriteAuthority::Filesystem,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(accepted.updated_instances.len(), 1);
+            let before = job.vfs.read("/project/Code.luau").unwrap();
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                property_update(id, "Source", Variant::String("return 2\n".into())),
+                cursor,
+                WriteAuthority::Filesystem,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(accepted, PatchSet::new());
+            assert_eq!(conflicts.updated_instances.len(), 1);
+            assert_eq!(job.vfs.read("/project/Code.luau").unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn payload_edits_ignore_unrelated_publications_but_keep_filesystem_payload_authority() {
+        for delivered in [false, true] {
+            let (job, id) = script_job(
+                vec![("Code.luau", VfsSnapshot::file("return 0\n"))],
+                "/project/Code.luau",
+            );
+            let cursor = job.message_queue.cursor();
+            // Another target's Source and this target's ordinary fields aren't conflicts.
+            let mut unrelated = AppliedPatchUpdate::new(Ref::new());
+            unrelated
+                .changed_properties
+                .insert(ustr("Source"), Some(Variant::String("external".into())));
+            let mut ordinary = AppliedPatchUpdate::new(id);
+            ordinary.changed_properties.insert(
+                ustr("Attributes"),
+                Some(Variant::Attributes(Attributes::new())),
+            );
+            job.message_queue.push_messages(&[AppliedPatchSet {
+                updated: vec![unrelated, ordinary],
+                ..AppliedPatchSet::new()
+            }]);
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                property_update(id, "Source", Variant::String("return 1\n".into())),
+                Some(cursor),
+                WriteAuthority::Filesystem,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(conflicts, PatchSet::new());
+            assert_eq!(accepted.updated_instances.len(), 1);
+            job.vfs.write("/project/Code.luau", "return 2\n").unwrap();
+            if delivered {
+                job.handle_vfs_event(VfsEvent::Write("/project/Code.luau".into()));
+            }
+            let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                property_update(id, "Source", Variant::String("return 3\n".into())),
+                Some(cursor),
+                WriteAuthority::Filesystem,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(accepted.updated_instances.is_empty());
+            assert_eq!(conflicts.updated_instances.len(), 1);
+            assert_eq!(
+                job.vfs
+                    .read_to_string("/project/Code.luau")
+                    .unwrap()
+                    .as_str(),
+                "return 2\n"
+            );
+        }
+    }
+
+    #[test]
+    fn catchups_from_other_writes_keep_payload_conflicts_in_and_across_batches() {
+        for same_batch in [false, true] {
+            for stale in [false, true] {
+                let (job, id) = script_job(
+                    vec![("Code.luau", VfsSnapshot::file("return 0\n"))],
+                    "/project/Code.luau",
+                );
+                let cursor = job.message_queue.cursor();
+                if stale {
+                    job.message_queue.push_messages(&[AppliedPatchSet::new()]);
+                }
+                job.vfs.write("/project/Code.luau", "return 2\n").unwrap();
+                let ordinary = property_update(
+                    id,
+                    "Attributes",
+                    Variant::Attributes({
+                        let mut attrs = Attributes::new();
+                        attrs.insert("Edited".into(), Variant::Bool(true));
+                        attrs
+                    }),
+                );
+                let source = property_update(id, "Source", Variant::String("return 3\n".into()));
+                let response = if same_batch {
+                    let mut batch = ordinary;
+                    batch.updated_instances.extend(source.updated_instances);
+                    job.handle_tree_event_at_cursor(batch, Some(cursor), WriteAuthority::Filesystem)
+                } else {
+                    let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                        ordinary,
+                        Some(cursor),
+                        WriteAuthority::Filesystem,
+                    );
+                    assert!(errors.is_empty(), "{errors:?}");
+                    assert_eq!(conflicts, PatchSet::new());
+                    assert_eq!(accepted.updated_instances.len(), 1);
+                    job.handle_tree_event_at_cursor(
+                        source,
+                        Some(cursor),
+                        WriteAuthority::Filesystem,
+                    )
+                };
+                let (accepted, conflicts, errors) = response;
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(accepted.updated_instances.len(), usize::from(same_batch));
+                assert_eq!(
+                    conflicts.updated_instances.len(),
+                    1,
+                    "same batch {same_batch}, stale {stale}"
+                );
+                assert_eq!(
+                    job.vfs
+                        .read_to_string("/project/Code.luau")
+                        .unwrap()
+                        .as_str(),
+                    "return 2\n"
+                );
+                assert_eq!(
+                    job.message_queue.has_filesystem_property_changes_since(
+                        cursor,
+                        id,
+                        [ustr("Source")]
+                    ),
+                    Some(true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stored_payloads_keep_external_catchups_but_accept_mixed_own_edits() {
+        for model in [false, true] {
+            for external in [false, true] {
+                for same_batch in [false, true] {
+                    let (job, _) = if model {
+                        script_job(
+                            vec![(
+                                "Container.model.json",
+                                VfsSnapshot::file(
+                                    r#"{"className":"Folder","children":[{"className":"ModuleScript","name":"InlineModule","properties":{"Source":"return 1"}},{"className":"Part","name":"Base"}]}"#,
+                                ),
+                            )],
+                            "/project/Container.model.json",
+                        )
+                    } else {
+                        inline_job()
+                    };
+                    let id = find(&job, &["InlineModule"]);
+                    let other = find(&job, &["Base"]);
+                    let path = if model {
+                        "/project/Container.model.json"
+                    } else {
+                        "/project/Props/init.meta.json"
+                    };
+                    let cursor = job.message_queue.cursor();
+                    if external {
+                        let bytes = job.vfs.read_to_string(path).unwrap();
+                        job.vfs
+                            .write(path, bytes.replace("return 1", "return 9"))
+                            .unwrap();
+                    }
+                    let ordinary = transparency_update(other, 0.75);
+                    let source = property_update(id, "Source", Variant::String("return 3".into()));
+                    let (accepted, conflicts, errors) = if same_batch {
+                        let mut batch = ordinary;
+                        batch.updated_instances.extend(source.updated_instances);
+                        job.handle_tree_event_at_cursor(
+                            batch,
+                            Some(cursor),
+                            WriteAuthority::Filesystem,
+                        )
+                    } else {
+                        let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+                            ordinary,
+                            Some(cursor),
+                            WriteAuthority::Filesystem,
+                        );
+                        assert!(errors.is_empty(), "{errors:?}");
+                        assert_eq!(conflicts, PatchSet::new());
+                        assert_eq!(accepted.updated_instances.len(), 1);
+                        job.handle_tree_event_at_cursor(
+                            source,
+                            Some(cursor),
+                            WriteAuthority::Filesystem,
+                        )
+                    };
+                    assert!(errors.is_empty(), "model {model}, {errors:?}");
+                    assert_eq!(
+                        accepted.updated_instances.len(),
+                        usize::from(same_batch) + usize::from(!external)
+                    );
+                    assert_eq!(conflicts.updated_instances.len(), usize::from(external));
+                    assert_eq!(
+                        job.tree
+                            .lock()
+                            .unwrap()
+                            .get_instance(id)
+                            .unwrap()
+                            .properties()[&ustr("Source")],
+                        Variant::String(if external { "return 9" } else { "return 3" }.into())
+                    );
+                    assert_eq!(
+                        job.message_queue.has_filesystem_property_changes_since(
+                            cursor,
+                            id,
+                            [ustr("Source")]
+                        ),
+                        Some(external)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_catchup_properties_remain_filesystem_owned() {
+        let (job, id) = script_job(
+            vec![("Code.luau", VfsSnapshot::file("return 0\n"))],
+            "/project/Code.luau",
+        );
+        let patch = property_update(id, "Source", Variant::String("return 1\n".into()));
+        let mut pending = WriteMessages::default();
+        let mut tree = job.tree.lock().unwrap();
+        catch_up(
+            &mut tree,
+            property_update(id, "Source", Variant::String("return 2\n".into())),
+            &patch.updated_instances,
+            &mut pending,
+        );
+        assert!(
+            pending.entries.is_empty(),
+            "Overwritten payloads must not be sent to Studio"
+        );
+        assert!(pending.invalidates(&tree, &patch.updated_instances[0], true));
+        pending.publish(&job.message_queue);
+        assert_eq!(
+            job.message_queue
+                .has_filesystem_property_changes_since(0, id, [ustr("Source")]),
+            Some(true)
+        );
     }
 
     #[test]

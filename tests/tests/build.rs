@@ -132,6 +132,75 @@ fn build_rejects_zero_workers() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("--jobs"));
 }
 
+#[test]
+fn automated_release_uses_the_exact_unprefixed_version_tag() {
+    let workflow: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../.github/workflows/release.yaml")).unwrap();
+    let steps = workflow["jobs"]["release-github"]["steps"]
+        .as_sequence()
+        .unwrap();
+    let publish = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Create release"))
+        .unwrap()["run"]
+        .as_str()
+        .unwrap();
+    assert!(publish.contains("gh release create \"${{ needs.init.outputs.version }}\""));
+    assert!(publish.contains("--target \"${{ github.sha }}\""));
+    #[cfg(unix)]
+    {
+        let script = publish
+            .replace("${{ needs.init.outputs.version }}", "1.2.3")
+            .replace("${{ github.sha }}", "owned-build");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "gh() {{ [ \"$1\" = release ] && [ \"$2\" = create ] && [ \"$4\" = --target ] && [ \"$5\" = owned-build ] || return 2; printf '%s' \"$3\"; }}\n{script}"
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"1.2.3");
+    }
+}
+
+#[test]
+fn automated_release_rejects_existing_unprefixed_and_historical_tags() {
+    let workflow: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../.github/workflows/release-checks.yaml")).unwrap();
+    let steps = workflow["jobs"]["version"]["steps"].as_sequence().unwrap();
+    let validation = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Check version bump"))
+        .unwrap()["run"]
+        .as_str()
+        .unwrap();
+    assert!(validation.contains("for TAG in \"$VERSION\" \"v$VERSION\""));
+    assert!(validation.contains("\"refs/tags/$TAG\""));
+    #[cfg(unix)]
+    {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("VERSION"), "1.2.3\n").unwrap();
+        let git = r#"git() {
+            [ "$1" = fetch ] && return 0
+            for argument in "$@"; do
+                [ "$argument" = "$EXPECTED_TAG" ] && return 0
+            done
+            return 1
+        }"#;
+        for existing in ["", "refs/tags/1.2.3", "refs/tags/v1.2.3"] {
+            let output = Command::new("bash")
+                .arg("-c")
+                .arg(format!("{git}\n{validation}"))
+                .current_dir(root.path())
+                .env("EXPECTED_TAG", existing)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), existing.is_empty(), "{existing}");
+        }
+    }
+}
+
 fn run_build_test(test_name: &str) {
     let working_dir = get_working_dir_path();
 

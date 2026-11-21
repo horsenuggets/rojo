@@ -353,7 +353,10 @@ impl VfsBackend for StdBackend {
     }
 
     fn unwatch(&mut self, path: &Path) -> io::Result<()> {
-        self.watches.remove(path);
+        // Unknown paths can restart the native stream even when unwatch returns an error.
+        if !self.watches.remove(path) {
+            return Ok(());
+        }
         self.watcher
             .get_mut()
             .unwrap()
@@ -411,6 +414,38 @@ mod tests {
             }
         }
         events
+    }
+
+    #[test]
+    fn unwatching_unregistered_descendants_keeps_recursive_watching_active() {
+        let root = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(root.path()).unwrap();
+        let nested = root.join("Nested");
+        std::fs::create_dir(&nested).unwrap();
+        let mut backend = StdBackend::new().unwrap();
+        let receiver = backend.event_receiver();
+        backend.watch(&root).unwrap();
+        backend.watch(&nested).unwrap();
+        // Descendants are covered by the registered recursive watch, not separate watches.
+        thread::sleep(Duration::from_millis(500));
+        backend.unwatch(&nested).unwrap();
+        for index in 0..32 {
+            backend
+                .unwatch(&nested.join(format!("save-{index}.tmp")))
+                .unwrap();
+        }
+        let feedback = nested.join("Feedback.txt");
+        std::fs::write(&feedback, "External edit.").unwrap();
+        let changed = |events: &[VfsEvent]| {
+            events.iter().any(|event| match event {
+                VfsEvent::Create(path) | VfsEvent::Write(path) => path == &feedback,
+                _ => false,
+            })
+        };
+        let events = collect_until(&receiver, changed);
+        assert!(changed(&events), "The parent watch lost the external edit.");
+        backend.unwatch(&root).unwrap();
+        backend.unwatch(&root).unwrap();
     }
 
     // Moving a folder soon after creating it is what lost the old path on

@@ -46,22 +46,54 @@ Making a new release? Simply add the new header with the version and date undern
   onto current disk values without false conflicts from earlier writes in the same drag.
   Unrelated disk properties remain intact, while structural and file-payload conflicts
   retain filesystem authority. Delayed server echoes no longer overwrite newer local
-  property edits while their batches are pending or in flight, and rejected writes still
-  restore the server value after their announcements arrive. Property values are encoded
-  once per batch rather than on each change signal, and omitted encodings release their
-  pending guards. Structural revisions are indexed per instance so repeated writes with
+  property edits while their batches are pending or in flight, and genuine filesystem
+  conflicts still restore the server value after their announcements arrive. Property
+  values are encoded once per batch rather than on each change signal, and omitted
+  encodings release their pending guards. Structural revisions are indexed per instance so repeated writes with
   an older cursor do not repeatedly scan intervening ordinary-property announcements.
-  Property aliases share canonical guards and batch encodings.
-* Required protocol version 12 and validated publication cursors and result fields in
-  every write response. Older peers are rejected before syncing. Unreadable, incomplete,
-  or unprocessed acknowledgements stop the session and queued writes without replaying
-  older values or leaving a disconnected context tracking Studio edits.
+  Property aliases share canonical guards and batch encodings. Server snapshots and
+  persisted edits use canonical names without conflicting legacy keys, including default
+  resets. Explicit canonical keys win within an authored map, and later metadata overlays
+  retain precedence. Alias-spelled syncback exclusions still apply to canonical writes.
+* Required protocol version 12 and validated publication cursors and nested patch fields
+  in every write response. Acknowledgements cannot predate progress known at dispatch,
+  but subscription progress can advance while a response is in flight. Older peers are
+  rejected before syncing. Unreadable, incomplete, or unprocessed acknowledgements stop
+  the session and queued writes without replaying older values or leaving a disconnected
+  context tracking Studio edits. Property guards release only after result processing
+  and callbacks succeed.
+* Distinguished filesystem-origin payload changes from earlier Studio saves, allowing
+  successive script, text, and localization edits to share a captured cursor without
+  conflicting with themselves. Requested fields and structural ancestry retain indexed
+  conflict checks, immediate disk validation, and expected-byte protections.
+* Guarded asynchronous Source application with editor text and observed edit revisions,
+  preserving newer drafts even when typing returns to the original text. Superseded
+  callbacks cancel safely, overlapping remote writes converge, and pending observers
+  disconnect on completion, errors, or destruction without serializing initial sync.
+* Preserved unsaved transformed-script drafts when strict import inversion refuses
+  incomplete or ambiguous edits. Typed serialization errors remain failures, not saves,
+  and do not publish synthetic Source restorations. Exact write-completion cursors and
+  buffered-message cursors keep later genuine filesystem edits authoritative.
+* Reconciled existing project property overrides for model-backed and nested-project paths,
+  including alias cleanup and default resets, without duplicating model-owned fields.
+  Compact instance metadata now round-trips omitted empty rule lists and directory
+  middleware while file sync rules still reject directory-only middleware.
+* Normalized existing authored filesystem mounts before snapshotting, keeping property
+  write targets aligned with atomic validation across parent components and path aliases.
+* Kept recursive filesystem watching active when atomic saves remove unregistered temporary
+  paths, avoiding native watcher restarts that could lose concurrent external edits.
 * Corrected numeric UI binding interpolation and the development plugin's TestEZ lookup,
   and resolved production Luau analysis diagnostics without changing decoder behavior.
 * Added fine-grained profiling scopes for filesystem refreshes, import mapping validation,
   Studio writeback, and sourcemap generation using the existing Tracy profiling feature.
   Studio timing labels now appear in MicroProfiler independently of console timing logs,
   with coroutine-local nesting and balanced scopes when patch application fails.
+  Yield-capable operations use wall-time spans rather than invalid CPU annotations.
+  Opt-in write diagnostics correlate request identities, cursors, queue depth, patch
+  counts, byte sizes, and wall timings without formatting script payloads.
+
+* Matched automated release tags to the exact unprefixed version and built commit while
+  rejecting duplicate versions under either current or historical tag spelling.
 
 ## `7.7.1-horse.2.6`
 

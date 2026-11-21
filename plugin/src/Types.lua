@@ -50,14 +50,47 @@ local ApiReadResponse = t.interface({
 	instances = t.map(RbxId, ApiInstance),
 })
 
+-- Acknowledgements contain Rust patch snapshots, not subscription instance records.
+local ApiWriteMetadata = t.interface({
+	ignore_unknown_instances = t.boolean,
+	relevant_paths = t.array(t.string),
+	context = t.interface({ emit_legacy_scripts = t.boolean }),
+	specified_id = t.optional(t.string),
+	middleware = t.optional(t.string),
+	schema = t.optional(t.string),
+	installed_paths = t.optional(t.array(t.string)),
+})
+
+local ApiWriteSnapshot
+ApiWriteSnapshot = t.interface({
+	snapshot_id = RbxId,
+	metadata = ApiWriteMetadata,
+	name = t.string,
+	class_name = t.string,
+	properties = t.map(t.string, ApiValue),
+	children = t.array(function(child)
+		return ApiWriteSnapshot(child)
+	end),
+})
+
+local ApiWriteUpdate = t.interface({
+	id = RbxId,
+	changed_name = t.optional(t.string),
+	changed_class_name = t.optional(t.string),
+	changedParent = t.optional(RbxId),
+	changed_properties = t.map(t.string, ApiValue),
+	changed_metadata = t.optional(ApiWriteMetadata),
+})
+
 local ApiWritePatch = t.interface({
 	removed_instances = t.array(RbxId),
-	added_instances = t.array(t.table),
-	updated_instances = t.array(t.table),
+	added_instances = t.array(t.interface({ parent_id = RbxId, instance = ApiWriteSnapshot })),
+	updated_instances = t.array(ApiWriteUpdate),
 })
 
 local ApiWriteError = t.interface({
 	id = RbxId,
+	kind = t.optional(t.literal("sourceSerializationDeferred")),
 	property = t.optional(t.string),
 	message = t.string,
 })

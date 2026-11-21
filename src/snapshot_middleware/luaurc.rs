@@ -78,7 +78,10 @@ pub(super) struct PathMappingIndex<'a> {
 
 impl<'a> PathMappingIndex<'a> {
     pub(super) fn new(mappings: &'a [(PathBuf, Vec<String>)]) -> Self {
-        profiling::scope!("Rojo.BuildImportMappingIndex");
+        profiling::scope!(
+            "Rojo.BuildImportMappingIndex",
+            format!("Mappings {}", mappings.len()).as_str()
+        );
         let mut prefixes = HashMap::with_capacity(mappings.len());
         for (ordinal, (path, _)) in mappings.iter().enumerate() {
             prefixes
@@ -182,6 +185,16 @@ pub(super) fn resolve_requires_with_mapping_index(
     package_dependencies: Option<&Path>,
     index: Option<&PathMappingIndex>,
 ) -> anyhow::Result<String> {
+    profiling::scope!(
+        "Rojo.ResolveSourceImports",
+        format!(
+            "Input bytes {}, mappings {}, indexed {}",
+            source.len(),
+            info.path_mappings.len(),
+            index.is_some()
+        )
+        .as_str()
+    );
     let mappings = PathMappings {
         paths: info.path_mappings,
         root: info.project_root,
@@ -285,16 +298,34 @@ pub(super) fn resolve_requires_with_mapping_index(
     Ok(result)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Source import inversion is deferred until the draft can be serialized safely")]
+pub(crate) struct SourceSerializationDeferred;
+
 /// Invert only proven token correspondences. Changed import topology is not a
 /// license to guess an alias or leak a generated import into source.
 pub(crate) fn restore_source(
     transform: &crate::snapshot::SourceTransform,
     edited: &str,
 ) -> anyhow::Result<String> {
+    profiling::scope!(
+        "Rojo.RestoreSourceImports",
+        format!(
+            "Original bytes {}, emitted bytes {}, edited bytes {}",
+            transform.original.len(),
+            transform.emitted.len(),
+            edited.len()
+        )
+        .as_str()
+    );
     if edited == transform.emitted {
         return Ok(transform.original.clone());
     }
     fn calls(source: &str) -> anyhow::Result<Vec<(Range<usize>, String)>> {
+        profiling::scope!(
+            "Rojo.ParseSourceImports",
+            format!("Input bytes {}", source.len()).as_str()
+        );
         let ast = full_moon::parse(source).map_err(|e| {
             anyhow::anyhow!("Cannot safely reverse imports in unparsable source {e:?}")
         })?;
