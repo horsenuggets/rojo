@@ -71,10 +71,12 @@ jobs:
           VERSION=$(cat VERSION | tr -d '[:space:]')
           echo "Current version: $VERSION"
 
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "::error::Tag v$VERSION already exists. Please bump the version."
-            exit 1
-          fi
+          for TAG in "$VERSION" "v$VERSION"; do
+            if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+              echo "::error::Version $VERSION already has tag $TAG. Please bump the version."
+              exit 1
+            fi
+          done
 
           echo "Version $VERSION is new."
 

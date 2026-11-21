@@ -35,7 +35,9 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// instance reparenting through `changedParent` updates. Version 9 makes `added` carry
 /// Studio-created subtrees as `InstanceAddition`s. Version 10 adds live Studio export jobs.
 /// Version 11 adds capture-relative service reference targets to export manifests.
-pub const PROTOCOL_VERSION: u64 = 11;
+/// Version 12 requires publication cursors in write acknowledgements so delayed
+/// announcements cannot overwrite newer Studio property edits.
+pub const PROTOCOL_VERSION: u64 = 12;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
@@ -429,9 +431,17 @@ pub struct WriteResponse {
     pub errors: Vec<WriteError>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WriteErrorKind {
+    SourceSerializationDeferred,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<WriteErrorKind>,
     pub id: Ref,
     pub property: Option<String>,
     pub message: String,
@@ -718,8 +728,55 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_protocol_requires_cursor_capable_peers() {
+        assert_eq!(PROTOCOL_VERSION, 12);
+        let config = include_str!("../../plugin/src/Config.lua");
+        assert!(config.contains("protocolVersion = 12,"));
+    }
+
+    #[test]
+    fn write_acknowledgement_cursor_is_required_in_json_and_messagepack() {
+        let response = WriteResponse {
+            session_id: SessionId::new(),
+            message_cursor: 7,
+            accepted: PatchSet::new(),
+            conflicts: PatchSet::new(),
+            errors: Vec::new(),
+        };
+        let mut json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["messageCursor"], 7);
+        let from_json: WriteResponse = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(from_json.message_cursor, 7);
+        let from_msgpack: WriteResponse =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&response).unwrap()).unwrap();
+        assert_eq!(from_msgpack.message_cursor, 7);
+        json.as_object_mut().unwrap().remove("messageCursor");
+        let error = serde_json::from_value::<WriteResponse>(json).unwrap_err();
+        assert!(error.to_string().contains("missing field `messageCursor`"));
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CursorlessResponse {
+            session_id: SessionId,
+            accepted: PatchSet,
+            conflicts: PatchSet,
+            errors: Vec<WriteError>,
+        }
+        let cursorless = CursorlessResponse {
+            session_id: response.session_id,
+            accepted: response.accepted,
+            conflicts: response.conflicts,
+            errors: response.errors,
+        };
+        let error =
+            rmp_serde::from_slice::<WriteResponse>(&rmp_serde::to_vec_named(&cursorless).unwrap())
+                .unwrap_err();
+        assert!(error.to_string().contains("missing field `messageCursor`"));
+    }
+
+    #[test]
     fn structural_protocol_round_trips_json_and_messagepack() {
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 12);
         let id = Ref::new();
         let parent = Ref::new();
         let update = InstanceUpdate {

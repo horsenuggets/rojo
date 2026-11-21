@@ -13,6 +13,8 @@ local validateApiRead = Types.ifEnabled(Types.ApiReadResponse)
 local validateApiSocketPacket = Types.ifEnabled(Types.ApiSocketPacket)
 local validateApiSerialize = Types.ifEnabled(Types.ApiSerializeResponse)
 local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
+-- Acknowledgement ordering is a wire contract, not an optional debug check.
+local validateApiWrite = Types.ApiWriteResponse
 
 local function rejectFailedRequests(response)
 	if response.code >= 400 then
@@ -22,6 +24,11 @@ local function rejectFailedRequests(response)
 	end
 
 	return response
+end
+
+local function rejectInvalidAcknowledgement(context, message)
+	context:disconnect()
+	return Promise.reject(Http.Error.new(Http.Error.Kind.Protocol, message))
 end
 
 -- Servers from before the switch to msgpack, including upstream Rojo, answer the info
@@ -121,6 +128,7 @@ function ApiContext.new(baseUrl)
 		__baseUrl = baseUrl,
 		__sessionId = nil,
 		__messageCursor = -1,
+		__writeCursor = 0,
 		__wsClient = nil,
 		__connected = true,
 		__activeRequests = {},
@@ -184,6 +192,7 @@ function ApiContext:connect()
 		:andThen(rejectWrongPlaceId)
 		:andThen(function(body)
 			self.__sessionId = body.sessionId
+			self.__writeCursor = 0
 
 			return body
 		end)
@@ -205,6 +214,9 @@ end
 
 function ApiContext:write(patch, messageCursor, authority)
 	assert(authority == "Filesystem" or authority == "Studio", "Write authority must be Filesystem or Studio")
+	if not self.__connected then
+		return Promise.reject("The connection is closed.")
+	end
 	local url = ("%s/api/write"):format(self.__baseUrl)
 
 	local updated = {}
@@ -239,18 +251,28 @@ function ApiContext:write(patch, messageCursor, authority)
 		added = added,
 	}
 
+	-- Subscription progress may advance while HTTP is in flight. Only progress
+	-- already known at dispatch constrains this response's publication cursor.
+	local minimumCursor = math.max(body.messageCursor, self.__messageCursor, self.__writeCursor)
 	body = Http.msgpackEncode(body)
 
-	return Http.post(url, body)
-		:andThen(rejectFailedRequests)
-		:andThen(Http.Response.msgpack)
-		:andThen(function(responseBody)
-			if responseBody.sessionId ~= self.__sessionId then
-				return Promise.reject("Server changed ID")
-			end
-
-			return responseBody
-		end)
+	return Http.post(url, body):andThen(rejectFailedRequests):andThen(function(response)
+		local decoded, responseBody = pcall(Http.Response.msgpack, response)
+		if not decoded then
+			return rejectInvalidAcknowledgement(self, "The write acknowledgement could not be decoded.")
+		end
+		if not validateApiWrite(responseBody) then
+			return rejectInvalidAcknowledgement(self, "The write acknowledgement is incomplete or has no valid cursor.")
+		end
+		if responseBody.sessionId ~= self.__sessionId then
+			return rejectInvalidAcknowledgement(self, "Server changed ID")
+		end
+		if responseBody.messageCursor < minimumCursor then
+			return rejectInvalidAcknowledgement(self, "The write acknowledgement predates known publication progress.")
+		end
+		self.__writeCursor = math.max(self.__writeCursor, responseBody.messageCursor)
+		return responseBody
+	end)
 end
 
 function ApiContext:connectWebSocket(packetHandlers)
@@ -272,6 +294,9 @@ function ApiContext:connectWebSocket(packetHandlers)
 		local closed, errored, received
 
 		received = self.__wsClient.MessageReceived:Connect(function(msg)
+			if not self.__connected then
+				return
+			end
 			local data = Http.msgpackDecode(msg)
 			if data.sessionId ~= self.__sessionId then
 				Log.warn("Received message with wrong session ID; ignoring")

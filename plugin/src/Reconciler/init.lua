@@ -38,9 +38,10 @@ end
 
 -- Hydrating and diffing walk the whole place, and call `step` as they go so
 -- the caller can yield or stop the walk by raising an error. The timer is
--- stopped either way, so a cancelled walk doesn't leave it running.
+-- stopped either way, so a cancelled walk doesn't leave it running. An opaque
+-- step can yield at any point, so only walks without one can use a CPU scope.
 function Reconciler:hydrate(virtualInstances, rootId, rootInstance, step)
-	Timer.start("Reconciler:hydrate")
+	Timer.start("Reconciler:hydrate", if step then "wall" else "cpu")
 	local ok, result = pcall(hydrate, self.__instanceMap, virtualInstances, rootId, rootInstance, step)
 	Timer.stop()
 
@@ -51,7 +52,7 @@ function Reconciler:hydrate(virtualInstances, rootId, rootInstance, step)
 end
 
 function Reconciler:diff(virtualInstances, rootId, step)
-	Timer.start("Reconciler:diff")
+	Timer.start("Reconciler:diff", if step then "wall" else "cpu")
 	local ok, success, result = pcall(diff, self.__instanceMap, virtualInstances, rootId, step)
 	Timer.stop()
 
