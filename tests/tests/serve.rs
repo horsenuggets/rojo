@@ -195,6 +195,97 @@ fn canonical_sound_writes_replace_authored_aliases_on_disk() {
 }
 
 #[test]
+fn property_writes_validate_authored_path_aliases() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    for storage in ["model", "script"] {
+        for authored in ["src", "src/../src", "absolute"]
+            .into_iter()
+            .chain(if cfg\!(unix) { Some("linked") } else { None })
+        {
+            let mut session = TestServeSession::with_setup("add_folder", |root| {
+                #[cfg(unix)]
+                if authored == "linked" {
+                    std::os::unix::fs::symlink(root.join("src"), root.join("linked")).unwrap();
+                }
+                let source = if authored == "absolute" {
+                    root.join("src/../src")
+                } else {
+                    authored.into()
+                };
+                fs::write(
+                    root.join("default.project.json"),
+                    serde_json::to_vec(&serde_json::json\!({
+                        "name": "Test",
+                        "tree": {"$className": "Folder", "Owned": {"$path": source}},
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                if storage == "model" {
+                    fs::write(
+                        root.join("src/Target.model.json"),
+                        r#"{"className":"Part"}"#,
+                    )
+                    .unwrap();
+                } else {
+                    fs::write(root.join("src/Target.luau"), "return 'initial'\n").unwrap();
+                }
+            });
+            let info = session.wait_to_come_online();
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            let id = read
+                .instances
+                .values()
+                .find(|instance| instance.name == "Target")
+                .unwrap()
+                .id;
+            let (property, value) = if storage == "model" {
+                (ustr("Transparency"), Variant::Float32(0.5))
+            } else {
+                (ustr("Source"), Variant::String("return 'saved'\n".into()))
+            };
+            let response = session.post_api_write(&WriteRequest {
+                session_id: info.session_id,
+                message_cursor: Some(read.message_cursor),
+                authority: WriteAuthority::Filesystem,
+                added: Default::default(),
+                removed: Vec::new(),
+                updated: vec\![InstanceUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_parent: None,
+                    changed_metadata: None,
+                    changed_properties: UstrMap::from_iter([(property, Some(value.clone()))]),
+                }],
+            });
+            assert\!(
+                response.errors.is_empty(),
+                "{storage}, {authored}, {response:?}"
+            );
+            assert\!(
+                response.conflicts.updated_instances.is_empty(),
+                "{response:?}"
+            );
+            let latest = session.get_api_read(id).unwrap();
+            assert_eq\!(latest.instances[&id].properties[&property].as_ref(), &value);
+            if storage == "model" {
+                let model: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(session.path().join("src/Target.model.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq\!(model["properties"]["Transparency"], 0.5);
+            } else {
+                assert_eq\!(
+                    fs::read_to_string(session.path().join("src/Target.luau")).unwrap(),
+                    "return 'saved'\n",
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn text_values_sync_in_both_directions_after_filesystem_edits() {
     use crate::rojo_test::serve_util::TestServeSession;
     let mut session = TestServeSession::with_setup("add_folder", |root| {

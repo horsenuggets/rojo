@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use memofs::Vfs;
+use memofs::{IoResultExt, Vfs};
 use rayon::prelude::*;
 use rbx_dom_weak::{
     types::{Attributes, Ref, Variant},
@@ -134,6 +134,13 @@ pub fn snapshot_project_node(
             Cow::Owned(project_folder.join(path))
         } else {
             Cow::Borrowed(path)
+        };
+
+        // Keep authored mount sources aligned with canonical validation paths. Otherwise
+        // parent components or filesystem aliases give the same file two storage keys.
+        let full_path = match vfs.canonicalize(&full_path).with_not_found()? {
+            Some(canonical) => Cow::Owned(canonical),
+            None => full_path,
         };
 
         if let Some(snapshot) = snapshot_from_vfs(context, vfs, &full_path)? {
