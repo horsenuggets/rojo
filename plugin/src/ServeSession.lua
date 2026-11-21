@@ -7,6 +7,7 @@ local Selection = game:GetService("Selection")
 local Packages = script.Parent.Parent.Packages
 local Log = require(Packages.Log)
 local Fmt = require(Packages.Fmt)
+local Http = require(Packages.Http)
 local t = require(Packages.t)
 local Promise = require(Packages.Promise)
 local Timer = require(script.Parent.Timer)
@@ -400,7 +401,7 @@ function ServeSession:__rememberLocalProperty(instance, propertyName)
 	local properties = self.__localPropertyEdits[id] or {}
 	self.__localPropertyEdits[id] = properties
 	-- Each entry is a generation token. A previous request cannot release a later edit.
-	properties[propertyName] = {}
+	properties[descriptor.name] = {}
 end
 
 function ServeSession:__takeLocalPropertyEdits(changes)
@@ -411,7 +412,10 @@ function ServeSession:__takeLocalPropertyEdits(changes)
 		if properties ~= nil then
 			local entries = {}
 			for propertyName in changed do
-				entries[propertyName] = properties[propertyName]
+				local descriptor = getWritablePropertyDescriptor(instance.ClassName, propertyName)
+				if descriptor ~= nil then
+					entries[descriptor.name] = properties[descriptor.name]
+				end
 			end
 			taken[id] = entries
 		end
@@ -513,8 +517,10 @@ function ServeSession:__protectLocalProperties(patch)
 		end
 		local kept = table.clone(update)
 		kept.changedProperties = table.clone(update.changedProperties or {})
+		local instance = self.__instanceMap.fromIds[update.id]
 		for propertyName, value in kept.changedProperties do
-			local entry = properties[propertyName]
+			local descriptor = instance and getWritablePropertyDescriptor(instance.ClassName, propertyName)
+			local entry = properties[if descriptor ~= nil then descriptor.name else propertyName]
 			if entry ~= nil then
 				entry.serverValue = value
 				kept.changedProperties[propertyName] = nil
@@ -619,6 +625,7 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties)
 	-- an instance never arrives before the write that created it. A write
 	-- still waiting when the session stops is never sent.
 	local previous = self.__lastWrite or Promise.resolve()
+	local acknowledged = false
 	local write = previous
 		:andThen(function()
 			if self.__status == Status.Disconnected then
@@ -627,6 +634,7 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties)
 			return self.__apiContext:write(patch, messageCursor, authority)
 		end)
 		:andThen(function(result)
+			acknowledged = true
 			forgetDeletions()
 			self:__finishLocalProperties(localProperties, result)
 			self:__untrackRejectedAdditions(patch, result)
@@ -636,8 +644,14 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties)
 		end)
 		:catch(function(err)
 			forgetDeletions()
-			self:__finishLocalProperties(localProperties, nil)
-			self:__untrackRejectedAdditions(patch, nil)
+			if acknowledged or (getmetatable(err) == Http.Error and err.type == Http.Error.Kind.Protocol) then
+				-- An invalid or unprocessed acknowledgement cannot release guards or
+				-- keep tracking edits. Stop before queued writes are considered.
+				self:__stopInternal(err)
+			else
+				self:__finishLocalProperties(localProperties, nil)
+				self:__untrackRejectedAdditions(patch, nil)
+			end
 			finish("Failed", {
 				errors = {
 					{
@@ -1198,8 +1212,11 @@ function ServeSession:__initialSync(serverInfo)
 end
 
 function ServeSession:__stopInternal(err)
+	if self.__status == Status.Disconnected then
+		return
+	end
+	self.__status = Status.Disconnected
 	self.__localPropertyEdits = nil
-	self:__setStatus(Status.Disconnected, err)
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()
@@ -1208,6 +1225,13 @@ function ServeSession:__stopInternal(err)
 		connection:Disconnect()
 	end
 	self.__connections = {}
+
+	-- Callbacks can reenter stop or throw. Notify only after cleanup, and keep a
+	-- callback failure from interrupting the write queue's failure handling.
+	local notified, problem = pcall(self.__setStatus, self, Status.Disconnected, err)
+	if not notified then
+		Log.warn("The disconnected status callback failed with {}", tostring(problem))
+	end
 end
 
 function ServeSession:__setStatus(status, detail)

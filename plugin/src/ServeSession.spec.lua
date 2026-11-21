@@ -44,6 +44,142 @@ return function()
 		return session, instance, control
 	end
 
+	it("should finish shutdown before notifying reentrant or throwing status callbacks", function()
+		for _, reenter in { false, true } do
+			local session, part = propertySession("Part")
+			session.__status = ServeSession.Status.Connected
+			local disconnected = false
+			session.__apiContext.disconnect = function()
+				disconnected = true
+			end
+			local notifications = 0
+			local cleanedUp = false
+			session:onStatusChanged(function(status)
+				notifications += 1
+				cleanedUp = status == ServeSession.Status.Disconnected
+					and disconnected
+					and session.__changeBatcher.__stopped
+					and session.__instanceMap:size() == 0
+					and session.__localPropertyEdits == nil
+					and #session.__connections == 0
+				if reenter and notifications == 1 then
+					session:stop()
+				else
+					error("The disconnected status callback failed.")
+				end
+			end)
+			local success, problem = pcall(function()
+				expect(pcall(function()
+					session:stop()
+				end)).to.equal(true)
+				expect(cleanedUp).to.equal(true)
+				expect(notifications).to.equal(1)
+				session:stop()
+				expect(notifications).to.equal(1)
+			end)
+			session:onStatusChanged(nil)
+			session:stop()
+			part:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should stop tracking and queued writes after a fatal acknowledgement without replaying old values", function()
+		local ApiContext = require(script.Parent.ApiContext)
+		local Http = require(script.Parent.Parent.Packages.Http)
+		local originalPost = Http.post
+		for _, body in { string.char(0x81), Http.msgpackEncode({ sessionId = "session", messageCursor = 100 }) } do
+			local session, part = propertySession("Part")
+			local context = ApiContext.new("http://localhost")
+			context.__sessionId = "session"
+			context:setMessageCursor(0)
+			session.__apiContext = context
+			session.__status = ServeSession.Status.Connected
+			local requests = 0
+			local settle
+			Http.post = function()
+				requests += 1
+				if requests == 1 then
+					return Promise.new(function(resolve)
+						settle = resolve
+					end)
+				end
+				return Promise.resolve({ code = 200, body = body })
+			end
+			local success, problem = pcall(function()
+				part.Transparency = 0.4
+				session:__queueChange(part, "Transparency")
+				local first = session:flushChanges()
+				part.Transparency = 0.7
+				local latest = part.Transparency
+				session:__queueChange(part, "Transparency")
+				local second = session:flushChanges()
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = { { id = "EDITED", changedProperties = { Transparency = { Float32 = 0.2 } } } },
+				})
+				settle({ code = 200, body = body })
+				first:await()
+				second:await()
+				expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+				expect(session.__changeBatcher.__stopped).to.equal(true)
+				expect(session.__instanceMap:size()).to.equal(0)
+				expect(session.__localPropertyEdits).to.equal(nil)
+				expect(part.Transparency).to.equal(latest)
+				expect(requests).to.equal(1)
+				for _, result in session:getSyncResults() do
+					expect(result.status).to.equal("Failed")
+				end
+			end)
+			Http.post = originalPost
+			session:stop()
+			part:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should stop after acknowledgement processing fails without treating it as a transport failure", function()
+		local session, part, control = propertySession("Part")
+		session.__status = ServeSession.Status.Connected
+		local transportFailures = 0
+		session.__untrackRejectedAdditions = function(_self, _patch, result)
+			if result ~= nil then
+				error("Acknowledgement processing failed.")
+			end
+			transportFailures += 1
+		end
+		local success, problem = pcall(function()
+			part.Transparency = 0.7
+			local latest = part.Transparency
+			session:__queueChange(part, "Transparency")
+			local first = session:flushChanges()
+			local second = session:__writePatch({ added = {}, removed = {}, updated = {} }, 0, {})
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = { { id = "EDITED", changedProperties = { Transparency = { Float32 = 0.2 } } } },
+			})
+			local result = writeResult()
+			result.messageCursor = 100
+			control.settle[1](result)
+			first:await()
+			second:await()
+			expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(session.__changeBatcher.__stopped).to.equal(true)
+			expect(session.__localPropertyEdits).to.equal(nil)
+			expect(part.Transparency).to.equal(latest)
+			expect(#control.requests).to.equal(1)
+			expect(transportFailures).to.equal(1)
+			for _, record in session:getSyncResults() do
+				expect(record.status).to.equal("Failed")
+			end
+		end)
+		session:stop()
+		part:Destroy()
+		assert(success, problem)
+	end)
+
 	it("should keep structural failures out of replacement fallback", function()
 		local InstanceMap = require(script.Parent.InstanceMap)
 		local PatchSet = require(script.Parent.PatchSet)
@@ -445,6 +581,143 @@ return function()
 			assert(success, problem)
 		end)
 	end
+
+	for _, names in { { "EmitterSize", "RollOffMinDistance" }, { "RollOffMinDistance", "EmitterSize" } } do
+		it(`should protect "{names[1]}" edits from delayed "{names[2]}" echoes`, function()
+			for _, stage in { "pending", "queued", "inflight", "answered" } do
+				local session, sound, control = propertySession("Sound")
+				local function edit(value)
+					sound[names[1]] = value
+					session:__queueChange(sound, names[1])
+				end
+				local function echo(value)
+					session:__applyPatch({
+						added = {},
+						removed = {},
+						updated = { { id = "EDITED", changedProperties = { [names[2]] = { Float32 = value } } } },
+					})
+				end
+				local function answer(index, revision)
+					local result = writeResult()
+					result.messageCursor = revision
+					control.settle[index](result)
+				end
+				local success, problem = pcall(function()
+					edit(4)
+					local first = session:flushChanges()
+					edit(5)
+					local second = if stage ~= "pending" then session:flushChanges() else nil
+					if stage == "inflight" or stage == "answered" then
+						answer(1, 1)
+						first:await()
+					end
+					if stage == "answered" then
+						answer(2, 2)
+						second:await()
+					end
+					echo(4)
+					expect(sound.RollOffMinDistance).to.equal(5)
+					control.cursor = 1
+					session:__releaseLocalProperties(control.cursor)
+					if stage == "pending" or stage == "queued" then
+						answer(1, 1)
+						first:await()
+					end
+					if second == nil then
+						second = session:flushChanges()
+					end
+					local encoded = control.requests[2].updated[1].changedProperties
+					expect(encoded.RollOffMinDistance.Float32).to.equal(5)
+					expect(encoded.EmitterSize).to.equal(nil)
+					if stage ~= "answered" then
+						answer(2, 2)
+						second:await()
+					end
+					echo(5)
+					control.cursor = 2
+					session:__releaseLocalProperties(control.cursor)
+					expect(sound.RollOffMinDistance).to.equal(5)
+					expect(next(session.__localPropertyEdits)).to.equal(nil)
+					echo(6)
+					expect(sound.RollOffMinDistance).to.equal(6)
+				end)
+				session:stop()
+				sound:Destroy()
+				assert(success, `{stage} {tostring(problem)}`)
+			end
+		end)
+	end
+
+	it("should use one generation and encoding for canonical and alias signals in a batch", function()
+		local session, sound, control = propertySession("Sound")
+		local RbxDom = require(script.Parent.Parent.Packages.RbxDom)
+		local original = RbxDom.findCanonicalPropertyDescriptor
+		local reads = 0
+		RbxDom.findCanonicalPropertyDescriptor = function(className, propertyName)
+			local descriptor = original(className, propertyName)
+			if descriptor and descriptor.name == "RollOffMinDistance" then
+				local observed = table.clone(descriptor)
+				observed.read = function(_self, instance)
+					reads += 1
+					return descriptor:read(instance)
+				end
+				return observed
+			end
+			return descriptor
+		end
+		local success, problem = pcall(function()
+			sound.EmitterSize = 4
+			session:__queueChange(sound, "EmitterSize")
+			sound.RollOffMinDistance = 5
+			session:__queueChange(sound, "RollOffMinDistance")
+			local pending = session.__localPropertyEdits.EDITED
+			expect(pending.EmitterSize).to.equal(nil)
+			expect(pending.RollOffMinDistance ~= nil).to.equal(true)
+			expect(reads).to.equal(0)
+			local write = session:flushChanges()
+			expect(reads).to.equal(1)
+			local encoded = control.requests[1].updated[1].changedProperties
+			expect(encoded.EmitterSize).to.equal(nil)
+			expect(encoded.RollOffMinDistance.Float32).to.equal(5)
+			local result = writeResult()
+			result.messageCursor = 0
+			control.settle[1](result)
+			write:await()
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+		RbxDom.findCanonicalPropertyDescriptor = original
+		session:stop()
+		sound:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should release a canonical guard when an alias signal is omitted during encoding", function()
+		local session, sound, control = propertySession("Sound")
+		local RbxDom = require(script.Parent.Parent.Packages.RbxDom)
+		local original = RbxDom.findCanonicalPropertyDescriptor
+		sound.EmitterSize = 5
+		session:__queueChange(sound, "EmitterSize")
+		RbxDom.findCanonicalPropertyDescriptor = function(className, propertyName)
+			local descriptor = original(className, propertyName)
+			if descriptor and descriptor.name == "RollOffMinDistance" then
+				local unreadable = table.clone(descriptor)
+				unreadable.read = function()
+					return false, "The property cannot be read."
+				end
+				return unreadable
+			end
+			return descriptor
+		end
+		local success, problem = pcall(function()
+			expect(session:flushChanges()).to.equal(nil)
+			expect(#control.requests).to.equal(0)
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+		RbxDom.findCanonicalPropertyDescriptor = original
+		session:stop()
+		sound:Destroy()
+		assert(success, problem)
+	end)
 
 	it("should preserve newer local properties across delayed server echoes at every write stage", function()
 		for _, stage in { "pending", "queued", "inflight", "answered" } do

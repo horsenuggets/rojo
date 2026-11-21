@@ -21,6 +21,9 @@ return function(instance, instanceId, properties, instanceMap)
 				continue
 			end
 
+			if update.changedProperties[descriptor.name] ~= nil then
+				continue
+			end
 			local encodeSuccess, encodeResult = encodeProperty(instance, propertyName, descriptor, instanceMap)
 
 			if not encodeSuccess then
@@ -28,7 +31,7 @@ return function(instance, instanceId, properties, instanceMap)
 				continue
 			end
 
-			update.changedProperties[propertyName] = encodeResult
+			update.changedProperties[descriptor.name] = encodeResult
 		end
 	end
 

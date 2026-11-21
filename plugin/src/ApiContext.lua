@@ -13,6 +13,8 @@ local validateApiRead = Types.ifEnabled(Types.ApiReadResponse)
 local validateApiSocketPacket = Types.ifEnabled(Types.ApiSocketPacket)
 local validateApiSerialize = Types.ifEnabled(Types.ApiSerializeResponse)
 local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
+-- Acknowledgement ordering is a wire contract, not an optional debug check.
+local validateApiWrite = Types.ApiWriteResponse
 
 local function rejectFailedRequests(response)
 	if response.code >= 400 then
@@ -22,6 +24,11 @@ local function rejectFailedRequests(response)
 	end
 
 	return response
+end
+
+local function rejectInvalidAcknowledgement(context, message)
+	context:disconnect()
+	return Promise.reject(Http.Error.new(Http.Error.Kind.Protocol, message))
 end
 
 -- Servers from before the switch to msgpack, including upstream Rojo, answer the info
@@ -205,6 +212,9 @@ end
 
 function ApiContext:write(patch, messageCursor, authority)
 	assert(authority == "Filesystem" or authority == "Studio", "Write authority must be Filesystem or Studio")
+	if not self.__connected then
+		return Promise.reject("The connection is closed.")
+	end
 	local url = ("%s/api/write"):format(self.__baseUrl)
 
 	local updated = {}
@@ -241,16 +251,19 @@ function ApiContext:write(patch, messageCursor, authority)
 
 	body = Http.msgpackEncode(body)
 
-	return Http.post(url, body)
-		:andThen(rejectFailedRequests)
-		:andThen(Http.Response.msgpack)
-		:andThen(function(responseBody)
-			if responseBody.sessionId ~= self.__sessionId then
-				return Promise.reject("Server changed ID")
-			end
-
-			return responseBody
-		end)
+	return Http.post(url, body):andThen(rejectFailedRequests):andThen(function(response)
+		local decoded, responseBody = pcall(Http.Response.msgpack, response)
+		if not decoded then
+			return rejectInvalidAcknowledgement(self, "The write acknowledgement could not be decoded.")
+		end
+		if not validateApiWrite(responseBody) then
+			return rejectInvalidAcknowledgement(self, "The write acknowledgement is incomplete or has no valid cursor.")
+		end
+		if responseBody.sessionId ~= self.__sessionId then
+			return rejectInvalidAcknowledgement(self, "Server changed ID")
+		end
+		return responseBody
+	end)
 end
 
 function ApiContext:connectWebSocket(packetHandlers)
@@ -272,6 +285,9 @@ function ApiContext:connectWebSocket(packetHandlers)
 		local closed, errored, received
 
 		received = self.__wsClient.MessageReceived:Connect(function(msg)
+			if not self.__connected then
+				return
+			end
 			local data = Http.msgpackDecode(msg)
 			if data.sessionId ~= self.__sessionId then
 				Log.warn("Received message with wrong session ID; ignoring")

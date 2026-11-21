@@ -17,8 +17,8 @@ use crate::{
     project::{Project, ProjectError},
     session_id::SessionId,
     snapshot::{
-        apply_patch_set, compute_patch_set, AppliedPatchSet, InstanceContext, InstanceSnapshot,
-        RequireContext, RojoTree,
+        apply_patch_set, compute_patch_set, InstanceContext, InstanceSnapshot, RequireContext,
+        RojoTree,
     },
     snapshot_middleware::snapshot_from_vfs,
 };
@@ -80,7 +80,7 @@ pub struct ServeSession {
     /// Clients to the serve session will subscribe to this queue either
     /// directly or through the HTTP API to be notified of mutations that need
     /// to be applied.
-    message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+    message_queue: Arc<MessageQueue>,
 
     /// A channel to send mutation requests on. These will be handled by the
     /// ChangeProcessor and trigger changes in the tree.
@@ -315,7 +315,7 @@ impl ServeSession {
         &self.vfs
     }
 
-    pub fn message_queue(&self) -> &MessageQueue<AppliedPatchSet> {
+    pub fn message_queue(&self) -> &MessageQueue {
         &self.message_queue
     }
 
