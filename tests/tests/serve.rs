@@ -102,6 +102,99 @@ fn interactive_scaling_saves_successive_properties_from_the_same_client_cursor()
 }
 
 #[test]
+fn canonical_sound_writes_replace_authored_aliases_on_disk() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    for storage in ["model", "directory", "inline"] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            let source = match storage {
+                "model" => root.join("src/Sound.model.json"),
+                "directory" => {
+                    fs::create_dir(root.join("src/Sound")).unwrap();
+                    root.join("src/Sound/init.meta.json")
+                }
+                "inline" => {
+                    fs::create_dir(root.join("src/Container")).unwrap();
+                    root.join("src/Container/init.meta.json")
+                }
+                _ => unreachable!(),
+            };
+            let sound = r#"{"name":"Sound","className":"Sound","properties":{"EmitterSize":5}}"#;
+            let contents = if storage == "inline" {
+                format!(r#"{{"children":[{sound}]}}"#)
+            } else {
+                sound.to_owned()
+            };
+            fs::write(source, contents).unwrap();
+        });
+        let info = session.wait_to_come_online();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let sound = read
+            .instances
+            .values()
+            .find(|instance| instance.name == "Sound")
+            .unwrap();
+        let id = sound.id;
+        assert!(!sound.properties.contains_key(&ustr("EmitterSize")));
+        assert_eq!(
+            sound.properties[&ustr("RollOffMinDistance")].as_ref(),
+            &Variant::Float32(5.0)
+        );
+        let source = session.path().join(match storage {
+            "model" => "src/Sound.model.json",
+            "directory" => "src/Sound/init.meta.json",
+            "inline" => "src/Container/init.meta.json",
+            _ => unreachable!(),
+        });
+        for value in [10.0, 7.0] {
+            let response = session.post_api_write(&WriteRequest {
+                session_id: info.session_id,
+                message_cursor: Some(read.message_cursor),
+                authority: WriteAuthority::Filesystem,
+                added: Default::default(),
+                removed: Vec::new(),
+                updated: vec![InstanceUpdate {
+                    id,
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_parent: None,
+                    changed_metadata: None,
+                    changed_properties: UstrMap::from_iter([(
+                        ustr("RollOffMinDistance"),
+                        Some(Variant::Float32(value)),
+                    )]),
+                }],
+            });
+            assert!(response.errors.is_empty(), "{storage}, {response:?}");
+            assert!(
+                response.conflicts.updated_instances.is_empty(),
+                "{storage}, {response:?}"
+            );
+            assert_eq!(response.accepted.updated_instances.len(), 1, "{storage}");
+            let contents = fs::read_to_string(&source).unwrap();
+            assert!(!contents.contains("EmitterSize"), "{storage}, {contents}");
+            let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            let properties = if storage == "inline" {
+                &json["children"][0]["properties"]
+            } else {
+                &json["properties"]
+            };
+            if value == 10.0 {
+                assert!(properties.get("RollOffMinDistance").is_none(), "{contents}");
+            } else {
+                assert_eq!(properties["RollOffMinDistance"], value, "{contents}");
+            }
+            let readback = session.get_api_read(id).unwrap();
+            let actual = readback.instances[&id]
+                .properties
+                .get(&ustr("RollOffMinDistance"))
+                .map(|value| value.as_ref().clone())
+                .unwrap_or(Variant::Float32(10.0));
+            assert_eq!(actual, Variant::Float32(value), "{storage}");
+        }
+    }
+}
+
+#[test]
 fn text_values_sync_in_both_directions_after_filesystem_edits() {
     use crate::rojo_test::serve_util::TestServeSession;
     let mut session = TestServeSession::with_setup("add_folder", |root| {

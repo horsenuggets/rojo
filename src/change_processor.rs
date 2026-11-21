@@ -5770,6 +5770,236 @@ mod tests {
         }
     }
 
+    fn sound_alias_job(
+        storage: &str,
+        properties: &str,
+    ) -> (JobThreadContext, Ref, &'static str, &'static str) {
+        let model = format!(r#"{{"className":"Sound","properties":{{{properties}}}}}"#);
+        let (job, id, source, disk) = match storage {
+            "project" | "project-path" => {
+                let path = if storage == "project-path" {
+                    r#""$path":"Sound","#
+                } else {
+                    r#""$className":"Sound","#
+                };
+                let files = if storage == "project-path" {
+                    vec![(
+                        "Sound",
+                        VfsSnapshot::dir([(
+                            "init.meta.json",
+                            VfsSnapshot::file(
+                                r#"{"className":"Sound","properties":{"RollOffMinDistance":3}}"#,
+                            ),
+                        )]),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                let job = project_job(
+                    "default.project.json",
+                    &format!(
+                        r#"{{"name":"Test","tree":{{"$className":"Folder","Sound":{{{path}"$properties":{{{properties}}}}}}}}}"#
+                    ),
+                    files,
+                );
+                let id = find(&job, &["Sound"]);
+                (
+                    job,
+                    id,
+                    "/project/default.project.json",
+                    "/project/default.project.json",
+                )
+            }
+            "directory" | "inline" => {
+                let metadata = if storage == "inline" {
+                    format!(
+                        r#"{{"children":[{{"name":"Sound","className":"Sound","properties":{{{properties}}}}}]}}"#
+                    )
+                } else {
+                    model.clone()
+                };
+                let (job, owner) = script_job(
+                    vec![(
+                        "Sound",
+                        VfsSnapshot::dir([("init.meta.json", VfsSnapshot::file(metadata))]),
+                    )],
+                    "/project/Sound",
+                );
+                let id = if storage == "inline" {
+                    job.tree
+                        .lock()
+                        .unwrap()
+                        .get_instance(owner)
+                        .unwrap()
+                        .children()[0]
+                } else {
+                    owner
+                };
+                (job, id, "/project/Sound", "/project/Sound/init.meta.json")
+            }
+            "model" | "adjacent" => {
+                let files = if storage == "adjacent" {
+                    vec![
+                        (
+                            "Sound.rbxmx",
+                            VfsSnapshot::file(
+                                r#"<roblox version="4"><Item class="Sound" referent="0"><Properties><float name="RollOffMinDistance">3</float></Properties></Item></roblox>"#,
+                            ),
+                        ),
+                        (
+                            "Sound.meta.json",
+                            VfsSnapshot::file(format!(r#"{{"properties":{{{properties}}}}}"#)),
+                        ),
+                    ]
+                } else {
+                    vec![("Sound.model.json", VfsSnapshot::file(model))]
+                };
+                let source = if storage == "adjacent" {
+                    "/project/Sound.rbxmx"
+                } else {
+                    "/project/Sound.model.json"
+                };
+                let (job, id) = script_job(files, source);
+                let disk = if storage == "adjacent" {
+                    "/project/Sound.meta.json"
+                } else {
+                    "/project/Sound.model.json"
+                };
+                (job, id, source, disk)
+            }
+            _ => panic!("Unknown test storage {storage}"),
+        };
+        (job, id, source, disk)
+    }
+
+    #[test]
+    fn sound_alias_ingestion_is_canonical_before_each_overlay() {
+        for storage in [
+            "model",
+            "directory",
+            "inline",
+            "project",
+            "adjacent",
+            "project-path",
+        ] {
+            for (properties, expected) in [
+                (r#""EmitterSize":5"#, 5.0),
+                (r#""EmitterSize":5,"RollOffMinDistance":7"#, 7.0),
+                (r#""RollOffMinDistance":7,"EmitterSize":5"#, 7.0),
+            ] {
+                let (job, id, _, _) = sound_alias_job(storage, properties);
+                let tree = job.tree.lock().unwrap();
+                let sound = tree.get_instance(id).unwrap();
+                assert_eq!(
+                    sound.properties().get(&ustr("EmitterSize")),
+                    None,
+                    "{storage}, {properties}"
+                );
+                assert_eq!(
+                    sound.properties().get(&ustr("RollOffMinDistance")),
+                    Some(&Variant::Float32(expected)),
+                    "{storage}, {properties}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sound_alias_canonical_writes_reload_without_stale_keys() {
+        // Project nodes intentionally refuse two-way writes. Their serialization is
+        // covered through full syncback instead, without changing that authority policy.
+        for storage in ["model", "directory", "inline", "adjacent"] {
+            for value in [10.0, 7.0] {
+                let (job, id, source, disk) = sound_alias_job(storage, r#""EmitterSize":5"#);
+                let (accepted, conflicts, errors) = job.handle_tree_event(property_update(
+                    id,
+                    "RollOffMinDistance",
+                    Variant::Float32(value),
+                ));
+                assert!(errors.is_empty(), "{storage}, {value}, {errors:?}");
+                assert_eq!(conflicts, PatchSet::new(), "{storage}, {value}");
+                assert_eq!(accepted.updated_instances.len(), 1, "{storage}, {value}");
+                if storage == "adjacent" {
+                    // Native models absorb sidecar properties and remove the empty
+                    // sidecar, so it cannot reapply the old alias on the next load.
+                    assert!(job.vfs.read(disk).with_not_found().unwrap().is_none());
+                } else {
+                    let text = job.vfs.read_to_string(disk).unwrap();
+                    assert!(!text.contains("EmitterSize"), "{storage}, {value}, {text}");
+                }
+                let reloaded =
+                    snapshot_from_vfs(&Default::default(), &job.vfs, Path::new(source)).unwrap();
+                let tree = job.tree.lock().unwrap();
+                let owner = tree.root().children()[0];
+                assert_eq!(
+                    compute_patch_set(reloaded, &tree, owner),
+                    PatchSet::new(),
+                    "{storage}, {value}"
+                );
+                let sound = tree.get_instance(id).unwrap();
+                assert!(!sound.properties().contains_key(&ustr("EmitterSize")));
+                assert_eq!(
+                    sound
+                        .properties()
+                        .get(&ustr("RollOffMinDistance"))
+                        .cloned()
+                        .unwrap_or(Variant::Float32(10.0)),
+                    Variant::Float32(value),
+                    "{storage}, {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sound_alias_exclusions_refuse_writes_without_disk_mutation() {
+        for storage in [
+            "model",
+            "directory",
+            "inline",
+            "project",
+            "project-path",
+            "adjacent",
+        ] {
+            for class in ["Sound", "Instance"] {
+                for ignored in ["EmitterSize", "RollOffMinDistance"] {
+                    let (mut job, id, source, disk) =
+                        sound_alias_job(storage, r#""EmitterSize":5"#);
+                    Arc::get_mut(job.project.project.get_mut().unwrap())
+                        .unwrap()
+                        .syncback_rules = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "ignoreProperties": {class: [ignored]}
+                        }))
+                        .unwrap(),
+                    );
+                    let before = job.vfs.read(disk).unwrap();
+                    let source_before = job.vfs.read(source).ok();
+                    let (accepted, _, errors) = job.handle_tree_event(property_update(
+                        id,
+                        "RollOffMinDistance",
+                        Variant::Float32(7.0),
+                    ));
+                    assert!(
+                        accepted.updated_instances.is_empty(),
+                        "{storage}, {class}, {ignored}"
+                    );
+                    assert!(!errors.is_empty(), "{storage}, {class}, {ignored}");
+                    assert_eq!(
+                        job.vfs.read(disk).unwrap(),
+                        before,
+                        "{storage}, {class}, {ignored}"
+                    );
+                    assert_eq!(
+                        job.vfs.read(source).ok(),
+                        source_before,
+                        "{storage}, {class}, {ignored}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn rounded_defaults_do_not_conflict_with_the_next_update_in_a_batch() {
         let (job, id) = part_job();

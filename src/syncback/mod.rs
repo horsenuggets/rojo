@@ -32,6 +32,7 @@ use std::{
 use crate::{
     glob::{Glob, IgnorableGlob},
     project::DEFAULT_PROJECT_NAMES,
+    resolution::canonical_property_name,
     snapshot::{InstanceWithMeta, RojoTree},
     snapshot_middleware::{dir_init_files, Middleware},
     syncback::ref_properties::{attribute_ids, collect_referents, ids_on_disk, link_referents},
@@ -1142,7 +1143,13 @@ pub(crate) fn get_property_filter(project: &Project, new_inst: &Instance) -> Opt
 
     loop {
         if let Some(list) = filter.get(&ustr(current_class_name)) {
-            set.extend(list)
+            for name in list {
+                set.insert(*name);
+                set.insert(ustr(canonical_property_name(
+                    &new_inst.class,
+                    name.as_str(),
+                )));
+            }
         }
 
         let class = database.classes.get(current_class_name)?;
@@ -1215,6 +1222,124 @@ mod test {
     use super::*;
     use crate::snapshot::{InstanceMetadata, InstanceSnapshot};
     use rbx_dom_weak::{types::Attributes, UstrMap};
+
+    #[test]
+    fn sound_alias_project_syncback_cleans_keys_even_without_value_changes() {
+        use rbx_dom_weak::InstanceBuilder;
+        for with_path in [false, true] {
+            for properties in [
+                r#""EmitterSize":5"#,
+                r#""EmitterSize":3,"RollOffMinDistance":5"#,
+                r#""RollOffMinDistance":5,"EmitterSize":3"#,
+            ] {
+                for value in [10.0, 7.0, 5.0] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = temp.path();
+                    let path = root.join("default.project.json");
+                    let vfs = Vfs::new_default().unwrap();
+                    vfs.set_watch_enabled(false);
+                    let source = if with_path {
+                        fs_err::create_dir(root.join("Sound")).unwrap();
+                        r#""$path":"Sound","#
+                    } else {
+                        ""
+                    };
+                    vfs.write(&path, format!(
+                        r#"{{"name":"Test","tree":{{"$className":"Folder","Sound":{{"$className":"Sound",{source}"$properties":{{{properties}}}}}}}}}"#
+                    )).unwrap();
+                    let project = Project::load_exact(&vfs, &path, Some("Test")).unwrap();
+                    let old = crate::snapshot_middleware::snapshot_from_vfs(
+                        &Default::default(),
+                        &vfs,
+                        &path,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let tree = RojoTree::new(old);
+                    let input = WeakDom::new(
+                        InstanceBuilder::new("Folder").with_name("Test").with_child(
+                            InstanceBuilder::new("Sound")
+                                .with_name("Sound")
+                                .with_property("RollOffMinDistance", Variant::Float32(value)),
+                        ),
+                    );
+                    // Exercise the project middleware's dirty contract directly. The
+                    // outer loop may skip an unchanged tree before any merge occurs.
+                    let attribute_ids = HashSet::new();
+                    let snapshot = SyncbackSnapshot {
+                        data: SyncbackData {
+                            vfs: &vfs,
+                            old_tree: &tree,
+                            new_tree: &input,
+                            project: &project,
+                            scoped: false,
+                            context: None,
+                            script_containers: None,
+                            model_trees: None,
+                            attribute_ids: &attribute_ids,
+                        },
+                        old: Some(tree.get_root_id()),
+                        new: input.root_ref(),
+                        path: path.clone(),
+                        middleware: Some(Middleware::Project),
+                    };
+                    let saved = Middleware::Project.syncback(&snapshot).unwrap().fs_snapshot;
+                    assert!(
+                        saved.added_paths().contains(&path.as_path()),
+                        "path {with_path}, {properties}, {value}"
+                    );
+                    saved.write_to_vfs(root, &vfs).unwrap();
+                    let text = vfs.read_to_string(&path).unwrap();
+                    assert!(!text.contains("EmitterSize"), "{text}");
+                    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    let written = &json["tree"]["Sound"]["$properties"];
+                    if value == 10.0 {
+                        assert!(written.get("RollOffMinDistance").is_none(), "{text}");
+                    } else {
+                        assert_eq!(written["RollOffMinDistance"], value, "{text}");
+                    }
+                    let reloaded = crate::snapshot_middleware::snapshot_from_vfs(
+                        &Default::default(),
+                        &vfs,
+                        &path,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert!(!reloaded.children[0]
+                        .properties
+                        .contains_key(&ustr("EmitterSize")));
+                    assert_eq!(
+                        reloaded.children[0]
+                            .properties
+                            .get(&ustr("RollOffMinDistance"))
+                            .cloned()
+                            .unwrap_or(Variant::Float32(10.0)),
+                        Variant::Float32(value)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sound_alias_filter_retains_configured_and_concrete_canonical_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let path = temp.path().join("default.project.json");
+        vfs.write(&path, r#"{"tree":{"$className":"Folder"},"syncbackRules":{"ignoreProperties":{"Instance":["EmitterSize","UnknownProperty"],"Sound":["Volume"]}}}"#).unwrap();
+        let project = Project::load_exact(&vfs, &path, Some("Test")).unwrap();
+        let dom = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("Sound"));
+        let filter = get_property_filter(&project, dom.root()).unwrap();
+        for name in [
+            "EmitterSize",
+            "RollOffMinDistance",
+            "UnknownProperty",
+            "Volume",
+        ] {
+            assert!(filter.contains(&ustr(name)), "Missing {name}");
+        }
+    }
 
     #[test]
     fn whole_tree_package_conflicts_return_errors_without_saving_any_edit() {

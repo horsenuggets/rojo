@@ -51,7 +51,10 @@ Making a new release? Simply add the new header with the version and date undern
   once per batch rather than on each change signal, and omitted encodings release their
   pending guards. Structural revisions are indexed per instance so repeated writes with
   an older cursor do not repeatedly scan intervening ordinary-property announcements.
-  Property aliases share canonical guards and batch encodings.
+  Property aliases share canonical guards and batch encodings. Server snapshots and
+  persisted edits use canonical names without conflicting legacy keys, including default
+  resets. Explicit canonical keys win within an authored map, and later metadata overlays
+  retain precedence. Alias-spelled syncback exclusions still apply to canonical writes.
 * Required protocol version 12 and validated publication cursors and nested patch fields
   in every write response. Acknowledgements cannot predate progress known at dispatch,
   but subscription progress can advance while a response is in flight. Older peers are
