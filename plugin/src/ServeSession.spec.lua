@@ -446,6 +446,143 @@ return function()
 		end)
 	end
 
+	for _, names in { { "EmitterSize", "RollOffMinDistance" }, { "RollOffMinDistance", "EmitterSize" } } do
+		it(`should protect "{names[1]}" edits from delayed "{names[2]}" echoes`, function()
+			for _, stage in { "pending", "queued", "inflight", "answered" } do
+				local session, sound, control = propertySession("Sound")
+				local function edit(value)
+					sound[names[1]] = value
+					session:__queueChange(sound, names[1])
+				end
+				local function echo(value)
+					session:__applyPatch({
+						added = {},
+						removed = {},
+						updated = { { id = "EDITED", changedProperties = { [names[2]] = { Float32 = value } } } },
+					})
+				end
+				local function answer(index, revision)
+					local result = writeResult()
+					result.messageCursor = revision
+					control.settle[index](result)
+				end
+				local success, problem = pcall(function()
+					edit(4)
+					local first = session:flushChanges()
+					edit(5)
+					local second = if stage ~= "pending" then session:flushChanges() else nil
+					if stage == "inflight" or stage == "answered" then
+						answer(1, 1)
+						first:await()
+					end
+					if stage == "answered" then
+						answer(2, 2)
+						second:await()
+					end
+					echo(4)
+					expect(sound.RollOffMinDistance).to.equal(5)
+					control.cursor = 1
+					session:__releaseLocalProperties(control.cursor)
+					if stage == "pending" or stage == "queued" then
+						answer(1, 1)
+						first:await()
+					end
+					if second == nil then
+						second = session:flushChanges()
+					end
+					local encoded = control.requests[2].updated[1].changedProperties
+					expect(encoded.RollOffMinDistance.Float32).to.equal(5)
+					expect(encoded.EmitterSize).to.equal(nil)
+					if stage ~= "answered" then
+						answer(2, 2)
+						second:await()
+					end
+					echo(5)
+					control.cursor = 2
+					session:__releaseLocalProperties(control.cursor)
+					expect(sound.RollOffMinDistance).to.equal(5)
+					expect(next(session.__localPropertyEdits)).to.equal(nil)
+					echo(6)
+					expect(sound.RollOffMinDistance).to.equal(6)
+				end)
+				session:stop()
+				sound:Destroy()
+				assert(success, `{stage} {tostring(problem)}`)
+			end
+		end)
+	end
+
+	it("should use one generation and encoding for canonical and alias signals in a batch", function()
+		local session, sound, control = propertySession("Sound")
+		local RbxDom = require(script.Parent.Parent.Packages.RbxDom)
+		local original = RbxDom.findCanonicalPropertyDescriptor
+		local reads = 0
+		RbxDom.findCanonicalPropertyDescriptor = function(className, propertyName)
+			local descriptor = original(className, propertyName)
+			if descriptor and descriptor.name == "RollOffMinDistance" then
+				local observed = table.clone(descriptor)
+				observed.read = function(_self, instance)
+					reads += 1
+					return descriptor:read(instance)
+				end
+				return observed
+			end
+			return descriptor
+		end
+		local success, problem = pcall(function()
+			sound.EmitterSize = 4
+			session:__queueChange(sound, "EmitterSize")
+			sound.RollOffMinDistance = 5
+			session:__queueChange(sound, "RollOffMinDistance")
+			local pending = session.__localPropertyEdits.EDITED
+			expect(pending.EmitterSize).to.equal(nil)
+			expect(pending.RollOffMinDistance ~= nil).to.equal(true)
+			expect(reads).to.equal(0)
+			local write = session:flushChanges()
+			expect(reads).to.equal(1)
+			local encoded = control.requests[1].updated[1].changedProperties
+			expect(encoded.EmitterSize).to.equal(nil)
+			expect(encoded.RollOffMinDistance.Float32).to.equal(5)
+			local result = writeResult()
+			result.messageCursor = 0
+			control.settle[1](result)
+			write:await()
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+		RbxDom.findCanonicalPropertyDescriptor = original
+		session:stop()
+		sound:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should release a canonical guard when an alias signal is omitted during encoding", function()
+		local session, sound, control = propertySession("Sound")
+		local RbxDom = require(script.Parent.Parent.Packages.RbxDom)
+		local original = RbxDom.findCanonicalPropertyDescriptor
+		sound.EmitterSize = 5
+		session:__queueChange(sound, "EmitterSize")
+		RbxDom.findCanonicalPropertyDescriptor = function(className, propertyName)
+			local descriptor = original(className, propertyName)
+			if descriptor and descriptor.name == "RollOffMinDistance" then
+				local unreadable = table.clone(descriptor)
+				unreadable.read = function()
+					return false, "The property cannot be read."
+				end
+				return unreadable
+			end
+			return descriptor
+		end
+		local success, problem = pcall(function()
+			expect(session:flushChanges()).to.equal(nil)
+			expect(#control.requests).to.equal(0)
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+		RbxDom.findCanonicalPropertyDescriptor = original
+		session:stop()
+		sound:Destroy()
+		assert(success, problem)
+	end)
+
 	it("should preserve newer local properties across delayed server echoes at every write stage", function()
 		for _, stage in { "pending", "queued", "inflight", "answered" } do
 			local session, part, control = propertySession("Part")

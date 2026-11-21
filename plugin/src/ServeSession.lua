@@ -400,7 +400,7 @@ function ServeSession:__rememberLocalProperty(instance, propertyName)
 	local properties = self.__localPropertyEdits[id] or {}
 	self.__localPropertyEdits[id] = properties
 	-- Each entry is a generation token. A previous request cannot release a later edit.
-	properties[propertyName] = {}
+	properties[descriptor.name] = {}
 end
 
 function ServeSession:__takeLocalPropertyEdits(changes)
@@ -411,7 +411,10 @@ function ServeSession:__takeLocalPropertyEdits(changes)
 		if properties ~= nil then
 			local entries = {}
 			for propertyName in changed do
-				entries[propertyName] = properties[propertyName]
+				local descriptor = getWritablePropertyDescriptor(instance.ClassName, propertyName)
+				if descriptor ~= nil then
+					entries[descriptor.name] = properties[descriptor.name]
+				end
 			end
 			taken[id] = entries
 		end
@@ -513,8 +516,10 @@ function ServeSession:__protectLocalProperties(patch)
 		end
 		local kept = table.clone(update)
 		kept.changedProperties = table.clone(update.changedProperties or {})
+		local instance = self.__instanceMap.fromIds[update.id]
 		for propertyName, value in kept.changedProperties do
-			local entry = properties[propertyName]
+			local descriptor = instance and getWritablePropertyDescriptor(instance.ClassName, propertyName)
+			local entry = properties[if descriptor ~= nil then descriptor.name else propertyName]
 			if entry ~= nil then
 				entry.serverValue = value
 				kept.changedProperties[propertyName] = nil
