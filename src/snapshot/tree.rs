@@ -56,6 +56,14 @@ pub struct RojoTree {
     /// the same RojoRef for multiple different instances. An entry containing
     /// multiple elements is an error condition that should be raised to the user.
     specified_id_to_refs: MultiMap<RojoRef, Ref>,
+
+    /// Recovery authority is separate from the live DOM and never used by syncback.
+    retired_sources: crate::source_checkpoints::RetiredSources,
+    track_retired_sources: bool,
+
+    /// Patch application updates metadata before class. Keep at most one bounded
+    /// pre-update descriptor until that instance's mutable edit finishes.
+    pending_source: Option<(Ref, Option<crate::source_checkpoints::SourceDescriptor>)>,
 }
 
 impl RojoTree {
@@ -69,6 +77,9 @@ impl RojoTree {
             metadata_map: HashMap::new(),
             path_to_ids: MultiMap::new(),
             specified_id_to_refs: MultiMap::new(),
+            track_retired_sources: true,
+            retired_sources: Default::default(),
+            pending_source: None,
         };
 
         let root_ref = tree.inner.root_ref();
@@ -106,7 +117,20 @@ impl RojoTree {
             metadata_map: self.metadata_map.clone(),
             path_to_ids: self.path_to_ids.clone(),
             specified_id_to_refs: self.specified_id_to_refs.clone(),
+            track_retired_sources: false,
+            retired_sources: Default::default(),
+            pending_source: None,
         }
+    }
+
+    /// A validated mapping candidate becomes live, so its bounded recovery state must
+    /// survive the copy without renewing descriptor timestamps or enabling detached clones.
+    pub(crate) fn clone_for_mapping(&self) -> Self {
+        let mut candidate = self.clone_for_serialization();
+        candidate.track_retired_sources = self.track_retired_sources;
+        candidate.retired_sources = self.retired_sources.clone();
+        candidate.pending_source = self.pending_source.clone();
+        candidate
     }
 
     pub fn inner(&self) -> &WeakDom {
@@ -135,13 +159,46 @@ impl RojoTree {
     }
 
     pub fn get_instance_mut(&mut self, id: Ref) -> Option<InstanceWithMetaMut<'_>> {
-        if let Some(instance) = self.inner.get_by_ref_mut(id) {
-            let metadata = self.metadata_map.get_mut(&id).unwrap();
+        self.inner.get_by_ref(id)?;
+        let pending_source = self
+            .pending_source
+            .take()
+            .and_then(|(pending_id, source)| (pending_id == id).then_some(source));
+        Some(InstanceWithMetaMut {
+            tree: self,
+            id,
+            pending_source,
+        })
+    }
 
-            Some(InstanceWithMetaMut { instance, metadata })
-        } else {
-            None
+    pub(crate) fn retired_source(
+        &self,
+        id: Ref,
+    ) -> Option<&crate::source_checkpoints::SourceDescriptor> {
+        self.retired_sources.get(id)
+    }
+
+    fn capture_retiring_source(
+        &self,
+        id: Ref,
+    ) -> Option<crate::source_checkpoints::SourceDescriptor> {
+        if !self.track_retired_sources {
+            return None;
         }
+        let source = crate::source_checkpoints::SourceDescriptor::capture(self, id).ok()?;
+        (source.payload_bytes() <= self.retired_sources.max_bytes).then_some(source)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_source_limits(
+        &mut self,
+        count: usize,
+        bytes: usize,
+        lifetime: std::time::Duration,
+    ) {
+        self.retired_sources.max_count = count;
+        self.retired_sources.max_bytes = bytes;
+        self.retired_sources.lifetime = lifetime;
     }
 
     pub fn insert_instance(&mut self, parent_ref: Ref, snapshot: InstanceSnapshot) -> Ref {
@@ -265,6 +322,8 @@ impl RojoTree {
         }
 
         let referent = self.inner.insert(parent_ref, builder);
+        // Explicitly reused IDs must never inherit a prior incarnation's authority.
+        self.retired_sources.forget(referent);
         self.insert_metadata(referent, snapshot.metadata);
         inserted.push((snapshot_id, referent));
 
@@ -298,6 +357,26 @@ impl RojoTree {
     }
 
     pub fn remove(&mut self, id: Ref) {
+        // Capture the entire retiring subtree before removing ANY ancestor metadata.
+        // Traversal is proportional to the structural removal, never a property edit.
+        let mut pending = vec![id];
+        while let Some(current) = pending.pop() {
+            if let Some(instance) = self.inner.get_by_ref(current) {
+                pending.extend_from_slice(instance.children());
+            }
+            let source = self.capture_retiring_source(current);
+            if let Some(source) = source {
+                self.retired_sources.retire(source);
+            } else if self.get_instance(current).is_some_and(|instance| {
+                matches!(
+                    instance.class_name().as_str(),
+                    "Script" | "LocalScript" | "ModuleScript"
+                )
+            }) {
+                self.retired_sources.forget(current);
+            }
+        }
+        self.pending_source = None;
         let mut to_move = VecDeque::new();
         to_move.push_back(id);
 
@@ -316,6 +395,11 @@ impl RojoTree {
     pub fn update_metadata(&mut self, id: Ref, metadata: InstanceMetadata) {
         use std::collections::hash_map::Entry;
 
+        self.pending_source = self
+            .metadata_map
+            .get(&id)
+            .filter(|old| !old.has_same_structure(&metadata))
+            .map(|_| (id, self.capture_retiring_source(id)));
         match self.metadata_map.entry(id) {
             Entry::Occupied(mut entry) => {
                 let existing_metadata = entry.get();
@@ -506,53 +590,66 @@ impl<'a> InstanceWithMeta<'a> {
 /// `InstanceWithMeta`.
 #[derive(Debug)]
 pub struct InstanceWithMetaMut<'a> {
-    instance: &'a mut Instance,
-    metadata: &'a mut InstanceMetadata,
+    tree: &'a mut RojoTree,
+    id: Ref,
+    pending_source: Option<Option<crate::source_checkpoints::SourceDescriptor>>,
 }
 
 impl InstanceWithMetaMut<'_> {
     pub fn id(&self) -> Ref {
-        self.instance.referent()
+        self.id
     }
 
     pub fn name(&self) -> &str {
-        &self.instance.name
+        &self.inner().name
     }
 
     pub fn name_mut(&mut self) -> &mut String {
-        &mut self.instance.name
+        &mut self.inner_mut().name
     }
 
     pub fn class_name(&self) -> &str {
-        &self.instance.class
+        &self.inner().class
     }
 
     pub fn set_class_name<'a, S: Into<&'a str>>(&mut self, new_class: S) {
-        self.instance.class = ustr(new_class.into());
+        let new_class = ustr(new_class.into());
+        if self.inner().class != new_class {
+            let source = self
+                .pending_source
+                .take()
+                .unwrap_or_else(|| self.tree.capture_retiring_source(self.id));
+            if let Some(source) = source {
+                self.tree.retired_sources.retire(source);
+            } else {
+                self.tree.retired_sources.forget(self.id);
+            }
+            self.inner_mut().class = new_class;
+        }
     }
 
     pub fn properties(&self) -> &UstrMap<Variant> {
-        &self.instance.properties
+        &self.inner().properties
     }
 
     pub fn properties_mut(&mut self) -> &mut UstrMap<Variant> {
-        &mut self.instance.properties
+        &mut self.inner_mut().properties
     }
 
     pub fn children(&self) -> &[Ref] {
-        self.instance.children()
+        self.inner().children()
     }
 
     pub fn metadata(&self) -> &InstanceMetadata {
-        self.metadata
+        self.tree.metadata_map.get(&self.id).unwrap()
     }
 
     pub fn inner(&self) -> &Instance {
-        self.instance
+        self.tree.inner.get_by_ref(self.id).unwrap()
     }
 
     pub fn inner_mut(&mut self) -> &mut Instance {
-        self.instance
+        self.tree.inner.get_by_ref_mut(self.id).unwrap()
     }
 }
 
@@ -569,6 +666,134 @@ mod test {
 
     use super::{RojoTree, SnapshotReferents};
     use std::path::PathBuf;
+
+    #[test]
+    fn ordinary_edits_do_not_retain_sources_and_serialization_disables_retirement() {
+        let metadata =
+            InstanceMetadata::new().relevant_paths(vec![PathBuf::from("src/Editor.luau")]);
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root").children(
+            vec![InstanceSnapshot::new()
+                    .name("Editor")
+                    .class_name("ModuleScript")
+                    .metadata(metadata.clone())
+                    .properties(UstrMap::from_iter([(
+                        ustr("Source"),
+                        Variant::String("return 1".into()),
+                    )]))],
+        ));
+        let id = tree.root().children()[0];
+        for _ in 0..1000 {
+            tree.update_metadata(id, metadata.clone());
+            assert!(tree.pending_source.is_none());
+            tree.get_instance_mut(id)
+                .unwrap()
+                .properties_mut()
+                .insert(ustr("Source"), Variant::String("return 2".into()));
+            assert!(tree.retired_source(id).is_none());
+        }
+        tree.get_instance_mut(id).unwrap().set_class_name("Folder");
+        assert!(tree.retired_source(id).is_some());
+        let mut copy = tree.clone_for_serialization();
+        assert!(copy.retired_source(id).is_none());
+        copy.get_instance_mut(id)
+            .unwrap()
+            .set_class_name("ModuleScript");
+        copy.remove(id);
+        assert!(copy.retired_source(id).is_none());
+        assert!(tree.retired_source(id).is_some());
+    }
+
+    #[test]
+    fn mapping_clone_preserves_recovery_bounds_and_pending_source() {
+        let mut metadata =
+            InstanceMetadata::new().relevant_paths(vec![PathBuf::from("src/Before.luau")]);
+        metadata.source_transform = Some(crate::snapshot::SourceTransform {
+            original: "return require(\"@owned/Target\")".into(),
+            emitted: "return require(\"@game/Target\")".into(),
+        });
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root").children(vec![
+            InstanceSnapshot::new()
+                .name("Retired")
+                .class_name("ModuleScript")
+                .metadata(metadata.clone())
+                .properties(UstrMap::from_iter([(
+                    ustr("Source"),
+                    Variant::String("return require(\"@game/Target\")".into()),
+                )])),
+            InstanceSnapshot::new()
+                .name("Pending")
+                .class_name("ModuleScript")
+                .metadata(metadata.clone())
+                .properties(UstrMap::from_iter([(
+                    ustr("Source"),
+                    Variant::String("return require(\"@game/Target\")".into()),
+                )])),
+        ]));
+        tree.retired_source_limits(1, 4096, std::time::Duration::from_secs(3600));
+        let retired = tree.root().children()[0];
+        let pending = tree.root().children()[1];
+        tree.remove(retired);
+        let mut moved_metadata = metadata.clone();
+        moved_metadata.relevant_paths = vec![PathBuf::from("src/After.luau")];
+        tree.update_metadata(pending, moved_metadata);
+        assert!(tree.pending_source.is_some());
+
+        let mut candidate = tree.clone_for_mapping();
+        let retained = candidate.retired_source(retired).unwrap();
+        assert_eq!(
+            retained.canonical_source,
+            "return require(\"@game/Target\")"
+        );
+        assert_eq!(retained.source_path, PathBuf::from("src/Before.luau"));
+        assert_eq!(retained.source_transform, metadata.source_transform);
+        let mut reused = candidate.clone_for_mapping();
+        reused.insert_instance_with_referents(
+            reused.get_root_id(),
+            InstanceSnapshot::new().name("Replacement"),
+            &SnapshotReferents {
+                id: Some(retired),
+                children: Vec::new(),
+            },
+            &mut Vec::new(),
+        );
+        assert!(reused.retired_source(retired).is_none());
+        assert!(candidate.retired_source(retired).is_some());
+        candidate
+            .get_instance_mut(pending)
+            .unwrap()
+            .set_class_name("Folder");
+        let captured = candidate.retired_source(pending).unwrap();
+        assert_eq!(
+            captured.canonical_source,
+            "return require(\"@game/Target\")"
+        );
+        assert_eq!(captured.source_path, PathBuf::from("src/Before.luau"));
+        assert_eq!(captured.source_transform, metadata.source_transform);
+        // The cloned one-entry budget evicts only the candidate's older descriptor.
+        assert!(candidate.retired_source(retired).is_none());
+        assert!(tree.retired_source(retired).is_some());
+        assert!(tree.retired_source(pending).is_none());
+        assert!(tree.pending_source.is_some());
+        assert_eq!(
+            tree.get_instance(pending).unwrap().class_name(),
+            ustr("ModuleScript")
+        );
+
+        candidate.retired_source_limits(1, 4096, std::time::Duration::ZERO);
+        assert!(candidate.retired_source(pending).is_none());
+        assert!(candidate
+            .clone_for_mapping()
+            .retired_source(pending)
+            .is_none());
+        assert!(tree.retired_source(retired).is_some());
+
+        let mut detached = tree.clone_for_serialization().clone_for_mapping();
+        assert!(!detached.track_retired_sources);
+        assert!(detached.pending_source.is_none());
+        detached.remove(pending);
+        assert!(detached.retired_source(retired).is_none());
+        assert!(detached.retired_source(pending).is_none());
+    }
 
     #[test]
     fn installed_watch_aliases_follow_metadata_updates_and_removal() {

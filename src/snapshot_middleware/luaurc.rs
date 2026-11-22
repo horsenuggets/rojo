@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::Context as _;
@@ -12,6 +13,9 @@ use full_moon::{
 };
 use memofs::Vfs;
 use serde::Deserialize;
+
+const REQUIRE_CALL_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const REQUIRE_CALL_CACHE_ENTRIES: usize = 16384;
 
 /// Parsed `.luaurc` file content.
 #[derive(Debug, Deserialize)]
@@ -589,18 +593,14 @@ fn find_require_replacements_with_mappings(
     mappings: PathMappings,
     is_init: bool,
 ) -> anyhow::Result<Vec<Replacement>> {
-    let ast = full_moon::parse(source)
-        .map_err(|e| anyhow::anyhow!("failed to parse Luau source: {e:?}"))?;
-
+    let calls = parse_require_calls(source)?;
     let mut replacements = Vec::new();
-
-    visit_block(ast.nodes(), &mut |range, content| {
+    for (range, content) in calls.iter() {
         if !content.starts_with('@') {
-            return;
+            continue;
         }
-
         if let Some(replacement) = resolve_alias_require(
-            (&content, range),
+            (content, range.clone()),
             script_dir,
             aliases,
             luaurc_dir,
@@ -609,9 +609,86 @@ fn find_require_replacements_with_mappings(
         ) {
             replacements.push(replacement);
         }
-    });
-
+    }
     Ok(replacements)
+}
+
+type RequireCalls = Arc<[(Range<usize>, String)]>;
+
+struct RequireCallCache {
+    entries: HashMap<Arc<str>, RequireCalls>,
+    order: VecDeque<Arc<str>>,
+    bytes: usize,
+    max_bytes: usize,
+    max_entries: usize,
+}
+
+impl RequireCallCache {
+    fn new(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            max_bytes,
+            max_entries,
+        }
+    }
+
+    fn weight(source: &str, calls: &RequireCalls) -> usize {
+        source.len()
+            + calls
+                .iter()
+                .map(|(_, content)| std::mem::size_of::<(Range<usize>, String)>() + content.len())
+                .sum::<usize>()
+    }
+
+    fn get(&self, source: &str) -> Option<RequireCalls> {
+        self.entries.get(source).cloned()
+    }
+
+    fn insert(&mut self, source: &str, calls: RequireCalls) -> RequireCalls {
+        if let Some(cached) = self.get(source) {
+            return cached;
+        }
+        let weight = Self::weight(source, &calls);
+        if weight > self.max_bytes || self.max_entries == 0 {
+            return calls;
+        }
+        while self.bytes + weight > self.max_bytes || self.entries.len() >= self.max_entries {
+            let oldest = self.order.pop_front().unwrap();
+            let removed = self.entries.remove(&oldest).unwrap();
+            self.bytes -= Self::weight(&oldest, &removed);
+        }
+        let key: Arc<str> = source.into();
+        self.bytes += weight;
+        self.order.push_back(key.clone());
+        self.entries.insert(key, calls.clone());
+        calls
+    }
+}
+
+fn parse_require_calls(source: &str) -> anyhow::Result<RequireCalls> {
+    // Only syntax is reusable. Alias files, package ownership, and mappings are
+    // still read and resolved on every call, including after structural changes.
+    static CACHE: OnceLock<Mutex<RequireCallCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        Mutex::new(RequireCallCache::new(
+            REQUIRE_CALL_CACHE_BYTES,
+            REQUIRE_CALL_CACHE_ENTRIES,
+        ))
+    });
+    if let Some(calls) = cache.lock().unwrap().get(source) {
+        return Ok(calls);
+    }
+    // Parsing outside the lock lets independent startup workers proceed together.
+    // Exact source bytes are the key; neither failed parses nor resolved paths live here.
+    let ast = full_moon::parse(source)
+        .map_err(|e| anyhow::anyhow!("failed to parse Luau source: {e:?}"))?;
+    let mut calls = Vec::new();
+    visit_block(ast.nodes(), &mut |range, content| {
+        calls.push((range, content));
+    });
+    Ok(cache.lock().unwrap().insert(source, calls.into()))
 }
 
 /// Visit a block, looking for require() calls with string arguments.
@@ -928,6 +1005,67 @@ fn resolve_alias_require(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn unchanged_require_syntax_reuses_extraction_without_reusing_resolution() {
+        let source = "-- Syntax reuse regression.\nreturn require('@shared/Value')";
+        let first = parse_require_calls(source).unwrap();
+        let second = parse_require_calls(source).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1, "@shared/Value");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let resolve = |target: &str| {
+            find_require_replacements(
+                source,
+                Path::new("/project/Scripts"),
+                &[("shared".to_owned(), target.to_owned())].into(),
+                Path::new("/project"),
+                &[],
+                Path::new("/project"),
+                false,
+            )
+            .unwrap()
+            .remove(0)
+            .new_text
+        };
+        assert_ne!(resolve("./First"), resolve("./Second"));
+    }
+
+    #[test]
+    fn require_syntax_reuse_never_accepts_changed_or_invalid_source() {
+        let first = parse_require_calls("return require('@one/Value')").unwrap();
+        let second = parse_require_calls("return require('@two/Value')").unwrap();
+        assert_ne!(first, second);
+        for _ in 0..2 {
+            assert!(parse_require_calls("return require('@one/Value'").is_err());
+        }
+    }
+
+    #[test]
+    fn require_syntax_cache_obeys_byte_and_entry_bounds() {
+        let calls: RequireCalls = vec![(0..4, "@shared/Value".to_owned())].into();
+        let entry_bytes = RequireCallCache::weight("first", &calls);
+        for (max_bytes, max_entries) in [(entry_bytes, 10), (usize::MAX, 1)] {
+            let mut cache = RequireCallCache::new(max_bytes, max_entries);
+            cache.insert("first", calls.clone());
+            assert_eq!(cache.get("first").as_deref(), Some(calls.as_ref()));
+            let retained = cache.bytes;
+            cache.insert("first", calls.clone());
+            assert_eq!(cache.bytes, retained);
+            cache.insert("other", calls.clone());
+            assert!(cache.get("first").is_none());
+            assert_eq!(cache.get("other").as_deref(), Some(calls.as_ref()));
+            assert!(cache.bytes <= max_bytes);
+            assert!(cache.entries.len() <= max_entries);
+        }
+        for (max_bytes, max_entries) in [(0, 10), (usize::MAX, 0)] {
+            let mut cache = RequireCallCache::new(max_bytes, max_entries);
+            assert_eq!(cache.insert("first", calls.clone()), calls);
+            assert!(cache.get("first").is_none());
+            assert_eq!(cache.bytes, 0);
+        }
+    }
 
     #[test]
     fn indexed_mapping_lookup_matches_linear_first_match_semantics() {

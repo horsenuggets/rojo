@@ -3,6 +3,8 @@ local RunService = game:GetService("RunService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local SerializationService = game:GetService("SerializationService")
 local Selection = game:GetService("Selection")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local HttpService = game:GetService("HttpService")
 
 local Packages = script.Parent.Parent.Packages
 local Log = require(Packages.Log)
@@ -22,9 +24,11 @@ local ReconcilerServices = require(script.Parent.Reconciler.services)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
 local StudioExport = require(script.Parent.StudioExport)
+local SourceHistory = require(script.Parent.SourceHistory)
 local orderSwaps = require(script.Parent.orderSwaps)
 local yieldBudget = require(script.Parent.yieldBudget)
 
+local STRUCTURAL_FIELDS = { Name = "changedName", Parent = "changedParent" }
 local Status = strict("Session.Status", {
 	NotStarted = "NotStarted",
 	Connecting = "Connecting",
@@ -54,7 +58,10 @@ local function debugPatch(object)
 	end)
 end
 
-local function attemptReparent(instance, parent)
+local function attemptReparent(instanceMap, instance, parent)
+	if instanceMap.fromInstances[instance] ~= nil then
+		return instanceMap:applyStructuralProperty(instance, "Parent", parent)
+	end
 	return pcall(function()
 		instance.Parent = parent
 	end)
@@ -140,8 +147,8 @@ function ServeSession.new(options)
 
 	-- Declare self ahead of time to capture it in a closure
 	local self
-	local function onInstanceChanged(instance, propertyName)
-		self:__onInstanceChanged(instance, propertyName)
+	local function onInstanceChanged(instance, propertyName, observation)
+		self:__onInstanceChanged(instance, propertyName, observation)
 	end
 
 	local function onChildAdded(child)
@@ -153,15 +160,24 @@ function ServeSession.new(options)
 	local function onBatchTaken(changes)
 		local cursor = self.__pendingWriteCursor
 		self.__pendingWriteCursor = nil
-		return { cursor = cursor, properties = self:__takeLocalPropertyEdits(changes) }
+		local dependencies = self.__pendingWriteDependencies or {}
+		self.__pendingWriteDependencies = nil
+		-- Install before encoding can yield. Edits during preparation depend on this
+		-- placeholder, not on whichever HTTP response happens to arrive next.
+		local ticket = self:__newWriteTicket(dependencies)
+		return { cursor = cursor, properties = self:__takeLocalPropertyEdits(changes), ticket = ticket }
 	end
 
 	local function onBatchPrepared(patch, context)
+		if patch == nil or PatchSet.isEmpty(patch) or self.__status == Status.Disconnected then
+			self:__resolveWriteTicket(context.ticket)
+			self:__completeWriteTicket(context.ticket)
+		end
 		self:__finishOmittedLocalProperties(patch, context.properties)
 	end
 
 	local function onChangesFlushed(patch, context)
-		return self:__writePatch(patch, context.cursor, context.properties)
+		return self:__writePatch(patch, context.cursor, context.properties, context.ticket)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged, onChildAdded)
@@ -195,12 +211,36 @@ function ServeSession.new(options)
 		__syncResults = {},
 		__syncResultCallback = nil,
 		__localPropertyEdits = {},
+		__sourceRevisions = {},
+		__sourceDrafts = {},
+		__sourcePublicationCursors = setmetatable({}, { __mode = "k" }),
+		__structuralPublicationCursors = setmetatable({}, { __mode = "k" }),
+		__sourceBaselines = setmetatable({}, { __mode = "k" }),
+		__sourcePendingCounts = setmetatable({}, { __mode = "k" }),
+		__writeTickets = {},
+		__remoteSources = {},
+		__sourceApplyBatches = setmetatable({}, { __mode = "k" }),
+		__sourceHistory = SourceHistory.new({
+			Clock = os.clock,
+			Horizon = 10,
+			MaxBytes = 8 * 1024 * 1024,
+			MaxEntries = 512,
+		}),
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
 	}
 
 	setmetatable(self, ServeSession)
+	instanceMap.onSourceScheduled = function(instance, operation)
+		self:__onSourceScheduled(instance, operation)
+	end
+	instanceMap.onSourceOutcome = function(instance, operation)
+		self:__onSourceOutcome(instance, operation)
+	end
+	instanceMap.onBeforeStructuralAssignment = function(instance, propertyName, value)
+		self:__beforeStructuralAssignment(instance, propertyName, value)
+	end
 
 	return self
 end
@@ -226,8 +266,225 @@ end
 	half-built instance map, where a move into a folder not reached yet looks
 	like a move to an unmanaged parent and gets undone. They are held instead.
 ]]
-function ServeSession:__onInstanceChanged(instance, propertyName)
+function ServeSession:__onSourceScheduled(instance, operation)
+	if self.__status == Status.Disconnected then
+		return
+	end
+	local id = self.__instanceMap.fromInstances[instance]
+	if id == nil then
+		return
+	end
+	if self.__remoteSources[operation] ~= nil then
+		return
+	end
+	self.__sourcePendingCounts[instance] = (self.__sourcePendingCounts[instance] or 0) + 1
+	local properties = self.__localPropertyEdits and self.__localPropertyEdits[id]
+	local pending = {
+		Id = id,
+		Instance = instance,
+		BeforeDraft = self.__sourceDrafts[id],
+		BeforeEntry = properties and properties.Source,
+		BeforeRevision = self:__sourceRevision(id, instance),
+		Operation = operation,
+	}
+	pending.Promise = Promise.new(function(resolve)
+		pending.Resolve = resolve
+	end)
+	self.__remoteSources[operation] = pending
+	local batch = self.__sourceApplyBatches[coroutine.running()]
+	if batch ~= nil then
+		pending.PublicationCursor = batch.Cursors and batch.Cursors[id]
+		pending.InBatch = true
+		table.insert(batch, pending)
+	end
+end
+
+function ServeSession:__resolveSourceBaseline(token, cursor)
+	if token.Resolve == nil then
+		return
+	end
+	local previous = token.Previous
+	local resolved = if cursor ~= nil
+		then Promise.resolve(cursor)
+		elseif previous ~= nil then previous.Promise or Promise.resolve(previous.Cursor)
+		else Promise.resolve()
+	resolved:andThen(function(value)
+		if token.Resolve == nil then
+			return
+		end
+		token.Cursor = value
+		if cursor == nil then
+			token.Revision = previous and previous.Revision
+		end
+		local resolve = token.Resolve
+		token.Previous, token.Resolve, token.Promise = nil, nil, nil
+		resolve(value)
+	end)
+end
+
+function ServeSession:__onSourceOutcome(instance, operation)
+	local pending = self.__remoteSources[operation]
+	if pending == nil then
+		return
+	end
+	self.__remoteSources[operation] = nil
+	local remaining = self.__sourcePendingCounts[instance] - 1
+	self.__sourcePendingCounts[instance] = if remaining > 0 then remaining else nil
+	local id = pending.Id
+	if self.__status ~= Status.Disconnected and self.__instanceMap.fromIds[id] == instance then
+		local properties = self.__localPropertyEdits and self.__localPropertyEdits[id]
+		local observed = pending.Observation
+		local visible, current = pcall(self.__readEditorSource, self, instance)
+		local committedObservation = operation.Status == "committed"
+			and observed ~= nil
+			and observed.Revision == operation.CommittedRevision
+		local confirmedObservation = committedObservation and visible and current == operation.Value
+		if pending.BaselineToken ~= nil then
+			self:__resolveSourceBaseline(
+				pending.BaselineToken,
+				if committedObservation then pending.PublicationCursor else nil
+			)
+		elseif
+			operation.Status == "committed"
+			and (operation.NoChange or observed == nil)
+			and pending.PublicationCursor ~= nil
+			and self:__sourceRevision(id, instance) == pending.BeforeRevision
+			and visible
+			and current == operation.Value
+		then
+			self.__sourceBaselines[instance] = { Cursor = pending.PublicationCursor, Revision = pending.BeforeRevision }
+		end
+		if confirmedObservation then
+			if properties and properties.Source == pending.ObservedEntry then
+				properties.Source = nil
+				if next(properties) == nil then
+					self.__localPropertyEdits[id] = nil
+				end
+			end
+			if self.__sourceDrafts[id] == pending.ObservedDraft then
+				self.__sourceDrafts[id] = nil
+			end
+		elseif operation.Status == "committed" and self:__sourceRevision(id, instance) == pending.BeforeRevision then
+			local draft = pending.BeforeDraft
+			local secured = draft == nil
+				or draft.Source == operation.Value
+				or draft.CheckpointSource == operation.Expected
+			local read, value = pcall(self.__readEditorSource, self, instance)
+			if secured and read and value == operation.Value and self.__sourceDrafts[id] == draft then
+				self.__sourceDrafts[id] = nil
+			end
+		elseif pending.ObservedEntry ~= nil then
+			-- A proposal that the engine retried or rejected never owns the observed edit.
+			self:__queueObservedSource(instance, pending.ObservedEntry)
+		end
+	end
+	if pending.BaselineToken ~= nil then
+		self:__resolveSourceBaseline(pending.BaselineToken)
+	end
+	local resolve = pending.Resolve
+	pending.Resolve = nil
+	resolve(operation)
+end
+
+function ServeSession:__awaitSourceOperations(operations)
+	if #operations == 0 then
+		return nil
+	end
+	local promises = {}
+	for _, pending in ipairs(operations) do
+		table.insert(
+			promises,
+			pending.Promise:andThen(function(operation)
+				if operation.Status == "committed" or operation.Status == "superseded" then
+					return
+				end
+				if self.__status == Status.Disconnected then
+					return Promise.reject("Source application was cancelled with its session.")
+				end
+				local instance = self.__instanceMap.fromIds[pending.Id]
+				if
+					instance == pending.Instance
+					and self.__sourceHistory:classify(
+							pending.Id,
+							operation.ServerOperation,
+							instance,
+							self:__sourceRevision(pending.Id, instance)
+						)
+						== "Echo"
+				then
+					return
+				end
+				return Promise.reject(
+					if operation.Status == "failed"
+						then "The editor failed to apply authoritative Source. Your draft was retained."
+						else "The editor changed while authoritative Source was being applied. Your newer draft was retained; reconnect to resolve the conflict."
+				)
+			end)
+		)
+	end
+	return Promise.all(promises)
+end
+
+function ServeSession:__queueObservedSource(instance, entry)
+	local id = self.__instanceMap.fromInstances[instance]
+	local properties = id and self.__localPropertyEdits and self.__localPropertyEdits[id]
+	if properties == nil or properties.Source ~= entry or entry.queued then
+		return
+	end
+	if self.__deferredChanges ~= nil then
+		if not entry.deferred then
+			entry.deferred = true
+			table.insert(self.__deferredChanges, { instance = instance, propertyName = "Source", sourceEntry = entry })
+		end
+		return
+	end
+	if self.__changeBatcher:isEmpty() then
+		self.__pendingWriteCursor = entry.baselineCursor
+	elseif self.__pendingWriteCursor ~= nil then
+		self.__pendingWriteCursor = math.min(self.__pendingWriteCursor, entry.baselineCursor)
+	end
+	entry.queued = true
+	self:__captureWriteDependency(entry.predecessor)
+	self.__changeBatcher:add(instance, "Source")
+end
+
+function ServeSession:__onInstanceChanged(instance, propertyName, observation)
 	if not self.__twoWaySync then
+		return
+	end
+	if propertyName == "Source" and observation ~= nil then
+		local _, generation = self.__instanceMap:getSourceRevision(instance)
+		if generation ~= observation.Generation then
+			return
+		end
+		if observation.Error ~= nil then
+			self:__stopInternal("The current editor Source could not be read safely.")
+			return
+		end
+		self:__rememberLocalProperty(instance, "Source", observation)
+		local id = self.__instanceMap.fromInstances[instance]
+		local entry = self.__localPropertyEdits[id].Source
+		local remote = observation.Operation and self.__remoteSources[observation.Operation]
+		if remote ~= nil then
+			remote.Observation = observation
+			remote.ObservedEntry = entry
+			remote.ObservedDraft = self.__sourceDrafts[id]
+			-- Notification is provisional. A genuine edit before the engine returns
+			-- captures this token and waits for its exact committed observation.
+			if remote.PublicationCursor ~= nil then
+				if remote.BaselineToken ~= nil then
+					self:__resolveSourceBaseline(remote.BaselineToken)
+				end
+				local token = { Previous = self.__sourceBaselines[instance], Revision = entry.revision }
+				token.Promise = Promise.new(function(resolve)
+					token.Resolve = resolve
+				end)
+				remote.BaselineToken = token
+				self.__sourceBaselines[instance] = token
+			end
+		else
+			self:__queueObservedSource(instance, entry)
+		end
 		return
 	end
 
@@ -270,6 +527,9 @@ function ServeSession:__releaseDeferredChanges()
 		if change.child ~= nil then
 			self:__markBatchStart()
 			self.__changeBatcher:addChild(change.child)
+		elseif change.sourceEntry ~= nil then
+			change.sourceEntry.deferred = nil
+			self:__queueObservedSource(change.instance, change.sourceEntry)
 		else
 			self:__queueChange(change.instance, change.propertyName)
 		end
@@ -279,6 +539,7 @@ end
 -- Retain the revision preceding the first local change, even if a websocket
 -- update arrives before this batch is sent.
 function ServeSession:__markBatchStart()
+	self:__captureWriteDependency(self.__writeHead)
 	if self.__changeBatcher:isEmpty() then
 		self.__pendingWriteCursor = self.__apiContext:getMessageCursor()
 	end
@@ -419,23 +680,124 @@ function ServeSession:__keepUndoneDeletions(patch)
 	end
 end
 
-function ServeSession:__rememberLocalProperty(instance, propertyName)
+function ServeSession:__readEditorSource(instance)
+	return ScriptEditorService:GetEditorSource(instance)
+end
+
+function ServeSession:__updateEditorSource(instance, callback)
+	return ScriptEditorService:UpdateSourceAsync(instance, callback)
+end
+
+function ServeSession:__hasOpenScriptDocument(instance)
+	return ScriptEditorService:FindScriptDocument(instance) ~= nil
+end
+
+function ServeSession:__rememberSourcePublication(patch, cursor)
+	for _, update in patch.updated do
+		local instance = self.__instanceMap.fromIds[update.id]
+		if instance ~= nil and update.changedProperties and update.changedProperties.Source ~= nil then
+			local previous = self.__sourcePublicationCursors[instance]
+			if previous == nil or previous < cursor then
+				self.__sourcePublicationCursors[instance] = cursor
+			end
+		end
+	end
+end
+
+function ServeSession:__sourceRevision(id, instance)
+	local revision = self.__sourceRevisions[id]
+	return if revision and revision.Instance == instance then revision.Revision else 0
+end
+
+function ServeSession:__filterSourceEchoes(patch)
+	if patch.sourceOperations == nil and patch.sourceReplays == nil then
+		return patch
+	end
+	local filtered = table.clone(patch)
+	filtered.updated = {}
+	for _, update in patch.updated do
+		local instance = self.__instanceMap.fromIds[update.id]
+		local properties = update.changedProperties
+		local operation = patch.sourceOperations and patch.sourceOperations[update.id]
+		local replay = patch.sourceReplays and patch.sourceReplays[update.id]
+		local latest = instance and self.__sourcePublicationCursors[instance]
+		local supersededReplay = replay ~= nil
+			and (replay.Instance ~= instance or (replay.Cursor ~= nil and latest ~= nil and replay.Cursor < latest))
+		if
+			properties ~= nil
+			and properties.Source ~= nil
+			and (
+				supersededReplay
+				or (
+					instance ~= nil
+					and self.__sourceHistory:classify(
+							update.id,
+							operation,
+							instance,
+							self:__sourceRevision(update.id, instance)
+						)
+						== "Echo"
+				)
+			)
+		then
+			local kept = table.clone(update)
+			kept.changedProperties = table.clone(properties)
+			kept.changedProperties.Source = nil
+			kept.sourceSuppressed = true
+			table.insert(filtered.updated, kept)
+		else
+			table.insert(filtered.updated, update)
+		end
+	end
+	return filtered
+end
+
+local function localPropertyName(instance, propertyName)
+	-- Structure has literal patch fields, not writable scalar Ref descriptors.
+	if STRUCTURAL_FIELDS[propertyName] ~= nil then
+		return propertyName
+	end
+	local descriptor = getWritablePropertyDescriptor(instance.ClassName, propertyName)
+	return if descriptor ~= nil and descriptor.dataType ~= "Ref" then descriptor.name else nil
+end
+
+function ServeSession:__rememberLocalProperty(instance, propertyName, observation)
 	local instanceMap = self.__instanceMap
 	local id = instanceMap and instanceMap.fromInstances[instance]
-	if id == nil or instance:IsA("DataModel") or propertyName == "Name" or propertyName == "Parent" then
+	if id == nil or instance:IsA("DataModel") then
 		return
 	end
-	-- Source, Value, and Contents can be file payloads. Buffer their echoes until the
-	-- server decides authority, including any rejected-write restoration.
-	local descriptor = getWritablePropertyDescriptor(instance.ClassName, propertyName)
-	if descriptor == nil or descriptor.dataType == "Ref" then
+	-- Buffer local generations until the server decides authority, including any
+	-- rejected-write restoration. Buffering does not prove a publication is our own.
+	local name = localPropertyName(instance, propertyName)
+	if name == nil then
 		return
 	end
 	self.__localPropertyEdits = self.__localPropertyEdits or {}
 	local properties = self.__localPropertyEdits[id] or {}
 	self.__localPropertyEdits[id] = properties
 	-- Each entry is a generation token. A previous request cannot release a later edit.
-	properties[descriptor.name] = {}
+	local entry = { instance = instance, predecessor = self.__writeHead }
+	local previous = properties[name]
+	if STRUCTURAL_FIELDS[name] ~= nil and previous ~= nil and previous.instance == instance then
+		-- Keep the last received server value, never the older generation's coverage.
+		-- A refusal need not publish the same authoritative field a second time.
+		entry.serverValue = previous.serverValue
+		entry.serverCursor = previous.serverCursor
+	end
+	if name == "Source" then
+		local revision = self:__sourceRevision(id, instance) + 1
+		self.__sourceRevisions[id] = { Instance = instance, Revision = revision }
+		entry.revision = revision
+		entry.baselineCursor = self.__apiContext:getMessageCursor()
+		entry.sourceBaseline = self.__sourceBaselines[instance]
+		self.__sourceDrafts[id] = {
+			Instance = instance,
+			Revision = revision,
+			Source = if observation then observation.Value else self:__readEditorSource(instance),
+		}
+	end
+	properties[name] = entry
 end
 
 function ServeSession:__takeLocalPropertyEdits(changes)
@@ -446,9 +808,9 @@ function ServeSession:__takeLocalPropertyEdits(changes)
 		if properties ~= nil then
 			local entries = {}
 			for propertyName in changed do
-				local descriptor = getWritablePropertyDescriptor(instance.ClassName, propertyName)
-				if descriptor ~= nil then
-					entries[descriptor.name] = properties[descriptor.name]
+				local name = localPropertyName(instance, propertyName)
+				if name ~= nil then
+					entries[name] = properties[name]
 				end
 			end
 			taken[id] = entries
@@ -459,29 +821,291 @@ end
 
 function ServeSession:__finishOmittedLocalProperties(patch, taken)
 	local emitted = {}
+	local removed = {}
 	if patch ~= nil then
+		for _, id in patch.removed do
+			removed[id] = true
+		end
 		for _, update in patch.updated do
-			emitted[update.id] = update.changedProperties
+			local properties = emitted[update.id] or {}
+			emitted[update.id] = properties
+			for propertyName in update.changedProperties or {} do
+				properties[propertyName] = true
+			end
+			for propertyName, field in STRUCTURAL_FIELDS do
+				if update[field] ~= nil then
+					properties[propertyName] = true
+				end
+			end
 		end
 	end
 	local omitted = {}
 	for id, entries in taken do
 		local properties = emitted[id]
 		for propertyName, entry in entries do
-			if properties == nil or properties[propertyName] == nil then
+			if removed[id] and STRUCTURAL_FIELDS[propertyName] ~= nil then
+				-- Nil Parent is encoded as removal. Its deletion lifecycle now owns
+				-- authority; replaying a buffered parent here would undo the deletion.
+				local current = self.__localPropertyEdits and self.__localPropertyEdits[id]
+				if current and current[propertyName] == entry then
+					current[propertyName] = nil
+					if next(current) == nil then
+						self.__localPropertyEdits[id] = nil
+					end
+				end
+			elseif properties == nil or properties[propertyName] == nil then
 				omitted[id] = omitted[id] or {}
 				omitted[id][propertyName] = entry
+			elseif STRUCTURAL_FIELDS[propertyName] ~= nil then
+				entry.encoded = true
 			end
 		end
 	end
 	self:__finishLocalProperties(omitted, nil)
 end
 
+function ServeSession:__rememberStructuralPublication(patch, cursor)
+	self.__structuralPublicationCursors = self.__structuralPublicationCursors or setmetatable({}, { __mode = "k" })
+	for _, update in patch.updated do
+		local instance = self.__instanceMap.fromIds[update.id]
+		if instance ~= nil then
+			local cursors = self.__structuralPublicationCursors[instance] or {}
+			for propertyName, field in STRUCTURAL_FIELDS do
+				if update[field] ~= nil and (cursors[propertyName] == nil or cursors[propertyName] < cursor) then
+					cursors[propertyName] = cursor
+				end
+			end
+			if next(cursors) ~= nil then
+				self.__structuralPublicationCursors[instance] = cursors
+			end
+		end
+	end
+end
+
+function ServeSession:__filterStructuralReplays(patch)
+	if patch.structuralReplays == nil then
+		return patch
+	end
+	local filtered = table.clone(patch)
+	filtered.updated = {}
+	for _, update in patch.updated do
+		local kept = table.clone(update)
+		local replays = patch.structuralReplays[update.id] or {}
+		local instance = self.__instanceMap.fromIds[update.id]
+		local cursors = instance
+			and self.__structuralPublicationCursors
+			and self.__structuralPublicationCursors[instance]
+		for propertyName, replay in replays do
+			local latest = cursors and cursors[propertyName]
+			-- These are internal replay receipts, not own-publication proof. Check at
+			-- execution too, since Source recovery and hooks can delay the replay.
+			if replay.Instance ~= instance or (latest ~= nil and replay.Cursor ~= nil and latest > replay.Cursor) then
+				kept[STRUCTURAL_FIELDS[propertyName]] = nil
+			end
+		end
+		table.insert(filtered.updated, kept)
+	end
+	return filtered
+end
+
+function ServeSession:__pruneStructuralGuards()
+	for id, properties in self.__localPropertyEdits or {} do
+		for propertyName in STRUCTURAL_FIELDS do
+			local entry = properties[propertyName]
+			if entry ~= nil and self.__instanceMap.fromIds[id] ~= entry.instance then
+				properties[propertyName] = nil
+			end
+		end
+		if next(properties) == nil then
+			self.__localPropertyEdits[id] = nil
+		end
+	end
+end
+
+function ServeSession:__prepareStructuralParents(patch)
+	local hasPendingParent = false
+	for _, properties in self.__localPropertyEdits do
+		if properties.Parent ~= nil then
+			hasPendingParent = true
+			break
+		end
+	end
+	if not hasPendingParent then
+		return patch
+	end
+	local instanceMap = self.__instanceMap
+	local planned = {}
+	local incomingParents = {}
+	local retired = {}
+	local updates = {}
+	for _, update in patch.updated do
+		local instance = instanceMap.fromIds[update.id]
+		if instance ~= nil and update.changedParent ~= nil then
+			incomingParents[instance] = instanceMap.fromIds[update.changedParent]
+		end
+	end
+	local function wouldCycle(target, parent)
+		local visited = {}
+		while parent ~= nil do
+			if parent == target or visited[parent] then
+				return true
+			end
+			visited[parent] = true
+			parent = planned[parent] or parent.Parent
+		end
+		return false
+	end
+	for _, update in patch.updated do
+		local target = instanceMap.fromIds[update.id]
+		local parent = instanceMap.fromIds[update.changedParent]
+		local properties = self.__localPropertyEdits[update.id]
+		local pending = properties and properties.Parent
+		if target ~= nil and parent ~= nil and (pending == nil or retired[pending]) then
+			while wouldCycle(target, parent) do
+				local ancestor = parent
+				local correction
+				while ancestor ~= nil and ancestor ~= target do
+					local id = instanceMap.fromInstances[ancestor]
+					local entries = self.__localPropertyEdits[id]
+					local entry = entries and entries.Parent
+					local confirmed = incomingParents[ancestor]
+						or (
+							if entry and entry.serverValue ~= nil
+								then instanceMap.fromIds[entry.serverValue]
+								else instanceMap.knownParents[ancestor]
+						)
+					if
+						entry ~= nil
+						and entry.encoded
+						and not retired[entry]
+						and confirmed ~= nil
+						and instanceMap.fromInstances[confirmed] ~= nil
+						and confirmed ~= (planned[ancestor] or ancestor.Parent)
+						and not wouldCycle(ancestor, confirmed)
+					then
+						-- The encoded request still carries the original intent for server
+						-- validation. Restore confirmed ancestry before applying its reverse
+						-- edge, never silently change a batch that has yet to encode.
+						correction =
+							{ id = id, changedParent = instanceMap.fromInstances[confirmed], changedProperties = {} }
+						planned[ancestor] = confirmed
+						retired[entry] = id
+						break
+					end
+					ancestor = planned[ancestor] or ancestor.Parent
+				end
+				if correction == nil then
+					error("The structural publication cannot be applied without a cycle. Local intent was retained.", 0)
+				end
+				table.insert(updates, correction)
+			end
+			planned[target] = parent
+		end
+		table.insert(updates, update)
+	end
+	if next(retired) == nil then
+		return patch
+	end
+	for entry, id in retired do
+		local properties = self.__localPropertyEdits[id]
+		if properties and properties.Parent == entry then
+			properties.Parent = nil
+			if next(properties) == nil then
+				self.__localPropertyEdits[id] = nil
+			end
+		end
+	end
+	local prepared = table.clone(patch)
+	prepared.updated = updates
+	return prepared
+end
+
+function ServeSession:__captureStructuralChanges(patch)
+	local instanceMap = self.__instanceMap
+	local instances = {}
+	for id, properties in self.__localPropertyEdits or {} do
+		if properties.Name ~= nil or properties.Parent ~= nil then
+			local instance = instanceMap.fromIds[id]
+			if instance ~= nil then
+				instances[instance] = true
+			end
+		end
+	end
+	if patch ~= nil then
+		for _, update in patch.updated do
+			if update.changedName ~= nil or update.changedParent ~= nil or update.changedClassName ~= nil then
+				local instance = instanceMap.fromIds[update.id]
+				if instance ~= nil then
+					instances[instance] = true
+				end
+			end
+			if update.changedParent ~= nil then
+				local ancestor = instanceMap.fromIds[update.changedParent]
+				local visited = {}
+				while ancestor ~= nil and not visited[ancestor] do
+					visited[ancestor] = true
+					instances[ancestor] = true
+					ancestor = ancestor.Parent
+				end
+			end
+		end
+		for _, id in patch.removed do
+			local instance = if typeof(id) == "Instance" then id else instanceMap.fromIds[id]
+			if instance ~= nil then
+				instances[instance] = true
+			end
+		end
+		for id in patch.added do
+			local instance = instanceMap.fromIds[id]
+			if instance ~= nil then
+				instances[instance] = true
+			end
+		end
+	end
+	for instance in instances do
+		instanceMap:captureStructuralChanges(instance)
+	end
+end
+
+function ServeSession:__beforeStructuralAssignment(instance, propertyName, value)
+	if not self.__twoWaySync then
+		return
+	end
+	local instanceMap = self.__instanceMap
+	local observed = if propertyName == "Parent" then instanceMap.observedParents else instanceMap.observedNames
+	if observed[instance] == instance[propertyName] then
+		return
+	end
+	local id = instanceMap.fromInstances[instance]
+	local signals = instanceMap.instancesToSignal[instance]
+	instanceMap:captureStructuralChanges(instance)
+	if
+		self.__status == Status.Disconnected
+		or instanceMap.fromInstances[instance] ~= id
+		or instanceMap.fromIds[id] ~= instance
+		or instanceMap.instancesToSignal[instance] ~= signals
+	then
+		error("The structural assignment outlived its tracked session. Local values were retained.", 0)
+	end
+	-- The normal filter captures before choosing guards. If a reentrant/yielding engine
+	-- boundary changes it afterwards, stop rather than erase an unencoded generation.
+	if instance[propertyName] ~= value then
+		error("A local structural edit arrived during reconciliation. Its value was retained.", 0)
+	end
+end
+
 function ServeSession:__protectLocalProperties(patch, publicationCursor)
+	self:__captureStructuralChanges(patch)
+	if self.__status == Status.Disconnected then
+		error(ServeSession.SYNC_CANCELLED, 0)
+	end
+	self:__pruneStructuralGuards()
+	patch = self:__filterStructuralReplays(self:__filterSourceEchoes(patch))
 	local edits = self.__localPropertyEdits
 	if edits == nil or next(edits) == nil then
 		return patch
 	end
+	patch = self:__prepareStructuralParents(patch)
 	local structural = {}
 	local replaced = {}
 	local removed = {}
@@ -517,9 +1141,11 @@ function ServeSession:__protectLocalProperties(patch, publicationCursor)
 			local instance = target
 			local invalidated = false
 			local discarded = replaced[id] == true
+			local removingAncestor = false
 			while instance ~= nil do
 				local ancestorId = instanceMap.fromInstances[instance]
-				invalidated = invalidated or structural[ancestorId] == true
+				invalidated = invalidated or structural[ancestorId] == true or structural[instance] == true
+				removingAncestor = removingAncestor or removed[ancestorId] == true or removed[instance] == true
 				-- Class changes retain children, and removals run after moves. Only a
 				-- remove-and-add subtree replacement destroys descendants before updates.
 				if
@@ -532,11 +1158,21 @@ function ServeSession:__protectLocalProperties(patch, publicationCursor)
 				instance = instanceMap.knownParents[instance] or instance.Parent
 			end
 			if invalidated then
-				edits[id] = nil
+				-- Surviving moves/renames do not settle another pending generation. A
+				-- removal must still permit escape moves before destroying its subtree.
+				local retained = {}
 				local restored = {}
 				for propertyName, entry in properties do
-					restored[propertyName] = entry.serverValue
+					if
+						not discarded
+						and (propertyName == "Source" or (STRUCTURAL_FIELDS[propertyName] and not removingAncestor))
+					then
+						retained[propertyName] = entry
+					elseif STRUCTURAL_FIELDS[propertyName] == nil then
+						restored[propertyName] = entry.serverValue
+					end
 				end
+				edits[id] = if next(retained) ~= nil then retained else nil
 				if not discarded and next(restored) ~= nil then
 					table.insert(filtered.updated, { id = id, changedProperties = restored })
 				end
@@ -552,16 +1188,41 @@ function ServeSession:__protectLocalProperties(patch, publicationCursor)
 		local kept = table.clone(update)
 		kept.changedProperties = table.clone(update.changedProperties or {})
 		local instance = self.__instanceMap.fromIds[update.id]
+		for propertyName, field in STRUCTURAL_FIELDS do
+			local value = kept[field]
+			local entry = properties[propertyName]
+			if value ~= nil and entry ~= nil then
+				local replays = patch.structuralReplays and patch.structuralReplays[update.id]
+				local replay = replays and replays[propertyName]
+				local cursor = if replay then replay.Cursor else publicationCursor
+				if entry.serverCursor == nil or cursor == nil or cursor >= entry.serverCursor then
+					entry.serverValue = value
+					entry.serverCursor = cursor
+				end
+				kept[field] = nil
+			end
+		end
 		for propertyName, value in kept.changedProperties do
 			local descriptor = instance and getWritablePropertyDescriptor(instance.ClassName, propertyName)
 			local entry = properties[if descriptor ~= nil then descriptor.name else propertyName]
 			if entry ~= nil then
 				entry.serverValue = value
 				entry.serverCursor = publicationCursor
+				entry.serverInstance = instance
+				entry.serverOperation = patch.sourceOperations and patch.sourceOperations[update.id]
+				if propertyName == "Source" then
+					kept.sourceSuppressed = true
+				end
 				kept.changedProperties[propertyName] = nil
 			end
 		end
-		if next(kept.changedProperties) ~= nil then
+		if
+			next(kept.changedProperties) ~= nil
+			or kept.changedMetadata ~= nil
+			or kept.changedName ~= nil
+			or kept.changedParent ~= nil
+			or kept.changedClassName ~= nil
+		then
 			table.insert(filtered.updated, kept)
 		end
 	end
@@ -569,36 +1230,58 @@ function ServeSession:__protectLocalProperties(patch, publicationCursor)
 end
 
 function ServeSession:__releaseLocalProperties(cursor)
+	self:__captureStructuralChanges()
+	self:__pruneStructuralGuards()
 	local edits = self.__localPropertyEdits
 	if edits == nil then
-		return
+		return nil
 	end
 	local patch = PatchSet.newEmpty()
+	patch.sourceOperations = {}
+	patch.sourceReplays = {}
+	patch.structuralReplays = {}
 	for id, properties in edits do
 		local released = {}
+		local update = { id = id, changedProperties = released }
 		for propertyName, entry in properties do
 			if entry.cursor ~= nil and entry.cursor <= cursor then
 				properties[propertyName] = nil
 				if not entry.preserveLocal or (entry.serverCursor ~= nil and entry.serverCursor > entry.cursor) then
-					released[propertyName] = entry.serverValue
+					local field = STRUCTURAL_FIELDS[propertyName]
+					if field ~= nil then
+						update[field] = entry.serverValue
+						patch.structuralReplays[id] = patch.structuralReplays[id] or {}
+						patch.structuralReplays[id][propertyName] =
+							{ Instance = entry.instance, Cursor = entry.serverCursor }
+					else
+						released[propertyName] = entry.serverValue
+					end
+					if propertyName == "Source" then
+						patch.sourceOperations[id] = entry.serverOperation
+						patch.sourceReplays[id] = { Instance = entry.serverInstance, Cursor = entry.serverCursor }
+					end
 				end
 			end
 		end
 		if next(properties) == nil then
 			edits[id] = nil
 		end
-		if next(released) ~= nil and self.__instanceMap.fromIds[id] ~= nil then
-			table.insert(patch.updated, { id = id, changedProperties = released })
+		if
+			(next(released) ~= nil or update.changedName ~= nil or update.changedParent ~= nil)
+			and self.__instanceMap.fromIds[id] ~= nil
+		then
+			table.insert(patch.updated, update)
 		end
 	end
 	if not PatchSet.isEmpty(patch) then
-		self:__applyPatch(patch)
+		return self:__applyPatch(patch)
 	end
+	return nil
 end
 
 function ServeSession:__finishLocalProperties(taken, result)
 	if taken == nil or next(taken) == nil or self.__localPropertyEdits == nil then
-		return
+		return nil
 	end
 	local cursor = self.__apiContext:getMessageCursor()
 	for id, entries in taken do
@@ -617,7 +1300,7 @@ function ServeSession:__finishLocalProperties(taken, result)
 			end
 		end
 	end
-	self:__releaseLocalProperties(cursor)
+	return self:__releaseLocalProperties(cursor)
 end
 
 function ServeSession:__queueChange(instance, propertyName)
@@ -626,10 +1309,217 @@ function ServeSession:__queueChange(instance, propertyName)
 	self.__changeBatcher:add(instance, propertyName)
 end
 
-function ServeSession:__writePatch(patch, messageCursor, localProperties)
+function ServeSession.sourceWriteSucceeded(result, id, ancestry)
+	assert(t.table(result) and t.string(id) and t.table(ancestry), "Source acknowledgement identity must be valid.")
+	local ancestors = { [id] = true }
+	for _, ancestor in ancestry do
+		ancestors[ancestor] = true
+	end
+	for _, failure in result.errors do
+		if failure.id == id and (failure.property == nil or failure.property == "Source") then
+			return false
+		end
+		if
+			ancestors[failure.id]
+			and (failure.property == nil or failure.property == "Parent" or failure.property == "Name")
+		then
+			return false
+		end
+	end
+	for _, removed in result.conflicts.removed_instances do
+		if ancestors[removed] then
+			return false
+		end
+	end
+	for _, added in result.conflicts.added_instances do
+		if ancestors[added.instance.snapshot_id] then
+			return false
+		end
+	end
+	for _, update in result.conflicts.updated_instances do
+		if update.id == id and update.changed_properties and update.changed_properties.Source ~= nil then
+			return false
+		end
+		if
+			ancestors[update.id]
+			and (
+				update.changed_name ~= nil
+				or update.changedParent ~= nil
+				or update.changed_class_name ~= nil
+				or update.changed_metadata ~= nil
+			)
+		then
+			return false
+		end
+	end
+	-- A successfully validated no-op has no accepted patch, but its Source was saved too.
+	return true
+end
+
+function ServeSession:__acknowledgeSourceDrafts(sources, result)
+	for id, source in sources do
+		local draft = self.__sourceDrafts[id]
+		if draft ~= nil and draft.Instance == source.Instance and draft.Revision == source.Revision then
+			local ancestry = {}
+			local parent = source.Instance.Parent
+			while parent ~= nil do
+				local ancestor = self.__instanceMap.fromInstances[parent]
+				if ancestor ~= nil then
+					table.insert(ancestry, ancestor)
+				end
+				parent = parent.Parent
+			end
+			if ServeSession.sourceWriteSucceeded(result, id, ancestry) then
+				self.__sourceDrafts[id] = nil
+			end
+		end
+	end
+end
+
+-- Histories contain only private token strings, never strong ticket ancestry. Keeping
+-- at most the server's live capability window bounds both storage and intersections.
+local function commonLineage(histories)
+	local common = table.clone(histories[1] or {})
+	for index = 2, #histories do
+		local included = {}
+		for _, token in histories[index] do
+			included[token] = true
+		end
+		local kept = {}
+		for _, token in common do
+			if included[token] then
+				table.insert(kept, token)
+			end
+		end
+		common = kept
+	end
+	return common
+end
+
+function ServeSession:__newWriteTicket(dependencies)
+	local ticket = { Parent = dependencies, PreviousWrite = self.__lastWrite or Promise.resolve() }
+	ticket.Promise = Promise.new(function(resolve)
+		ticket.Resolve = resolve
+	end)
+	-- Reserve serialization order at capture too. A direct caller during encoding
+	-- must not make the preparing batch wait on its own dependent write.
+	self.__lastWrite = Promise.new(function(resolve)
+		ticket.Complete = resolve
+	end)
+	self.__writeTickets = self.__writeTickets or {}
+	self.__writeTickets[ticket] = true
+	local promises = {}
+	for _, dependency in dependencies do
+		table.insert(promises, if dependency == false then Promise.resolve({}) else dependency.Promise)
+	end
+	ticket.Dependency = Promise.all(promises):andThen(commonLineage)
+	self.__writeHead = ticket
+	return ticket
+end
+
+function ServeSession:__resolveWriteTicket(ticket, acknowledgement)
+	if ticket.Resolving or ticket.Resolve == nil then
+		return
+	end
+	ticket.Resolving = true
+	ticket.Dependency:andThen(function(lineage)
+		if ticket.Resolve == nil then
+			return
+		end
+		local kept = table.clone(lineage)
+		if acknowledgement ~= nil then
+			table.insert(kept, acknowledgement)
+			if #kept > 256 then
+				table.remove(kept, 1)
+			end
+		end
+		local resolve = ticket.Resolve
+		ticket.Parent, ticket.Resolve, ticket.Dependency = nil, nil, nil
+		if ticket.Complete == nil then
+			self.__writeTickets[ticket] = nil
+		end
+		resolve(kept)
+	end)
+end
+
+function ServeSession:__completeWriteTicket(ticket)
+	local previous = ticket.PreviousWrite or Promise.resolve()
+	ticket.PreviousWrite = nil
+	previous:andThen(function()
+		local complete = ticket.Complete
+		if complete == nil then
+			return
+		end
+		ticket.Complete = nil
+		if ticket.Resolve == nil then
+			self.__writeTickets[ticket] = nil
+		end
+		complete()
+	end)
+end
+
+function ServeSession:__captureWriteDependency(dependency)
+	local dependencies = self.__pendingWriteDependencies or {}
+	self.__pendingWriteDependencies = dependencies
+	local captured = dependency or false
+	if not table.find(dependencies, captured) then
+		table.insert(dependencies, captured)
+	end
+end
+
+function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket)
+	if ticket == nil then
+		local dependencies = {}
+		if localProperties ~= nil then
+			for _, entries in localProperties do
+				for _, entry in entries do
+					local captured = entry.predecessor or false
+					if not table.find(dependencies, captured) then
+						table.insert(dependencies, captured)
+					end
+				end
+			end
+		end
+		if #dependencies == 0 then
+			table.insert(dependencies, self.__writeHead or false)
+		end
+		ticket = self:__newWriteTicket(dependencies)
+	end
+	messageCursor = messageCursor or self.__apiContext:getMessageCursor()
+	local dependency = ticket.Dependency or Promise.resolve({})
 	-- Read when each batch is sent, so changing it applies to the next write
 	-- without reconnecting. A pinned session authority wins over the setting.
 	local authority = self.__twoWaySyncAuthority or Settings:get("twoWaySyncAuthority")
+	local operationId = HttpService:GenerateGUID(false)
+	local sources = {}
+	local baselinePromises = {}
+	local sourceBaselines = {}
+	local structuralWrite = false
+	for _, update in patch.updated do
+		structuralWrite = structuralWrite or update.changedName ~= nil or update.changedParent ~= nil
+		local value = update.changedProperties and update.changedProperties.Source
+		local instance = self.__instanceMap.fromIds[update.id]
+		if value and instance then
+			local taken = localProperties and localProperties[update.id]
+			local entry = taken and taken.Source
+			local baseline = if entry then entry.sourceBaseline else self.__sourceBaselines[instance]
+			if baseline ~= nil then
+				table.insert(
+					baselinePromises,
+					(baseline.Promise or Promise.resolve(baseline.Cursor)):andThen(function(cursor)
+						sourceBaselines[update.id] = cursor
+					end)
+				)
+			end
+			sources[update.id] = {
+				Instance = instance,
+				Revision = if entry and entry.revision
+					then entry.revision
+					else self:__sourceRevision(update.id, instance),
+				Source = value.String,
+			}
+		end
+	end
 
 	-- One record per write, which moves from Pending to its outcome, so a write
 	-- is never reported as both pending and finished.
@@ -641,6 +1531,10 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties)
 	table.insert(self.__syncResults, record)
 
 	local function finish(status, result)
+		if result and result.acknowledgement ~= nil then
+			result = table.clone(result)
+			result.acknowledgement = nil
+		end
 		record.status = status
 		record.result = result
 		if self.__syncResultCallback ~= nil then
@@ -665,30 +1559,66 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties)
 	-- Writes reach the server in the order they were made, so a later edit to
 	-- an instance never arrives before the write that created it. A write
 	-- still waiting when the session stops is never sent.
-	local previous = self.__lastWrite or Promise.resolve()
+	local previous = ticket.PreviousWrite or Promise.resolve()
+	ticket.PreviousWrite = nil
 	local acknowledged = false
 	local write = previous
 		:andThen(function()
+			return Promise.all({ dependency, Promise.all(baselinePromises) })
+		end)
+		:andThen(function(resolved)
 			if self.__status == Status.Disconnected then
 				return Promise.reject("The session stopped before this write was sent")
 			end
-			return self.__apiContext:write(patch, messageCursor, authority)
+			if next(sources) ~= nil then
+				self.__sourceHistory:begin(operationId, sources)
+			end
+			local lineage = resolved[1]
+			return self.__apiContext:write(
+				patch,
+				messageCursor,
+				authority,
+				operationId,
+				lineage[#lineage],
+				sourceBaselines
+			)
 		end)
 		:andThen(function(result)
 			acknowledged = true
+			-- Partial failures grant nothing new. The captured valid predecessor still
+			-- proves only its old effects, so missing effects continue to fail closed.
+			self:__resolveWriteTicket(
+				ticket,
+				if ServeSession.getWriteStatus(result) == "Saved" then result.acknowledgement else nil
+			)
+			if next(sources) ~= nil then
+				self.__sourceHistory:consume(self.__apiContext:getMessageCursor())
+				self.__sourceHistory:acknowledge(operationId, result.messageCursor)
+			end
+			self:__acknowledgeSourceDrafts(sources, result)
 			forgetDeletions()
 			self:__untrackRejectedAdditions(patch, result)
 			self:__untrackSavedRemovals(result)
 			finish(ServeSession.getWriteStatus(result), result)
 			-- Handlers and callbacks must succeed before buffered values can replay.
-			self:__finishLocalProperties(localProperties, result)
+			local replay = self:__finishLocalProperties(localProperties, result)
+			if replay ~= nil then
+				return replay:andThen(function()
+					return result
+				end)
+			end
 			return result
 		end)
 		:catch(function(err)
+			self:__resolveWriteTicket(ticket)
 			forgetDeletions()
-			if acknowledged or (getmetatable(err) == Http.Error and err.type == Http.Error.Kind.Protocol) then
-				-- An invalid or unprocessed acknowledgement cannot release guards or
-				-- keep tracking edits. Stop before queued writes are considered.
+			if
+				acknowledged
+				or structuralWrite
+				or (getmetatable(err) == Http.Error and err.type == Http.Error.Kind.Protocol)
+			then
+				-- Without a validated structural response, replay could destroy unsaved
+				-- intent. Like invalid acknowledgements, stop before queued writes run.
 				self:__stopInternal(err)
 			else
 				self:__finishLocalProperties(localProperties, nil)
@@ -702,8 +1632,66 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties)
 				},
 			})
 		end)
-	self.__lastWrite = write
+	write
+		:finally(function()
+			self:__completeWriteTicket(ticket)
+		end)
+		:catch(function() end)
 	return write
+end
+
+function ServeSession:listSourceCheckpoints()
+	return self.__apiContext:listSourceCheckpoints()
+end
+
+function ServeSession:readSourceCheckpoint(checkpointId)
+	return self.__apiContext:readSourceCheckpoint(checkpointId)
+end
+
+function ServeSession:discardSourceCheckpoint(checkpointId)
+	return self.__apiContext:discardSourceCheckpoint(checkpointId)
+end
+
+function ServeSession:restoreSourceCheckpoint(checkpointId, instanceId, expectedSource)
+	assert(
+		type(instanceId) == "string" and type(expectedSource) == "string",
+		"Restoration requires a script identity and its exact current editor text."
+	)
+	local instance = self.__instanceMap.fromIds[instanceId]
+	if instance == nil or not instance:IsA("LuaSourceContainer") then
+		return Promise.reject("The recovery target is not a tracked script.")
+	end
+	local revision = self:__sourceRevision(instanceId, instance)
+	return self.__apiContext:readSourceCheckpoint(checkpointId):andThen(function(response)
+		local checkpoint = response.checkpoint
+		if type(checkpoint) ~= "table" or checkpoint.id ~= instanceId or type(checkpoint.source) ~= "string" then
+			return Promise.reject(
+				"This checkpoint does not identify the selected script. Read it explicitly instead of replaying it onto another identity."
+			)
+		end
+		if self.__status == Status.Disconnected or self.__instanceMap.fromIds[instanceId] ~= instance then
+			return Promise.reject("The recovery target changed while the checkpoint was read.")
+		end
+		local proposed = false
+		self:__updateEditorSource(instance, function()
+			proposed = false
+			if
+				self.__status == Status.Disconnected
+				or self.__instanceMap.fromIds[instanceId] ~= instance
+				or self:__sourceRevision(instanceId, instance) ~= revision
+				or self:__readEditorSource(instance) ~= expectedSource
+			then
+				return nil
+			end
+			proposed = true
+			return checkpoint.source
+		end)
+		if not proposed or self:__readEditorSource(instance) ~= checkpoint.source then
+			return Promise.reject("The editor changed during recovery. Its newer text was preserved.")
+		end
+		-- Restoring a draft is a new local edit, not permission to bypass disk authority.
+		return { sessionId = response.sessionId, checkpointId = checkpointId, editorRestored = true }
+	end)
 end
 
 function ServeSession:getSyncResults()
@@ -816,12 +1804,26 @@ function ServeSession:start()
 
 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
+						local chain = self.__lastPublication or Promise.resolve()
 						for index, message in messagesPacket.messages do
 							local publicationCursor = messagesPacket.messageCursor - #messagesPacket.messages + index
-							self:__applyPatch(message, publicationCursor)
+							self:__rememberSourcePublication(message, publicationCursor)
+							self:__rememberStructuralPublication(message, publicationCursor)
+							chain = chain:andThen(function()
+								return self:__applyPatch(message, publicationCursor)
+							end)
 						end
-						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
-						self:__releaseLocalProperties(messagesPacket.messageCursor)
+						self.__lastPublication = chain
+							:andThen(function()
+								self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+								return Promise.resolve(self:__releaseLocalProperties(messagesPacket.messageCursor))
+									:andThen(function()
+										self.__sourceHistory:consume(messagesPacket.messageCursor)
+									end)
+							end)
+							:catch(function(err)
+								self:__stopInternal(err)
+							end)
 					end,
 				})
 			end)
@@ -977,11 +1979,8 @@ function ServeSession:__replaceInstances(idList)
 		for _, child in oldInstance:GetChildren() do
 			self.__instanceMap:pauseInstance(child)
 			-- Some children cannot be reparented, such as a TouchTransmitter
-			local reparentSuccess, reparentError = attemptReparent(child, replacement)
-			if reparentSuccess and self.__instanceMap.fromInstances[child] ~= nil then
-				self.__instanceMap.knownParents[child] = replacement
-				self.__instanceMap.observedParents[child] = replacement
-			elseif not reparentSuccess then
+			local reparentSuccess, reparentError = attemptReparent(self.__instanceMap, child, replacement)
+			if not reparentSuccess then
 				Log.warn(
 					"Could not reparent child {} of instance {} during sync replacement: {}",
 					child.Name,
@@ -994,8 +1993,8 @@ function ServeSession:__replaceInstances(idList)
 		-- ChangeHistoryService doesn't like it if an Instance has been
 		-- Destroyed. So, we have to accept the potential memory hit and
 		-- just set the parent to `nil`.
-		local deleteSuccess, deleteError = attemptReparent(oldInstance, nil)
-		local replaceSuccess, replaceError = attemptReparent(replacement, oldParent)
+		local deleteSuccess, deleteError = attemptReparent(self.__instanceMap, oldInstance, nil)
+		local replaceSuccess, replaceError = attemptReparent(self.__instanceMap, replacement, oldParent)
 
 		if not (deleteSuccess and replaceSuccess) then
 			Log.warn(
@@ -1007,21 +2006,15 @@ function ServeSession:__replaceInstances(idList)
 
 			-- We need to revert the failed swap to avoid losing the old instance and children.
 			for _, child in replacement:GetChildren() do
-				if attemptReparent(child, oldInstance) and self.__instanceMap.fromInstances[child] ~= nil then
-					self.__instanceMap.knownParents[child] = oldInstance
-					self.__instanceMap.observedParents[child] = oldInstance
-				end
+				attemptReparent(self.__instanceMap, child, oldInstance)
 			end
-			attemptReparent(oldInstance, oldParent)
+			attemptReparent(self.__instanceMap, oldInstance, oldParent)
 			self.__instanceMap:insert(id, oldInstance)
 
 			-- Our replacement should never have existed in the first place, so we can just destroy it.
 			replacement:Destroy()
 			continue
 		end
-
-		self.__instanceMap.knownParents[replacement] = oldParent
-		self.__instanceMap.observedParents[replacement] = oldParent
 
 		if selectionMap[oldInstance] then
 			-- This is a bit funky, but it saves the order of Selection
@@ -1042,7 +2035,7 @@ function ServeSession:__replaceInstances(idList)
 			if child.Parent == targetParent then
 				-- Reassigning Parent appends the child, so walking the original
 				-- order rebuilds GetChildren().
-				attemptReparent(child, targetParent)
+				attemptReparent(self.__instanceMap, child, targetParent)
 			end
 		end
 	end
@@ -1056,7 +2049,214 @@ function ServeSession:__replaceInstances(idList)
 	end
 end
 
+function ServeSession:__notifySourceRecovery(id, checkpointId)
+	local result = {
+		accepted = { removed_instances = {}, added_instances = {}, updated_instances = {} },
+		conflicts = { removed_instances = {}, added_instances = {}, updated_instances = {} },
+		errors = {
+			{
+				id = id,
+				property = "Source",
+				message = `A filesystem conflict was detected. Your Studio draft was saved in recovery checkpoint "{checkpointId}".`,
+			},
+		},
+	}
+	table.insert(self.__syncResults, { status = "Conflicted", result = result })
+	if self.__syncResultCallback ~= nil then
+		self.__syncResultCallback("Conflicted", result)
+	end
+end
+
+function ServeSession:__checkpointDisplacedSources(patch, publicationCursor)
+	local targets = {}
+	local untrackedDocument = false
+	local function discover(instance)
+		if
+			not self.__initialSourceRecovery
+			or not instance:IsA("LuaSourceContainer")
+			or not self:__hasOpenScriptDocument(instance)
+		then
+			return
+		end
+		local id = self.__instanceMap.fromInstances[instance]
+		if id == nil then
+			untrackedDocument = true
+			return
+		end
+		if self.__sourceDrafts[id] == nil then
+			self.__sourceDrafts[id] = {
+				Instance = instance,
+				Revision = self:__sourceRevision(id, instance),
+				Source = self:__readEditorSource(instance),
+			}
+		end
+	end
+	for _, update in patch.updated do
+		local instance = self.__instanceMap.fromIds[update.id]
+		local value = update.changedProperties and update.changedProperties.Source
+		if instance and value then
+			discover(instance)
+			local draft = self.__sourceDrafts[update.id]
+			local origin = self.__sourceHistory:classify(
+				update.id,
+				patch.sourceOperations and patch.sourceOperations[update.id],
+				instance,
+				self:__sourceRevision(update.id, instance)
+			)
+			if
+				draft
+				and draft.Instance == instance
+				and origin == "Independent"
+				and self:__readEditorSource(instance) ~= value.String
+			then
+				targets[update.id] = { Draft = draft, Expected = value.String }
+			end
+		end
+	end
+	local replaced = {}
+	for _, id in patch.removed do
+		local instance = if typeof(id) == "Instance" then id else self.__instanceMap.fromIds[id]
+		if instance ~= nil then
+			replaced[instance] = true
+		end
+	end
+	for _, update in patch.updated do
+		local instance = self.__instanceMap.fromIds[update.id]
+		if update.changedClassName ~= nil and instance ~= nil and replaced[instance] == nil then
+			replaced[instance] = false
+		end
+	end
+	if next(replaced) ~= nil then
+		for root, descendants in replaced do
+			discover(root)
+			if descendants and self.__initialSourceRecovery then
+				for _, instance in root:GetDescendants() do
+					discover(instance)
+				end
+			end
+		end
+		if untrackedDocument then
+			return Promise.reject(
+				"An open script document would be removed without a managed recovery identity. Its editor text was retained. Copy the draft to a safe file before reconnecting."
+			)
+		end
+		for id, draft in self.__sourceDrafts do
+			local instance = self.__instanceMap.fromIds[id]
+			if instance == draft.Instance then
+				for root, descendants in replaced do
+					if instance == root or (descendants and instance:IsDescendantOf(root)) then
+						targets[id] = targets[id] or { Draft = draft, Expected = "" }
+					end
+				end
+			end
+		end
+	end
+	local requests = {}
+	for id, target in targets do
+		local draft = target.Draft
+		local source = self:__readEditorSource(draft.Instance)
+		if draft.CheckpointSource == source then
+			continue
+		end
+		table.insert(
+			requests,
+			self.__apiContext
+				:createSourceCheckpoint(
+					id,
+					source,
+					target.Expected,
+					publicationCursor or self.__apiContext:getMessageCursor()
+				)
+				:andThen(function(response)
+					if self.__status == Status.Disconnected then
+						return Promise.reject("The session stopped while securing a Source recovery checkpoint.")
+					end
+					if
+						self.__instanceMap.fromIds[id] ~= draft.Instance
+						or self:__readEditorSource(draft.Instance) ~= source
+						or self.__sourceDrafts[id] ~= draft
+					then
+						return Promise.reject(
+							"The script changed while its recovery checkpoint was being stored. The current editor draft was retained."
+						)
+					end
+					draft.CheckpointSource = source
+					draft.CheckpointId = response.checkpointId
+					self:__notifySourceRecovery(id, response.checkpointId)
+					return nil
+				end)
+		)
+	end
+	return if #requests > 0 then Promise.all(requests) else nil
+end
+
 function ServeSession:__applyPatch(patch, publicationCursor)
+	if publicationCursor ~= nil then
+		self:__rememberSourcePublication(patch, publicationCursor)
+		self:__rememberStructuralPublication(patch, publicationCursor)
+	end
+	local function apply()
+		if self.__status == Status.Disconnected then
+			return Promise.reject("The session stopped before applying this publication.")
+		end
+		return self:__applyPatchNow(self:__filterSourceEchoes(patch), publicationCursor)
+	end
+	local pending = self.__pendingSourcePatch
+	local success, result = pcall(function()
+		return if pending ~= nil then pending:andThen(apply) else apply()
+	end)
+	if not success then
+		self:__stopInternal(result)
+		return Promise.reject(result)
+	end
+	if result == nil then
+		return nil
+	end
+	local token = {}
+	self.__pendingSourcePatchToken = token
+	local guarded = result:catch(function(err)
+		self:__stopInternal(err)
+		return Promise.reject(err)
+	end)
+	self.__pendingSourcePatch = guarded
+	guarded
+		:finally(function()
+			if self.__pendingSourcePatchToken == token then
+				self.__pendingSourcePatch = nil
+				self.__pendingSourcePatchToken = nil
+			end
+		end)
+		:catch(function() end)
+	return guarded
+end
+
+function ServeSession:__applyPatchNow(patch, publicationCursor, prepared)
+	local cursors = {}
+	for id in patch.added do
+		cursors[id] = publicationCursor
+	end
+	for _, update in patch.updated do
+		local replay = patch.sourceReplays and patch.sourceReplays[update.id]
+		cursors[update.id] = if replay then replay.Cursor else publicationCursor
+	end
+	local operations = { Cursors = cursors }
+	local thread = coroutine.running()
+	local previous = self.__sourceApplyBatches[thread]
+	self.__sourceApplyBatches[thread] = operations
+	local success, result = pcall(self.__applyPatchBody, self, patch, publicationCursor, prepared)
+	self.__sourceApplyBatches[thread] = previous
+	if not success then
+		error(result, 0)
+	end
+	if result ~= nil then
+		return result:andThen(function()
+			return self:__awaitSourceOperations(operations)
+		end)
+	end
+	return self:__awaitSourceOperations(operations)
+end
+
+function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
 	self:__keepUndoneDeletions(patch)
 	patch = self:__protectLocalProperties(patch, publicationCursor)
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
@@ -1067,17 +2267,32 @@ function ServeSession:__applyPatch(patch, publicationCursor)
 		Log.debug("Failed to begin history recording for " .. patchTimestamp .. ". Another recording is in progress.")
 	end
 
-	Timer.start("precommitCallbacks", "wall")
-	-- Precommit callbacks must be serial in order to obey the contract that
-	-- they execute before commit
-	for _, callback in self.__precommitCallbacks do
-		local success, err = pcall(callback, patch, self.__instanceMap)
-		if not success then
-			Log.warn("Precommit hook errored: {}", err)
+	if not prepared then
+		Timer.start("precommitCallbacks", "wall")
+		-- Hooks may yield or edit documents. Revalidate intent after they return.
+		for _, callback in self.__precommitCallbacks do
+			local success, err = pcall(callback, patch, self.__instanceMap)
+			if not success then
+				Log.warn("Precommit hook errored: {}", err)
+			end
 		end
+		Timer.stop()
 	end
-	Timer.stop()
+	patch = self:__protectLocalProperties(patch, publicationCursor)
+	local checkpoint = self:__checkpointDisplacedSources(patch, publicationCursor)
+	if checkpoint ~= nil then
+		if historyRecording then
+			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+		end
+		return checkpoint:andThen(function()
+			return self:__applyPatchNow(patch, publicationCursor, true)
+		end)
+	end
 
+	local addedBefore = {}
+	for id in patch.added do
+		addedBefore[id] = self.__instanceMap.fromIds[id] or false
+	end
 	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, patch)
 	if not patchApplySuccess then
 		if historyRecording then
@@ -1137,6 +2352,64 @@ function ServeSession:__applyPatch(patch, publicationCursor)
 		)
 	end
 
+	-- A metadata-only context refresh may change authored/emitted transforms without
+	-- changing bytes. It can advance an unchanged, proven document, never an older
+	-- captured draft, a suppressed echo, or a pending/failed Source proposal.
+	if publicationCursor ~= nil and self.__status ~= Status.Disconnected then
+		local failedSource = {}
+		for id in unappliedPatch.added do
+			failedSource[id] = true
+		end
+		local failed = {}
+		for _, update in unappliedPatch.updated do
+			if update.changedProperties and update.changedProperties.Source ~= nil then
+				failedSource[update.id] = true
+			end
+			if update.changedMetadata ~= nil then
+				failed[update.id] = true
+			end
+		end
+		-- Reification can finish before the new instance's observer is attached.
+		-- Only a newly created, successfully matched document gets this baseline;
+		-- existing/unapplied documents must use their guarded terminal outcome.
+		for id, virtual in patch.added do
+			local instance = self.__instanceMap.fromIds[id]
+			local source = virtual.Properties and virtual.Properties.Source
+			if
+				instance ~= nil
+				and instance ~= addedBefore[id]
+				and source ~= nil
+				and not failedSource[id]
+				and self.__sourcePendingCounts[instance] == nil
+				and self:__sourceRevision(id, instance) == 0
+				and instance:IsA("LuaSourceContainer")
+				and self:__readEditorSource(instance) == source.String
+			then
+				self.__sourceBaselines[instance] = { Cursor = publicationCursor, Revision = 0 }
+			end
+		end
+		for _, update in patch.updated do
+			local instance = self.__instanceMap.fromIds[update.id]
+			local baseline = instance and self.__sourceBaselines[instance]
+			if
+				update.changedMetadata ~= nil
+				and not update.sourceSuppressed
+				and not failed[update.id]
+				and (update.changedProperties == nil or update.changedProperties.Source == nil)
+				and baseline ~= nil
+				and self.__sourcePendingCounts[instance] == nil
+				and baseline.Promise == nil
+				and baseline.Cursor ~= nil
+				and publicationCursor > baseline.Cursor
+				and baseline.Revision == self:__sourceRevision(update.id, instance)
+				and self.__sourceDrafts[update.id] == nil
+				and not (self.__localPropertyEdits[update.id] and self.__localPropertyEdits[update.id].Source)
+			then
+				self.__sourceBaselines[instance] = { Cursor = publicationCursor, Revision = baseline.Revision }
+			end
+		end
+	end
+
 	Timer.start("postcommitCallbacks")
 	-- Postcommit callbacks can be called with spawn since regardless of firing order, they are
 	-- guaranteed to be called after the commit
@@ -1150,9 +2423,28 @@ function ServeSession:__applyPatch(patch, publicationCursor)
 	end
 	Timer.stop()
 
+	-- Fallback reconciliation can replace identity even for a scalar-only packet.
+	self:__pruneStructuralGuards()
+	local structural = #patch.removed > 0
+	for _, update in patch.updated do
+		structural = structural or update.changedClassName ~= nil
+	end
+	if structural then
+		for id, revision in self.__sourceRevisions do
+			if self.__instanceMap.fromIds[id] ~= revision.Instance then
+				self.__sourceRevisions[id] = nil
+			end
+		end
+		for id, draft in self.__sourceDrafts do
+			if self.__instanceMap.fromIds[id] ~= draft.Instance then
+				self.__sourceDrafts[id] = nil
+			end
+		end
+	end
 	if historyRecording then
 		ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
 	end
+	return nil
 end
 
 function ServeSession:__initialSync(serverInfo)
@@ -1177,6 +2469,19 @@ function ServeSession:__initialSync(serverInfo)
 		local success, catchUpPatch =
 			self.__reconciler:diff(readResponseBody.instances, serverInfo.rootInstanceId, step)
 
+		-- This is the only hydration-wide baseline pass. Mere map hydration is not
+		-- Source consumption, especially for open documents with older unsaved text.
+		for id, virtual in readResponseBody.instances do
+			local instance = self.__instanceMap.fromIds[id]
+			local source = virtual.Properties and virtual.Properties.Source
+			if instance ~= nil and source ~= nil and instance:IsA("LuaSourceContainer") then
+				local revision = self:__sourceRevision(id, instance)
+				if self:__readEditorSource(instance) == source.String then
+					self.__sourceBaselines[instance] = { Cursor = readResponseBody.messageCursor, Revision = revision }
+				end
+			end
+			step()
+		end
 		self:__releaseDeferredChanges()
 
 		if not success then
@@ -1254,8 +2559,10 @@ function ServeSession:__initialSync(serverInfo)
 			-- wins even if the disk changes again before this write lands.
 			return self.__apiContext:write(inversePatch, nil, "Studio")
 		elseif userDecision == "Accept" then
-			self:__applyPatch(catchUpPatch)
-			return Promise.resolve()
+			self.__initialSourceRecovery = true
+			return Promise.resolve(self:__applyPatch(catchUpPatch, readResponseBody.messageCursor)):finally(function()
+				self.__initialSourceRecovery = nil
+			end)
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)
 		end
@@ -1268,6 +2575,24 @@ function ServeSession:__stopInternal(err)
 	end
 	self.__status = Status.Disconnected
 	self.__localPropertyEdits = nil
+	for ticket in table.clone(self.__writeTickets or {}) do
+		local resolve, complete = ticket.Resolve, ticket.Complete
+		ticket.Parent, ticket.Resolve, ticket.Dependency, ticket.PreviousWrite, ticket.Complete =
+			nil, nil, nil, nil, nil
+		if resolve ~= nil then
+			resolve({})
+		end
+		if complete ~= nil then
+			complete()
+		end
+	end
+	self.__writeTickets = {}
+	self.__writeHead, self.__pendingWriteDependencies = nil, nil
+	for _, pending in self.__remoteSources do
+		if pending.BaselineToken ~= nil then
+			self:__resolveSourceBaseline(pending.BaselineToken)
+		end
+	end
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()

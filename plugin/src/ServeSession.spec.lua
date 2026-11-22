@@ -1,9 +1,39 @@
 return function()
 	local ServeSession = require(script.Parent.ServeSession)
 	local Promise = require(script.Parent.Parent.Packages.Promise)
+	local SourceHistory = require(script.Parent.SourceHistory)
+
+	local function sessionState(fields, class)
+		if fields.__instanceMap ~= nil and fields.__instanceMap.captureStructuralChanges == nil then
+			-- These fixtures replace the instance-observation boundary with plain maps.
+			fields.__instanceMap.captureStructuralChanges = function() end
+		end
+		if fields.__apiContext ~= nil and fields.__apiContext.getMessageCursor == nil then
+			fields.__apiContext.getMessageCursor = function()
+				return 0
+			end
+		end
+		fields.__sourceHistory = SourceHistory.new({
+			Clock = function()
+				return 0
+			end,
+			Horizon = 10,
+			MaxBytes = 8192,
+			MaxEntries = 32,
+		})
+		fields.__sourceDrafts = {}
+		fields.__sourceRevisions = {}
+		fields.__sourcePublicationCursors = setmetatable({}, { __mode = "k" })
+		fields.__sourceBaselines = setmetatable({}, { __mode = "k" })
+		fields.__sourcePendingCounts = setmetatable({}, { __mode = "k" })
+		fields.__remoteSources = {}
+		fields.__sourceApplyBatches = setmetatable({}, { __mode = "k" })
+		return setmetatable(fields, class)
+	end
 
 	local function writeResult(errors, conflicts)
 		return {
+			messageCursor = 0,
 			errors = errors or {},
 			accepted = {
 				removed_instances = {},
@@ -43,6 +73,1106 @@ return function()
 		session.__instanceMap:insert("EDITED", instance)
 		return session, instance, control
 	end
+
+	local function structuralSession(propertyName)
+		local session, instance, control = propertySession("Actor")
+		session.__instanceMap.onChildAdded = nil
+		local root = Instance.new("Folder")
+		local parents = {}
+		for _, id in { "PROBE", "DESTINATION", "DISK" } do
+			local parent = Instance.new("Folder")
+			parent.Name = id
+			parent.Parent = root
+			parents[id] = parent
+			session.__instanceMap:insert(id, parent)
+		end
+		session.__instanceMap:insert("ROOT", root)
+		instance.Parent = session.__instanceMap.fromIds.PROBE
+		session.__instanceMap.knownParents[instance] = instance.Parent
+		local field = if propertyName == "Parent" then "changedParent" else "changedName"
+		control.edit = function(value)
+			instance[propertyName] = if propertyName == "Parent" then session.__instanceMap.fromIds[value] else value
+			session:__queueChange(instance, propertyName)
+			return session.__localPropertyEdits.EDITED and session.__localPropertyEdits.EDITED[propertyName]
+		end
+		control.expectValue = function(value)
+			expect(instance[propertyName]).to.equal(if propertyName == "Parent" then parents[value] else value)
+		end
+		control.publish = function(value, cursor)
+			return session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = { { id = "EDITED", [field] = value, changedProperties = {} } },
+			}, cursor)
+		end
+		control.answer = function(index, cursor, conflicts)
+			local result = writeResult(nil, conflicts)
+			result.messageCursor = cursor
+			control.settle[index](result)
+		end
+		control.cleanup = function()
+			session:stop()
+			instance:Destroy()
+			root:Destroy()
+		end
+		return session, instance, control, field
+	end
+
+	local function deferredStructuralSession(propertyName)
+		local session, instance, control, field = structuralSession(propertyName)
+		local map = session.__instanceMap
+		for _, connection in map.instancesToSignal[instance] do
+			connection:Disconnect()
+		end
+		map.observedNames[instance] = instance.Name
+		map.observedParents[instance] = instance.Parent
+		map.__isGameRunning = function()
+			return false
+		end
+		map.onInstanceChanged = function(changed, property)
+			session:__onInstanceChanged(changed, property)
+		end
+		control.assign = function(value)
+			instance[propertyName] = if propertyName == "Parent" then map.fromIds[value] else value
+		end
+		control.deliver = function()
+			map:__maybeFireInstanceChanged(instance, propertyName)
+		end
+		control.edit = function(value)
+			control.assign(value)
+			control.deliver()
+			return session.__localPropertyEdits.EDITED and session.__localPropertyEdits.EDITED[propertyName]
+		end
+		return session, instance, control, field
+	end
+
+	local function forDeferredStructures(run)
+		for _, propertyName in { "Parent", "Name" } do
+			local session, instance, control, field = deferredStructuralSession(propertyName)
+			local success, problem = pcall(run, propertyName, session, instance, control, field)
+			control.cleanup()
+			assert(success, `The "{propertyName}" schedule failed. {tostring(problem)}`)
+		end
+	end
+
+	local function sourceRecoverySession()
+		local session, instance, control = propertySession("ModuleScript")
+		control.text = "return 'draft'"
+		control.checkpoints = {}
+		session.__readEditorSource = function()
+			return control.text
+		end
+		session.__apiContext.createSourceCheckpoint = function(_, id, source, expectedSource, cursor)
+			table.insert(
+				control.checkpoints,
+				{ id = id, source = source, expectedSource = expectedSource, cursor = cursor }
+			)
+			return Promise.new(function(resolve, reject)
+				control.finishCheckpoint = resolve
+				control.failCheckpoint = reject
+			end)
+		end
+		session.__reconciler.applyPatch = function(_, patch)
+			for _, update in patch.updated do
+				if update.changedProperties.Source then
+					control.text = update.changedProperties.Source.String
+				end
+			end
+			return { added = {}, removed = {}, updated = {} }
+		end
+		return session, instance, control
+	end
+
+	local function sourcePublication(text, operation)
+		return {
+			added = {},
+			removed = {},
+			updated = { { id = "EDITED", changedProperties = { Source = { String = text } } } },
+			sourceOperations = if operation then { EDITED = operation } else nil,
+		}
+	end
+
+	it("should capture a preparing batch ticket before serialization yields and drain omitted tickets", function()
+		for _, omitted in { false, true } do
+			local session, instance, control = sourceRecoverySession()
+			local calls = {}
+			session.__apiContext.write = function(_, _, cursor, _, _, predecessor)
+				table.insert(calls, { Cursor = cursor, Predecessor = predecessor })
+				local result = writeResult()
+				result.acknowledgement = if #calls == 1 then "first-proof" else "second-proof"
+				return Promise.resolve(result)
+			end
+			local success, problem = pcall(function()
+				session:__queueChange(instance, "Name")
+				local batcher = session.__changeBatcher
+				local context = batcher.__onBatchTaken({ [instance] = { Name = true } })
+				batcher.__pendingPropertyChanges = {}
+				-- The next document edit occurs while the first batch is being encoded.
+				control.text = "next draft"
+				session:__queueChange(instance, "Source")
+				local captured = session:__takeLocalPropertyEdits({ [instance] = { Source = true } })
+				local writing = session:__writePatch(sourcePublication(control.text), 0, captured)
+				expect(#calls).to.equal(0)
+				local first = { added = {}, removed = {}, updated = {} }
+				if not omitted then
+					first.updated = { { id = "EDITED", changedName = "Renamed", changedProperties = {} } }
+				end
+				batcher.__onBatchPrepared(first, context)
+				if not omitted then
+					assert(batcher.__onChangesFlushed(first, context):await())
+				end
+				assert(writing:await())
+				expect(#calls).to.equal(if omitted then 1 else 2)
+				expect(calls[#calls].Predecessor).to.equal(if omitted then nil else "first-proof")
+				expect(context.ticket.Parent).to.equal(nil)
+				expect(context.ticket.Resolve).to.equal(nil)
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should never substitute a later acknowledgement for captured direct write dependencies", function()
+		local session, instance, control = sourceRecoverySession()
+		local calls, settles = {}, {}
+		session.__apiContext.write = function(_, _, cursor, _, _, predecessor, baselines)
+			table.insert(calls, { Cursor = cursor, Predecessor = predecessor, Baselines = baselines })
+			return Promise.new(function(resolve)
+				table.insert(settles, resolve)
+			end)
+		end
+		local success, problem = pcall(function()
+			local first = session:__writePatch(sourcePublication("first"), 0)
+			local second = session:__writePatch(sourcePublication("second"), 0)
+			-- This captures the second ticket, not the latest capability at dispatch.
+			control.text = "captured"
+			session:__rememberLocalProperty(instance, "Source")
+			local captured = session:__takeLocalPropertyEdits({ [instance] = { Source = true } })
+			local unrelated = session:__writePatch(sourcePublication("unrelated"), 0)
+			local last = session:__writePatch(sourcePublication(control.text), 0, captured)
+			for index, proof in { "one", "two", "unrelated", "last" } do
+				local result = writeResult()
+				result.acknowledgement = proof
+				settles[index](result)
+			end
+			assert(
+				first:await() and second:await() and unrelated:await() and last:await(),
+				"Captured writes must finish."
+			)
+			expect(calls[2].Predecessor).to.equal("one")
+			expect(calls[3].Predecessor).to.equal("two")
+			expect(calls[4].Predecessor).to.equal("two")
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should await a candidate baseline for typing before the remote terminal outcome", function()
+		for _, kind in { "committed", "failed", "locally-cancelled", "retried", "session-stopped" } do
+			local committed = kind == "committed"
+			local session, instance, control = sourceRecoverySession()
+			local _, generation = session.__instanceMap:getSourceRevision(instance)
+			local operation = { Status = "pending", Expected = control.text, Value = "remote" }
+			local calls = {}
+			session.__apiContext.write = function(_, _, _, _, _, _, baselines)
+				table.insert(calls, baselines.EDITED)
+				return Promise.resolve(writeResult())
+			end
+			local success, problem = pcall(function()
+				session.__sourceBaselines[instance] = { Cursor = 3, Revision = 0 }
+				local operations = { Cursors = { EDITED = 7 } }
+				session.__sourceApplyBatches[coroutine.running()] = operations
+				session:__onSourceScheduled(instance, operation)
+				session.__sourceApplyBatches[coroutine.running()] = nil
+				control.text = "remote"
+				session:__onInstanceChanged(instance, "Source", {
+					Operation = operation,
+					Generation = generation,
+					Revision = 1,
+					Value = control.text,
+				})
+				control.text = "new local typing"
+				session:__onInstanceChanged(instance, "Source", {
+					Generation = generation,
+					Revision = 2,
+					Value = control.text,
+				})
+				local captured = session:__takeLocalPropertyEdits({ [instance] = { Source = true } })
+				local writing = session:__writePatch(sourcePublication(control.text), 0, captured)
+				expect(#calls).to.equal(0)
+				if kind == "session-stopped" then
+					session:stop()
+				end
+				operation.Status = if kind == "retried"
+					then "committed"
+					elseif kind == "session-stopped" then "locally-cancelled"
+					else kind
+				operation.CommittedRevision = if committed then 1 elseif kind == "retried" then 3 else nil
+				session:__onSourceOutcome(instance, operation)
+				assert(writing:await())
+				if kind == "session-stopped" then
+					expect(#calls).to.equal(0)
+				else
+					expect(calls[1]).to.equal(if committed then 7 else 3)
+				end
+				expect(control.text).to.equal("new local typing")
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should bound completed lineage without retaining ticket parents or resolvers", function()
+		local session, instance = sourceRecoverySession()
+		local success, problem = pcall(function()
+			for index = 1, 600 do
+				local ticket = session:__newWriteTicket({ session.__writeHead or false })
+				session:__resolveWriteTicket(ticket, `proof-{index}`)
+				session:__completeWriteTicket(ticket)
+				local resolved, lineage = ticket.Promise:await()
+				assert(resolved, "The ticket must resolve.")
+				expect(#lineage).to.equal(math.min(index, 256))
+				expect(ticket.Parent).to.equal(nil)
+				expect(ticket.Resolve).to.equal(nil)
+				expect(ticket.PreviousWrite).to.equal(nil)
+				expect(ticket.Complete).to.equal(nil)
+				expect(next(session.__writeTickets)).to.equal(nil)
+			end
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should retain only complete common lineage across mixed batch intents and partial failures", function()
+		for _, failed in { false, true } do
+			local session, instance = sourceRecoverySession()
+			local calls = {}
+			session.__apiContext.write = function(_, _, _, _, _, predecessor)
+				table.insert(calls, predecessor or false)
+				local result = writeResult()
+				result.acknowledgement = `proof-{#calls}`
+				if failed and #calls == 2 then
+					result.errors = { { id = "EDITED", property = "Source", message = "Rejected." } }
+					result.acknowledgement = nil
+				end
+				return Promise.resolve(result)
+			end
+			local success, problem = pcall(function()
+				assert(session:__writePatch(sourcePublication("first"), 0):await())
+				-- Capture one intent before another successful (or partial) write.
+				session:__rememberLocalProperty(instance, "Source")
+				local source = session:__takeLocalPropertyEdits({ [instance] = { Source = true } })
+				assert(session:__writePatch(sourcePublication("second"), 0):await())
+				session:__rememberLocalProperty(instance, "Archivable")
+				local other = session:__takeLocalPropertyEdits({ [instance] = { Archivable = true } })
+				source.EDITED.Archivable = other.EDITED.Archivable
+				assert(session:__writePatch(sourcePublication("mixed"), 0, source):await())
+				expect(calls[3]).to.equal("proof-1")
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should advance metadata-only context only for unchanged consumed documents", function()
+		for _, edited in { false, true } do
+			local session, instance, control = sourceRecoverySession()
+			local success, problem = pcall(function()
+				session.__sourceBaselines[instance] = { Cursor = 2, Revision = 0 }
+				local captured
+				if edited then
+					local original = control.text
+					control.text = "edit"
+					session:__rememberLocalProperty(instance, "Source")
+					control.text = original
+					session:__rememberLocalProperty(instance, "Source")
+					captured = session:__takeLocalPropertyEdits({ [instance] = { Source = true } })
+				end
+				local patch = {
+					added = {},
+					removed = {},
+					updated = {
+						{ id = "EDITED", changedProperties = {}, changedMetadata = { ignoreUnknownInstances = true } },
+					},
+				}
+				session:__applyPatchNow(patch, 8)
+				expect(session.__sourceBaselines[instance].Cursor).to.equal(if edited then 2 else 8)
+				if captured then
+					expect(captured.EDITED.Source.sourceBaseline.Cursor).to.equal(2)
+				end
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should not consume a metadata context attached to suppressed Source or a pending proposal", function()
+		for _, kind in { "echo", "pending", "failed" } do
+			local session, instance, control = sourceRecoverySession()
+			local success, problem = pcall(function()
+				session.__sourceBaselines[instance] = { Cursor = 2, Revision = 0 }
+				local patch = {
+					added = {},
+					removed = {},
+					updated = {
+						{ id = "EDITED", changedProperties = {}, changedMetadata = { ignoreUnknownInstances = true } },
+					},
+				}
+				local operation
+				if kind == "echo" then
+					session.__sourceHistory:begin(
+						"old",
+						{ EDITED = { Instance = instance, Revision = 0, Source = "old" } }
+					)
+					session.__sourceRevisions.EDITED = { Instance = instance, Revision = 1 }
+					session.__sourceBaselines[instance].Revision = 1
+					patch.updated[1].changedProperties.Source = { String = "old" }
+					patch.sourceOperations = { EDITED = "old" }
+				elseif kind == "pending" then
+					operation = { Status = "pending", Value = "not yet consumed" }
+					session:__onSourceScheduled(instance, operation)
+				else
+					session.__reconciler.applyPatch = function()
+						return patch
+					end
+					session.__replaceInstances = function()
+						return false
+					end
+				end
+				session:__applyPatchNow(patch, 8)
+				expect(session.__sourceBaselines[instance].Cursor).to.equal(2)
+				expect(control.text).to.equal("return 'draft'")
+				if operation then
+					operation.Status = "superseded"
+					session:__onSourceOutcome(instance, operation)
+				end
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should not turn a partially applied packet or an echo into consumed Source", function()
+		local session, instance, control = sourceRecoverySession()
+		local other = Instance.new("ModuleScript")
+		session.__instanceMap:insert("OTHER", other)
+		local success, problem = pcall(function()
+			session.__sourceBaselines[instance] = { Cursor = 1, Revision = 0 }
+			session.__sourceBaselines[other] = { Cursor = 1, Revision = 0 }
+			local operations = { Cursors = { EDITED = 4, OTHER = 5 } }
+			session.__sourceApplyBatches[coroutine.running()] = operations
+			local first = { Status = "pending", Value = control.text, NoChange = true }
+			local second = { Status = "pending", Value = "unapplied" }
+			session:__onSourceScheduled(instance, first)
+			session:__onSourceScheduled(other, second)
+			session.__sourceApplyBatches[coroutine.running()] = nil
+			first.Status = "committed"
+			session:__onSourceOutcome(instance, first)
+			control.cursor = 0
+			expect(session.__sourceBaselines[instance].Cursor).to.equal(4)
+			expect(session.__sourceBaselines[other].Cursor).to.equal(1)
+			second.Status = "failed"
+			session:__onSourceOutcome(other, second)
+			expect(session.__sourceBaselines[other].Cursor).to.equal(1)
+			session:__rememberLocalProperty(instance, "Source")
+			session.__sourceHistory:begin(
+				"older",
+				{ EDITED = { Instance = instance, Revision = 0, Source = control.text } }
+			)
+			session:__applyPatch(sourcePublication("older bytes", "older"), 8)
+			expect(session.__sourcePublicationCursors[instance]).to.equal(8)
+			expect(session.__sourceBaselines[instance].Cursor).to.equal(4)
+		end)
+		session:stop()
+		instance:Destroy()
+		other:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should resolve preparing tickets on session cancellation without sending dependent drafts", function()
+		local session, instance, control = sourceRecoverySession()
+		local success, problem = pcall(function()
+			session:__queueChange(instance, "Name")
+			local context = session.__changeBatcher.__onBatchTaken({ [instance] = { Name = true } })
+			session:__rememberLocalProperty(instance, "Source")
+			local captured = session:__takeLocalPropertyEdits({ [instance] = { Source = true } })
+			local writing = session:__writePatch(sourcePublication(control.text), 0, captured)
+			expect(#control.requests).to.equal(0)
+			session:stop()
+			assert(writing:await())
+			expect(#control.requests).to.equal(0)
+			expect(context.ticket.Resolve).to.equal(nil)
+			expect(session:getSyncResults()[1].status).to.equal("Failed")
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it(
+		"should establish initial READ baselines only on matching documents without rewriting captured intent",
+		function()
+			for _, matches in { false, true } do
+				local session, instance, control = sourceRecoverySession()
+				session.__apiContext.read = function()
+					return Promise.resolve({
+						messageCursor = 7,
+						instances = {
+							EDITED = {
+								Properties = {
+									Source = { String = if matches then control.text else "unapplied server text" },
+								},
+							},
+						},
+					})
+				end
+				session.__apiContext.setMessageCursor = function(_, cursor)
+					control.cursor = cursor
+				end
+				session.__reconciler.hydrate = function() end
+				session.__reconciler.diff = function()
+					return true, { added = {}, removed = {}, updated = {} }
+				end
+				local success, problem = pcall(function()
+					session:__rememberLocalProperty(instance, "Source")
+					local captured = session:__takeLocalPropertyEdits({ [instance] = { Source = true } })
+					assert(session:__initialSync({ rootInstanceId = "ROOT" }):await())
+					local baseline = session.__sourceBaselines[instance]
+					expect(baseline and baseline.Cursor).to.equal(if matches then 7 else nil)
+					expect(captured.EDITED.Source.sourceBaseline).to.equal(nil)
+					session.__apiContext.write = function(_, _, _, _, _, _, baselines)
+						expect(next(baselines)).to.equal(nil)
+						return Promise.resolve(writeResult())
+					end
+					assert(session:__writePatch(sourcePublication(control.text), 0, captured):await())
+				end)
+				session:stop()
+				instance:Destroy()
+				assert(success, problem)
+			end
+		end
+	)
+
+	it("should baseline only successfully reified new matching documents", function()
+		for _, kind in { "new", "existing", "unapplied", "pending", "committed" } do
+			local session, instance, control = sourceRecoverySession()
+			local target = Instance.new("ModuleScript")
+			local operation
+			local patch = {
+				added = {
+					EDITED = {
+						Id = "EDITED",
+						Name = "Module",
+						ClassName = "ModuleScript",
+						Children = {},
+						Properties = { Source = { String = control.text } },
+					},
+				},
+				removed = {},
+				updated = {},
+			}
+			session.__reconciler.applyPatch = function()
+				if kind ~= "existing" then
+					session.__instanceMap:insert("EDITED", target)
+				end
+				if kind == "pending" or kind == "committed" then
+					operation = { Status = "pending", Value = control.text, Expected = "before reification" }
+					session:__onSourceScheduled(target, operation)
+				end
+				return if kind == "unapplied" then patch else { added = {}, removed = {}, updated = {} }
+			end
+			session.__replaceInstances = function()
+				return false
+			end
+			local success, problem = pcall(function()
+				local applying = session:__applyPatchNow(patch, 9)
+				local baseline = session.__sourceBaselines[target]
+				expect(baseline and baseline.Cursor).to.equal(if kind == "new" then 9 else nil)
+				expect(session.__sourceBaselines[instance]).to.equal(nil)
+				if operation then
+					operation.Status = if kind == "committed" then "committed" else "locally-cancelled"
+					session:__onSourceOutcome(target, operation)
+					expect(applying:await()).to.equal(kind == "committed")
+					local consumed = session.__sourceBaselines[target]
+					expect(consumed and consumed.Cursor).to.equal(if kind == "committed" then 9 else nil)
+				end
+			end)
+			session:stop()
+			instance:Destroy()
+			target:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should revalidate document intent after a precommit hook edits the buffer", function()
+		local session, instance, control = sourceRecoverySession()
+		session.__applyPatchNow = ServeSession.__applyPatchNow
+		session.__reconciler.applyPatch = function(_, patch)
+			for _, update in patch.updated do
+				if update.changedProperties.Source then
+					control.text = update.changedProperties.Source.String
+				end
+			end
+			return { added = {}, removed = {}, updated = {} }
+		end
+		session:hookPrecommit(function()
+			control.text = "new typing during hook"
+			session:__queueChange(instance, "Source")
+		end)
+		local success, problem = pcall(function()
+			session:__applyPatchNow(sourcePublication("filesystem"), 1)
+			expect(control.text).to.equal("new typing during hook")
+			expect(session.__localPropertyEdits.EDITED.Source.serverValue.String).to.equal("filesystem")
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should defer a candidate remote notification until its actual commit is confirmed", function()
+		local session, instance, control = sourceRecoverySession()
+		local _, generation = session.__instanceMap:getSourceRevision(instance)
+		local operation =
+			{ Status = "pending", Expected = control.text, Value = "return 'filesystem'", Generation = generation }
+		local operations = {}
+		session.__sourceApplyBatches[coroutine.running()] = operations
+		session:__onSourceScheduled(instance, operation)
+		session.__sourceApplyBatches[coroutine.running()] = nil
+		local success, problem = pcall(function()
+			control.text = operation.Value
+			session:__onInstanceChanged(
+				instance,
+				"Source",
+				{ Operation = operation, Generation = generation, Revision = 1, Value = operation.Value }
+			)
+			expect(session.__changeBatcher:isEmpty()).to.equal(true)
+			expect(session.__sourceDrafts.EDITED ~= nil).to.equal(true)
+			operation.Status = "committed"
+			operation.CommittedRevision = 1
+			session:__onSourceOutcome(instance, operation)
+			expect(session:__awaitSourceOperations(operations):await()).to.equal(true)
+			expect(session.__sourceDrafts.EDITED).to.equal(nil)
+			expect(session.__localPropertyEdits.EDITED).to.equal(nil)
+			expect(session.__changeBatcher:isEmpty()).to.equal(true)
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should promote a rejected candidate observation to genuine local intent", function()
+		local session, instance, control = sourceRecoverySession()
+		local _, generation = session.__instanceMap:getSourceRevision(instance)
+		local operation = { Status = "pending", Expected = "older", Value = control.text, Generation = generation }
+		local success, problem = pcall(function()
+			session:__onSourceScheduled(instance, operation)
+			session:__onInstanceChanged(
+				instance,
+				"Source",
+				{ Operation = operation, Generation = generation, Revision = 1, Value = control.text }
+			)
+			expect(session.__changeBatcher:isEmpty()).to.equal(true)
+			operation.Status = "locally-cancelled"
+			operation.Reason = "local-edit"
+			session:__onSourceOutcome(instance, operation)
+			expect(session.__changeBatcher:isEmpty()).to.equal(false)
+			expect(session.__sourceDrafts.EDITED.Source).to.equal(control.text)
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should retire a secured draft after authoritative Source commits without a notification", function()
+		local session, instance, control = sourceRecoverySession()
+		local success, problem = pcall(function()
+			session:__rememberLocalProperty(instance, "Source")
+			session.__sourceDrafts.EDITED.CheckpointSource = control.text
+			session.__localPropertyEdits = {}
+			local operation = { Status = "pending", Expected = control.text, Value = "return 'disk'" }
+			session:__onSourceScheduled(instance, operation)
+			control.text = operation.Value
+			operation.Status = "committed"
+			session:__onSourceOutcome(instance, operation)
+			expect(session.__sourceDrafts.EDITED).to.equal(nil)
+			expect(session:__checkpointDisplacedSources(sourcePublication("return 'next disk revision'"), 2)).to.equal(
+				nil
+			)
+			expect(#control.checkpoints).to.equal(0)
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should acknowledge no-op Source writes without clearing deferred or conflicted drafts", function()
+		for _, deferred in { false, true } do
+			for _, conflict in { false, true } do
+				local result = writeResult(
+					if deferred
+						then { { id = "SCRIPT", property = "Source", kind = "sourceSerializationDeferred" } }
+						else nil
+				)
+				if conflict then
+					result.conflicts.updated_instances =
+						{ { id = "ANCESTOR", changedParent = "OTHER", changed_properties = {} } }
+				end
+				expect(ServeSession.sourceWriteSucceeded(result, "SCRIPT", { "ANCESTOR" })).to.equal(
+					not deferred and not conflict
+				)
+			end
+		end
+	end)
+
+	it("should suppress a proven old Source echo even after newer intent was acknowledged", function()
+		local session, instance, control = sourceRecoverySession()
+		local success, problem = pcall(function()
+			session:__rememberLocalProperty(instance, "Source")
+			session.__sourceHistory:begin(
+				"old",
+				{ EDITED = { Instance = instance, Revision = 1, Source = control.text } }
+			)
+			session.__sourceHistory:finish("old")
+			control.text = "return 'newer saved text'"
+			session:__rememberLocalProperty(instance, "Source")
+			session.__localPropertyEdits = {}
+			session.__sourceDrafts = {}
+			session:__applyPatch(sourcePublication("return 'draft'", "old"), 1)
+			expect(control.text).to.equal("return 'newer saved text'")
+			expect(#control.checkpoints).to.equal(0)
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should keep ambiguous transport outcomes pinned until their session ends", function()
+		local session, instance, control = sourceRecoverySession()
+		local clock = 0
+		local operation
+		session.__sourceHistory = SourceHistory.new({
+			Clock = function()
+				return clock
+			end,
+			Horizon = 10,
+			MaxBytes = 8192,
+			MaxEntries = 32,
+		})
+		session.__apiContext.write = function(_self, _patch, _cursor, _authority, identity)
+			operation = identity
+			return Promise.reject("The acknowledgement was lost.")
+		end
+		local success, problem = pcall(function()
+			session:__rememberLocalProperty(instance, "Source")
+			session:__writePatch(sourcePublication(control.text), 0):await()
+			clock = 100
+			control.text = "return 'newer draft'"
+			session:__rememberLocalProperty(instance, "Source")
+			expect(session.__sourceHistory:classify("EDITED", operation, instance, 2)).to.equal("Echo")
+			session:__applyPatch(sourcePublication("return 'draft'", operation), 1)
+			expect(control.text).to.equal("return 'newer draft'")
+			expect(#control.checkpoints).to.equal(0)
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should retain pending Source intent across a structural refresh that preserves its identity", function()
+		local session, instance, control = sourceRecoverySession()
+		local parent = Instance.new("Folder")
+		instance.Parent = parent
+		session.__instanceMap:insert("PARENT", parent)
+		local success, problem = pcall(function()
+			session:__rememberLocalProperty(instance, "Source")
+			local entry = session.__localPropertyEdits.EDITED.Source
+			local patch = sourcePublication("return 'refreshed filesystem'")
+			table.insert(patch.updated, { id = "PARENT", changedName = "MovedParent", changedProperties = {} })
+			local filtered = session:__protectLocalProperties(patch, 1)
+			expect(session.__localPropertyEdits.EDITED.Source).to.equal(entry)
+			expect(#filtered.updated).to.equal(1)
+			expect(filtered.updated[1].changedName).to.equal("MovedParent")
+			expect(session:__checkpointDisplacedSources(filtered, 1)).to.equal(nil)
+			expect(control.text).to.equal("return 'draft'")
+		end)
+		session:stop()
+		parent:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should discover initial open drafts before structural replacement or subtree removal", function()
+		for _, replacingClass in { false, true } do
+			local session, instance, control = sourceRecoverySession()
+			local parent = Instance.new("Folder")
+			instance.Parent = parent
+			session.__initialSourceRecovery = true
+			session.__hasOpenScriptDocument = function(_self, target)
+				return target == instance
+			end
+			local success, problem = pcall(function()
+				local patch = if replacingClass
+					then {
+						added = {},
+						removed = {},
+						updated = { { id = "EDITED", changedClassName = "Folder", changedProperties = {} } },
+					}
+					else { added = {}, removed = { parent }, updated = {} }
+				local securing = session:__checkpointDisplacedSources(patch, 1)
+				expect(#control.checkpoints).to.equal(1)
+				expect(control.checkpoints[1].source).to.equal("return 'draft'")
+				control.finishCheckpoint({ checkpointId = "initial-draft" })
+				expect(securing:await()).to.equal(true)
+			end)
+			session:stop()
+			parent:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should refuse initial removal when an open draft has no checkpointable identity", function()
+		local session, instance, control = sourceRecoverySession()
+		local unknown = Instance.new("ModuleScript")
+		session.__initialSourceRecovery = true
+		session.__hasOpenScriptDocument = function(_self, target)
+			return target == unknown
+		end
+		local success, problem = pcall(function()
+			local securing =
+				session:__checkpointDisplacedSources({ added = {}, removed = { unknown }, updated = {} }, 1)
+			expect(securing:await()).to.equal(false)
+			expect(#control.checkpoints).to.equal(0)
+			expect(control.text).to.equal("return 'draft'")
+		end)
+		session:stop()
+		instance:Destroy()
+		unknown:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should secure the exact editor draft before applying a genuine filesystem revision", function()
+		local session, instance, control = sourceRecoverySession()
+		local success, problem = pcall(function()
+			session:__rememberLocalProperty(instance, "Source")
+			session.__localPropertyEdits = {}
+			local applying = session:__applyPatch(sourcePublication("return 'filesystem'"), 1)
+			expect(control.text).to.equal("return 'draft'")
+			expect(control.checkpoints[1].source).to.equal("return 'draft'")
+			expect(control.checkpoints[1].expectedSource).to.equal("return 'filesystem'")
+			control.finishCheckpoint({ checkpointId = "secured" })
+			expect(applying:await()).to.equal(true)
+			expect(control.text).to.equal("return 'filesystem'")
+			expect(session:getSyncResults()[1].status).to.equal("Conflicted")
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should retain the latest draft when checkpoint storage fails or typing overtakes storage", function()
+		for _, newer in { false, true } do
+			local session, instance, control = sourceRecoverySession()
+			local success, problem = pcall(function()
+				session:__rememberLocalProperty(instance, "Source")
+				session.__localPropertyEdits = {}
+				local applying = session:__applyPatch(sourcePublication("return 'filesystem'"), 1)
+				if newer then
+					control.text = "return 'newest draft'"
+					session:__rememberLocalProperty(instance, "Source")
+					control.finishCheckpoint({ checkpointId = "previous draft only" })
+				else
+					control.failCheckpoint("The recovery cache is full.")
+				end
+				expect(applying:await()).to.equal(false)
+				expect(control.text).to.equal(if newer then "return 'newest draft'" else "return 'draft'")
+				expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+		end
+	end)
+
+	it("should preserve integrated document intent over one thousand replayable acknowledgement schedules", function()
+		local Source = require(script.Parent.Reconciler.setSource)
+		for seed = 1, 1000 do
+			local control = { cursor = 0, text = "return 'initial'", requests = {}, jobs = {} }
+			local changed
+			local setter = Source({
+				ConnectChanged = function(_, callback)
+					changed = callback
+					return { Disconnect = function() end }
+				end,
+				GetEditorSource = function()
+					return control.text
+				end,
+				Spawn = function(callback)
+					table.insert(control.jobs, callback)
+				end,
+				UpdateSourceAsync = function(_, callback)
+					local value = callback(control.text)
+					if value ~= nil and value ~= control.text then
+						control.text = value
+						changed()
+					end
+				end,
+			})
+			local session = ServeSession.new({
+				twoWaySync = true,
+				apiContext = {
+					getMessageCursor = function()
+						return control.cursor
+					end,
+					disconnect = function() end,
+					write = function(_, _, cursor, _, operation, predecessor, baselines)
+						return Promise.new(function(resolve)
+							table.insert(control.requests, {
+								Operation = operation,
+								Resolve = resolve,
+								Cursor = cursor,
+								Predecessor = predecessor,
+								Baselines = baselines,
+							})
+						end)
+					end,
+				},
+			})
+			session.__changeBatcher.__renderSteppedConnection:Disconnect()
+			session.__deferredChanges = nil
+			session.__instanceMap.sourceSetter = setter
+			session.__instanceMap.__isGameRunning = function()
+				return false
+			end
+			session.__readEditorSource = function()
+				return control.text
+			end
+			local instance = Instance.new("ModuleScript")
+			session.__instanceMap:insert("EDITED", instance)
+			local function edit(text)
+				control.text = text
+				changed()
+			end
+			local function write()
+				local captured = session:__takeLocalPropertyEdits({ [instance] = { Source = true } })
+				return session:__writePatch({
+					added = {},
+					removed = {},
+					updated = {
+						{ id = "EDITED", changedProperties = { Source = { String = control.text } } },
+					},
+				}, control.cursor, captured)
+			end
+			local function acknowledge(index)
+				local response = writeResult()
+				response.messageCursor = index
+				response.operationId = control.requests[index].Operation
+				response.acknowledgement = `proof-{index}`
+				control.requests[index].Resolve(response)
+			end
+			local function publish(text, operation, cursor)
+				local applying = session:__applyPatch(sourcePublication(text, operation), cursor)
+				while #control.jobs > 0 do
+					table.remove(control.jobs, 1)()
+				end
+				if applying ~= nil then
+					assert(applying:await(), `Source publication failed at seed {seed}.`)
+				end
+			end
+			local randomState = seed
+			local function choose()
+				randomState = randomState * 48271 % 2147483647
+				return randomState
+			end
+			local success, problem = pcall(function()
+				publish(control.text, nil, 0)
+				for generation = 1, 8 do
+					local firstIndex, latestIndex = generation * 2 - 1, generation * 2
+					local first = `return 'first {seed}/{generation}'`
+					local latest = `return 'latest {seed}/{generation}'`
+					edit(first)
+					local firstWrite = write()
+					local operation = control.requests[firstIndex].Operation
+					local earlyAcknowledgement = choose() % 2 == 0
+					if earlyAcknowledgement then
+						acknowledge(firstIndex)
+					end
+					edit(latest)
+					if choose() % 2 == 0 then
+						edit(first)
+						edit(latest)
+					end
+					local secondWrite = write()
+					publish(first, operation, firstIndex)
+					assert(
+						control.text == latest,
+						`An earlier echo rewound typing at seed {seed}, generation {generation}.`
+					)
+					if not earlyAcknowledgement then
+						acknowledge(firstIndex)
+					end
+					assert(firstWrite:await(), `The first write failed at seed {seed}.`)
+					expect(control.requests[firstIndex].Predecessor).to.equal(
+						if firstIndex == 1 then nil else `proof-{firstIndex - 1}`
+					)
+					expect(control.requests[latestIndex].Predecessor).to.equal(`proof-{firstIndex}`)
+					expect(control.requests[firstIndex].Cursor).to.equal((generation - 1) * 2)
+					expect(control.requests[firstIndex].Baselines.EDITED).to.equal((generation - 1) * 2)
+					expect(control.requests[latestIndex].Baselines.EDITED).to.equal((generation - 1) * 2)
+					for _ = 1, choose() % 4 do
+						publish(first, operation, firstIndex)
+					end
+					acknowledge(latestIndex)
+					assert(secondWrite:await(), `The latest write failed at seed {seed}.`)
+					control.cursor = latestIndex
+					session:__releaseLocalProperties(latestIndex)
+					publish(latest, control.requests[latestIndex].Operation, latestIndex)
+					for _ = 1, 1 + choose() % 4 do
+						publish(first, operation, firstIndex)
+					end
+					assert(
+						control.text == latest,
+						`A settled earlier echo rewound typing at seed {seed}, generation {generation}.`
+					)
+					assert(session.__sourceDrafts.EDITED == nil, `A saved draft remained at seed {seed}.`)
+					assert(next(session.__remoteSources) == nil, `A Source operation remained at seed {seed}.`)
+				end
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+			if seed % 32 == 0 then
+				task.wait()
+			end
+		end
+	end)
+
+	it("should not replay buffered Source behind a newer queued filesystem publication", function()
+		local session, instance, control = sourceRecoverySession()
+		local release
+		session.__pendingSourcePatch = Promise.new(function(resolve)
+			release = resolve
+		end)
+		session.__localPropertyEdits.EDITED = {
+			Source = {
+				cursor = 1,
+				serverCursor = 1,
+				serverInstance = instance,
+				serverValue = { String = "return 'disk1'" },
+			},
+		}
+		local success, problem = pcall(function()
+			local newer = session:__applyPatch(sourcePublication("return 'disk2'"), 2)
+			local replay = session:__releaseLocalProperties(1)
+			release()
+			expect(newer:getStatus()).to.equal(Promise.Status.Resolved)
+			if replay ~= nil then
+				expect(replay:getStatus()).to.equal(Promise.Status.Resolved)
+			end
+			expect(control.text).to.equal("return 'disk2'")
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should not classify matching historical text without provenance as an echo", function()
+		local session, instance, control = sourceRecoverySession()
+		local success, problem = pcall(function()
+			session.__sourceHistory:begin(
+				"old",
+				{ EDITED = { Instance = instance, Revision = 0, Source = "return 'historical'" } }
+			)
+			session.__sourceHistory:finish("old")
+			session:__rememberLocalProperty(instance, "Source")
+			session.__localPropertyEdits = {}
+			local applying = session:__applyPatch(sourcePublication("return 'historical'"), 1)
+			expect(#control.checkpoints).to.equal(1)
+			control.finishCheckpoint({ checkpointId = "secured" })
+			expect(applying:await()).to.equal(true)
+			expect(control.text).to.equal("return 'historical'")
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should restore a checkpoint only as an explicit guarded local editor change", function()
+		local session, instance, control = sourceRecoverySession()
+		session.__apiContext.readSourceCheckpoint = function()
+			return Promise.resolve({
+				sessionId = "session",
+				checkpoint = { id = "EDITED", source = "return 'recovered'" },
+			})
+		end
+		session.__updateEditorSource = function(self, _instance, callback)
+			local value = callback()
+			if value ~= nil then
+				control.text = value
+				self:__rememberLocalProperty(instance, "Source")
+			end
+		end
+		local success, problem = pcall(function()
+			local restored, result = session:restoreSourceCheckpoint("checkpoint", "EDITED", control.text):await()
+			expect(restored).to.equal(true)
+			expect(result.editorRestored).to.equal(true)
+			expect(control.text).to.equal("return 'recovered'")
+			expect(session.__sourceDrafts.EDITED.Source).to.equal("return 'recovered'")
+			expect(#control.requests).to.equal(0)
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should refuse recovery after an edit and exact reversion while reading its checkpoint", function()
+		local session, instance, control = sourceRecoverySession()
+		local resolveRead
+		session.__apiContext.readSourceCheckpoint = function()
+			return Promise.new(function(resolve)
+				resolveRead = resolve
+			end)
+		end
+		session.__updateEditorSource = function(_, _instance, callback)
+			expect(callback()).to.equal(nil)
+		end
+		local success, problem = pcall(function()
+			local restoring = session:restoreSourceCheckpoint("checkpoint", "EDITED", control.text)
+			local previous = control.text
+			control.text = "new typing"
+			session:__rememberLocalProperty(instance, "Source")
+			control.text = previous
+			session:__rememberLocalProperty(instance, "Source")
+			resolveRead({ sessionId = "session", checkpoint = { id = "EDITED", source = "return 'recovered'" } })
+			expect(restoring:await()).to.equal(false)
+			expect(control.text).to.equal(previous)
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should never replay a checkpoint onto a different tracked script identity", function()
+		local session, instance, control = sourceRecoverySession()
+		session.__apiContext.readSourceCheckpoint = function()
+			return Promise.resolve({ sessionId = "session", checkpoint = { id = "OTHER", source = "wrong draft" } })
+		end
+		session.__updateEditorSource = function()
+			error("A different identity must not reach the editor.")
+		end
+		local success, problem = pcall(function()
+			expect(session:restoreSourceCheckpoint("checkpoint", "EDITED", control.text):await()).to.equal(false)
+			expect(control.text).to.equal("return 'draft'")
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
 
 	it("should finish shutdown before notifying reentrant or throwing status callbacks", function()
 		for _, reenter in { false, true } do
@@ -240,7 +1370,7 @@ return function()
 		instanceMap:insert("INSTANCE", instance)
 		local success, err = pcall(function()
 			Settings:set("enableSyncFallback", true)
-			local session = setmetatable({
+			local session = sessionState({
 				__instanceMap = instanceMap,
 				__precommitCallbacks = {},
 				__postcommitCallbacks = {},
@@ -276,7 +1406,13 @@ return function()
 		local child = Instance.new("Folder")
 		child.Parent = original
 		local unmanaged = Instance.new("Folder")
-		local instanceMap = InstanceMap.new()
+		local reports = {}
+		local instanceMap = InstanceMap.new(function(_, property)
+			table.insert(reports, property)
+		end)
+		instanceMap.__isGameRunning = function()
+			return false
+		end
 		instanceMap:insert("ROOT", root)
 		instanceMap:insert("PARENT", original)
 		instanceMap:insert("CHILD", child)
@@ -290,7 +1426,7 @@ return function()
 		serializedParent.Parent = pointer
 		pointer.Value = serializedParent
 		local contents = game:GetService("SerializationService"):SerializeInstancesAsync({ model })
-		local session = setmetatable({
+		local session = sessionState({
 			__instanceMap = instanceMap,
 			__apiContext = {
 				serialize = function()
@@ -308,6 +1444,9 @@ return function()
 		}, ServeSession)
 		local success, unapplied = session:__replaceInstances({ "PARENT" })
 		expect(success).to.equal(true)
+		for _, property in reports do
+			expect(property == "Parent").to.equal(false)
+		end
 		expect(PatchSet.isEmpty(unapplied)).to.equal(true)
 		local replacement = instanceMap.fromIds.PARENT
 		expect(replacement ~= original).to.equal(true)
@@ -356,7 +1495,7 @@ return function()
 			},
 		}
 		local sent
-		local session = setmetatable({
+		local session = sessionState({
 			__instanceMap = instanceMap,
 			__twoWaySync = true,
 			__updateLoadingText = function() end,
@@ -395,7 +1534,7 @@ return function()
 	end)
 
 	it("should report transport failures to the notification callback", function()
-		local session = setmetatable({
+		local session = sessionState({
 			__apiContext = {
 				write = function()
 					return Promise.reject("Connection lost")
@@ -417,7 +1556,7 @@ return function()
 
 	it("should keep one record per write that moves from pending to its outcome", function()
 		local resolveWrite = nil
-		local session = setmetatable({
+		local session = sessionState({
 			__apiContext = {
 				write = function()
 					return Promise.new(function(resolve)
@@ -455,7 +1594,7 @@ return function()
 	it("should not send writes queued when the session stops", function()
 		local settle = nil
 		local started = {}
-		local session = setmetatable({
+		local session = sessionState({
 			__apiContext = {
 				write = function(_self, patch)
 					table.insert(started, patch.name)
@@ -491,7 +1630,7 @@ return function()
 			instanceMap:insert("DELETED", deleted)
 			instanceMap:insert("CHILD", child)
 			local queued = {}
-			local session = setmetatable({
+			local session = sessionState({
 				__instanceMap = instanceMap,
 				__pendingDeletions = { DELETED = deleted },
 				__markBatchStart = function() end,
@@ -525,7 +1664,7 @@ return function()
 		for _, firstFails in { false, true } do
 			local settle = {}
 			local started = {}
-			local session = setmetatable({
+			local session = sessionState({
 				__apiContext = {
 					write = function(_self, patch)
 						table.insert(started, patch.name)
@@ -1064,6 +2203,861 @@ return function()
 		end
 	end)
 
+	it("should capture undelivered structure before an older acknowledgement releases its guard", function()
+		for _, publicationFirst in { false, true } do
+			forDeferredStructures(function(propertyName, session, _, control, field)
+				local firstEntry = control.edit("DESTINATION")
+				local first = session:flushChanges()
+				if publicationFirst then
+					control.publish("DESTINATION", 1)
+				end
+				control.assign("PROBE")
+				control.cursor = 1
+				control.answer(1, 1)
+				first:await()
+				if not publicationFirst then
+					control.publish("DESTINATION", 1)
+				end
+				control.expectValue("PROBE")
+				local newer = session.__localPropertyEdits.EDITED[propertyName]
+				expect(newer ~= nil and newer ~= firstEntry).to.equal(true)
+				expect(newer.cursor).to.equal(nil)
+				control.deliver()
+				control.deliver()
+				expect(session.__localPropertyEdits.EDITED[propertyName]).to.equal(newer)
+				local second = session:flushChanges()
+				expect(control.requests[2].updated[1][field]).to.equal("PROBE")
+				control.publish("PROBE", 2)
+				control.cursor = 2
+				control.answer(2, 2)
+				second:await()
+				control.expectValue("PROBE")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+		end
+	end)
+
+	it("should capture undelivered structure without a guard before independent disk validation", function()
+		forDeferredStructures(function(propertyName, session, _, control, field)
+			control.assign("DESTINATION")
+			control.publish("DISK", 1)
+			control.expectValue("DESTINATION")
+			local entry = session.__localPropertyEdits.EDITED[propertyName]
+			expect(entry ~= nil and entry.cursor == nil).to.equal(true)
+			local write = session:flushChanges()
+			expect(control.requests[1].updated[1][field]).to.equal("DESTINATION")
+			control.cursor = 1
+			control.answer(1, 1, {
+				removed_instances = {},
+				added_instances = {},
+				updated_instances = {
+					{
+						id = "EDITED",
+						changed_properties = {},
+						[if propertyName == "Parent" then "changedParent" else "changed_name"] = "DISK",
+					},
+				},
+			})
+			write:await()
+			control.expectValue("DISK")
+			control.deliver()
+			control.deliver()
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+			expect(session:getSyncResults()[1].status).to.equal("Conflicted")
+		end)
+	end)
+
+	it("should recapture undelivered structure after a yielding precommit boundary", function()
+		forDeferredStructures(function(propertyName, session, _, control)
+			local resume
+			local gate = Promise.new(function(resolve)
+				resume = resolve
+			end)
+			local entered = false
+			session:hookPrecommit(function()
+				entered = true
+				local resumed = gate:await()
+				assert(resumed, "The withheld structural precommit did not resume.")
+			end)
+			local application = Promise.new(function(resolve, reject)
+				local result = control.publish("PROBE", 1)
+				if result ~= nil then
+					result:andThen(resolve):catch(reject)
+				else
+					resolve()
+				end
+			end)
+			expect(entered).to.equal(true)
+			control.assign("DESTINATION")
+			resume()
+			local applied, err = application:await()
+			assert(applied, tostring(err))
+			control.expectValue("DESTINATION")
+			expect(session.__localPropertyEdits.EDITED[propertyName] ~= nil).to.equal(true)
+			control.deliver()
+			local write = session:flushChanges()
+			control.publish("DESTINATION", 2)
+			control.cursor = 2
+			control.answer(1, 2)
+			write:await()
+			control.expectValue("DESTINATION")
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+		end)
+	end)
+
+	it("should retain late undelivered structure if the engine boundary overtakes filtering", function()
+		forDeferredStructures(function(_propertyName, session, _, control)
+			local apply = session.__reconciler.applyPatch
+			session.__reconciler.applyPatch = function(self, patch)
+				control.assign("DESTINATION")
+				return apply(self, patch)
+			end
+			local application = control.publish("PROBE", 1)
+			expect(application ~= nil).to.equal(true)
+			local applied = application:await()
+			expect(applied).to.equal(false)
+			control.expectValue("DESTINATION")
+			expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(#control.requests).to.equal(0)
+		end)
+	end)
+
+	it("should discard captured structure when its authoritative identity is removed", function()
+		forDeferredStructures(function(_propertyName, session, instance, control)
+			control.assign("DESTINATION")
+			session:__applyPatch({ added = {}, removed = { "EDITED" }, updated = {} }, 1)
+			expect(session.__instanceMap.fromIds.EDITED).to.equal(nil)
+			expect(session.__localPropertyEdits.EDITED).to.equal(nil)
+			local replacement = Instance.new("Actor")
+			replacement.Parent = session.__instanceMap.fromIds.PROBE
+			session.__instanceMap:insert("EDITED", replacement)
+			session:__releaseLocalProperties(2)
+			expect(replacement.Name).to.equal("Actor")
+			expect(replacement.Parent).to.equal(session.__instanceMap.fromIds.PROBE)
+			expect(instance.Parent).to.equal(nil)
+		end)
+	end)
+
+	it("should not replay captured structure onto a class replacement", function()
+		forDeferredStructures(function(_propertyName, session, instance, control)
+			control.assign("DESTINATION")
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = {
+					{
+						id = "EDITED",
+						changedClassName = "Folder",
+						changedName = "Canonical",
+						changedParent = "DISK",
+						changedProperties = {},
+					},
+				},
+			}, 1)
+			local replacement = session.__instanceMap.fromIds.EDITED
+			expect(replacement ~= instance).to.equal(true)
+			expect(replacement.ClassName).to.equal("Folder")
+			expect(replacement.Name).to.equal("Canonical")
+			expect(replacement.Parent).to.equal(session.__instanceMap.fromIds.DISK)
+			control.deliver()
+			session:__releaseLocalProperties(2)
+			expect(session.__localPropertyEdits.EDITED).to.equal(nil)
+			expect(replacement.Name).to.equal("Canonical")
+		end)
+	end)
+
+	it("should abandon reconciliation if deferred structural capture stops its session", function()
+		forDeferredStructures(function(_propertyName, session, _, control)
+			session.__instanceMap.onInstanceChanged = function()
+				session:stop()
+			end
+			control.assign("DESTINATION")
+			local application = control.publish("PROBE", 1)
+			expect(application ~= nil).to.equal(true)
+			local applied = application:await()
+			expect(applied).to.equal(false)
+			control.expectValue("DESTINATION")
+			expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(control.cursor).to.equal(0)
+			expect(#control.requests).to.equal(0)
+		end)
+	end)
+
+	for _, propertyName in { "Parent", "Name" } do
+		it(
+			`should guard rapid {propertyName} generations through older acknowledgements and duplicate publications`,
+			function()
+				for _, order in { { false, false }, { false, true }, { true, false }, { true, true } } do
+					local responseFirst, takeSecond = order[1], order[2]
+					local session, instance, control, field = structuralSession(propertyName)
+					local success, problem = pcall(function()
+						local firstEntry = control.edit("DESTINATION")
+						local first = session:flushChanges()
+						local secondEntry = control.edit("PROBE")
+						local second = if takeSecond then session:flushChanges() else nil
+						if responseFirst then
+							control.answer(1, 1)
+							first:await()
+						end
+						for _ = 1, 2 do
+							control.publish("DESTINATION", 1)
+							control.expectValue("PROBE")
+						end
+						expect(firstEntry ~= nil and secondEntry ~= nil and firstEntry ~= secondEntry).to.equal(true)
+						control.cursor = 1
+						session:__releaseLocalProperties(1)
+						if not responseFirst then
+							control.answer(1, 1)
+							first:await()
+						end
+						expect(session.__localPropertyEdits.EDITED[propertyName]).to.equal(secondEntry)
+						expect(secondEntry.cursor).to.equal(nil)
+						if second == nil then
+							second = session:flushChanges()
+						end
+						expect(control.requests[2].updated[1][field]).to.equal("PROBE")
+						expect(control.requests[2].updated[1].changedProperties[propertyName]).to.equal(nil)
+						control.answer(2, 2)
+						second:await()
+						session:__finishLocalProperties(
+							{ EDITED = { [propertyName] = firstEntry } },
+							{ messageCursor = 1 }
+						)
+						expect(session.__localPropertyEdits.EDITED[propertyName]).to.equal(secondEntry)
+						expect(secondEntry.cursor).to.equal(2)
+						control.publish("PROBE", 2)
+						control.cursor = 2
+						session:__releaseLocalProperties(2)
+						control.expectValue("PROBE")
+						expect(next(session.__localPropertyEdits)).to.equal(nil)
+						expect(instance.Parent ~= nil).to.equal(true)
+					end)
+					control.cleanup()
+					assert(success, problem)
+				end
+			end
+		)
+
+		it(`should retain pending {propertyName} across same-identity ancestor moves and renames`, function()
+			local session, _, control = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				local entry = control.edit("DESTINATION")
+				expect(entry ~= nil).to.equal(true)
+				local write = session:flushChanges()
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = {
+						{ id = "PROBE", changedName = "MovedProbe", changedParent = "DISK", changedProperties = {} },
+					},
+				}, 1)
+				control.publish("PROBE", 2)
+				control.expectValue("DESTINATION")
+				expect(session.__localPropertyEdits.EDITED[propertyName]).to.equal(entry)
+				control.answer(1, 3)
+				write:await()
+				control.publish("DESTINATION", 3)
+				control.cursor = 3
+				session:__releaseLocalProperties(3)
+				control.expectValue("DESTINATION")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+
+		it(
+			`should release the exact independent disk {propertyName} after validation in either completion order`,
+			function()
+				for _, responseFirst in { false, true } do
+					local session, _, control = structuralSession(propertyName)
+					local success, problem = pcall(function()
+						local entry = control.edit("DESTINATION")
+						expect(entry ~= nil).to.equal(true)
+						local write = session:flushChanges()
+						local conflict = {
+							removed_instances = {},
+							added_instances = {},
+							updated_instances = {
+								{
+									id = "EDITED",
+									changed_properties = {},
+									[if propertyName == "Parent" then "changedParent" else "changed_name"] = "DISK",
+								},
+							},
+						}
+						if responseFirst then
+							control.answer(1, 2, conflict)
+							write:await()
+						end
+						control.publish("DESTINATION", 1)
+						control.publish("DISK", 2)
+						control.expectValue("DESTINATION")
+						expect(session.__localPropertyEdits.EDITED[propertyName]).to.equal(entry)
+						control.cursor = 2
+						session:__releaseLocalProperties(2)
+						if not responseFirst then
+							control.answer(1, 2, conflict)
+							write:await()
+						end
+						control.expectValue("DISK")
+						expect(next(session.__localPropertyEdits)).to.equal(nil)
+					end)
+					control.cleanup()
+					assert(success, problem)
+				end
+			end
+		)
+
+		it(
+			`should retain buffered {propertyName} authority when a newer generation is refused without republication`,
+			function()
+				local session, _, control = structuralSession(propertyName)
+				local success, problem = pcall(function()
+					control.edit("DESTINATION")
+					local first = session:flushChanges()
+					control.publish("DISK", 1)
+					local newer = control.edit("PROBE")
+					local second = session:flushChanges()
+					control.cursor = 1
+					control.answer(1, 1)
+					first:await()
+					expect(session.__localPropertyEdits.EDITED[propertyName]).to.equal(newer)
+					control.expectValue("PROBE")
+					control.answer(2, 1, {
+						removed_instances = {},
+						added_instances = {},
+						updated_instances = { { id = "EDITED", changed_properties = {} } },
+					})
+					second:await()
+					control.expectValue("DISK")
+					expect(next(session.__localPropertyEdits)).to.equal(nil)
+				end)
+				control.cleanup()
+				assert(success, problem)
+			end
+		)
+
+		it(`should keep newer {propertyName} publications ahead of delayed buffered replay`, function()
+			local session, _, control, field = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				control.edit("DESTINATION")
+				local write = session:flushChanges()
+				control.publish("PROBE", 1)
+				control.answer(1, 1)
+				write:await()
+				local resume
+				session.__pendingSourcePatch = Promise.new(function(resolve)
+					resume = resolve
+				end)
+				control.cursor = 1
+				local replay = session:__releaseLocalProperties(1)
+				local publication = control.publish("DISK", 2)
+				local applied = {}
+				session:hookPrecommit(function(patch)
+					for _, update in patch.updated do
+						if update.id == "EDITED" and update[field] ~= nil then
+							table.insert(applied, update[field])
+						end
+					end
+				end)
+				resume()
+				replay:await()
+				publication:await()
+				control.expectValue("DISK")
+				expect(#applied).to.equal(1)
+				expect(applied[1]).to.equal("DISK")
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+
+		it(`should remember queued WebSocket {propertyName} receipts before an earlier replay completes`, function()
+			local session, _, control, field = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				local messages
+				session.__apiContext.connect = function()
+					return Promise.resolve({ projectName = "StructuralReceiptTest" })
+				end
+				session.__apiContext.connectWebSocket = function(_, handlers)
+					messages = handlers.messages
+					return Promise.resolve()
+				end
+				session.__apiContext.setMessageCursor = function(_, cursor)
+					control.cursor = cursor
+				end
+				session.__initialSync = function()
+					return Promise.resolve()
+				end
+				session:start()
+				expect(messages ~= nil).to.equal(true)
+				control.edit("DESTINATION")
+				local write = session:flushChanges()
+				control.publish("PROBE", 1)
+				control.answer(1, 1)
+				write:await()
+				local resume
+				session.__pendingSourcePatch = Promise.new(function(resolve)
+					resume = resolve
+				end)
+				control.cursor = 1
+				local replay = session:__releaseLocalProperties(1)
+				session.__lastPublication = replay
+				messages({
+					messageCursor = 2,
+					messages = {
+						{
+							added = {},
+							removed = {},
+							updated = { { id = "EDITED", [field] = "DISK", changedProperties = {} } },
+						},
+					},
+				})
+				local applied = {}
+				session:hookPrecommit(function(patch)
+					for _, update in patch.updated do
+						if update.id == "EDITED" and update[field] ~= nil then
+							table.insert(applied, update[field])
+						end
+					end
+				end)
+				resume()
+				session.__lastPublication:await()
+				control.expectValue("DISK")
+				expect(#applied).to.equal(1)
+				expect(applied[1]).to.equal("DISK")
+				expect(control.cursor).to.equal(2)
+				expect(session:getStatus()).to.equal(ServeSession.Status.Connected)
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+
+		it(`should stop unknown {propertyName} transport without replaying an older buffered value`, function()
+			local session, _, control = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				local fail
+				session.__apiContext.write = function()
+					return Promise.new(function(_, reject)
+						fail = reject
+					end)
+				end
+				control.edit("DESTINATION")
+				local write = session:flushChanges()
+				control.publish("PROBE", 1)
+				control.cursor = 1
+				fail("The write outcome is unknown.")
+				write:await()
+				control.expectValue("DESTINATION")
+				expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+				expect(session.__localPropertyEdits).to.equal(nil)
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+
+		it(`should retain deferred {propertyName} intent through initial structural catch-up`, function()
+			local session, instance, control = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				session.__deferredChanges = {}
+				instance[propertyName] = if propertyName == "Parent"
+					then session.__instanceMap.fromIds.DESTINATION
+					else "DESTINATION"
+				session:__onInstanceChanged(instance, propertyName)
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+				session:__releaseDeferredChanges()
+				local entry = session.__localPropertyEdits.EDITED[propertyName]
+				expect(entry ~= nil).to.equal(true)
+				control.publish("PROBE", 0)
+				control.expectValue("DESTINATION")
+				local write = session:flushChanges()
+				control.publish("DESTINATION", 1)
+				control.cursor = 1
+				control.answer(1, 1)
+				write:await()
+				control.expectValue("DESTINATION")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+
+		it(`should allow authoritative escape before ancestor removal without pinning {propertyName}`, function()
+			for _, actualInstanceRemoval in { false, true } do
+				local session, instance, control = structuralSession(propertyName)
+				local success, problem = pcall(function()
+					control.edit("DESTINATION")
+					local write = session:flushChanges()
+					local probe = session.__instanceMap.fromIds.PROBE
+					session:__applyPatch({
+						added = {},
+						removed = { if actualInstanceRemoval then probe else "PROBE" },
+						updated = {
+							{
+								id = "EDITED",
+								changedName = "ServerSurvivor",
+								changedParent = "DISK",
+								changedProperties = {},
+							},
+						},
+					}, 1)
+					expect(session.__instanceMap.fromIds.EDITED).to.equal(instance)
+					expect(instance.Parent).to.equal(session.__instanceMap.fromIds.DISK)
+					expect(instance.Name).to.equal("ServerSurvivor")
+					expect(next(session.__localPropertyEdits)).to.equal(nil)
+					control.cursor = 1
+					control.answer(1, 1)
+					write:await()
+				end)
+				control.cleanup()
+				assert(success, problem)
+			end
+		end)
+
+		it(
+			`should release the newest buffered {propertyName} cursor despite reordered duplicate announcements`,
+			function()
+				local session, _, control = structuralSession(propertyName)
+				local success, problem = pcall(function()
+					control.edit("DESTINATION")
+					local write = session:flushChanges()
+					control.publish("DISK", 2)
+					control.publish("PROBE", 1)
+					control.publish("PROBE", 1)
+					control.expectValue("DESTINATION")
+					control.cursor = 2
+					control.answer(1, 2)
+					write:await()
+					control.expectValue("DISK")
+					expect(next(session.__localPropertyEdits)).to.equal(nil)
+					control.publish("PROBE", 3)
+					control.expectValue("PROBE")
+				end)
+				control.cleanup()
+				assert(success, problem)
+			end
+		)
+
+		it(`should discard {propertyName} guards on same-ID class replacement`, function()
+			local session, instance, control = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				control.edit("DESTINATION")
+				local write = session:flushChanges()
+				control.publish("PROBE", 1)
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = {
+						{
+							id = "EDITED",
+							changedClassName = "Folder",
+							changedName = "ClassReplacement",
+							changedProperties = {},
+						},
+					},
+				}, 2)
+				local replacement = session.__instanceMap.fromIds.EDITED
+				expect(replacement == instance).to.equal(false)
+				expect(replacement.Name).to.equal("ClassReplacement")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+				control.cursor = 2
+				control.answer(1, 2)
+				write:await()
+				expect(replacement.Name).to.equal("ClassReplacement")
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+
+		it(`should release explicit failed {propertyName} responses through exact server restoration`, function()
+			local session, _, control = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				control.edit("DESTINATION")
+				local write = session:flushChanges()
+				control.publish("DISK", 1)
+				control.expectValue("DESTINATION")
+				local result =
+					writeResult({ { id = "EDITED", property = propertyName, message = "The field is excluded." } })
+				result.messageCursor = 1
+				control.cursor = 1
+				control.settle[1](result)
+				write:await()
+				control.expectValue("DISK")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+				expect(session:getSyncResults()[1].status).to.equal("Failed")
+				expect(session:getStatus() == ServeSession.Status.Disconnected).to.equal(false)
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+
+		it(`should clear omitted and validated no-op {propertyName} generations without publications`, function()
+			local session, instance, control, field = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				local omitted = control.edit("DESTINATION")
+				expect(omitted ~= nil).to.equal(true)
+				local taken = session:__takeLocalPropertyEdits({ [instance] = { [propertyName] = true } })
+				expect(taken.EDITED[propertyName]).to.equal(omitted)
+				session:__finishOmittedLocalProperties({ added = {}, removed = {}, updated = {} }, taken)
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+				local newer = control.edit("PROBE")
+				session:__finishOmittedLocalProperties(nil, taken)
+				expect(session.__localPropertyEdits.EDITED[propertyName]).to.equal(newer)
+				local write = session:flushChanges()
+				expect(control.requests[1].updated[1][field]).to.equal("PROBE")
+				control.answer(1, 0)
+				write:await()
+				control.expectValue("PROBE")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+
+		it(`should discard pending {propertyName} on removal and never replay onto a replacement identity`, function()
+			for _, replacement in { false, true } do
+				local session, instance, control = structuralSession(propertyName)
+				local success, problem = pcall(function()
+					local entry = control.edit("DESTINATION")
+					expect(entry ~= nil).to.equal(true)
+					local write = session:flushChanges()
+					control.publish("PROBE", 1)
+					session:__applyPatch({
+						added = if replacement
+							then {
+								EDITED = {
+									Id = "EDITED",
+									Parent = "DISK",
+									Name = "ServerReplacement",
+									ClassName = "Folder",
+									Properties = {},
+									Children = {},
+								},
+							}
+							else {},
+						removed = { "EDITED" },
+						updated = {},
+					}, 2)
+					expect(next(session.__localPropertyEdits)).to.equal(nil)
+					control.cursor = 2
+					control.answer(1, 2)
+					write:await()
+					local current = session.__instanceMap.fromIds.EDITED
+					if replacement then
+						expect(current == instance).to.equal(false)
+						expect(current.Name).to.equal("ServerReplacement")
+						expect(current.Parent).to.equal(session.__instanceMap.fromIds.DISK)
+					else
+						expect(current).to.equal(nil)
+					end
+				end)
+				control.cleanup()
+				assert(success, problem)
+			end
+		end)
+	end
+
+	it("should restore confirmed ancestry before an authoritative move reverses a pending optimistic edge", function()
+		for _, responseFirst in { false, true } do
+			local session, actor, control = structuralSession("Parent")
+			local success, problem = pcall(function()
+				control.edit("DESTINATION")
+				local write = session:flushChanges()
+				local conflict = {
+					removed_instances = {},
+					added_instances = {},
+					updated_instances = { { id = "EDITED", changedParent = "PROBE", changed_properties = {} } },
+				}
+				if responseFirst then
+					control.answer(1, 2, conflict)
+					write:await()
+				end
+				local destination = session.__instanceMap.fromIds.DESTINATION
+				local apply = session.__reconciler.applyPatch
+				session.__reconciler.applyPatch = function(self, patch)
+					local unapplied = apply(self, patch)
+					expect(#unapplied.updated).to.equal(0)
+					return unapplied
+				end
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = {
+						{ id = "DESTINATION", changedParent = "EDITED", changedProperties = {} },
+					},
+				}, 1)
+				expect(destination.Parent).to.equal(actor)
+				control.expectValue("PROBE")
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+				control.publish("PROBE", 2)
+				control.cursor = 2
+				if not responseFirst then
+					control.answer(1, 2, conflict)
+					write:await()
+				end
+				expect(destination.Parent).to.equal(actor)
+				control.expectValue("PROBE")
+				expect(session:getStatus() == ServeSession.Status.Disconnected).to.equal(false)
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end
+	end)
+
+	it("should use the packet's exact Parent correction before reversing a buffered optimistic edge", function()
+		local session, actor, control = structuralSession("Parent")
+		local success, problem = pcall(function()
+			control.edit("DESTINATION")
+			local write = session:flushChanges()
+			control.publish("DESTINATION", 1)
+			local destination = session.__instanceMap.fromIds.DESTINATION
+			local apply = session.__reconciler.applyPatch
+			session.__reconciler.applyPatch = function(self, patch)
+				local unapplied = apply(self, patch)
+				expect(#unapplied.updated).to.equal(0)
+				return unapplied
+			end
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = {
+					{ id = "DESTINATION", changedParent = "EDITED", changedProperties = {} },
+					{ id = "EDITED", changedParent = "DISK", changedProperties = {} },
+				},
+			}, 2)
+			control.expectValue("DISK")
+			expect(destination.Parent).to.equal(actor)
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+			control.cursor = 2
+			control.answer(1, 2)
+			write:await()
+			control.expectValue("DISK")
+			expect(destination.Parent).to.equal(actor)
+		end)
+		control.cleanup()
+		assert(success, problem)
+	end)
+
+	it("should stop an unprovable structural cycle without losing local ancestry or consuming its cursor", function()
+		local session, actor, control = structuralSession("Parent")
+		local success, problem = pcall(function()
+			control.edit("DESTINATION")
+			control.publish("DESTINATION", 1)
+			local destination = session.__instanceMap.fromIds.DESTINATION
+			local publication = session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = {
+					{ id = "DESTINATION", changedParent = "EDITED", changedProperties = {} },
+				},
+			}, 2)
+			local applied = publication:await()
+			expect(applied).to.equal(false)
+			expect(actor.Parent).to.equal(destination)
+			expect(destination.Parent == actor).to.equal(false)
+			expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(session.__localPropertyEdits).to.equal(nil)
+			expect(control.cursor).to.equal(0)
+		end)
+		control.cleanup()
+		assert(success, problem)
+	end)
+
+	it("should stop a reversing publication before it rewrites an unencoded Parent intention", function()
+		local session, actor, control = structuralSession("Parent")
+		local success, problem = pcall(function()
+			control.edit("DESTINATION")
+			local destination = session.__instanceMap.fromIds.DESTINATION
+			local publication = session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = {
+					{ id = "DESTINATION", changedParent = "EDITED", changedProperties = {} },
+				},
+			}, 1)
+			expect(publication ~= nil).to.equal(true)
+			expect(publication:await()).to.equal(false)
+			expect(actor.Parent).to.equal(destination)
+			expect(destination.Parent == actor).to.equal(false)
+			expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(session.__localPropertyEdits).to.equal(nil)
+			expect(#control.requests).to.equal(0)
+			expect(control.cursor).to.equal(0)
+		end)
+		control.cleanup()
+		assert(success, problem)
+	end)
+
+	it("should prune structural guards after identity replacement during a nonstructural reconciliation", function()
+		for _, propertyName in { "Parent", "Name" } do
+			local session, instance, control = structuralSession(propertyName)
+			local success, problem = pcall(function()
+				control.edit("DESTINATION")
+				local write = session:flushChanges()
+				local replacement = Instance.new("Actor")
+				replacement.Name = "FallbackReplacement"
+				replacement.Parent = session.__instanceMap.fromIds.DISK
+				session.__reconciler.applyPatch = function()
+					session.__instanceMap:insert("EDITED", replacement)
+					return { added = {}, removed = {}, updated = {} }
+				end
+				session:__applyPatch({
+					added = {},
+					removed = {},
+					updated = { { id = "EDITED", changedProperties = { Archivable = { Bool = true } } } },
+				}, 1)
+				expect(session.__instanceMap.fromIds.EDITED == instance).to.equal(false)
+				expect(next(session.__localPropertyEdits)).to.equal(nil)
+				control.answer(1, 0)
+				write:await()
+				expect(replacement.Name).to.equal("FallbackReplacement")
+				expect(replacement.Parent).to.equal(session.__instanceMap.fromIds.DISK)
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end
+	end)
+
+	it("should transfer a nil Parent intent to deletion without replaying its buffered old parent", function()
+		local session, instance, control = structuralSession("Parent")
+		local success, problem = pcall(function()
+			control.edit("DESTINATION")
+			control.publish("DISK", 1)
+			instance.Parent = nil
+			session:__queueChange(instance, "Parent")
+			local write = session:flushChanges()
+			expect(control.requests[1].removed[1]).to.equal("EDITED")
+			expect(instance.Parent).to.equal(nil)
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+			local result = writeResult()
+			result.accepted.removed_instances = { "EDITED" }
+			control.settle[1](result)
+			write:await()
+			expect(instance.Parent).to.equal(nil)
+			expect(session.__instanceMap.fromIds.EDITED).to.equal(nil)
+			expect(session.__changeBatcher:isEmpty()).to.equal(true)
+		end)
+		control.cleanup()
+		assert(success, problem)
+	end)
+
+	it("should clear Parent guards when the real encoder restores an unmanaged destination", function()
+		local session, instance, control = structuralSession("Parent")
+		local unmanaged = Instance.new("Folder")
+		local success, problem = pcall(function()
+			instance.Parent = unmanaged
+			session:__queueChange(instance, "Parent")
+			expect(session.__localPropertyEdits.EDITED.Parent ~= nil).to.equal(true)
+			expect(session:flushChanges()).to.equal(nil)
+			control.expectValue("PROBE")
+			expect(next(session.__localPropertyEdits)).to.equal(nil)
+			expect(#control.requests).to.equal(0)
+		end)
+		control.cleanup()
+		unmanaged:Destroy()
+		assert(success, problem)
+	end)
+
 	it("should preserve newer local properties across delayed server echoes at every write stage", function()
 		for _, stage in { "pending", "queued", "inflight", "answered" } do
 			local session, part, control = propertySession("Part")
@@ -1448,7 +3442,7 @@ return function()
 				self.__pendingPropertyChanges[instance] = propertyName
 			end,
 		}
-		local session = setmetatable({
+		local session = sessionState({
 			__apiContext = {
 				getMessageCursor = function()
 					return cursor
@@ -1490,7 +3484,7 @@ return function()
 		local original = Settings:get("twoWaySyncAuthority")
 		local success, err = pcall(function()
 			local sent = {}
-			local session = setmetatable({
+			local session = sessionState({
 				__apiContext = {
 					write = function(_self, _patch, _cursor, authority)
 						table.insert(sent, authority)
@@ -1520,7 +3514,7 @@ return function()
 		local success, err = pcall(function()
 			Settings:set("twoWaySyncAuthority", "Studio")
 			local sent = {}
-			local session = setmetatable({
+			local session = sessionState({
 				__twoWaySyncAuthority = "Filesystem",
 				__apiContext = {
 					write = function(_self, _patch, _cursor, authority)
@@ -1546,7 +3540,7 @@ return function()
 	-- A session that records what reaches the change batcher.
 	local function changeSession(twoWaySync, deferring)
 		local queued = {}
-		local session = setmetatable({
+		local session = sessionState({
 			__twoWaySync = twoWaySync,
 			__deferredChanges = if deferring then {} else nil,
 			__changeBatcher = {
@@ -1604,7 +3598,7 @@ return function()
 			for _, id in { "A", "A_CHILD", "B" } do
 				instanceMap:insert(id, Instance.new("Folder"))
 			end
-			local session = setmetatable({ __instanceMap = instanceMap }, ServeSession)
+			local session = sessionState({ __instanceMap = instanceMap }, ServeSession)
 			local patch = PatchSet.newEmpty()
 			patch.added = {
 				A = { ids = { id = "A", children = { { id = "A_CHILD", children = {} } } } },
@@ -1655,7 +3649,7 @@ return function()
 					deleted.Parent = kept
 				end
 				local queued = {}
-				local session = setmetatable({
+				local session = sessionState({
 					__instanceMap = instanceMap,
 					__markBatchStart = function() end,
 					__changeBatcher = {
@@ -1735,7 +3729,7 @@ return function()
 	it("should cancel the initial sync only after a yield in a stopped session", function()
 		for _, yielded in { false, true } do
 			for _, status in { "Connecting", "Connected", "Disconnected" } do
-				local session = setmetatable({ __status = status }, ServeSession)
+				local session = sessionState({ __status = status }, ServeSession)
 				local step = session:__syncStep(function()
 					return yielded
 				end)
@@ -1755,7 +3749,7 @@ return function()
 		local reached = {}
 		local queued = {}
 		local session
-		session = setmetatable({
+		session = sessionState({
 			__status = "Connecting",
 			__twoWaySync = true,
 			__deferredChanges = { { instance = Instance.new("Folder"), propertyName = "Name" } },

@@ -32,6 +32,11 @@ API (shown as shared.Rojo, identical under shared.RojoPlus):
 > shared.Rojo.getConfirmationSummary(limit?) - Describe the pending sync confirmation
 > shared.Rojo.getNotifications() - Get current write and connection notifications
 > shared.Rojo.clearSyncResults() - Clear recorded write outcomes
+> shared.Rojo.listSourceCheckpoints() - List durable displaced drafts
+> shared.Rojo.readSourceCheckpoint(id) - Read a recovery draft without applying it
+> shared.Rojo.discardSourceCheckpoint(id) - Explicitly discard a recovery draft
+> shared.Rojo.restoreSourceCheckpoint(id, instanceId, expectedSource) - Restore a draft
+  as a new local edit only if the target identity and current editor text still match
 > shared.Rojo.syncbackFromStudio(host?, port?) - Send the open place to
   `rojo syncback --from-studio`
 
@@ -322,6 +327,34 @@ function SharedAPI.register(app)
 		return {
 			success = true,
 		}
+	end
+
+	const function sourceCheckpointRequest(method, ...)
+		if registeredApp == nil or registeredApp.serveSession == nil then
+			return { success = false, error = "Rojo+ is not connected." }
+		end
+		const success, result = registeredApp.serveSession[method](registeredApp.serveSession, ...):await()
+		if not success then
+			return { success = false, error = tostring(result) }
+		end
+		result.success = true
+		return result
+	end
+
+	function api.listSourceCheckpoints()
+		return sourceCheckpointRequest("listSourceCheckpoints")
+	end
+
+	function api.readSourceCheckpoint(checkpointId)
+		return sourceCheckpointRequest("readSourceCheckpoint", checkpointId)
+	end
+
+	function api.discardSourceCheckpoint(checkpointId)
+		return sourceCheckpointRequest("discardSourceCheckpoint", checkpointId)
+	end
+
+	function api.restoreSourceCheckpoint(checkpointId, instanceId, expectedSource)
+		return sourceCheckpointRequest("restoreSourceCheckpoint", checkpointId, instanceId, expectedSource)
 	end
 
 	function api.flush()

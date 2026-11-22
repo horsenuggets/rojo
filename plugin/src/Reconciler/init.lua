@@ -27,13 +27,13 @@ end
 function Reconciler:applyPatch(patch)
 	Timer.start("Reconciler:applyPatch")
 
-	local ok, unappliedPatch = pcall(applyPatch, self.__instanceMap, patch)
+	local ok, unappliedPatch, sourceOperations = pcall(applyPatch, self.__instanceMap, patch)
 
 	Timer.stop()
 	if not ok then
 		error(unappliedPatch, 0)
 	end
-	return unappliedPatch
+	return unappliedPatch, sourceOperations
 end
 
 -- Hydrating and diffing walk the whole place, and call `step` as they go so

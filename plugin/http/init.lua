@@ -29,7 +29,7 @@ local function performRequest(requestParams)
 	Log.trace("HTTP {}({}) {}", requestParams.Method, requestId, requestParams.Url)
 
 	if requestParams.Body ~= nil then
-		Log.trace("{}", requestParams.Body)
+		Log.trace("Request body contains {} bytes.", #requestParams.Body)
 	end
 
 	return Promise.new(function(resolve, reject)
@@ -39,7 +39,7 @@ local function performRequest(requestParams)
 			end)
 
 			if success then
-				Log.trace("Request {} success, response {:#?}", requestId, response)
+				Log.trace("Request {} completed with HTTP {}.", requestId, response.StatusCode)
 				local httpResponse = HttpResponse.fromRobloxResponse(response)
 				if httpResponse:isSuccess() then
 					resolve(httpResponse)
@@ -65,6 +65,14 @@ function Http.post(url, body)
 	return performRequest({
 		Url = url,
 		Method = "POST",
+		Body = body,
+	})
+end
+
+function Http.delete(url, body)
+	return performRequest({
+		Url = url,
+		Method = "DELETE",
 		Body = body,
 	})
 end

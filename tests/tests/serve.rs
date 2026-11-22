@@ -22,6 +22,206 @@ use librojo::web_api::{
 };
 
 #[test]
+fn studio_repeated_actor_moves_resolve_authored_relative_mount_destinations() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    for mapping in ["src", "./src", "directory/../src"] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fs::create_dir_all(root.join("src/Actor/Nested")).unwrap();
+            fs::create_dir_all(root.join("src/Destination")).unwrap();
+            fs::create_dir_all(root.join("directory")).unwrap();
+            fs::write(
+                root.join("src/Actor/init.meta.json"),
+                r#"{"className":"Actor"}"#,
+            )
+            .unwrap();
+            fs::write(root.join("src/Actor/Handler.local.luau"), "return 1\n").unwrap();
+            fs::write(root.join("src/Actor/Nested/init.luau"), "return 2\n").unwrap();
+            fs::write(root.join("default.project.json"), serde_json::to_vec(&serde_json::json!({
+                "name": "RelativeMount",
+                "tree": {"$className":"Folder", "Mount":{"$path":mapping}},
+                "syncRules":[{"pattern":"*.local.luau", "use":"legacyClientScript", "suffix":".local.luau"}]
+            })).unwrap()).unwrap();
+        });
+        let info = session.wait_to_come_online();
+        let initial = session.get_api_read(info.root_instance_id).unwrap();
+        let find = |name: &str| {
+            initial
+                .instances
+                .values()
+                .find(|instance| instance.name == name)
+                .unwrap()
+                .id
+        };
+        let actor = find("Actor");
+        let handler = find("Handler");
+        let mount = find("Mount");
+        let destination = find("Destination");
+        for index in 0..12 {
+            let parent = if index % 2 == 0 { destination } else { mount };
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            let response = session.post_api_write(&WriteRequest {
+                session_id: info.session_id,
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
+                message_cursor: Some(read.message_cursor),
+                authority: WriteAuthority::Filesystem,
+                removed: Vec::new(),
+                added: Default::default(),
+                updated: vec![InstanceUpdate {
+                    id: actor,
+                    changed_parent: Some(parent),
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_metadata: None,
+                    changed_properties: UstrMap::default(),
+                }],
+            });
+            assert!(
+                response.errors.is_empty(),
+                "Mapping {mapping:?}, move {index}. {:?}",
+                response.errors
+            );
+            assert!(
+                response.conflicts.updated_instances.is_empty(),
+                "Mapping {mapping:?}, move {index}. {:?}",
+                response.conflicts
+            );
+            let after = session.get_api_read(info.root_instance_id).unwrap();
+            assert_eq!(after.instances[&actor].parent, parent);
+            assert_eq!(after.instances[&handler].parent, actor);
+            let path = if index % 2 == 0 {
+                "src/Destination/Actor/Handler.local.luau"
+            } else {
+                "src/Actor/Handler.local.luau"
+            };
+            assert_eq!(
+                fs::read_to_string(session.path().join(path)).unwrap(),
+                "return 1\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn studio_separate_noop_parent_keeps_captured_source_lineage() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    for reverse in [false, true] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fs::create_dir_all(root.join("src/Actor/Nested")).unwrap();
+            fs::create_dir_all(root.join("src/Destination")).unwrap();
+            fs::write(
+                root.join("src/Actor/init.meta.json"),
+                r#"{"className":"Actor"}"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("src/Actor/.luaurc"),
+                r#"{"aliases":{"nested":"Nested"}}"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("src/Actor/Handler.local.luau"),
+                "return require(\"@nested\")\n",
+            )
+            .unwrap();
+            fs::write(root.join("src/Actor/Nested/init.luau"), "return 2\n").unwrap();
+            fs::write(root.join("default.project.json"), serde_json::to_vec(&serde_json::json!({
+                "name": "CausalNoopParent",
+                "tree": {"$className":"Folder", "$path":"src"},
+                "syncRules":[{"pattern":"*.local.luau", "use":"legacyClientScript", "suffix":".local.luau"}]
+            })).unwrap()).unwrap();
+        });
+        let info = session.wait_to_come_online();
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        let find = |name: &str| {
+            read.instances
+                .values()
+                .find(|instance| instance.name == name)
+                .unwrap()
+                .id
+        };
+        let actor = find("Actor");
+        let handler = find("Handler");
+        let destination = find("Destination");
+        let captured = match read.instances[&handler].properties[&ustr("Source")].as_ref() {
+            Variant::String(source) => source.clone(),
+            _ => panic!("The managed script must have Source."),
+        };
+        let cursor = read.message_cursor;
+        let mut predecessor = None;
+        let mut suffix = String::new();
+        for (index, parent) in [
+            Some(destination),
+            Some(info.root_instance_id),
+            Some(destination),
+            Some(info.root_instance_id),
+            None,
+            Some(info.root_instance_id),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            suffix.push_str(&format!("-- generation {index}\n"));
+            let mut updated = vec![InstanceUpdate {
+                id: handler,
+                changed_parent: None,
+                changed_name: None,
+                changed_class_name: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::from_iter([(
+                    ustr("Source"),
+                    Some(Variant::String(format!("{captured}{suffix}"))),
+                )]),
+            }];
+            if let Some(parent) = parent {
+                updated.push(InstanceUpdate {
+                    id: actor,
+                    changed_parent: Some(parent),
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_metadata: None,
+                    changed_properties: UstrMap::default(),
+                });
+            }
+            if reverse {
+                updated.reverse();
+            }
+            let response = session.post_api_write(&WriteRequest {
+                session_id: info.session_id,
+                operation_id: Some(format!("generation-{index}")),
+                predecessor,
+                source_baselines: [(handler, cursor)].into_iter().collect(),
+                message_cursor: Some(cursor),
+                authority: WriteAuthority::Filesystem,
+                removed: Vec::new(),
+                added: Default::default(),
+                updated,
+            });
+            assert!(
+                response.errors.is_empty(),
+                "Order {reverse}, generation {index}. {:?}",
+                response.errors
+            );
+            assert!(
+                response.conflicts.updated_instances.is_empty(),
+                "Order {reverse}, generation {index}. {:?}",
+                response.conflicts
+            );
+            predecessor = Some(
+                response
+                    .acknowledgement
+                    .expect("Every successful own batch must retain causal coverage."),
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(session.path().join("src/Actor/Handler.local.luau")).unwrap(),
+            format!("return require(\"@nested\")\n{suffix}")
+        );
+    }
+}
+
+#[test]
 fn interactive_scaling_saves_successive_properties_from_the_same_client_cursor() {
     use crate::rojo_test::serve_util::TestServeSession;
     use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
@@ -50,6 +250,9 @@ fn interactive_scaling_saves_successive_properties_from_the_same_client_cursor()
             Matrix3::identity(),
         ));
         let response = session.post_api_write(&WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(cursor),
             authority: WriteAuthority::Filesystem,
@@ -147,6 +350,9 @@ fn canonical_sound_writes_replace_authored_aliases_on_disk() {
         });
         for value in [10.0, 7.0] {
             let response = session.post_api_write(&WriteRequest {
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
                 session_id: info.session_id,
                 message_cursor: Some(read.message_cursor),
                 authority: WriteAuthority::Filesystem,
@@ -245,6 +451,9 @@ fn property_writes_validate_authored_path_aliases() {
                 (ustr("Source"), Variant::String("return 'saved'\n".into()))
             };
             let response = session.post_api_write(&WriteRequest {
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
                 session_id: info.session_id,
                 message_cursor: Some(read.message_cursor),
                 authority: WriteAuthority::Filesystem,
@@ -301,6 +510,9 @@ fn successive_script_writes_do_not_conflict_with_prior_studio_saves() {
         .id;
     for source in ["return 'a'\n", "return 'ab'\n", "return 'abc'\n"] {
         let response = session.post_api_write(&WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(read.message_cursor),
             authority: WriteAuthority::Filesystem,
@@ -362,6 +574,9 @@ fn transformed_script_serialization_errors_do_not_restore_editor_drafts() {
         };
         assert_ne!(emitted, original);
         let request = |source: String| WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(read.message_cursor),
             authority: WriteAuthority::Filesystem,
@@ -465,6 +680,9 @@ fn text_values_sync_in_both_directions_after_filesystem_edits() {
         };
         let studio_value = format!("studio {iteration}\n");
         let response = session.post_api_write(&WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(cursor),
             authority: WriteAuthority::Filesystem,
@@ -542,6 +760,9 @@ fn filesystem_module_rename_converges_and_keeps_followup_source_edits() {
     };
     let source = "return { Revision = 2 }\n";
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(cursor),
         authority: WriteAuthority::Filesystem,
@@ -601,6 +822,9 @@ fn package_sources_serve_routes_originals_and_watches_without_reinstall() {
         .id;
     let before = fixture::files(session.path());
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(read.message_cursor),
         authority: WriteAuthority::Filesystem,
@@ -697,6 +921,9 @@ fn package_sources_serve_blocks_registry_generated_and_structural_writes_without
         for remove in [false, true] {
             let read = session.get_api_read(info.root_instance_id).unwrap();
             let response = session.post_api_write(&WriteRequest {
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
                 session_id: info.session_id,
                 message_cursor: Some(read.message_cursor),
                 authority: WriteAuthority::Studio,
@@ -754,6 +981,9 @@ fn package_sources_serve_preserves_stale_source_edits_without_restoring_studio()
     }
     let before = fixture::files(session.path());
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(original.message_cursor),
         authority: WriteAuthority::Studio,
@@ -801,6 +1031,9 @@ fn package_sources_serve_reverses_generated_imports_and_rejects_ambiguous_edits(
     );
     let mut expected = fixture::files(session.path());
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(read.message_cursor),
         authority: WriteAuthority::Filesystem,
@@ -829,6 +1062,9 @@ fn package_sources_serve_reverses_generated_imports_and_rejects_ambiguous_edits(
         thread::sleep(Duration::from_millis(20));
     };
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(read.message_cursor),
         authority: WriteAuthority::Studio,
@@ -862,6 +1098,9 @@ fn package_sources_serve_invalid_or_absent_provenance_fails_closed() {
             .id;
         let before = fixture::files(session.path());
         let response = session.post_api_write(&WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(read.message_cursor),
             authority: WriteAuthority::Studio,
@@ -897,6 +1136,9 @@ fn package_sources_serve_add_rename_and_remove_use_original_directories() {
     let folder_id = ids.id;
     let module_id = ids.children[0].id;
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(read.message_cursor),
         authority: WriteAuthority::Filesystem,
@@ -924,6 +1166,9 @@ fn package_sources_serve_add_rename_and_remove_use_original_directories() {
     let mut rename = fixture::source_update(module_id, "return \"Module\"\n");
     rename.changed_name = Some("Renamed".into());
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(read.message_cursor),
         authority: WriteAuthority::Filesystem,
@@ -936,6 +1181,9 @@ fn package_sources_serve_add_rename_and_remove_use_original_directories() {
     assert!(!original.join("Module.luau").exists());
     let read = session.get_api_read(info.root_instance_id).unwrap();
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(read.message_cursor),
         authority: WriteAuthority::Filesystem,
@@ -974,6 +1222,9 @@ fn package_sources_serve_batches_model_properties_with_script_sources() {
     model.changed_properties = UstrMap::from_iter([(ustr("Value"), Some(Variant::Float64(4.0)))]);
     let mut expected = fixture::files(session.path());
     let response = session.post_api_write(&WriteRequest {
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
         session_id: info.session_id,
         message_cursor: Some(read.message_cursor),
         authority: WriteAuthority::Filesystem,
@@ -1043,6 +1294,9 @@ fn assert_numeric_api_writes_converge(cases: &[(f64, f64)]) {
             for attempt in 0..3 {
                 let read = session.get_api_read(root_id).unwrap();
                 let response = session.post_api_write(&WriteRequest {
+                    operation_id: None,
+                    predecessor: None,
+                    source_baselines: Default::default(),
                     session_id: info.session_id,
                     message_cursor: Some(read.message_cursor),
                     authority: WriteAuthority::Filesystem,
@@ -1307,6 +1561,9 @@ fn assert_created_subtrees_are_written(fixture: &str, check_layout: impl Fn(&std
         let response = post_write(
             &session,
             &WriteRequest {
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
                 session_id: info.session_id,
                 message_cursor: Some(cursor),
                 authority: WriteAuthority::Filesystem,
@@ -1374,6 +1631,9 @@ fn announce_authority(
     let response = post_write(
         session,
         &WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(read.message_cursor),
             authority,
@@ -1592,6 +1852,9 @@ fn studio_created_subtrees_remove_the_gitkeep_they_replace() {
         let response = post_write(
             &session,
             &WriteRequest {
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
                 session_id: info.session_id,
                 message_cursor: Some(read.message_cursor),
                 authority: WriteAuthority::Filesystem,
@@ -1631,6 +1894,9 @@ fn studio_created_subtrees_reject_ids_that_are_not_new() {
         let response = post_write(
             &session,
             &WriteRequest {
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
                 session_id: info.session_id,
                 message_cursor: Some(read.message_cursor),
                 authority: WriteAuthority::Filesystem,
@@ -1671,6 +1937,9 @@ fn studio_move_to_the_datamodel_root_writes_into_its_path() {
             .id;
 
         let request = WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(read.message_cursor),
             authority: WriteAuthority::Studio,
@@ -1742,6 +2011,9 @@ impl SharedFiles {
         post_write(
             session,
             &WriteRequest {
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
                 session_id: self.info.session_id,
                 message_cursor: Some(self.cursor),
                 authority: WriteAuthority::Filesystem,
@@ -2033,6 +2305,9 @@ fn studio_created_subtrees_keep_their_references() {
         let response = post_write(
             &session,
             &WriteRequest {
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
                 session_id: fixture.info.session_id,
                 message_cursor: Some(fixture.cursor),
                 authority: WriteAuthority::Filesystem,
@@ -2125,6 +2400,9 @@ fn studio_move_and_rename_preserve_ids_through_real_watcher_events() {
             .any(|message| message.added.contains_key(&destination)));
         let cursor = setup.message_cursor;
         let request = WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(cursor),
             authority: WriteAuthority::Studio,
@@ -2226,6 +2504,9 @@ fn studio_move_promotes_script_parent_through_real_watcher_events() {
             .id;
         let parent_bytes = fs::read(session.path().join("src/bar.server.lua")).unwrap();
         let request = WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(initial.message_cursor),
             authority: WriteAuthority::Studio,
@@ -2335,6 +2616,9 @@ fn studio_move_cannot_overwrite_an_occupied_destination() {
                 thread::sleep(Duration::from_millis(20));
             };
         let request = WriteRequest {
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
             session_id: info.session_id,
             message_cursor: Some(cursor),
             authority: WriteAuthority::Studio,

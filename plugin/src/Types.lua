@@ -34,6 +34,7 @@ local ApiSubscribeMessage = t.interface({
 	removed = t.array(RbxId),
 	added = t.map(RbxId, ApiInstance),
 	updated = t.array(ApiInstanceUpdate),
+	sourceOperations = t.optional(t.map(RbxId, t.string)),
 })
 
 local ApiInfoResponse = t.interface({
@@ -95,8 +96,15 @@ local ApiWriteError = t.interface({
 	message = t.string,
 })
 
+local function acknowledgementToken(value)
+	return type(value) == "string"
+		and value:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-4%x%x%x%-[89aAbB]%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") ~= nil
+end
+
 local ApiWriteResponse = t.interface({
+	acknowledgement = t.optional(acknowledgementToken),
 	sessionId = t.string,
+	operationId = t.optional(t.string),
 	messageCursor = t.intersection(t.integer, t.numberConstrained(0, 4294967295)),
 	accepted = ApiWritePatch,
 	conflicts = ApiWritePatch,
