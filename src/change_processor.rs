@@ -7735,6 +7735,67 @@ mod tests {
         )
     }
 
+    /// The plugin drops writes whose target was replaced or removed before dispatch.
+    /// Writes that still arrive late must fail closed, never recreating the files the
+    /// filesystem replaced or deleted.
+    #[test]
+    fn stale_part_writes_after_class_replacement_and_removal_fail_closed() {
+        let (job, id) = part_job();
+        let cursor = job.message_queue.cursor();
+        let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+            property_update(id, "Size", Variant::Vector3(Vector3::new(8.0, 4.0, 2.0))),
+            Some(cursor),
+            WriteAuthority::Filesystem,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(conflicts, PatchSet::new());
+        assert_eq!(accepted.updated_instances.len(), 1);
+
+        let metadata = PathBuf::from("/project/Part/init.meta.json");
+        job.vfs.remove_file(&metadata).unwrap();
+        job.handle_vfs_event(VfsEvent::Remove(metadata));
+        assert_eq!(
+            job.tree
+                .lock()
+                .unwrap()
+                .get_instance(id)
+                .unwrap()
+                .class_name(),
+            ustr("Folder")
+        );
+        // The Folder keeps the id, so a Part property is a conflict restoring disk's value.
+        let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+            property_update(id, "Size", Variant::Vector3(Vector3::new(9.0, 4.0, 2.0))),
+            Some(cursor),
+            WriteAuthority::Filesystem,
+        );
+        assert_eq!(accepted, PatchSet::new());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(conflicts.updated_instances.len(), 1);
+        assert_eq!(conflicts.updated_instances[0].id, id);
+        assert!(!exists(&job, "/project/Part/init.meta.json"));
+
+        let directory = PathBuf::from("/project/Part");
+        job.vfs.remove_dir_all(&directory).unwrap();
+        job.handle_vfs_event(VfsEvent::Remove(directory.clone()));
+        assert!(job.tree.lock().unwrap().get_instance(id).is_none());
+
+        // A removed id is unknown. The write is refused without publishing anything.
+        let published = job.message_queue.cursor();
+        let (accepted, conflicts, errors) = job.handle_tree_event_at_cursor(
+            property_update(id, "Size", Variant::Vector3(Vector3::new(9.0, 4.0, 2.0))),
+            Some(cursor),
+            WriteAuthority::Filesystem,
+        );
+        assert_eq!(accepted, PatchSet::new());
+        assert_eq!(conflicts, PatchSet::new());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].id, id);
+        assert_eq!(errors[0].message, "Cannot update an unknown instance");
+        assert_eq!(job.message_queue.cursor(), published);
+        assert!(!exists(&job, directory.to_str().unwrap()));
+    }
+
     /// Builds a job whose tree holds the instance at `source` as the root's
     /// only child, with `files` loaded under `/project`.
     fn script_job(files: Vec<(&str, VfsSnapshot)>, source: &str) -> (JobThreadContext, Ref) {
