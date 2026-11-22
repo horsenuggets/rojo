@@ -31,15 +31,8 @@ return function(instanceMap, propertyChanges)
 			if properties.Parent and instanceMap.fromInstances[instance.Parent] == nil then
 				-- An unmanaged destination has no server identity. Undo only the move,
 				-- without feeding our restoration back into the batcher.
-				local wasPaused = instanceMap.pausedUpdateInstances[instance]
-				instanceMap:pauseInstance(instance)
-				local success, err = pcall(function()
-					instance.Parent = instanceMap.knownParents[instance]
-					instanceMap.observedParents[instance] = instance.Parent
-				end)
-				if not wasPaused then
-					instanceMap:unpauseInstance(instance)
-				end
+				local success, err =
+					instanceMap:applyStructuralProperty(instance, "Parent", instanceMap.knownParents[instance])
 				properties.Parent = nil
 				if not success then
 					Log.warn("Could not restore the authoritative parent of {:?}. {}", instance, err)

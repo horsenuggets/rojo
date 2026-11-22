@@ -2,6 +2,7 @@ local RunService = game:GetService("RunService")
 
 local Packages = script.Parent.Parent.Packages
 local Log = require(Packages.Log)
+local Source = require(script.Parent.Reconciler.setSource)
 
 --[[
 	A bidirectional map between instance IDs and Roblox instances. It lets us
@@ -10,8 +11,12 @@ local Log = require(Packages.Log)
 local InstanceMap = {}
 InstanceMap.__index = InstanceMap
 
-function InstanceMap.new(onInstanceChanged, onChildAdded)
+function InstanceMap.new(onInstanceChanged, onChildAdded, sourceSetter)
 	local self = {
+		-- Shared with the reconciler, but replaceable with a deterministic editor in tests.
+		sourceSetter = sourceSetter or Source.shared(),
+		sourceConnections = {},
+
 		-- A map from IDs to instances.
 		fromIds = {},
 
@@ -21,8 +26,10 @@ function InstanceMap.new(onInstanceChanged, onChildAdded)
 		-- Last authoritative parents, not speculative Studio moves awaiting a reply.
 		knownParents = {},
 
-		-- Also suppress deferred notifications for a parent we already observed.
+		-- Structural notifications can be deferred until after a later local edit.
+		observedNames = {},
 		observedParents = {},
+		structuralAssignments = {},
 
 		-- A set of all instances that updates should be paused for. This set
 		-- should generally be empty, and will be filled by pauseInstance
@@ -32,8 +39,8 @@ function InstanceMap.new(onInstanceChanged, onChildAdded)
 		-- A map from instances to a signal or list of signals connected to it.
 		instancesToSignal = {},
 
-		-- Callback that's invoked whenever an instance is changed and it was
-		-- not paused.
+		-- Source includes an observation as the third argument and bypasses the generic
+		-- pause. Its Operation is only a candidate until onSourceOutcome confirms it.
 		onInstanceChanged = onInstanceChanged,
 
 		-- Callback that's invoked with each instance that gains a known parent
@@ -60,8 +67,90 @@ end
 function InstanceMap:stop()
 	-- I think this is safe.
 	for instance in pairs(self.fromInstances) do
-		self:removeInstance(instance)
+		self:removeInstance(instance, "stopped")
 	end
+end
+
+-- Returns the live observation revision and its instance/session generation.
+function InstanceMap:getSourceRevision(instance)
+	local revision, generation = self.sourceSetter.GetRevision(instance)
+	local connection = self.sourceConnections[instance]
+	if connection and connection.Generation == generation then
+		return revision, generation
+	end
+	return nil, nil
+end
+
+-- The returned operation is pending until the editor reports its actual outcome.
+-- onSourceScheduled(instance, operation) runs before starting the asynchronous work.
+-- onSourceOutcome(instance, operation) runs once at completion, including cancellation.
+-- Both callbacks also cover pending writes adopted during insertion. ServerOperation is
+-- the optional protocol token, not a content-based echo identity.
+function InstanceMap:setSource(instance, value, completed, serverOperation)
+	assert(self.fromInstances[instance] ~= nil, "Source instance must be tracked.")
+	assert(self:getSourceRevision(instance) ~= nil, "Source observation belongs to another session.")
+	return self.sourceSetter(instance, value, completed, serverOperation)
+end
+
+function InstanceMap:__assignStructuralProperty(instance, propertyName, value)
+	instance[propertyName] = value
+end
+
+-- Native signals may still be queued when reconciliation reaches this instance. Capture
+-- its actual values before deciding which pending generation a publication may replace.
+function InstanceMap:captureStructuralChanges(instance)
+	local id = self.fromInstances[instance]
+	if id == nil then
+		return
+	end
+	local signals = self.instancesToSignal[instance]
+	self:__maybeFireInstanceChanged(instance, "Name")
+	if
+		self.fromInstances[instance] == id
+		and self.fromIds[id] == instance
+		and self.instancesToSignal[instance] == signals
+	then
+		self:__maybeFireInstanceChanged(instance, "Parent")
+	end
+end
+
+-- Record only this remote assignment, not an instance-wide quiet period. Pre-recording
+-- its value handles immediate signals; deferred signals still report any newer local value.
+function InstanceMap:applyStructuralProperty(instance, propertyName, value)
+	assert(propertyName == "Name" or propertyName == "Parent", "Expected a structural property.")
+	if self.onBeforeStructuralAssignment ~= nil then
+		self.onBeforeStructuralAssignment(instance, propertyName, value)
+	end
+	local id = self.fromInstances[instance]
+	assert(id ~= nil, "Structural instance must be tracked.")
+	local observed = if propertyName == "Parent" then self.observedParents else self.observedNames
+	local previous = observed[instance]
+	local assignments = self.structuralAssignments[instance] or {}
+	self.structuralAssignments[instance] = assignments
+	local predecessor = assignments[propertyName]
+	local assignment = {}
+	assignments[propertyName] = assignment
+	observed[instance] = value
+
+	local success, err = pcall(self.__assignStructuralProperty, self, instance, propertyName, value)
+	-- A synchronous listener can remove/reinsert the instance or apply a nested assignment.
+	-- Neither an old success nor its rollback may replace that newer observation state.
+	if self.structuralAssignments[instance] == assignments and assignments[propertyName] == assignment then
+		assignments[propertyName] = if success then nil else predecessor
+		if next(assignments) == nil then
+			self.structuralAssignments[instance] = nil
+		end
+		if self.fromInstances[instance] == id and self.fromIds[id] == instance then
+			if success then
+				if propertyName == "Parent" then
+					self.knownParents[instance] = value
+				end
+			elseif observed[instance] == value then
+				observed[instance] = previous
+			end
+		end
+	end
+	return success, err
 end
 
 function InstanceMap:__fmtDebug(output)
@@ -96,6 +185,7 @@ function InstanceMap:insert(id, instance)
 	self.fromIds[id] = instance
 	self.fromInstances[instance] = id
 	self.knownParents[instance] = instance.Parent
+	self.observedNames[instance] = instance.Name
 	self.observedParents[instance] = instance.Parent
 	self:__connectSignals(instance)
 end
@@ -110,9 +200,9 @@ function InstanceMap:removeId(id)
 	end
 end
 
-function InstanceMap:removeInstance(instance)
+function InstanceMap:removeInstance(instance, reason)
 	local id = self.fromInstances[instance]
-	self:__disconnectSignals(instance)
+	self:__disconnectSignals(instance, reason)
 
 	if id ~= nil then
 		self.fromInstances[instance] = nil
@@ -127,7 +217,14 @@ function InstanceMap:destroyInstance(instance)
 	-- Because the user might want to Undo this change, we cannot use Destroy
 	-- since that locks that parent and prevents ChangeHistoryService from
 	-- ever bringing it back. Instead, we parent to nil.
-	instance.Parent = nil
+	if id ~= nil then
+		local success, err = self:applyStructuralProperty(instance, "Parent", nil)
+		if not success then
+			error(err, 0)
+		end
+	else
+		instance.Parent = nil
+	end
 
 	-- After the instance is successfully destroyed,
 	-- we can remove all the id mappings
@@ -181,6 +278,29 @@ function InstanceMap:unpauseAllInstances()
 end
 
 function InstanceMap:__connectSignals(instance)
+	if instance:IsA("LuaSourceContainer") then
+		local sourceConnection = self.sourceSetter.Observe(instance, function(observation)
+			self:__maybeFireInstanceChanged(instance, "Source", observation)
+		end, function(outcome)
+			if self.onSourceOutcome then
+				self.onSourceOutcome(instance, outcome)
+			elseif outcome.Status == "failed" then
+				Log.warn("Source update failed for {}. {}", instance:GetFullName(), outcome.Error)
+			end
+		end, function(operation)
+			if self.onSourceScheduled then
+				self.onSourceScheduled(instance, operation)
+			end
+		end)
+		local _, generation = self.sourceSetter.GetRevision(instance)
+		if self.fromInstances[instance] == nil or generation ~= sourceConnection.Generation then
+			-- Adopting an existing operation can synchronously stop or replace this session.
+			sourceConnection:Disconnect("stopped")
+			return
+		end
+		self.sourceConnections[instance] = sourceConnection
+	end
+
 	-- ValueBase instances have an overriden version of the Changed signal that
 	-- only detects changes to their Value property.
 	--
@@ -231,20 +351,28 @@ function InstanceMap:__connectSignals(instance)
 	-- deleted folder, and about every nested instance created by the initial sync.
 end
 
-function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
+function InstanceMap:__maybeFireInstanceChanged(instance, propertyName, observation)
+	if self.fromInstances[instance] == nil then
+		return
+	end
+	-- Source has one revision boundary for both the editor buffer and closed scripts.
+	-- Instance.Changed is a duplicate and must never hide an open editor draft.
+	if propertyName == "Source" and observation == nil then
+		return
+	end
 	Log.trace("{}.{} changed", instance:GetFullName(), propertyName)
 
-	if propertyName == "Parent" then
-		if self.observedParents[instance] == instance.Parent then
+	local structural = propertyName == "Name" or propertyName == "Parent"
+	if structural then
+		local observed = if propertyName == "Parent" then self.observedParents else self.observedNames
+		local value = instance[propertyName]
+		if observed[instance] == value then
 			return
 		end
-		self.observedParents[instance] = instance.Parent
+		observed[instance] = value
 	end
 
-	if self.pausedUpdateInstances[instance] then
-		if propertyName == "Parent" then
-			self.knownParents[instance] = instance.Parent
-		end
+	if self.pausedUpdateInstances[instance] and propertyName ~= "Source" and not structural then
 		return
 	end
 
@@ -258,7 +386,7 @@ function InstanceMap:__maybeFireInstanceChanged(instance, propertyName)
 		return
 	end
 
-	self.onInstanceChanged(instance, propertyName)
+	self.onInstanceChanged(instance, propertyName, observation)
 end
 
 --[[
@@ -284,10 +412,17 @@ function InstanceMap:__isGameRunning()
 	return RunService:IsRunning()
 end
 
-function InstanceMap:__disconnectSignals(instance)
+function InstanceMap:__disconnectSignals(instance, reason)
+	local sourceConnection = self.sourceConnections[instance]
+	self.sourceConnections[instance] = nil
+	if sourceConnection then
+		sourceConnection:Disconnect(reason or "untracked")
+	end
 	local signals = self.instancesToSignal[instance]
 	self.knownParents[instance] = nil
+	self.observedNames[instance] = nil
 	self.observedParents[instance] = nil
+	self.structuralAssignments[instance] = nil
 	self.pausedUpdateInstances[instance] = nil
 
 	if signals ~= nil then

@@ -70,6 +70,70 @@ return function()
 		root:Destroy()
 	end)
 
+	it("should not lose local structure after an empty guarded update pauses the instance", function()
+		for _, className in { "Folder", "StringValue" } do
+			local reports = {}
+			local instanceMap = InstanceMap.new(function(_, propertyName)
+				reports[propertyName] = (reports[propertyName] or 0) + 1
+			end)
+			instanceMap.__isGameRunning = function()
+				return false
+			end
+			local root = Instance.new("Folder")
+			local target = Instance.new("Folder")
+			target.Parent = root
+			local instance = Instance.new(className)
+			instance.Parent = root
+			instanceMap:insert("INSTANCE", instance)
+			local patch = PatchSet.newEmpty()
+			patch.updated = { { id = "INSTANCE", changedProperties = {} } }
+			expect(PatchSet.isEmpty(applyPatch(instanceMap, patch))).to.equal(true)
+			instance.Parent = target
+			instance.Name = "Local intent"
+			task.wait()
+			expect(reports.Parent).to.equal(1)
+			expect(reports.Name).to.equal(1)
+			expect(instanceMap.knownParents[instance]).to.equal(root)
+			instanceMap:stop()
+			root:Destroy()
+		end
+	end)
+
+	it("should suppress explicit remote structure but report later local structure in the same frame", function()
+		for _, className in { "Folder", "StringValue" } do
+			local reports = {}
+			local instanceMap = InstanceMap.new(function(_, propertyName)
+				reports[propertyName] = (reports[propertyName] or 0) + 1
+			end)
+			instanceMap.__isGameRunning = function()
+				return false
+			end
+			local root = Instance.new("Folder")
+			local target = Instance.new("Folder")
+			target.Parent = root
+			local instance = Instance.new(className)
+			instance.Parent = root
+			instanceMap:insert("INSTANCE", instance)
+			instanceMap:insert("TARGET", target)
+			local patch = PatchSet.newEmpty()
+			patch.updated = {
+				{ id = "INSTANCE", changedName = "Server intent", changedParent = "TARGET", changedProperties = {} },
+			}
+			expect(PatchSet.isEmpty(applyPatch(instanceMap, patch))).to.equal(true)
+			task.wait()
+			expect(next(reports)).to.equal(nil)
+			instanceMap:pauseInstance(instance)
+			instance.Parent = root
+			instance.Name = "Local intent"
+			task.wait()
+			expect(reports.Parent).to.equal(1)
+			expect(reports.Name).to.equal(1)
+			expect(instanceMap.knownParents[instance]).to.equal(target)
+			instanceMap:stop()
+			root:Destroy()
+		end
+	end)
+
 	-- Metadata has nothing to apply in Studio. Leaving it unapplied would make
 	-- the sync fallback replace the instance, alone or alongside a rename.
 	it("should apply metadata changes without touching the instance", function()

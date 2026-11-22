@@ -1,4 +1,5 @@
 [tools]
+luau-lsp = "horsenuggets/luau-lsp@1.70.1-horse.2.0"
 rojo = "horsenuggets/rojo@7.7.1-horse.2.8"
 selene = "kampfkarren/selene@0.32.0"
 stylua = "johnnymorganz/stylua@2.6.0"

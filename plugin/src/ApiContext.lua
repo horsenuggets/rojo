@@ -212,8 +212,20 @@ function ApiContext:read(ids)
 	end)
 end
 
-function ApiContext:write(patch, messageCursor, authority)
+function ApiContext:write(patch, messageCursor, authority, operationId, predecessor, sourceBaselines)
 	assert(authority == "Filesystem" or authority == "Studio", "Write authority must be Filesystem or Studio")
+	assert(predecessor == nil or type(predecessor) == "string", "Write predecessor must be an opaque string.")
+	assert(sourceBaselines == nil or type(sourceBaselines) == "table", "Source baselines must be a cursor map.")
+	for id, cursor in sourceBaselines or {} do
+		assert(
+			type(id) == "string"
+				and type(cursor) == "number"
+				and cursor % 1 == 0
+				and cursor >= 0
+				and cursor <= 4294967295,
+			"Source baselines must contain script identities and u32 cursors."
+		)
+	end
 	if not self.__connected then
 		return Promise.reject("The connection is closed.")
 	end
@@ -244,6 +256,10 @@ function ApiContext:write(patch, messageCursor, authority)
 
 	local body = {
 		sessionId = self.__sessionId,
+		operationId = operationId,
+		predecessor = predecessor,
+		-- Empty tables encode as arrays, not maps, in the wire encoder.
+		sourceBaselines = if sourceBaselines and next(sourceBaselines) ~= nil then sourceBaselines else nil,
 		messageCursor = messageCursor or self.__messageCursor,
 		authority = authority,
 		removed = patch.removed,
@@ -267,12 +283,87 @@ function ApiContext:write(patch, messageCursor, authority)
 		if responseBody.sessionId ~= self.__sessionId then
 			return rejectInvalidAcknowledgement(self, "Server changed ID")
 		end
+		if operationId ~= nil and responseBody.operationId ~= operationId then
+			return rejectInvalidAcknowledgement(self, "The write acknowledgement belongs to another operation.")
+		end
 		if responseBody.messageCursor < minimumCursor then
 			return rejectInvalidAcknowledgement(self, "The write acknowledgement predates known publication progress.")
+		end
+		local conflicts = responseBody.conflicts
+		if
+			responseBody.acknowledgement ~= nil
+			and (
+				#responseBody.errors > 0
+				or #conflicts.removed_instances > 0
+				or #conflicts.added_instances > 0
+				or #conflicts.updated_instances > 0
+			)
+		then
+			return rejectInvalidAcknowledgement(self, "A rejected write cannot grant a lineage capability.")
 		end
 		self.__writeCursor = math.max(self.__writeCursor, responseBody.messageCursor)
 		return responseBody
 	end)
+end
+
+function ApiContext:__sourceCheckpointRequest(method, checkpointId, body)
+	if not self.__connected then
+		return Promise.reject("The connection is closed.")
+	end
+	local url = self.__baseUrl .. "/api/source-checkpoints"
+	if checkpointId ~= nil then
+		assert(
+			type(checkpointId) == "string" and #checkpointId <= 96 and checkpointId:match("^[%w_%-]+$") ~= nil,
+			"Checkpoint identity must be an opaque identifier."
+		)
+		url ..= "/" .. checkpointId
+	end
+	local request
+	if method == "GET" then
+		request = Http.get(url)
+	else
+		body = table.clone(body)
+		body.sessionId = self.__sessionId
+		request = if method == "POST"
+			then Http.post(url, Http.msgpackEncode(body))
+			else Http.delete(url, Http.msgpackEncode(body))
+	end
+	return request:andThen(rejectFailedRequests):andThen(Http.Response.msgpack):andThen(function(response)
+		if type(response) ~= "table" or response.sessionId ~= self.__sessionId then
+			return rejectInvalidAcknowledgement(self, "The Source checkpoint response has an invalid session.")
+		end
+		return response
+	end)
+end
+
+function ApiContext:createSourceCheckpoint(id, source, expectedSource, messageCursor)
+	assert(
+		type(id) == "string" and type(source) == "string" and type(expectedSource) == "string",
+		"Source checkpoints require script identity and text."
+	)
+	return self:__sourceCheckpointRequest("POST", nil, {
+		id = id,
+		source = source,
+		expectedSource = expectedSource,
+		messageCursor = messageCursor,
+	}):andThen(function(response)
+		if type(response.checkpointId) ~= "string" or #response.checkpointId == 0 then
+			return rejectInvalidAcknowledgement(self, "The Source checkpoint was not acknowledged as durable.")
+		end
+		return response
+	end)
+end
+
+function ApiContext:listSourceCheckpoints()
+	return self:__sourceCheckpointRequest("GET")
+end
+
+function ApiContext:readSourceCheckpoint(checkpointId)
+	return self:__sourceCheckpointRequest("GET", checkpointId)
+end
+
+function ApiContext:discardSourceCheckpoint(checkpointId)
+	return self:__sourceCheckpointRequest("DELETE", checkpointId, {})
 end
 
 function ApiContext:connectWebSocket(packetHandlers)

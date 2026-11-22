@@ -45,11 +45,9 @@ return function()
 			instance.Parent = authoritative
 			instanceMap:insert("INSTANCE", instance)
 			instanceMap:insert("ACCEPTED", accepted)
-			-- A server move supersedes the parent captured at insertion.
-			instanceMap:pauseInstance(instance)
-			instance.Parent = accepted
+			-- Only an explicit server assignment advances authoritative ancestry.
+			expect(instanceMap:applyStructuralProperty(instance, "Parent", accepted)).to.equal(true)
 			task.wait()
-			instanceMap:unpauseInstance(instance)
 			instance.Parent = unmanaged
 			task.wait()
 			table.clear(reports)
