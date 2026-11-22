@@ -1614,15 +1614,20 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 
 	-- The instances this write deletes are remembered until it's answered, so
 	-- an announcement of the deletion can tell whether an undo came first.
+	-- Each guard belongs to the instance this write encoded, so a target already
+	-- replaced or removed gets none, and an id reused by a newer instance keeps its own.
 	self.__pendingDeletions = self.__pendingDeletions or {}
-	for _, id in patch.removed do
-		if self.__instanceMap ~= nil and self.__instanceMap.fromIds[id] ~= nil then
-			self.__pendingDeletions[id] = self.__instanceMap.fromIds[id]
+	for index, id in patch.removed do
+		local target = targets.Removed[index]
+		if target ~= nil and self.__instanceMap ~= nil and self.__instanceMap.fromIds[id] == target then
+			self.__pendingDeletions[id] = target
 		end
 	end
 	local function forgetDeletions()
-		for _, id in patch.removed do
-			self.__pendingDeletions[id] = nil
+		for index, id in patch.removed do
+			if self.__pendingDeletions[id] == targets.Removed[index] then
+				self.__pendingDeletions[id] = nil
+			end
 		end
 	end
 

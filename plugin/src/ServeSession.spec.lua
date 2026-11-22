@@ -49,7 +49,7 @@ return function()
 	end
 
 	local function propertySession(className)
-		local control = { cursor = 0, requests = {}, settle = {} }
+		local control = { cursor = 0, fail = {}, requests = {}, settle = {} }
 		local session = ServeSession.new({
 			twoWaySync = true,
 			apiContext = {
@@ -60,7 +60,8 @@ return function()
 				write = function(_self, patch)
 					table.insert(control.requests, patch)
 					local index = #control.requests
-					return Promise.new(function(resolve)
+					return Promise.new(function(resolve, reject)
+						control.fail[index] = reject
 						control.settle[index] = resolve
 					end)
 				end,
@@ -435,6 +436,64 @@ return function()
 			end)
 			control.cleanup()
 			assert(success, `Removal {removal} failed. {tostring(problem)}`)
+		end
+	end)
+
+	it("should keep a newer instance's deletion guard when an older deletion under its id settles", function()
+		for _, outcome in { "Superseded", "Mixed", "Saved", "Failed" } do
+			local session, part, control = queuedPartSession()
+			local success, problem = pcall(function()
+				local root = part.Parent
+				local dispatched = outcome == "Saved" or outcome == "Failed"
+				part.Parent = nil
+				session:__queueChange(part, "Parent")
+				if outcome == "Mixed" then
+					control.edit(control.other, 3)
+				end
+				local older = session:flushChanges()
+				if dispatched then
+					control.settle[1](writeResult())
+					assert(control.first:await())
+					expect(control.requests[2].removed[1]).to.equal("EDITED")
+				end
+
+				-- Studio undoes the Part's deletion, the filesystem replaces it, and Studio
+				-- then deletes the replacement Folder under the same id.
+				part.Parent = root
+				control.replace()
+				local folder = control.folder
+				expect(folder.Parent).to.equal(root)
+				folder.Parent = nil
+				session:__queueChange(folder, "Parent")
+				local newer = session:flushChanges()
+				expect(session.__pendingDeletions.EDITED).to.equal(folder)
+
+				if outcome == "Failed" then
+					control.fail[2]("The connection dropped")
+				elseif dispatched then
+					control.settle[2](writeResult())
+				else
+					control.settle[1](writeResult())
+					assert(control.first:await())
+					if outcome == "Mixed" then
+						expect(control.sentIds(2)).to.equal("OTHER")
+						control.settle[2](writeResult())
+					end
+				end
+				older:await()
+				expect(session.__pendingDeletions.EDITED).to.equal(folder)
+
+				-- An undo before the Folder's deletion announcement keeps it restored.
+				local index = #control.requests
+				expect(control.requests[index].removed[1]).to.equal("EDITED")
+				folder.Parent = root
+				session:__applyPatch({ added = {}, removed = { "EDITED" }, updated = {} }, 3)
+				expect(folder.Parent).to.equal(root)
+				control.settle[index](writeResult())
+				assert(newer:await())
+			end)
+			control.cleanup()
+			assert(success, `Outcome "{outcome}" failed. {tostring(problem)}`)
 		end
 	end)
 
