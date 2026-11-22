@@ -68,6 +68,11 @@ Making a new release? Simply add the new header with the version and date undern
   recovery structure. Ownership, storage layout, namespace, and write-policy changes retain
   their retirement validation.
 
+Verification boundaries remain explicit. Sustained large-project watcher usage measured
+roughly 53% of one CPU core, so the below-50% target is not met. Native keyboard undo/redo
+was not exercised, and controlled restart recovery does not establish power-loss durability.
+The newly reported metadata-and-folder deletion notification loop is a separate follow-up.
+
 ## `7.7.1-horse.2.8`
 
 * Preserved filesystem authority for every affected sibling write when an earlier write
