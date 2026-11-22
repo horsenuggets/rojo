@@ -28,7 +28,8 @@ API (shown as shared.Rojo, identical under shared.RojoPlus):
 > shared.Rojo.setTwoWaySyncAuthority(authority) - Choose "Filesystem" or "Studio" to
   win when a two-way sync edit meets an unseen file change, applied from the next write
 > shared.Rojo.getTwoWaySyncAuthority() - Get the current two-way sync authority
-> shared.Rojo.getSyncResults() - Get pending, saved, conflicted, and failed writes
+> shared.Rojo.getSyncResults() - Get pending, saved, conflicted, failed, and superseded
+  writes
 > shared.Rojo.getConfirmationSummary(limit?) - Describe the pending sync confirmation
 > shared.Rojo.getNotifications() - Get current write and connection notifications
 > shared.Rojo.clearSyncResults() - Clear recorded write outcomes

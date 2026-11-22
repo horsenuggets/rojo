@@ -6,6 +6,55 @@ return function()
 
 	local container = Instance.new("Folder")
 
+	it("should retire Part observers and queued edits after class replacement and disk removal", function()
+		local createPatchSet = require(script.Parent.Parent.ChangeBatcher.createPatchSet)
+		local changes = {}
+		local instanceMap = InstanceMap.new(function(instance, propertyName)
+			changes[instance] = changes[instance] or {}
+			changes[instance][propertyName] = true
+		end)
+		instanceMap.__isGameRunning = function()
+			return false
+		end
+		local root = Instance.new("Folder")
+		local part = Instance.new("Part")
+		part.Parent = root
+		instanceMap:insert("ROOT", root)
+		instanceMap:insert("EDITED", part)
+		part.Size = Vector3.new(8, 4, 2)
+		instanceMap:__maybeFireInstanceChanged(part, "Size")
+
+		local replacement = PatchSet.newEmpty()
+		replacement.updated = { { id = "EDITED", changedClassName = "Folder", changedProperties = {} } }
+		expect(PatchSet.isEmpty(applyPatch(instanceMap, replacement))).to.equal(true)
+		local folder = instanceMap.fromIds.EDITED
+		expect(folder.ClassName).to.equal("Folder")
+		expect(folder.Parent).to.equal(root)
+		expect(part.Parent).to.equal(nil)
+		expect(instanceMap.fromInstances[part]).to.equal(nil)
+		expect(instanceMap.instancesToSignal[part]).to.equal(nil)
+		-- Explicitly deliver callbacks that might have been queued before disconnection.
+		instanceMap:__maybeFireInstanceChanged(part, "Parent")
+		instanceMap:__maybeFireInstanceChanged(part, "Size")
+		expect(PatchSet.isEmpty(createPatchSet(instanceMap, changes))).to.equal(true)
+
+		folder.Name = "Pending local name"
+		instanceMap:__maybeFireInstanceChanged(folder, "Name")
+		local removal = PatchSet.newEmpty()
+		removal.removed = { "EDITED" }
+		expect(PatchSet.isEmpty(applyPatch(instanceMap, removal))).to.equal(true)
+		instanceMap:__maybeFireInstanceChanged(folder, "Parent")
+		instanceMap:__maybeFireInstanceChanged(folder, "Name")
+		expect(instanceMap.fromIds.EDITED).to.equal(nil)
+		expect(instanceMap.fromInstances[folder]).to.equal(nil)
+		expect(instanceMap.instancesToSignal[folder]).to.equal(nil)
+		expect(PatchSet.isEmpty(createPatchSet(instanceMap, changes))).to.equal(true)
+		instanceMap:stop()
+		part:Destroy()
+		folder:Destroy()
+		root:Destroy()
+	end)
+
 	it("should close its profiling scope when applying a patch throws", function()
 		local Reconciler = require(script.Parent)
 		local Timer = require(script.Parent.Parent.Timer)
