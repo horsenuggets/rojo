@@ -74,6 +74,13 @@ pub struct AppliedPatchSet {
     pub removed: Vec<Ref>,
     pub added: Vec<Ref>,
     pub updated: Vec<AppliedPatchUpdate>,
+    /// Server-only publication provenance. Never supplied by a proposed patch.
+    #[serde(
+        default,
+        rename = "sourceOperations",
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub source_operations: std::collections::HashMap<Ref, String>,
 }
 
 impl AppliedPatchSet {
@@ -82,6 +89,7 @@ impl AppliedPatchSet {
             removed: Vec::new(),
             added: Vec::new(),
             updated: Vec::new(),
+            source_operations: Default::default(),
         }
     }
 

@@ -157,16 +157,20 @@ fn tree_patch_affects_sourcemap(
         !set.removed.is_empty()
             // 2. A newly added instance passes the filter
             || set.added.iter().any(|referent| {
-                let instance = tree
-                    .get_instance(*referent)
-                    .expect("instance did not exist when updating sourcemap");
-                filter(&instance)
+                // The live tree can advance past a queued addition before we read it.
+                // Rebuild from that tree when the historical instance is already gone.
+                tree.get_instance(*referent)
+                    .is_none_or(|instance| filter(&instance))
             })
             // 3. An existing instance changes the structure or paths of a mapped
             // subtree. A folder can affect script paths without passing the filter.
             || set.updated.iter().any(|updated| {
+                // The previous class may have passed a filter that the new class
+                // no longer passes, so the latest subtree cannot rule it out.
+                if updated.changed_class_name.is_some() {
+                    return true;
+                }
                 let changed = updated.changed_parent.is_some()
-                    || updated.changed_class_name.is_some()
                     || updated.changed_name.is_some()
                     || updated.changed_metadata.is_some();
                 if changed {
@@ -317,6 +321,143 @@ mod test {
         update.changed_parent = None;
         update.changed_name = Some("Renamed".into());
         assert!(affects(update));
+    }
+
+    #[test]
+    fn historical_additions_removed_from_the_latest_tree_affect_sourcemaps() {
+        use super::{filter_non_scripts, filter_nothing, tree_patch_affects_sourcemap};
+        use crate::snapshot::{AppliedPatchSet, InstanceSnapshot, RojoTree};
+
+        let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Folder"));
+        let root = tree.get_root_id();
+        let script = tree.insert_instance(root, InstanceSnapshot::new().class_name("ModuleScript"));
+        let addition = AppliedPatchSet {
+            added: vec![script],
+            ..Default::default()
+        };
+        tree.remove(script);
+        assert!(tree.get_instance(script).is_none());
+
+        let filters: [fn(&crate::snapshot::InstanceWithMeta) -> bool; 2] =
+            [filter_non_scripts, filter_nothing];
+        for filter in filters {
+            assert!(tree_patch_affects_sourcemap(
+                &tree,
+                std::slice::from_ref(&addition),
+                filter,
+            ));
+            assert!(tree_patch_affects_sourcemap(
+                &tree,
+                &[
+                    addition.clone(),
+                    AppliedPatchSet {
+                        removed: vec![script],
+                        ..Default::default()
+                    },
+                ],
+                filter,
+            ));
+        }
+    }
+
+    #[test]
+    fn ancestor_class_and_path_updates_respect_sourcemap_filters() {
+        use super::{filter_non_scripts, filter_nothing, tree_patch_affects_sourcemap};
+        use crate::snapshot::{
+            AppliedPatchSet, AppliedPatchUpdate, InstanceMetadata, InstanceSnapshot, RojoTree,
+        };
+        use rbx_dom_weak::ustr;
+
+        for has_script in [false, true] {
+            let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Folder"));
+            let root = tree.get_root_id();
+            let ancestor = tree.insert_instance(root, InstanceSnapshot::new().class_name("Model"));
+            if has_script {
+                tree.insert_instance(ancestor, InstanceSnapshot::new().class_name("ModuleScript"));
+            }
+            let mut class_update = AppliedPatchUpdate::new(ancestor);
+            class_update.changed_class_name = Some(ustr("Model"));
+            let mut path_update = AppliedPatchUpdate::new(ancestor);
+            path_update.changed_metadata = Some(
+                InstanceMetadata::new().relevant_paths(vec![Path::new("Moved").to_path_buf()]),
+            );
+
+            for (update, expected) in [(class_update, true), (path_update, has_script)] {
+                let patches = [AppliedPatchSet {
+                    updated: vec![update],
+                    ..Default::default()
+                }];
+                assert_eq!(
+                    tree_patch_affects_sourcemap(&tree, &patches, filter_non_scripts),
+                    expected,
+                );
+                assert!(tree_patch_affects_sourcemap(
+                    &tree,
+                    &patches,
+                    filter_nothing
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn class_changes_that_remove_the_last_script_still_affect_sourcemaps() {
+        use super::{filter_non_scripts, tree_patch_affects_sourcemap};
+        use crate::snapshot::{AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, RojoTree};
+        use rbx_dom_weak::ustr;
+
+        let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Folder"));
+        let root = tree.get_root_id();
+        let script = tree.insert_instance(root, InstanceSnapshot::new().class_name("ModuleScript"));
+        tree.get_instance_mut(script)
+            .unwrap()
+            .set_class_name("Folder");
+        let mut update = AppliedPatchUpdate::new(script);
+        update.changed_class_name = Some(ustr("Folder"));
+        assert!(tree_patch_affects_sourcemap(
+            &tree,
+            &[AppliedPatchSet {
+                updated: vec![update],
+                ..Default::default()
+            }],
+            filter_non_scripts,
+        ));
+    }
+
+    #[test]
+    fn property_only_updates_do_not_affect_either_sourcemap_filter() {
+        use super::{filter_non_scripts, filter_nothing, tree_patch_affects_sourcemap};
+        use crate::snapshot::{AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, RojoTree};
+        use rbx_dom_weak::{types::Variant, ustr};
+
+        for class_name in ["Folder", "ModuleScript", "Part"] {
+            let mut tree = RojoTree::new(InstanceSnapshot::new().class_name("Folder"));
+            let root = tree.get_root_id();
+            let instance =
+                tree.insert_instance(root, InstanceSnapshot::new().class_name(class_name));
+            let mut update = AppliedPatchUpdate::new(instance);
+            let (name, value) = if class_name == "ModuleScript" {
+                ("Source", Variant::String("return 2".into()))
+            } else {
+                ("Archivable", Variant::Bool(false))
+            };
+            update.changed_properties.insert(ustr(name), Some(value));
+            let patches = [AppliedPatchSet {
+                updated: vec![update],
+                ..Default::default()
+            }];
+
+            assert!(!tree_patch_affects_sourcemap(
+                &tree,
+                &patches,
+                filter_non_scripts,
+            ));
+            assert!(!tree_patch_affects_sourcemap(
+                &tree,
+                &patches,
+                filter_nothing
+            ));
+        }
     }
 
     #[test]

@@ -106,7 +106,7 @@ impl InstanceMetadata {
         self.ignore_unknown_instances == other.ignore_unknown_instances
             && self.instigating_source == other.instigating_source
             && self.relevant_paths == other.relevant_paths
-            && self.context == other.context
+            && self.context.has_same_structure(&other.context)
             && self.specified_id == other.specified_id
             && self.middleware == other.middleware
             && self.schema == other.schema
@@ -268,6 +268,39 @@ impl InstanceContext {
         }
     }
 
+    fn has_same_structure(&self, other: &Self) -> bool {
+        let Self {
+            path_ignore_rules,
+            emit_legacy_scripts,
+            reserved_cache_path,
+            sync_rules,
+            require_context,
+            active_projects,
+            active_directories,
+            shallow,
+            package_sources,
+            package_mount,
+        } = self;
+        // Global mappings drive import reemission, not this instance's physical
+        // identity. Compare their namespace without revisiting every project path.
+        path_ignore_rules == &other.path_ignore_rules
+            && emit_legacy_scripts == &other.emit_legacy_scripts
+            && reserved_cache_path == &other.reserved_cache_path
+            && sync_rules == &other.sync_rules
+            && match (require_context, &other.require_context) {
+                (Some(left), Some(right)) => {
+                    left.project_root == right.project_root && left.datamodel == right.datamodel
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && active_projects == &other.active_projects
+            && active_directories == &other.active_directories
+            && shallow == &other.shallow
+            && package_sources == &other.package_sources
+            && package_mount == &other.package_mount
+    }
+
     pub fn with_emit_legacy_scripts(emit_legacy_scripts: Option<bool>) -> Self {
         Self {
             emit_legacy_scripts: emit_legacy_scripts
@@ -337,6 +370,30 @@ impl InstanceContext {
     /// matches the provided path. This does not handle default syncing rules.
     pub fn get_user_sync_rule(&self, path: &Path) -> Option<&SyncRule> {
         self.sync_rules.iter().find(|&rule| rule.matches(path))
+    }
+
+    /// Whether the effective interpretation is identical to the built-in mapping.
+    /// File rules never select directory middleware. For files, both middleware and
+    /// the pre-metadata name must agree, since that name also selects adjacent sidecars.
+    pub(crate) fn has_default_sync_mapping(
+        &self,
+        path: &Path,
+        is_directory: bool,
+    ) -> anyhow::Result<bool> {
+        if is_directory {
+            return Ok(true);
+        }
+        let Some(rule) = self.get_user_sync_rule(path) else {
+            return Ok(true);
+        };
+        let Some(default) = crate::snapshot_middleware::default_sync_rules()
+            .iter()
+            .find(|rule| rule.matches(path))
+        else {
+            return Ok(false);
+        };
+        Ok(rule.middleware == default.middleware
+            && rule.file_name_for_path(path)? == default.file_name_for_path(path)?)
     }
 }
 
@@ -571,6 +628,165 @@ mod test {
     }
 
     #[test]
+    fn structural_metadata_ignores_derived_require_mapping_changes() {
+        let mut original = InstanceMetadata::new();
+        original.context.require_context = Some(Arc::new(RequireContext {
+            project_root: "/project".into(),
+            path_mappings: vec![("Source/Actor".into(), vec!["Actor".into()])],
+            datamodel: true,
+        }));
+        let mut equal = original.clone();
+        equal.context.require_context = Some(Arc::new(
+            original.context.require_context.as_deref().unwrap().clone(),
+        ));
+        assert!(!Arc::ptr_eq(
+            original.context.require_context.as_ref().unwrap(),
+            equal.context.require_context.as_ref().unwrap()
+        ));
+        assert_eq!(original, equal);
+        assert!(original.has_same_structure(&equal));
+        assert!(equal.has_same_structure(&original));
+
+        let mut changed = equal;
+        Arc::make_mut(changed.context.require_context.as_mut().unwrap()).path_mappings[0].1 =
+            vec!["Destination".into(), "Actor".into()];
+        assert_ne!(original.context, changed.context);
+        assert_ne!(original, changed);
+        for _ in 0..2 {
+            assert!(original.has_same_structure(&changed));
+            assert!(changed.has_same_structure(&original));
+        }
+    }
+
+    #[test]
+    fn structural_metadata_preserves_every_local_context_field() {
+        let mut original = InstanceMetadata::new();
+        original.context.require_context = Some(Arc::new(RequireContext {
+            project_root: "/project".into(),
+            path_mappings: vec![("Source/Actor".into(), vec!["Actor".into()])],
+            datamodel: true,
+        }));
+        let package_sources: crate::package_sources::PackageSources =
+            serde_json::from_value(serde_json::json!({
+                "root": "/project",
+                "install": null,
+                "problem": null,
+                "local_sources": [],
+                "deny_all_writes": false
+            }))
+            .unwrap();
+        let package_sources = Arc::new(package_sources);
+        for flags in 0..4096 {
+            let mut changed = original.clone();
+            let require_context = Arc::make_mut(changed.context.require_context.as_mut().unwrap());
+            require_context.path_mappings.clear();
+            if flags & 1 != 0 {
+                changed.context.path_ignore_rules = Arc::new(vec![PathIgnoreRule {
+                    base_path: "/project".into(),
+                    glob: IgnorableGlob::new("Ignored/**").unwrap(),
+                }]);
+            }
+            if flags & 2 != 0 {
+                changed.context.emit_legacy_scripts = !changed.context.emit_legacy_scripts;
+            }
+            if flags & 4 != 0 {
+                changed.context.reserved_cache_path = Some("/project/.rojo".into());
+            }
+            if flags & 8 != 0 {
+                changed.context.sync_rules = Arc::new(vec![rule("*.text")]);
+            }
+            if flags & 32 != 0 {
+                Arc::make_mut(changed.context.require_context.as_mut().unwrap()).project_root =
+                    "/other-project".into();
+            }
+            if flags & 64 != 0 {
+                Arc::make_mut(changed.context.require_context.as_mut().unwrap()).datamodel = false;
+            }
+            if flags & 16 != 0 {
+                changed.context.require_context = None;
+            }
+            if flags & 128 != 0 {
+                changed.context.active_projects = Some(Arc::new(vec!["/project".into()]));
+            }
+            if flags & 256 != 0 {
+                changed.context.active_directories = Some(Arc::new(vec!["/project/Source".into()]));
+            }
+            if flags & 512 != 0 {
+                changed.context.shallow = true;
+            }
+            if flags & 1024 != 0 {
+                changed.context.package_sources = Some(Arc::clone(&package_sources));
+            }
+            if flags & 2048 != 0 {
+                changed.context.package_mount =
+                    Some(("/project/Packages/Local".into(), "/project/Source".into()));
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    original.has_same_structure(&changed),
+                    flags == 0,
+                    "flags {flags}"
+                );
+                assert_eq!(
+                    changed.has_same_structure(&original),
+                    flags == 0,
+                    "flags {flags}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn structural_metadata_package_context_compares_policy_values() {
+        let package_sources = serde_json::json!({
+            "root": "/project",
+            "install": null,
+            "problem": null,
+            "local_sources": [],
+            "deny_all_writes": false
+        });
+        let mut original = InstanceMetadata::new();
+        original.context.package_sources = Some(Arc::new(
+            serde_json::from_value(package_sources.clone()).unwrap(),
+        ));
+        let mut equal = original.clone();
+        equal.context.package_sources = Some(Arc::new(
+            serde_json::from_value(package_sources.clone()).unwrap(),
+        ));
+        assert!(!Arc::ptr_eq(
+            original.context.package_sources.as_ref().unwrap(),
+            equal.context.package_sources.as_ref().unwrap()
+        ));
+        assert_eq!(original, equal);
+        assert!(original.has_same_structure(&equal));
+        for (field, value) in [
+            ("root", serde_json::json!("/other-project")),
+            ("problem", serde_json::json!("Invalid generation")),
+            ("local_sources", serde_json::json!(["/project/Source"])),
+            ("deny_all_writes", serde_json::json!(true)),
+            (
+                "install",
+                serde_json::json!({
+                    "version": 1,
+                    "manifest_hash": "generation",
+                    "local_manifests": {},
+                    "package_roots": [],
+                    "generated_paths": []
+                }),
+            ),
+        ] {
+            let mut changed_sources = package_sources.clone();
+            changed_sources[field] = value;
+            let mut changed = original.clone();
+            changed.context.package_sources =
+                Some(Arc::new(serde_json::from_value(changed_sources).unwrap()));
+            assert_ne!(original, changed);
+            assert!(!original.has_same_structure(&changed), "{field}");
+            assert!(!changed.has_same_structure(&original), "{field}");
+        }
+    }
+
+    #[test]
     fn structural_metadata_classification_ignores_only_save_bookkeeping() {
         let original = InstanceMetadata::new();
         for flags in 0..256 {
@@ -629,6 +845,120 @@ mod test {
             middleware: Middleware::Text,
             suffix: None,
             base_path: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn relocation_mapping_equivalence_compares_effective_names_and_middleware() {
+        for (filename, middleware, suffix) in [
+            ("Code.luau", Middleware::ModuleScript, ".luau"),
+            ("Code.lua", Middleware::ModuleScript, ".lua"),
+            (
+                "Code.server.luau",
+                Middleware::RunContextServerScript,
+                ".server.luau",
+            ),
+            (
+                "Code.client.lua",
+                Middleware::RunContextClientScript,
+                ".client.lua",
+            ),
+            (
+                "Code.local.luau",
+                Middleware::LegacyClientScript,
+                ".local.luau",
+            ),
+            (
+                "Code.legacy.lua",
+                Middleware::LegacyServerScript,
+                ".legacy.lua",
+            ),
+            ("Code.plugin.luau", Middleware::PluginScript, ".plugin.luau"),
+            ("Code.txt", Middleware::Text, ".txt"),
+            ("Code.jsonc", Middleware::Json, ".jsonc"),
+            ("Code.model.json", Middleware::JsonModel, ".model.json"),
+            ("Code.csv", Middleware::Csv, ".csv"),
+            ("Code.toml", Middleware::Toml, ".toml"),
+            ("Code.yml", Middleware::Yaml, ".yml"),
+        ] {
+            let path = PathBuf::from("/project/src").join(filename);
+            for wrong_middleware in [false, true] {
+                for trim in [None, Some(suffix), Some(".not-a-suffix"), Some(filename)] {
+                    let mut context = InstanceContext::new();
+                    context.add_sync_rules([SyncRule {
+                        include: Glob::new("*").unwrap(),
+                        exclude: None,
+                        middleware: if wrong_middleware {
+                            Middleware::Ignore
+                        } else {
+                            middleware
+                        },
+                        suffix: trim.map(str::to_owned),
+                        base_path: "/project".into(),
+                    }]);
+                    let expected = !wrong_middleware
+                        && (trim == Some(suffix)
+                            || (trim.is_none() && path.file_stem().unwrap() == "Code"));
+                    for _ in 0..2 {
+                        assert_eq!(
+                            context.has_default_sync_mapping(&path, false).unwrap(),
+                            expected,
+                            "{filename} {trim:?} {wrong_middleware}"
+                        );
+                        // File rules do not participate in directory interpretation,
+                        // even when a directory's name looks like a script or sidecar.
+                        assert!(context.has_default_sync_mapping(&path, true).unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relocation_mapping_equivalence_respects_precedence_exclusions_and_sidecars() {
+        let mut context = InstanceContext::new();
+        let path = Path::new("/project/src/Code.local.luau");
+        let equivalent = SyncRule {
+            include: Glob::new("*.local.luau").unwrap(),
+            exclude: None,
+            middleware: Middleware::LegacyClientScript,
+            suffix: Some(".local.luau".into()),
+            base_path: "/project".into(),
+        };
+        let mut custom = equivalent.clone();
+        custom.suffix = None;
+        context.add_sync_rules([equivalent.clone(), custom.clone()]);
+        assert!(context.has_default_sync_mapping(path, false).unwrap());
+        context.clear_sync_rules();
+        context.add_sync_rules([custom.clone(), equivalent.clone()]);
+        assert!(!context.has_default_sync_mapping(path, false).unwrap());
+        custom.exclude = Some(Glob::new("src/**").unwrap());
+        context.clear_sync_rules();
+        context.add_sync_rules([custom, equivalent]);
+        assert!(context.has_default_sync_mapping(path, false).unwrap());
+        assert!(context
+            .has_default_sync_mapping(Path::new("/elsewhere/Code.local.luau"), false)
+            .unwrap());
+        context.add_sync_rules([SyncRule {
+            include: Glob::new("*").unwrap(),
+            exclude: None,
+            middleware: Middleware::Text,
+            suffix: None,
+            base_path: "/project".into(),
+        }]);
+        for filename in ["Code.meta.json", "Code.meta.jsonc", "unmanaged.bin"] {
+            assert!(
+                !context
+                    .has_default_sync_mapping(&PathBuf::from("/project/src").join(filename), false)
+                    .unwrap(),
+                "{filename}"
+            );
+        }
+        context.clear_sync_rules();
+        for filename in ["Code.meta.json", "Code.meta.jsonc", "unmanaged.bin"] {
+            assert!(context
+                .has_default_sync_mapping(&PathBuf::from("/project/src").join(filename), false)
+                .unwrap());
         }
     }
 

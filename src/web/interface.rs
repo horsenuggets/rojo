@@ -46,6 +46,9 @@ pub struct SubscribeMessage<'a> {
     pub removed: Vec<Ref>,
     pub added: HashMap<Ref, Instance<'a>>,
     pub updated: Vec<InstanceUpdate>,
+    /// Causal tokens apply only to the Source field of these updates.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub source_operations: HashMap<Ref, String>,
 }
 
 impl<'a> SubscribeMessage<'a> {
@@ -119,6 +122,7 @@ impl<'a> SubscribeMessage<'a> {
             removed,
             added,
             updated,
+            source_operations: patch.source_operations,
         }
     }
 }
@@ -379,6 +383,19 @@ pub enum WriteAuthority {
 #[serde(rename_all = "camelCase")]
 pub struct WriteRequest {
     pub session_id: SessionId,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_operation_id"
+    )]
+    pub operation_id: Option<String>,
+    /// A private capability returned by the preceding accepted write in this chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<String>,
+    /// Per-source last applied publication cursors at draft capture time. These do
+    /// not advance when a packet or acknowledgement merely includes newer Source.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub source_baselines: HashMap<Ref, u32>,
     /// The last server revision applied before this Studio batch began.
     #[serde(default)]
     pub message_cursor: Option<u32>,
@@ -389,6 +406,32 @@ pub struct WriteRequest {
     #[serde(default)]
     pub added: HashMap<Ref, InstanceAddition>,
     pub updated: Vec<InstanceUpdate>,
+}
+
+fn deserialize_operation_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let token = Option::<String>::deserialize(deserializer)?;
+    if token.as_ref().is_some_and(|value| {
+        value.is_empty()
+            || value.len() > 96
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    }) {
+        return Err(serde::de::Error::custom("operationId must contain 1 to 96 ASCII letters, digits, underscores, hyphens, or periods"));
+    }
+    Ok(token)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceCheckpointRequest {
+    pub session_id: SessionId,
+    pub id: Ref,
+    pub source: String,
+    pub expected_source: String,
+    pub message_cursor: u32,
 }
 
 /// A subtree created in Studio. Studio picks every id itself and starts
@@ -423,8 +466,18 @@ pub struct AddedIds {
 #[serde(rename_all = "camelCase")]
 pub struct WriteResponse {
     pub session_id: SessionId,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_operation_id"
+    )]
+    pub operation_id: Option<String>,
+    /// Opaque session-local proof of this successful write's exact effects and
+    /// its validated predecessors. Never included in subscription publications.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledgement: Option<String>,
     /// Every announcement or restoration produced by this write is published
-    /// at or before this cursor.
+    /// at or before this cursor. This is not causal coverage or Source application.
     pub message_cursor: u32,
     pub accepted: PatchSet,
     pub conflicts: PatchSet,
@@ -628,6 +681,69 @@ mod tests {
     use crate::snapshot::{apply_patch_set, InstanceSnapshot, PatchUpdate};
     use rbx_dom_weak::ustr;
 
+    #[test]
+    fn operation_id_round_trips_and_rejects_unsafe_tokens() {
+        let body = serde_json::json!({
+            "sessionId": SessionId::new(), "operationId": "editor_1.write-2",
+            "authority": "Filesystem", "removed": [], "updated": []
+        });
+        let request: WriteRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["operationId"],
+            body["operationId"]
+        );
+        let decoded: WriteRequest =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&request).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["operationId"],
+            body["operationId"]
+        );
+        for token in [
+            "".to_owned(),
+            "a".repeat(97),
+            "not safe".into(),
+            "../escape".into(),
+            "é".into(),
+        ] {
+            let mut invalid = body.clone();
+            invalid["operationId"] = token.into();
+            assert!(serde_json::from_value::<WriteRequest>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn causal_contract_is_optional_and_keeps_source_cursors_separate() {
+        let id = Ref::new();
+        let mut body = serde_json::json!({
+            "sessionId": SessionId::new(), "authority":"Filesystem",
+            "messageCursor": 80, "removed": [], "updated": []
+        });
+        let old: WriteRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(old.predecessor.is_none());
+        assert!(old.source_baselines.is_empty());
+        assert!(serde_json::to_value(old)
+            .unwrap()
+            .get("predecessor")
+            .is_none());
+        body["predecessor"] = "private-server-capability".into();
+        body["sourceBaselines"] = serde_json::json!({ id.to_string(): 72 });
+        let request: WriteRequest = serde_json::from_value(body).unwrap();
+        let roundtrip: WriteRequest =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&request).unwrap()).unwrap();
+        assert_eq!(roundtrip.message_cursor, Some(80));
+        assert_eq!(roundtrip.source_baselines[&id], 72);
+        assert_eq!(
+            roundtrip.predecessor.as_deref(),
+            Some("private-server-capability")
+        );
+        let response: WriteResponse = serde_json::from_value(serde_json::json!({
+            "sessionId": request.session_id, "messageCursor": 81,
+            "accepted": PatchSet::new(), "conflicts": PatchSet::new(), "errors": []
+        }))
+        .unwrap();
+        assert!(response.acknowledgement.is_none());
+    }
+
     /// An instance created and removed again before its message is sent is
     /// left out, instead of the server panicking while it holds the tree.
     #[test]
@@ -737,6 +853,8 @@ mod tests {
     #[test]
     fn write_acknowledgement_cursor_is_required_in_json_and_messagepack() {
         let response = WriteResponse {
+            acknowledgement: Some("server-issued-private-proof".into()),
+            operation_id: Some("roundtrip_1".into()),
             session_id: SessionId::new(),
             message_cursor: 7,
             accepted: PatchSet::new(),
@@ -747,9 +865,11 @@ mod tests {
         assert_eq!(json["messageCursor"], 7);
         let from_json: WriteResponse = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(from_json.message_cursor, 7);
+        assert_eq!(from_json.operation_id, response.operation_id);
         let from_msgpack: WriteResponse =
             rmp_serde::from_slice(&rmp_serde::to_vec_named(&response).unwrap()).unwrap();
         assert_eq!(from_msgpack.message_cursor, 7);
+        assert_eq!(from_msgpack.operation_id, response.operation_id);
         json.as_object_mut().unwrap().remove("messageCursor");
         let error = serde_json::from_value::<WriteResponse>(json).unwrap_err();
         assert!(error.to_string().contains("missing field `messageCursor`"));

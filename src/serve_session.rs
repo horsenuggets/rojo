@@ -58,6 +58,9 @@ pub struct ServeSession {
     /// path to a `.project.json` file.
     root_project: Arc<Project>,
 
+    // Retain identity while the project exists. Recovery must survive its deletion or rename.
+    checkpoint_identity: PathBuf,
+
     /// A randomly generated ID for this serve session. It's used to ensure that
     /// a client doesn't begin connecting to a different server part way through
     /// an operation that needs to be atomic.
@@ -218,6 +221,7 @@ impl ServeSession {
         log::trace!("Starting new ServeSession at path {}", start_path.display());
 
         let root_project = Arc::new(Project::load_initial_project(&vfs, start_path)?);
+        let checkpoint_identity = vfs.canonicalize(&root_project.file_location)?.to_path_buf();
         // Establish package authority before recovery can touch original sources.
         // Replacement journals additionally verify their durable generation witness;
         // missing or stale provenance never grants rollback ownership.
@@ -286,6 +290,7 @@ impl ServeSession {
             start_time,
             session_id,
             root_project,
+            checkpoint_identity,
             tree,
             message_queue,
             tree_mutation_sender,
@@ -364,6 +369,10 @@ impl ServeSession {
 
     pub fn root_dir(&self) -> &Path {
         self.root_project.folder_location()
+    }
+
+    pub(crate) fn checkpoint_identity(&self) -> &Path {
+        &self.checkpoint_identity
     }
 
     pub fn root_project(&self) -> &Project {
@@ -488,17 +497,18 @@ fn extract_path_mappings(
 }
 
 fn normalize_path_mappings(
-    mut mappings: Vec<(PathBuf, Vec<String>)>,
+    mappings: Vec<(PathBuf, Vec<String>)>,
     root: &Path,
     context: &InstanceContext,
 ) -> anyhow::Result<Vec<(PathBuf, Vec<String>)>> {
     profiling::scope!("Rojo require mappings normalization");
-    mappings.sort_by(|a, b| {
-        b.0.components()
-            .count()
-            .cmp(&a.0.components().count())
-            .then(a.0.cmp(&b.0))
-    });
+    let mut decorated: Vec<_> = mappings
+        .into_iter()
+        .map(|mapping| (mapping.0.components().count(), mapping))
+        .collect();
+    decorated
+        .sort_by(|(a_depth, a), (b_depth, b)| b_depth.cmp(a_depth).then_with(|| a.0.cmp(&b.0)));
+    let mut mappings: Vec<_> = decorated.into_iter().map(|(_, mapping)| mapping).collect();
     mappings.dedup();
     if let Some(packages) = &context.package_sources {
         for pair in mappings.windows(2) {
@@ -515,6 +525,42 @@ mod test {
     use super::*;
 
     use memofs::StdBackend;
+
+    #[test]
+    fn path_mapping_normalization_preserves_eager_ordering_for_all_small_permutations() {
+        let entries = [
+            (PathBuf::from("a/deep"), vec!["First".to_owned()]),
+            (PathBuf::from("b/deep"), vec!["Second".to_owned()]),
+            (PathBuf::from("shallow"), vec!["Third".to_owned()]),
+            (PathBuf::from("a/deep"), vec!["Alias".to_owned()]),
+            (PathBuf::from("a/deep"), vec!["First".to_owned()]),
+        ];
+        let context = InstanceContext::default();
+        let root = Path::new("/root");
+        for mut ordinal in 0..120 {
+            let mut remaining = entries.to_vec();
+            let mut mappings = Vec::new();
+            while !remaining.is_empty() {
+                let index = ordinal % remaining.len();
+                ordinal /= remaining.len();
+                mappings.push(remaining.remove(index));
+            }
+            let mut expected = mappings.clone();
+            expected.sort_by(|a, b| {
+                b.0.components()
+                    .count()
+                    .cmp(&a.0.components().count())
+                    .then(a.0.cmp(&b.0))
+            });
+            expected.dedup();
+            let actual = normalize_path_mappings(mappings, root, &context).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                normalize_path_mappings(actual.clone(), root, &context).unwrap(),
+                actual
+            );
+        }
+    }
 
     #[test]
     fn borrowed_require_context_matches_snapshot_mappings() {
