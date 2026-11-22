@@ -192,6 +192,348 @@ return function()
 		}
 	end
 
+	-- Holds a first write open so later batches queue behind it, as Studio edits do while
+	-- an earlier request is in flight. Statuses are what the app turns into notifications.
+	local function queuedPartSession()
+		local session, part, control = propertySession("Part")
+		local instanceMap = session.__instanceMap
+		local root = Instance.new("Folder")
+		local other = Instance.new("Part")
+		instanceMap.onChildAdded = nil
+		part.Parent = root
+		other.Parent = root
+		instanceMap:insert("ROOT", root)
+		instanceMap:insert("OTHER", other)
+		instanceMap.knownParents[part] = root
+		instanceMap.observedParents[part] = root
+		control.other = other
+		control.statuses = {}
+		control.results = {}
+		session:setSyncResultCallback(function(status, result)
+			table.insert(control.statuses, status)
+			table.insert(control.results, result)
+		end)
+		control.first = session:__writePatch({
+			added = {},
+			removed = {},
+			updated = { { id = "EDITED", changedProperties = { Transparency = { Float32 = 0.5 } } } },
+		})
+		control.edit = function(instance, width)
+			instance.Size = Vector3.new(width, 4, 2)
+			session:__queueChange(instance, "Size")
+		end
+		control.replace = function()
+			session:__applyPatch({
+				added = {},
+				removed = {},
+				updated = { { id = "EDITED", changedClassName = "Folder", changedProperties = {} } },
+			}, 1)
+			control.folder = instanceMap.fromIds.EDITED
+			expect(control.folder.ClassName).to.equal("Folder")
+		end
+		control.remove = function()
+			session:__applyPatch({ added = {}, removed = { "EDITED" }, updated = {} }, 2)
+			expect(instanceMap.fromIds.EDITED).to.equal(nil)
+		end
+		control.sentIds = function(index)
+			local ids = {}
+			for _, update in control.requests[index].updated do
+				table.insert(ids, update.id)
+			end
+			table.sort(ids)
+			return table.concat(ids, ",")
+		end
+		control.cleanup = function()
+			session:stop()
+			part:Destroy()
+			other:Destroy()
+			if control.folder ~= nil then
+				control.folder:Destroy()
+			end
+			root:Destroy()
+		end
+		return session, part, control
+	end
+
+	it("should supersede encoded property batches when disk replaces and removes their instance", function()
+		local session, part, control = queuedPartSession()
+		local success, problem = pcall(function()
+			local queued = {}
+			for width = 8, 13 do
+				control.edit(part, width)
+				table.insert(queued, session:flushChanges())
+			end
+			expect(#control.requests).to.equal(1)
+			control.replace()
+			control.settle[1](writeResult())
+			assert(control.first:await())
+			control.remove()
+			-- Only the first write was sent. The six Size batches lost their Part before
+			-- dispatch, so none of them can come back as a conflict or an unknown instance.
+			expect(#control.requests).to.equal(1)
+			assert(Promise.all(queued):await())
+			expect(table.concat(control.statuses, ",")).to.equal(
+				"Saved,Superseded,Superseded,Superseded,Superseded,Superseded,Superseded"
+			)
+			for index = 2, #control.results do
+				local result = control.results[index]
+				expect(#result.errors).to.equal(0)
+				expect(result.acknowledgement).to.equal(nil)
+				expect(result.superseded.updated[1].id).to.equal("EDITED")
+			end
+
+			-- Superseded tickets still complete, so a later edit is not stuck behind them.
+			control.edit(control.other, 3)
+			local later = session:flushChanges()
+			expect(#control.requests).to.equal(2)
+			expect(control.sentIds(2)).to.equal("OTHER")
+			control.settle[2](writeResult())
+			assert(later:await())
+			expect(control.statuses[#control.statuses]).to.equal("Saved")
+		end)
+		control.cleanup()
+		assert(success, problem)
+	end)
+
+	it("should send only the operations whose encoded targets survive until dispatch", function()
+		-- Every combination of class replacement, removal, and a surviving neighbor in the
+		-- same batch. Only the replaced or removed target's intent may be dropped.
+		for row = 0, 7 do
+			local replaced, removed, survivor = row % 2 == 1, row // 2 % 2 == 1, row // 4 == 1
+			local session, part, control = queuedPartSession()
+			local success, problem = pcall(function()
+				control.edit(part, 8)
+				if survivor then
+					control.edit(control.other, 3)
+				end
+				local queued = session:flushChanges()
+				expect(#control.requests).to.equal(1)
+				if replaced then
+					control.replace()
+				end
+				if removed then
+					control.remove()
+				end
+				control.settle[1](writeResult())
+				assert(control.first:await())
+
+				local stale = replaced or removed
+				local expectedIds = {}
+				if not stale then
+					table.insert(expectedIds, "EDITED")
+				end
+				if survivor then
+					table.insert(expectedIds, "OTHER")
+				end
+				-- A batch whose every operation was superseded sends no empty request.
+				expect(#control.requests).to.equal(if #expectedIds > 0 then 2 else 1)
+				if #expectedIds > 0 then
+					expect(control.sentIds(2)).to.equal(table.concat(expectedIds, ","))
+					control.settle[2](writeResult())
+				end
+				assert(queued:await())
+				expect(table.concat(control.statuses, ",")).to.equal(
+					if not stale then "Saved,Saved" elseif survivor then "Saved,Superseded,Saved" else "Saved,Superseded"
+				)
+				if stale then
+					local superseded = control.results[2].superseded
+					expect(#superseded.updated).to.equal(1)
+					expect(superseded.updated[1].id).to.equal("EDITED")
+				end
+			end)
+			control.cleanup()
+			assert(
+				success,
+				`Replaced {replaced}, removed {removed}, and survivor {survivor} failed. {tostring(problem)}`
+			)
+		end
+	end)
+
+	it("should still report a genuine outcome for a surviving instance beside a superseded one", function()
+		for _, staleNeighbor in { false, true } do
+			for _, outcome in { "Conflicted", "Failed" } do
+				local session, part, control = queuedPartSession()
+				local success, problem = pcall(function()
+					control.edit(part, 8)
+					control.edit(control.other, 3)
+					local queued = session:flushChanges()
+					if staleNeighbor then
+						control.remove()
+					end
+					control.settle[1](writeResult())
+					assert(control.first:await())
+					expect(control.sentIds(2)).to.equal(if staleNeighbor then "OTHER" else "EDITED,OTHER")
+					control.settle[2](if outcome == "Conflicted"
+						then writeResult(nil, {
+							removed_instances = {},
+							added_instances = {},
+							updated_instances = { { id = "OTHER", changed_properties = {} } },
+						})
+						else writeResult({ { id = "OTHER", property = "Size", message = "Rejected" } }))
+					assert(queued:await())
+					expect(table.concat(control.statuses, ",")).to.equal(
+						if staleNeighbor then `Saved,Superseded,{outcome}` else `Saved,{outcome}`
+					)
+				end)
+				control.cleanup()
+				assert(success, `Stale neighbor {staleNeighbor} with "{outcome}" failed. {tostring(problem)}`)
+			end
+		end
+	end)
+
+	it("should supersede a queued deletion only when the filesystem removed it first", function()
+		for _, removedFirst in { false, true } do
+			local session, part, control = queuedPartSession()
+			local success, problem = pcall(function()
+				part.Parent = nil
+				session:__queueChange(part, "Parent")
+				local queued = session:flushChanges()
+				expect(session.__pendingDeletions.EDITED).to.equal(part)
+				if removedFirst then
+					control.remove()
+				end
+				control.settle[1](writeResult())
+				assert(control.first:await())
+				expect(#control.requests).to.equal(if removedFirst then 1 else 2)
+				if not removedFirst then
+					expect(control.requests[2].removed[1]).to.equal("EDITED")
+					control.settle[2](writeResult())
+				end
+				assert(queued:await())
+				expect(table.concat(control.statuses, ",")).to.equal(
+					if removedFirst then "Saved,Superseded" else "Saved,Saved"
+				)
+				expect(session.__pendingDeletions.EDITED).to.equal(nil)
+			end)
+			control.cleanup()
+			assert(success, `Removed first {removedFirst} failed. {tostring(problem)}`)
+		end
+	end)
+
+	it("should neither send a stopped session's batch nor supersede a new session's write", function()
+		local old, part, oldControl = queuedPartSession()
+		local new, unused, newControl = propertySession("Part")
+		local success, problem = pcall(function()
+			oldControl.edit(part, 8)
+			local stale = old:flushChanges()
+			old:stop()
+			oldControl.settle[1](writeResult())
+			stale:await()
+			expect(#oldControl.requests).to.equal(1)
+
+			-- The reconnected session tracks the same instance under the same id.
+			local statuses = {}
+			new:setSyncResultCallback(function(status)
+				table.insert(statuses, status)
+			end)
+			new.__instanceMap:insert("EDITED", part)
+			part.Size = Vector3.new(9, 4, 2)
+			new:__queueChange(part, "Size")
+			local write = new:flushChanges()
+			expect(#newControl.requests).to.equal(1)
+			expect(newControl.requests[1].updated[1].id).to.equal("EDITED")
+			newControl.settle[1](writeResult())
+			assert(write:await())
+			expect(table.concat(statuses, ",")).to.equal("Saved")
+			expect(#oldControl.requests).to.equal(1)
+		end)
+		oldControl.cleanup()
+		new:stop()
+		unused:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should keep a secured recovery checkpoint while superseding the script's queued Source write", function()
+		local session, module, control = sourceRecoverySession()
+		local instanceMap = session.__instanceMap
+		local root = Instance.new("Folder")
+		instanceMap.onChildAdded = nil
+		module.Parent = root
+		instanceMap:insert("ROOT", root)
+		instanceMap.knownParents[module] = root
+		instanceMap.observedParents[module] = root
+		session.__reconciler.applyPatch = function(_, patch)
+			for _, id in patch.removed do
+				instanceMap:destroyId(id)
+			end
+			return { added = {}, removed = {}, updated = {} }
+		end
+		local statuses = {}
+		session:setSyncResultCallback(function(status)
+			table.insert(statuses, status)
+		end)
+		local begun = 0
+		local begin = session.__sourceHistory.begin
+		session.__sourceHistory.begin = function(history, ...)
+			begun += 1
+			return begin(history, ...)
+		end
+		local success, problem = pcall(function()
+			local first = session:__writePatch({ added = {}, removed = {}, updated = {} })
+			session:__queueChange(module, "Source")
+			local queued = session:flushChanges()
+			expect(#control.requests).to.equal(1)
+
+			local applying = session:__applyPatch({ added = {}, removed = { "EDITED" }, updated = {} }, 1)
+			expect(#control.checkpoints).to.equal(1)
+			expect(control.checkpoints[1].source).to.equal("return 'draft'")
+			control.finishCheckpoint({ checkpointId = "secured" })
+			assert(applying:await())
+			expect(instanceMap.fromIds.EDITED).to.equal(nil)
+
+			control.settle[1](writeResult())
+			assert(first:await())
+			-- The removed script's draft lives in its checkpoint. Its write is neither sent,
+			-- begun as Source history, nor reported as saved.
+			expect(#control.requests).to.equal(1)
+			assert(queued:await())
+			expect(begun).to.equal(0)
+			expect(table.concat(statuses, ",")).to.equal("Conflicted,Saved,Superseded")
+			expect(#control.checkpoints).to.equal(1)
+		end)
+		session:stop()
+		module:Destroy()
+		root:Destroy()
+		assert(success, problem)
+	end)
+
+	it("should partition superseded operations without changing intact patches", function()
+		local kept = Instance.new("Folder")
+		local replaced = Instance.new("Folder")
+		local replacement = Instance.new("Folder")
+		local patch = {
+			added = { NEW = { parent = "KEPT" } },
+			removed = { "REMOVED", "KEPT" },
+			updated = {
+				{ id = "KEPT", changedProperties = {} },
+				{ id = "REPLACED", changedProperties = {} },
+				{ id = "UNTRACKED", changedProperties = {} },
+			},
+		}
+		local before = { KEPT = kept, REMOVED = replaced, REPLACED = replaced }
+		local targets = ServeSession.captureOperationTargets(patch, before)
+		local intact, none = ServeSession.partitionSupersededOperations(patch, targets, before)
+		expect(intact).to.equal(patch)
+		expect(#none.updated + #none.removed).to.equal(0)
+
+		local after = { KEPT = kept, REPLACED = replacement, UNTRACKED = kept }
+		for _ = 1, 2 do
+			local sent, superseded = ServeSession.partitionSupersededOperations(patch, targets, after)
+			expect(sent.added).to.equal(patch.added)
+			expect(table.concat(sent.removed, ",")).to.equal("KEPT")
+			expect(#sent.updated).to.equal(2)
+			expect(sent.updated[1].id).to.equal("KEPT")
+			expect(sent.updated[2].id).to.equal("UNTRACKED")
+			expect(table.concat(superseded.removed, ",")).to.equal("REMOVED")
+			expect(#superseded.updated).to.equal(1)
+			expect(superseded.updated[1].id).to.equal("REPLACED")
+			expect(#patch.updated).to.equal(3)
+		end
+		kept:Destroy()
+		replaced:Destroy()
+		replacement:Destroy()
+	end)
+
 	it("should capture a preparing batch ticket before serialization yields and drain omitted tickets", function()
 		for _, omitted in { false, true } do
 			local session, instance, control = sourceRecoverySession()

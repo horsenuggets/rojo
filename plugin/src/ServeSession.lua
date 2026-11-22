@@ -134,6 +134,66 @@ function ServeSession.shouldPreserveFailedProperty(result, id, propertyName)
 	return true
 end
 
+--[[
+	Records the tracked instance each update and removal was encoded against. Class
+	replacement tracks a new instance under the same id and removal untracks it, so
+	comparing at dispatch shows which queued intent outlived its target. Additions are
+	not captured, because a replacement carries their parent's children along with it.
+]]
+function ServeSession.captureOperationTargets(patch, fromIds)
+	assert(t.table(patch))
+	assert(t.table(fromIds))
+
+	local targets = { Removed = {}, Updated = {} }
+	for index, update in patch.updated do
+		targets.Updated[index] = fromIds[update.id]
+	end
+	for index, id in patch.removed do
+		targets.Removed[index] = fromIds[id]
+	end
+	return targets
+end
+
+--[[
+	Splits an encoded write into what may still be sent and what an authoritative
+	replacement or removal superseded after capture. Operations without a captured
+	target are kept, so the server still decides about ids this session never tracked.
+	The original patch is returned unchanged when nothing was superseded.
+]]
+function ServeSession.partitionSupersededOperations(patch, targets, fromIds)
+	assert(t.table(patch))
+	assert(t.table(targets))
+	assert(t.table(fromIds))
+
+	local superseded = PatchSet.newEmpty()
+	local remaining = table.clone(patch)
+	remaining.updated = {}
+	remaining.removed = {}
+	for index, update in patch.updated do
+		local target = targets.Updated[index]
+		local stale = target ~= nil and fromIds[update.id] ~= target
+		table.insert(if stale then superseded.updated else remaining.updated, update)
+	end
+	for index, id in patch.removed do
+		local target = targets.Removed[index]
+		local stale = target ~= nil and fromIds[id] ~= target
+		table.insert(if stale then superseded.removed else remaining.removed, id)
+	end
+	if PatchSet.isEmpty(superseded) then
+		return patch, superseded
+	end
+	return remaining, superseded
+end
+
+local function supersededResult(superseded)
+	return {
+		accepted = { removed_instances = {}, added_instances = {}, updated_instances = {} },
+		conflicts = { removed_instances = {}, added_instances = {}, updated_instances = {} },
+		errors = {},
+		superseded = superseded,
+	}
+end
+
 local validateServeOptions = t.strictInterface({
 	apiContext = t.table,
 	twoWaySync = t.boolean,
@@ -1486,6 +1546,9 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 		ticket = self:__newWriteTicket(dependencies)
 	end
 	messageCursor = messageCursor or self.__apiContext:getMessageCursor()
+	-- Batches are written right after encoding, so these are the encoded targets.
+	local targets =
+		ServeSession.captureOperationTargets(patch, if self.__instanceMap then self.__instanceMap.fromIds else {})
 	local dependency = ticket.Dependency or Promise.resolve({})
 	-- Read when each batch is sent, so changing it applies to the next write
 	-- without reconnecting. A pinned session authority wins over the setting.
@@ -1530,13 +1593,14 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 	}
 	table.insert(self.__syncResults, record)
 
-	local function finish(status, result)
+	local function finish(status, result, target)
+		target = target or record
 		if result and result.acknowledgement ~= nil then
 			result = table.clone(result)
 			result.acknowledgement = nil
 		end
-		record.status = status
-		record.result = result
+		target.status = status
+		target.result = result
 		if self.__syncResultCallback ~= nil then
 			self.__syncResultCallback(status, result)
 		end
@@ -1561,7 +1625,11 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 	-- still waiting when the session stops is never sent.
 	local previous = ticket.PreviousWrite or Promise.resolve()
 	ticket.PreviousWrite = nil
-	local acknowledged = false
+	-- Set once an outcome is being processed, after which a failure must stop the session.
+	local settled = false
+	local allSuperseded = false
+	local superseded = nil
+	local sent = patch
 	local write = previous
 		:andThen(function()
 			return Promise.all({ dependency, Promise.all(baselinePromises) })
@@ -1570,12 +1638,35 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 			if self.__status == Status.Disconnected then
 				return Promise.reject("The session stopped before this write was sent")
 			end
+			-- Earlier writes and publications may have replaced or removed a target while
+			-- this one waited. Its intent no longer has a target, so sending it would only
+			-- earn a conflict or an unknown-instance error for an edit nobody can see.
+			local fromIds = if self.__instanceMap then self.__instanceMap.fromIds else {}
+			sent, superseded = ServeSession.partitionSupersededOperations(patch, targets, fromIds)
+			if not PatchSet.isEmpty(superseded) then
+				for _, update in superseded.updated do
+					sources[update.id] = nil
+					sourceBaselines[update.id] = nil
+				end
+				if PatchSet.isEmpty(sent) then
+					allSuperseded = true
+					return nil
+				end
+				record.patch = sent
+				local entry = { status = "Pending", patch = superseded, authority = authority }
+				table.insert(self.__syncResults, entry)
+				finish("Superseded", supersededResult(superseded), entry)
+			end
+			structuralWrite = false
+			for _, update in sent.updated do
+				structuralWrite = structuralWrite or update.changedName ~= nil or update.changedParent ~= nil
+			end
 			if next(sources) ~= nil then
 				self.__sourceHistory:begin(operationId, sources)
 			end
 			local lineage = resolved[1]
 			return self.__apiContext:write(
-				patch,
+				sent,
 				messageCursor,
 				authority,
 				operationId,
@@ -1584,7 +1675,15 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 			)
 		end)
 		:andThen(function(result)
-			acknowledged = true
+			settled = true
+			if allSuperseded then
+				-- Nothing was sent, so nothing was acknowledged. Dependents keep the
+				-- predecessor lineage, and buffered guards release without a response.
+				self:__resolveWriteTicket(ticket)
+				forgetDeletions()
+				finish("Superseded", supersededResult(superseded))
+				return self:__finishLocalProperties(localProperties, nil)
+			end
 			-- Partial failures grant nothing new. The captured valid predecessor still
 			-- proves only its old effects, so missing effects continue to fail closed.
 			self:__resolveWriteTicket(
@@ -1613,7 +1712,7 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 			self:__resolveWriteTicket(ticket)
 			forgetDeletions()
 			if
-				acknowledged
+				settled
 				or structuralWrite
 				or (getmetatable(err) == Http.Error and err.type == Http.Error.Kind.Protocol)
 			then
