@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.10`
+
 * Stopped queued two-way sync writes from reaching the server after the filesystem replaced
   or removed their instance, which repeated conflict and unknown-instance notifications.
   Each write now drops only operations whose captured target changed before dispatch,
