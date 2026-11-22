@@ -2178,6 +2178,7 @@ dependencies = [
  "rmp-serde",
  "roblox_install",
  "rojo-insta-ext",
+ "rustix",
  "semver",
  "serde",
  "serde_bytes",

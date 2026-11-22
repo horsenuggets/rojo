@@ -275,6 +275,10 @@ pub(crate) struct Checkpoint {
     pub source_transform: Option<SourceTransform>,
 }
 
+#[cfg(unix)]
+#[path = "source_checkpoints/unix.rs"]
+mod unix;
+
 /// A cross-process lock covers capacity checks and commits. The lock is released by
 /// the OS on crashes, unlike a directory lock that could strand all future recovery.
 pub(crate) struct Store {
@@ -283,7 +287,10 @@ pub(crate) struct Store {
     _lock: File,
     // Windows denies delete sharing on these handles for the lifetime of every operation.
     // This pins this namespace, not arbitrary ancestors of the project root.
+    #[cfg(not(unix))]
     _directories: Vec<File>,
+    #[cfg(unix)]
+    namespace: unix::Namespace,
     max_bytes: u64,
     max_count: usize,
 }
@@ -322,23 +329,30 @@ impl Store {
         let root = identity
             .parent()
             .context("Checkpoint project has no parent")?;
-        let cache = root.join(".rojo");
-        let mut directories = vec![private_directory(&cache)?];
-        let cache = cache.join("source-checkpoints");
-        directories.push(private_directory(&cache)?);
         let key = format!(
             "{:x}",
             Sha256::digest(identity.to_string_lossy().as_bytes())
         );
-        let directory = cache.join(key);
-        directories.push(private_directory(&directory)?);
-        let lock_path = directory.join(".lock");
-        let lock = match create_private_file(&lock_path, false) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                open_private_file(&lock_path, true)?
-            }
-            Err(error) => return Err(error.into()),
+        let directory = root.join(".rojo").join("source-checkpoints").join(&key);
+        #[cfg(unix)]
+        let namespace = unix::Namespace::open(root, &key)?;
+        #[cfg(unix)]
+        let lock = namespace.lock_file()?;
+        #[cfg(not(unix))]
+        let (directories, lock) = {
+            let cache = root.join(".rojo");
+            let mut directories = vec![private_directory(&cache)?];
+            directories.push(private_directory(&cache.join("source-checkpoints"))?);
+            directories.push(private_directory(&directory)?);
+            let lock_path = directory.join(".lock");
+            let lock = match create_private_file(&lock_path, false) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    open_private_file(&lock_path, true)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            (directories, lock)
         };
         lock.try_lock().context(
             "Checkpoint storage is busy. Retry after the other recovery operation completes",
@@ -347,13 +361,16 @@ impl Store {
             directory,
             identity,
             _lock: lock,
+            #[cfg(not(unix))]
             _directories: directories,
+            #[cfg(unix)]
+            namespace,
             max_bytes: MAX_TOTAL_BYTES,
             max_count: MAX_COUNT,
         };
         let owner = store.directory.join("owner.json");
-        if owner.exists() {
-            let bytes = read_bounded(&owner, 64 * 1024)?;
+        if store.file_exists(&owner)? {
+            let bytes = store.read_bounded(&owner, 64 * 1024)?;
             let (version, identity): (u32, PathBuf) = serde_json::from_slice(&bytes).context(
                 "Checkpoint ownership is unreadable. Preserve this cache and reconcile it manually",
             )?;
@@ -385,10 +402,8 @@ impl Store {
             "Checkpoint exceeds the per-record storage limit. Copy the editor source to a safe file before continuing");
         let mut count = 0;
         let mut total = 0u64;
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file = open_private_file(&path, false)?;
+        for path in self.entries()? {
+            let file = self.open_file(&path, false)?;
             total = total
                 .checked_add(file.metadata()?.len())
                 .context("Checkpoint storage size overflow")?;
@@ -408,8 +423,7 @@ impl Store {
 
     pub fn list(&self) -> anyhow::Result<Vec<CheckpointMetadata>> {
         let mut records = Vec::new();
-        for entry in fs::read_dir(&self.directory)? {
-            let path = entry?.path();
+        for path in self.entries()? {
             if path.extension().is_none_or(|extension| extension != "json")
                 || path.file_name().is_some_and(|name| name == "owner.json")
             {
@@ -426,24 +440,29 @@ impl Store {
                 .cmp(&b.created)
                 .then_with(|| a.checkpoint_id.cmp(&b.checkpoint_id))
         });
+        #[cfg(unix)]
+        self.namespace.validate()?;
         Ok(records)
     }
 
     pub fn read(&self, id: &str) -> anyhow::Result<Checkpoint> {
         let path = self.record_path(id)?;
-        let record: Checkpoint = serde_json::from_slice(&read_bounded(&path, MAX_RECORD_BYTES)?)
-            .context("Checkpoint is unreadable. Preserve its file and recover it manually")?;
+        let record: Checkpoint =
+            serde_json::from_slice(&self.read_bounded(&path, MAX_RECORD_BYTES)?)
+                .context("Checkpoint is unreadable. Preserve its file and recover it manually")?;
         ensure!(record.metadata.checkpoint_id == id
             && record.metadata.provenance.schema_version == SCHEMA_VERSION
             && record.metadata.provenance.project_identity == self.identity,
             "Checkpoint provenance does not match this project or schema. Preserve the file for manual recovery");
+        #[cfg(unix)]
+        self.namespace.validate()?;
         Ok(record)
     }
 
     pub fn discard(&self, id: &str) -> anyhow::Result<()> {
         // Validate provenance too. Never remove an unknown or foreign cache file.
         self.read(id)?;
-        fs::remove_file(self.record_path(id)?)?;
+        self.remove_file(&self.record_path(id)?)?;
         self.sync_directory()
     }
 
@@ -455,6 +474,12 @@ impl Store {
         Ok(self.directory.join(format!("{id}.json")))
     }
 
+    #[cfg(all(unix, test))]
+    fn temporary_file(&self) -> anyhow::Result<unix::Temporary> {
+        self.namespace.temporary_file(&self.directory)
+    }
+
+    #[cfg(not(unix))]
     fn temporary_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
         tempfile::Builder::new()
             .prefix(INCOMPLETE_PREFIX)
@@ -465,8 +490,7 @@ impl Store {
 
     fn reconcile_incomplete_writes(&self) -> anyhow::Result<()> {
         let mut removed = false;
-        for entry in fs::read_dir(&self.directory)? {
-            let path = entry?.path();
+        for path in self.entries()? {
             let incomplete = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -479,9 +503,9 @@ impl Store {
             if incomplete {
                 // Only our reserved uncommitted namespace is reclaimable, under the
                 // exclusive store lock. UUID.json records are never implicitly removed.
-                drop(open_private_file(&path, false).with_context(|| format!(
+                drop(self.open_file(&path, false).with_context(|| format!(
                     "Cannot safely reclaim incomplete checkpoint file \"{}\". Preserve it and reconcile manually before retrying", path.display()))?);
-                fs::remove_file(&path)?;
+                self.remove_file(&path)?;
                 removed = true;
             } else {
                 let name = path
@@ -496,9 +520,18 @@ impl Store {
         if removed {
             self.sync_directory()?;
         }
+        #[cfg(unix)]
+        self.namespace.validate()?;
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn atomic_write(&self, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        self.namespace
+            .atomic_write(&self.directory, self.entry_name(path)?, bytes)
+    }
+
+    #[cfg(not(unix))]
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let mut temporary = self.temporary_file()?;
         temporary.write_all(bytes)?;
@@ -509,9 +542,67 @@ impl Store {
         self.sync_directory()
     }
 
+    #[cfg(unix)]
+    fn entry_name<'a>(&self, path: &'a Path) -> anyhow::Result<&'a std::ffi::OsStr> {
+        ensure!(
+            path.parent() == Some(self.directory.as_path()),
+            "Invalid checkpoint storage entry"
+        );
+        path.file_name()
+            .context("Invalid checkpoint storage filename")
+    }
+
+    fn entries(&self) -> anyhow::Result<Vec<PathBuf>> {
+        #[cfg(unix)]
+        return Ok(self
+            .namespace
+            .entries()?
+            .into_iter()
+            .map(|name| self.directory.join(name))
+            .collect());
+        #[cfg(not(unix))]
+        fs::read_dir(&self.directory)?
+            .map(|entry| Ok(entry?.path()))
+            .collect()
+    }
+
+    fn file_exists(&self, path: &Path) -> anyhow::Result<bool> {
+        #[cfg(unix)]
+        return self.namespace.exists(self.entry_name(path)?);
+        #[cfg(not(unix))]
+        Ok(path.try_exists()?)
+    }
+
+    fn open_file(&self, path: &Path, writable: bool) -> anyhow::Result<File> {
+        #[cfg(unix)]
+        return self.namespace.open_file(self.entry_name(path)?, writable);
+        #[cfg(not(unix))]
+        open_private_file(path, writable)
+    }
+
+    fn read_bounded(&self, path: &Path, limit: u64) -> anyhow::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.open_file(path, false)?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            bail!("Checkpoint file exceeds its size limit. Preserve it for manual recovery");
+        }
+        #[cfg(unix)]
+        self.namespace.validate()?;
+        Ok(bytes)
+    }
+
+    fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        return self.namespace.remove_file(self.entry_name(path)?);
+        #[cfg(not(unix))]
+        Ok(fs::remove_file(path)?)
+    }
+
     fn sync_directory(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
-        self._directories.last().unwrap().sync_all()?;
+        self.namespace.sync()?;
         // Windows flushes record contents before an atomic rename, but has no supported
         // directory fsync here. Atomic visibility is not equal power-loss durability.
         #[cfg(not(any(unix, windows)))]
@@ -531,61 +622,15 @@ fn private_directory(_path: &Path) -> anyhow::Result<File> {
     bail!("Private checkpoint storage is unsupported on this platform")
 }
 
-#[cfg(unix)]
-fn private_directory(path: &Path) -> anyhow::Result<File> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "Checkpoint cache must be an owned real directory, not a symlink"
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::DirBuilder::new().mode(0o700).create(path) {
-                Ok(()) => {
-                    if let Some(parent) = path.parent() {
-                        File::open(parent)?.sync_all()?;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return private_directory(path)
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(error) => return Err(error.into()),
-    }
-    // Do not chmod the shared .rojo directory, which other server caches also use.
-    if path.file_name().is_some_and(|name| name != ".rojo") {
-        ensure!(
-            fs::metadata(path)?.permissions().mode() & 0o077 == 0,
-            "Checkpoint directory is not private. Restrict access to its owner before retrying"
-        );
-    }
-    Ok(File::open(path)?)
-}
-
+#[cfg(not(unix))]
 fn open_private_file(path: &Path, writable: bool) -> anyhow::Result<File> {
     #[cfg(windows)]
     return windows::open_file(path, writable).map_err(Into::into);
     #[cfg(not(any(unix, windows)))]
     bail!("Private checkpoint storage is unsupported on this platform");
-    #[cfg(unix)]
-    {
-        let metadata = fs::symlink_metadata(path)?;
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "Checkpoint file must be a regular owned file, not a symlink"
-        );
-        let file = OpenOptions::new().read(true).write(writable).open(path)?;
-        let opened = file.metadata()?;
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        ensure!(opened.is_file() && metadata.dev() == opened.dev() && metadata.ino() == opened.ino()
-            && opened.permissions().mode() & 0o077 == 0 && opened.nlink() == 1,
-            "Checkpoint file is not private or has additional hard links. Preserve it and restrict access before retrying");
-        Ok(file)
-    }
 }
 
+#[cfg(not(unix))]
 fn create_private_file(path: &Path, temporary: bool) -> std::io::Result<File> {
     #[cfg(windows)]
     return windows::create_file(path, temporary);
@@ -593,28 +638,6 @@ fn create_private_file(path: &Path, temporary: bool) -> std::io::Result<File> {
     return Err(std::io::Error::other(
         "Private checkpoint storage is unsupported on this platform",
     ));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let _ = temporary;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-    }
-}
-
-fn read_bounded(path: &Path, limit: u64) -> anyhow::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    open_private_file(path, false)?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        bail!("Checkpoint file exceeds its size limit. Preserve it for manual recovery");
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -842,6 +865,183 @@ mod tests {
                 abandoned.exists(),
                 "Ownership must be checked before reclamation"
             );
+        }
+    }
+
+    #[test]
+    fn bounded_reads_preserve_oversized_owner_and_record_files() {
+        let (_directory, project) = project();
+        let store = Store::open(&project).unwrap();
+        let identity = store.identity.clone();
+        let id = store.create(record(&store)).unwrap();
+        let path = store.record_path(&id).unwrap();
+        store
+            .open_file(&path, true)
+            .unwrap()
+            .set_len(MAX_RECORD_BYTES + 1)
+            .unwrap();
+        assert!(store
+            .read(&id)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("exceeds its size limit"));
+        assert!(store.discard(&id).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_RECORD_BYTES + 1);
+        let owner = store.directory.join("owner.json");
+        store
+            .open_file(&owner, true)
+            .unwrap()
+            .set_len(64 * 1024 + 1)
+            .unwrap();
+        drop(store);
+        assert!(Store::open_identity(&identity)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("exceeds its size limit"));
+        assert_eq!(fs::metadata(owner).unwrap().len(), 64 * 1024 + 1);
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_cache_parent_is_rejected_without_repair() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o775, 0o757, 0o777] {
+            let (directory, project) = project();
+            let cache = directory.path().join(".rojo");
+            fs::create_dir(&cache).unwrap();
+            fs::set_permissions(&cache, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(Store::open(&project).is_err(), "Accepted mode {mode:o}");
+            assert_eq!(
+                fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert!(!cache.join("source-checkpoints").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_namespace_is_never_used_or_acknowledged_as_durable() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for level in 0..4 {
+            let (_directory, project) = project();
+            let store = Store::open(&project).unwrap();
+            let id = store.create(record(&store)).unwrap();
+            let original = store.record_path(&id).unwrap();
+            let before = fs::read(&original).unwrap();
+            let temporary = store.temporary_file().unwrap();
+            let temporary_name = temporary.path().file_name().unwrap().to_owned();
+            let replaced = store.directory.ancestors().nth(level).unwrap();
+            let moved = replaced.with_extension(format!("detached-{}", uuid::Uuid::new_v4()));
+            fs::rename(replaced, &moved).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), replaced).unwrap();
+            let substituted = store.directory.clone();
+            fs::create_dir_all(&substituted).unwrap();
+            fs::write(&original, &before).unwrap();
+            fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+            let sentinel = substituted.join(temporary_name);
+            fs::write(&sentinel, b"must survive temporary cleanup").unwrap();
+            assert!(store.read(&id).is_err());
+            assert!(store.list().is_err());
+            assert!(store.discard(&id).is_err());
+            assert!(store.create(record(&store)).is_err());
+            assert!(store
+                .atomic_write(&substituted.join("new.json"), b"secret")
+                .is_err());
+            assert!(store.sync_directory().is_err());
+            drop(temporary);
+            assert_eq!(
+                fs::read(&sentinel).unwrap(),
+                b"must survive temporary cleanup"
+            );
+            assert_eq!(fs::read(&original).unwrap(), before);
+            assert_eq!(fs::read_dir(&substituted).unwrap().count(), 2);
+            fs::remove_file(replaced).unwrap();
+            fs::rename(&moved, replaced).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_private_directories_and_project_root_are_rejected_without_repair() {
+        use std::os::unix::fs::PermissionsExt;
+        for level in 0..4 {
+            let (_directory, project) = project();
+            let store = Store::open(&project).unwrap();
+            let identity = store.identity.clone();
+            let id = store.create(record(&store)).unwrap();
+            let record_path = store.record_path(&id).unwrap();
+            let path = store
+                .directory
+                .ancestors()
+                .nth(level)
+                .unwrap()
+                .to_path_buf();
+            let mode = if level >= 2 { 0o775 } else { 0o755 };
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(store.list().is_err());
+            assert!(store.read(&id).is_err());
+            assert!(store.discard(&id).is_err());
+            assert!(store.create(record(&store)).is_err());
+            assert!(store.sync_directory().is_err());
+            drop(store);
+            assert!(Store::open_identity(&identity).is_err());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert!(record_path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_lock_owner_records_and_incomplete_files_are_never_followed_or_reclaimed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for name in [".lock", "owner.json", "record", "incomplete"] {
+            for hardlink in [false, true] {
+                let (_directory, project) = project();
+                let store = Store::open(&project).unwrap();
+                let identity = store.identity.clone();
+                let id = store.create(record(&store)).unwrap();
+                let path = match name {
+                    "record" => store.record_path(&id).unwrap(),
+                    "incomplete" => {
+                        let (file, path) = store.temporary_file().unwrap().keep().unwrap();
+                        drop(file);
+                        path
+                    }
+                    _ => store.directory.join(name),
+                };
+                drop(store);
+                let outside = tempfile::tempdir().unwrap();
+                let target = outside.path().join("untouched");
+                fs::write(&target, b"private external data").unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::remove_file(&path).unwrap();
+                if hardlink {
+                    fs::hard_link(&target, &path).unwrap();
+                } else {
+                    symlink(&target, &path).unwrap();
+                }
+                // Ordinary records are validated on explicit access, not silently pruned
+                // during startup. Infrastructure and incomplete files fail on open.
+                if name == "record" {
+                    let store = Store::open_identity(&identity).unwrap();
+                    assert!(store.list().is_err());
+                    assert!(store.read(&id).is_err());
+                    assert!(store.discard(&id).is_err());
+                    assert!(store.create(record(&store)).is_err());
+                } else {
+                    assert!(Store::open_identity(&identity).is_err());
+                }
+                assert_eq!(fs::read(&target).unwrap(), b"private external data");
+                assert!(fs::symlink_metadata(&path).is_ok());
+            }
         }
     }
 
