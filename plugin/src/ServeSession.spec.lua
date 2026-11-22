@@ -410,6 +410,34 @@ return function()
 		end
 	end)
 
+	it("should supersede a batch whose target a publication changes while omitted properties replay", function()
+		for _, removal in { false, true } do
+			local session, part, control = queuedPartSession()
+			local success, problem = pcall(function()
+				-- Replaying omitted properties runs precommit hooks, which may yield. A
+				-- publication landing meanwhile changes the target after it was encoded.
+				local finishOmitted = session.__finishOmittedLocalProperties
+				session.__finishOmittedLocalProperties = function(...)
+					if removal then
+						control.remove()
+					else
+						control.replace()
+					end
+					return finishOmitted(...)
+				end
+				control.edit(part, 8)
+				local queued = session:flushChanges()
+				control.settle[1](writeResult())
+				assert(control.first:await())
+				expect(#control.requests).to.equal(1)
+				assert(queued:await())
+				expect(table.concat(control.statuses, ",")).to.equal("Saved,Superseded")
+			end)
+			control.cleanup()
+			assert(success, `Removal {removal} failed. {tostring(problem)}`)
+		end
+	end)
+
 	it("should neither send a stopped session's batch nor supersede a new session's write", function()
 		local old, part, oldControl = queuedPartSession()
 		local new, unused, newControl = propertySession("Part")

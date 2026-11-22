@@ -229,6 +229,11 @@ function ServeSession.new(options)
 	end
 
 	local function onBatchPrepared(patch, context)
+		-- Encoding just finished. Replaying omitted properties below runs precommit
+		-- hooks that may yield while a publication replaces or removes a target.
+		if patch ~= nil then
+			context.targets = ServeSession.captureOperationTargets(patch, self.__instanceMap.fromIds)
+		end
 		if patch == nil or PatchSet.isEmpty(patch) or self.__status == Status.Disconnected then
 			self:__resolveWriteTicket(context.ticket)
 			self:__completeWriteTicket(context.ticket)
@@ -237,7 +242,7 @@ function ServeSession.new(options)
 	end
 
 	local function onChangesFlushed(patch, context)
-		return self:__writePatch(patch, context.cursor, context.properties, context.ticket)
+		return self:__writePatch(patch, context.cursor, context.properties, context.ticket, context.targets)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged, onChildAdded)
@@ -1527,7 +1532,7 @@ function ServeSession:__captureWriteDependency(dependency)
 	end
 end
 
-function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket)
+function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket, targets)
 	if ticket == nil then
 		local dependencies = {}
 		if localProperties ~= nil then
@@ -1546,9 +1551,10 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 		ticket = self:__newWriteTicket(dependencies)
 	end
 	messageCursor = messageCursor or self.__apiContext:getMessageCursor()
-	-- Batches are written right after encoding, so these are the encoded targets.
-	local targets =
-		ServeSession.captureOperationTargets(patch, if self.__instanceMap then self.__instanceMap.fromIds else {})
+	-- Batches bring the targets captured when they were encoded. Direct callers write
+	-- what they just built without yielding, so their current targets are the encoded ones.
+	targets = targets
+		or ServeSession.captureOperationTargets(patch, if self.__instanceMap then self.__instanceMap.fromIds else {})
 	local dependency = ticket.Dependency or Promise.resolve({})
 	-- Read when each batch is sent, so changing it applies to the next write
 	-- without reconnecting. A pinned session authority wins over the setting.
