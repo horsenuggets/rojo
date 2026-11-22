@@ -72,8 +72,8 @@ pub(crate) fn plan_relocation(
             | Middleware::Yaml => {
                 if middleware == Middleware::Json && filename.ends_with(".jsonc") {
                     ".jsonc".to_owned()
-                } else if middleware == Middleware::Yaml && filename.ends_with(".yml") {
-                    ".yml".to_owned()
+                } else if middleware == Middleware::Yaml && filename.ends_with(".yaml") {
+                    ".yaml".to_owned()
                 } else {
                     format!(".{}", extension_for_middleware(middleware))
                 }
@@ -786,6 +786,7 @@ mod tests {
         for (filename, middleware, destination) in [
             ("Before.jsonc", Middleware::Json, "dst/After.jsonc"),
             ("Before.yml", Middleware::Yaml, "dst/After.yml"),
+            ("Before.yaml", Middleware::Yaml, "dst/After.yaml"),
             (
                 "Before.legacy.lua",
                 Middleware::LegacyServerScript,

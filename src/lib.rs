@@ -23,6 +23,7 @@ mod serve_session;
 mod session_id;
 mod snapshot;
 mod snapshot_middleware;
+mod source_checkpoints;
 mod syncback;
 mod variant_eq;
 mod web;

@@ -107,20 +107,307 @@ return function()
 		return count
 	end
 
+	-- Keep observations fixed while actual values change, modelling queued native signals.
+	const function withholdSignals(map, instance)
+		for _, connection in map.instancesToSignal[instance] do
+			connection:Disconnect()
+		end
+	end
+
 	-- Signals can be deferred, so give them a frame to arrive before checking.
 	const function settle()
 		task.wait()
 	end
 
-	it("should retain authoritative parents until a paused move replaces them", function()
+	it("should capture undelivered structural changes once without advancing authority", function()
+		for _, className in CLASS_NAMES do
+			const tree = createTree(className)
+			const map = tree.InstanceMap
+			const reports = {}
+			withholdSignals(map, tree.Leaf)
+			map.onInstanceChanged = function(instance, property)
+				table.insert(reports, { Property = property, Value = instance[property] })
+			end
+			tree.Leaf.Name = "Undelivered name"
+			tree.Leaf.Parent = tree.Other
+			map:pauseInstance(tree.Leaf)
+			map:captureStructuralChanges(tree.Leaf)
+			map:captureStructuralChanges(tree.Leaf)
+			map:__maybeFireInstanceChanged(tree.Leaf, "Name")
+			map:__maybeFireInstanceChanged(tree.Leaf, "Parent")
+			expect(#reports).to.equal(2)
+			expect(reports[1].Property).to.equal("Name")
+			expect(reports[1].Value).to.equal("Undelivered name")
+			expect(reports[2].Property).to.equal("Parent")
+			expect(reports[2].Value).to.equal(tree.Other)
+			expect(map.knownParents[tree.Leaf]).to.equal(tree.Ancestor)
+			map:stop()
+			tree.Container:Destroy()
+		end
+	end)
+
+	it("should stop a structural capture when its notification reinserts the identity", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		const reports = {}
+		withholdSignals(map, tree.Leaf)
+		tree.Leaf.Name = "New lease"
+		tree.Leaf.Parent = tree.Other
+		map.onInstanceChanged = function(instance, property)
+			table.insert(reports, property)
+			map:insert("LEAF", instance)
+		end
+		map:captureStructuralChanges(tree.Leaf)
+		expect(#reports).to.equal(1)
+		expect(reports[1]).to.equal("Name")
+		expect(map.knownParents[tree.Leaf]).to.equal(tree.Other)
+		map:stop()
+		tree.Container:Destroy()
+	end)
+
+	it("should consult the assignment boundary before replacing an unobserved value", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		withholdSignals(map, tree.Leaf)
+		tree.Leaf.Name = "Undelivered name"
+		map.onBeforeStructuralAssignment = function(instance, property, value)
+			expect(instance[property]).to.equal("Undelivered name")
+			expect(map.observedNames[instance]).to.equal("Leaf")
+			expect(value).to.equal("Older echo")
+			map:captureStructuralChanges(instance)
+			error("The caller must revalidate this generation.")
+		end
+		const success = pcall(map.applyStructuralProperty, map, tree.Leaf, "Name", "Older echo")
+		expect(success).to.equal(false)
+		expect(tree.Leaf.Name).to.equal("Undelivered name")
+		expect(map.observedNames[tree.Leaf]).to.equal("Undelivered name")
+		expect(next(map.structuralAssignments)).to.equal(nil)
+		map:stop()
+		tree.Container:Destroy()
+	end)
+
+	it("should report local Parent and Name edits even while the instance is paused", function()
+		for _, className in CLASS_NAMES do
+			const tree = createTree(className)
+			const map = tree.InstanceMap
+			const reports = {}
+			map.onInstanceChanged = function(instance, propertyName)
+				if instance == tree.Leaf then
+					reports[propertyName] = (reports[propertyName] or 0) + 1
+				end
+			end
+			map:pauseInstance(tree.Leaf)
+			tree.Leaf.Parent = tree.Other
+			tree.Leaf.Name = "Local name"
+			settle()
+			expect(reports.Parent).to.equal(1)
+			expect(reports.Name).to.equal(1)
+			expect(map.knownParents[tree.Leaf]).to.equal(tree.Ancestor)
+			map:stop()
+			tree.Container:Destroy()
+		end
+	end)
+
+	it("should report a same-frame local edit after an explicit remote structural assignment", function()
+		for _, className in CLASS_NAMES do
+			const tree = createTree(className)
+			const map = tree.InstanceMap
+			const reports = {}
+			map.onInstanceChanged = function(instance, propertyName)
+				if instance == tree.Leaf then
+					reports[propertyName] = (reports[propertyName] or 0) + 1
+				end
+			end
+			map:pauseInstance(tree.Leaf)
+			expect(map:applyStructuralProperty(tree.Leaf, "Parent", tree.Other)).to.equal(true)
+			expect(map:applyStructuralProperty(tree.Leaf, "Name", "Server name")).to.equal(true)
+			tree.Leaf.Parent = tree.Container
+			tree.Leaf.Name = "Local name"
+			settle()
+			expect(reports.Parent).to.equal(1)
+			expect(reports.Name).to.equal(1)
+			expect(map.knownParents[tree.Leaf]).to.equal(tree.Other)
+			map:stop()
+			tree.Container:Destroy()
+		end
+	end)
+
+	it("should suppress only explicit remote Parent and Name effects", function()
+		for _, className in CLASS_NAMES do
+			const tree = createTree(className)
+			const map = tree.InstanceMap
+			const reports = {}
+			map.onInstanceChanged = function(_, propertyName)
+				table.insert(reports, propertyName)
+			end
+			expect(map:applyStructuralProperty(tree.Leaf, "Parent", tree.Other)).to.equal(true)
+			expect(map:applyStructuralProperty(tree.Leaf, "Name", "Server name")).to.equal(true)
+			map:unpauseAllInstances()
+			settle()
+			map:__maybeFireInstanceChanged(tree.Leaf, "Parent")
+			map:__maybeFireInstanceChanged(tree.Leaf, "Name")
+			expect(#reports).to.equal(0)
+			expect(map.knownParents[tree.Leaf]).to.equal(tree.Other)
+			expect(next(map.structuralAssignments)).to.equal(nil)
+			map:stop()
+			tree.Container:Destroy()
+		end
+	end)
+
+	it("should retain reentrant local edits during immediate remote notifications", function()
+		for _, propertyName in { "Parent", "Name" } do
+			const tree = createTree("Folder")
+			const map = tree.InstanceMap
+			const reports = {}
+			map.onInstanceChanged = function(instance, property)
+				if instance == tree.Leaf and property == propertyName then
+					table.insert(reports, instance[property])
+				end
+			end
+			const remote = if propertyName == "Parent" then tree.Other else "Server name"
+			const localValue = if propertyName == "Parent" then tree.Container else "Local name"
+			map.__assignStructuralProperty = function(self, instance, property, value)
+				InstanceMap.__assignStructuralProperty(self, instance, property, value)
+				self:__maybeFireInstanceChanged(instance, property)
+				instance[property] = localValue
+				self:__maybeFireInstanceChanged(instance, property)
+			end
+			map:pauseInstance(tree.Leaf)
+			expect(map:applyStructuralProperty(tree.Leaf, propertyName, remote)).to.equal(true)
+			expect(#reports).to.equal(1)
+			expect(reports[1]).to.equal(localValue)
+			settle()
+			expect(#reports).to.equal(1)
+			expect(tree.Leaf[propertyName]).to.equal(localValue)
+			expect(map.knownParents[tree.Leaf]).to.equal(if propertyName == "Parent" then remote else tree.Ancestor)
+			map:stop()
+			tree.Container:Destroy()
+		end
+	end)
+
+	it("should keep a nested remote assignment newer than its returning predecessor", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		local nested = false
+		map.__assignStructuralProperty = function(self, instance, propertyName, value)
+			InstanceMap.__assignStructuralProperty(self, instance, propertyName, value)
+			if not nested then
+				nested = true
+				expect(self:applyStructuralProperty(instance, propertyName, tree.Container)).to.equal(true)
+			end
+		end
+		expect(map:applyStructuralProperty(tree.Leaf, "Parent", tree.Other)).to.equal(true)
+		settle()
+		expect(tree.Leaf.Parent).to.equal(tree.Container)
+		expect(map.knownParents[tree.Leaf]).to.equal(tree.Container)
+		expect(map.observedParents[tree.Leaf]).to.equal(tree.Container)
+		expect(#tree.Reports).to.equal(0)
+		expect(next(map.structuralAssignments)).to.equal(nil)
+		map:stop()
+		tree.Container:Destroy()
+	end)
+
+	it("should retain an outer accepted move when a nested assignment fails", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		local nested = false
+		map.__assignStructuralProperty = function(self, instance, propertyName, value)
+			InstanceMap.__assignStructuralProperty(self, instance, propertyName, value)
+			if not nested then
+				nested = true
+				expect(self:applyStructuralProperty(instance, propertyName, instance)).to.equal(false)
+			end
+		end
+		expect(map:applyStructuralProperty(tree.Leaf, "Parent", tree.Other)).to.equal(true)
+		settle()
+		expect(tree.Leaf.Parent).to.equal(tree.Other)
+		expect(map.knownParents[tree.Leaf]).to.equal(tree.Other)
+		expect(map.observedParents[tree.Leaf]).to.equal(tree.Other)
+		expect(#tree.Reports).to.equal(0)
+		expect(next(map.structuralAssignments)).to.equal(nil)
+		map:stop()
+		tree.Container:Destroy()
+	end)
+
+	it("should preserve a newer observation when assignment failure returns", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		map.__assignStructuralProperty = function(self, instance, propertyName)
+			instance[propertyName] = tree.Container
+			self:__maybeFireInstanceChanged(instance, propertyName)
+			error("Injected assignment failure.", 0)
+		end
+		expect(map:applyStructuralProperty(tree.Leaf, "Parent", tree.Other)).to.equal(false)
+		settle()
+		expect(map.observedParents[tree.Leaf]).to.equal(tree.Container)
+		expect(map.knownParents[tree.Leaf]).to.equal(tree.Ancestor)
+		expect(countReports(tree.Reports, tree.Leaf)).to.equal(1)
+		expect(next(map.structuralAssignments)).to.equal(nil)
+		map:stop()
+		tree.Container:Destroy()
+	end)
+
+	it("should not attach a returning assignment to a reinserted identity", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		map.__assignStructuralProperty = function(self, instance, propertyName, value)
+			InstanceMap.__assignStructuralProperty(self, instance, propertyName, value)
+			self:removeInstance(instance)
+			instance.Parent = tree.Container
+			self:insert("LEAF", instance)
+		end
+		expect(map:applyStructuralProperty(tree.Leaf, "Parent", tree.Other)).to.equal(true)
+		settle()
+		expect(map.knownParents[tree.Leaf]).to.equal(tree.Container)
+		expect(map.observedParents[tree.Leaf]).to.equal(tree.Container)
+		expect(next(map.structuralAssignments)).to.equal(nil)
+		map:stop()
+		tree.Container:Destroy()
+	end)
+
+	it("should roll back failed structural assignments without hiding the next local edit", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		expect(map:applyStructuralProperty(tree.Ancestor, "Parent", tree.Leaf)).to.equal(false)
+		expect(tree.Ancestor.Parent).to.equal(tree.Container)
+		expect(map.knownParents[tree.Ancestor]).to.equal(tree.Container)
+		expect(map.observedParents[tree.Ancestor]).to.equal(tree.Container)
+		expect(next(map.structuralAssignments)).to.equal(nil)
+		map:pauseInstance(tree.Ancestor)
+		tree.Ancestor.Parent = tree.Other
+		settle()
+		expect(countReports(tree.Reports, tree.Ancestor)).to.equal(1)
+		expect(map.knownParents[tree.Ancestor]).to.equal(tree.Container)
+		map:stop()
+		tree.Container:Destroy()
+	end)
+
+	it("should suppress authoritative detach and clear structural observation state", function()
+		const tree = createTree("Folder")
+		const map = tree.InstanceMap
+		map:destroyInstance(tree.Leaf)
+		settle()
+		expect(#tree.Reports).to.equal(0)
+		expect(tree.Leaf.Parent).to.equal(nil)
+		expect(map.knownParents[tree.Leaf]).to.equal(nil)
+		expect(map.observedNames[tree.Leaf]).to.equal(nil)
+		expect(map.observedParents[tree.Leaf]).to.equal(nil)
+		expect(map.structuralAssignments[tree.Leaf]).to.equal(nil)
+		map:stop()
+		tree.Leaf:Destroy()
+		tree.Container:Destroy()
+	end)
+
+	it("should retain authoritative parents until an explicit remote move replaces them", function()
 		const tree = createTree("Folder")
 		const map = tree.InstanceMap
 		expect(map.knownParents[tree.Leaf]).to.equal(tree.Ancestor)
 		tree.Leaf.Parent = tree.Other
 		settle()
 		expect(map.knownParents[tree.Leaf]).to.equal(tree.Ancestor)
+		-- A pause alone no longer attributes arbitrary local changes to the server.
 		map:pauseInstance(tree.Leaf)
-		tree.Leaf.Parent = tree.Container
+		expect(map:applyStructuralProperty(tree.Leaf, "Parent", tree.Container)).to.equal(true)
 		settle()
 		expect(map.knownParents[tree.Leaf]).to.equal(tree.Container)
 		map:removeInstance(tree.Leaf)

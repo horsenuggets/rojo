@@ -22,6 +22,7 @@ local unmanagedAttributes = require(script.Parent.unmanagedAttributes)
 local function applyPatch(instanceMap, patch)
 	-- Tracks any portions of the patch that could not be applied to the DOM.
 	local unappliedPatch = PatchSet.newEmpty()
+	local sourceOperations = {}
 
 	-- Contains a list of all of the ref properties that we'll need to assign.
 	-- It is imperative that refs are assigned after all instances are created
@@ -192,12 +193,13 @@ local function applyPatch(instanceMap, patch)
 			-- TODO: If this fails part way through, should we move everything
 			-- back? For now, we assume that moving things will not fail.
 			for _, child in ipairs(instance:GetChildren()) do
-				instanceMap:pauseInstance(child)
-				child.Parent = newInstance
-				-- A later rejected move must restore the replacement, not the detached parent.
 				if instanceMap.fromInstances[child] ~= nil then
-					instanceMap.knownParents[child] = newInstance
-					instanceMap.observedParents[child] = newInstance
+					local success, err = instanceMap:applyStructuralProperty(child, "Parent", newInstance)
+					if not success then
+						error(err, 0)
+					end
+				else
+					child.Parent = newInstance
 				end
 			end
 
@@ -217,9 +219,7 @@ local function applyPatch(instanceMap, patch)
 		end
 
 		if update.changedName ~= nil then
-			local setNameSuccess = pcall(function()
-				instance.Name = update.changedName
-			end)
+			local setNameSuccess = instanceMap:applyStructuralProperty(instance, "Name", update.changedName)
 			if not setNameSuccess then
 				unappliedUpdate.changedName = update.changedName
 				partiallyApplied = true
@@ -256,7 +256,16 @@ local function applyPatch(instanceMap, patch)
 					decodedValue = unmanagedAttributes.merge(decodedValue, instance:GetAttributes())
 				end
 
-				local setPropertySuccess = setProperty(instance, propertyName, decodedValue)
+				local setPropertySuccess, _, operation = setProperty(
+					instance,
+					propertyName,
+					decodedValue,
+					instanceMap,
+					patch.sourceOperations and patch.sourceOperations[update.id]
+				)
+				if operation then
+					table.insert(sourceOperations, { id = update.id, operation = operation })
+				end
 				if not setPropertySuccess then
 					unappliedUpdate.changedProperties[propertyName] = propertyValue
 					partiallyApplied = true
@@ -284,12 +293,8 @@ local function applyPatch(instanceMap, patch)
 			local parent = instanceMap.fromIds[update.changedParent]
 			local success = false
 			if parent ~= nil and not services.isProtected(instance) then
-				instanceMap:pauseInstance(instance)
-				success = pcall(function()
-					instance.Parent = parent
-				end)
+				success = instanceMap:applyStructuralProperty(instance, "Parent", parent)
 				if success then
-					instanceMap.knownParents[instance] = parent
 					local unappliedUpdate = PatchSet.getUpdateForId(unappliedPatch, update.id)
 					if unappliedUpdate ~= nil then
 						unappliedUpdate.changedParent = nil
@@ -343,7 +348,9 @@ local function applyPatch(instanceMap, patch)
 
 	applyDeferredRefs(instanceMap, deferredRefs, unappliedPatch)
 
-	return unappliedPatch
+	-- Pending Source operations are not successes or failures yet. Consumers must use
+	-- their outcomes, not the heartbeat-scoped pause or this immediate unapplied patch.
+	return unappliedPatch, sourceOperations
 end
 
 return applyPatch

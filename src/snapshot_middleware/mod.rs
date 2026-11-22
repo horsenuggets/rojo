@@ -288,7 +288,7 @@ pub(crate) fn dir_init_files() -> &'static [(Middleware, &'static str)] {
 ///
 /// Returns the middleware, the name of the directory, and the path to
 /// the init location.
-fn get_dir_middleware<'path>(
+pub(crate) fn get_dir_middleware<'path>(
     vfs: &Vfs,
     dir_path: &'path Path,
     entries: Option<&[DirEntry]>,

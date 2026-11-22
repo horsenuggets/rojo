@@ -13,6 +13,48 @@ return function()
 		}
 	end
 
+	it("should transmit private proof separately and validate capabilities even without optional checks", function()
+		local Settings = require(script.Parent.Settings)
+		local originalPost = Http.post
+		local enabled = Settings:get("typecheckingEnabled")
+		local token = "12345678-1234-4234-8234-123456789abc"
+		local success, problem = pcall(function()
+			Settings:set("typecheckingEnabled", false)
+			for _, kind in { "valid", "legacy", "malformed", "wrong-version", "conflict", "partial" } do
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "session"
+				context:setMessageCursor(2)
+				Http.post = function(_, encoded)
+					local sent = Http.msgpackDecode(encoded)
+					expect(sent.predecessor).to.equal(token)
+					expect(sent.sourceBaselines.SCRIPT).to.equal(1)
+					expect(sent.operationId).to.equal("public")
+					local response = writeResponse("session", 3)
+					response.operationId = "public"
+					response.acknowledgement = if kind == "legacy" then nil else token
+					if kind == "malformed" then
+						response.acknowledgement = "public"
+					elseif kind == "wrong-version" then
+						response.acknowledgement = "12345678-1234-1234-8234-123456789abc"
+					elseif kind == "conflict" then
+						response.conflicts.removed_instances = { "SCRIPT" }
+					elseif kind == "partial" then
+						response.errors = { { id = "SCRIPT", property = "Source", message = "Rejected." } }
+					end
+					return Promise.resolve({ code = 200, body = Http.msgpackEncode(response) })
+				end
+				local accepted = context
+					:write({ added = {}, removed = {}, updated = {} }, 2, "Filesystem", "public", token, { SCRIPT = 1 })
+					:await()
+				expect(accepted).to.equal(kind == "valid" or kind == "legacy")
+				expect(context:getMessageCursor()).to.equal(2)
+			end
+		end)
+		Http.post = originalPost
+		Settings:set("typecheckingEnabled", enabled)
+		assert(success, problem)
+	end)
+
 	it("should round-trip parent updates with and without other changes", function()
 		local Types = require(script.Parent.Types)
 		local originalPost = Http.post
@@ -47,6 +89,69 @@ return function()
 		end)
 		Http.post = originalPost
 		assert(success, err)
+	end)
+
+	it("should bind a write acknowledgement to its exact operation", function()
+		local originalPost = Http.post
+		local success, problem = pcall(function()
+			for _, returned in { "operation", "other", false } do
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "session"
+				context:setMessageCursor(0)
+				Http.post = function(_url, body)
+					expect(Http.msgpackDecode(body).operationId).to.equal("operation")
+					local response = writeResponse("session", 0)
+					response.operationId = if returned then returned else nil
+					return Promise.resolve({ code = 200, body = Http.msgpackEncode(response) })
+				end
+				local accepted =
+					context:write({ added = {}, removed = {}, updated = {} }, 0, "Filesystem", "operation"):await()
+				expect(accepted).to.equal(returned == "operation")
+				expect(context.__connected).to.equal(returned == "operation")
+			end
+		end)
+		Http.post = originalPost
+		assert(success, problem)
+	end)
+
+	it("should require a durable checkpoint acknowledgement from the current session", function()
+		local originalPost = Http.post
+		local success, problem = pcall(function()
+			for _, kind in { "valid", "missing", "other-session" } do
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "session"
+				Http.post = function(url, body)
+					expect(url).to.equal("http://localhost/api/source-checkpoints")
+					local sent = Http.msgpackDecode(body)
+					expect(sent.source).to.equal("local draft =")
+					expect(sent.expectedSource).to.equal("return 'disk'")
+					expect(sent.messageCursor).to.equal(7)
+					expect(sent.sessionId).to.equal("session")
+					return Promise.resolve({
+						code = 200,
+						body = Http.msgpackEncode({
+							sessionId = if kind == "other-session" then "other" else "session",
+							checkpointId = if kind == "missing" then nil else "checkpoint",
+						}),
+					})
+				end
+				expect(context:createSourceCheckpoint("SCRIPT", "local draft =", "return 'disk'", 7):await()).to.equal(
+					kind == "valid"
+				)
+				expect(context.__connected).to.equal(kind == "valid")
+			end
+		end)
+		Http.post = originalPost
+		assert(success, problem)
+	end)
+
+	it("should reject recovery identifiers that could escape the endpoint path", function()
+		local context = ApiContext.new("http://localhost")
+		for _, identity in { "../secret", "with/slash", "", "?query", string.rep("a", 97) } do
+			expect(function()
+				context:readSourceCheckpoint(identity)
+			end).to.throw()
+		end
 	end)
 
 	it("should send the captured batch cursor instead of a newer cursor", function()
