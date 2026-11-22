@@ -44,6 +44,10 @@ Making a new release? Simply add the new header with the version and date undern
 * Preserved exact editor drafts in a bounded, project-private recovery store before genuine
   filesystem conflicts replace them. Recovery supports explicit read, restore, and discard,
   survives server restart, and refuses automatic replay onto a different script identity.
+  Authorization follows refreshed syncback rules. Unix storage validates owned directories
+  and uses descriptor-relative operations rather than following replaced cache paths.
+* Preserved the last served root while its source is unavailable instead of panicking on
+  root deletion. Restoring the source reconciles subsequent changes without replacing IDs.
 * Reduced structural import-refresh work by retaining only Source and relevant metadata
   in temporary refresh snapshots, without weakening transactional mapping validation or
   changing native model payloads. Mapping normalization computes path depths once while

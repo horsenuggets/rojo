@@ -6985,6 +6985,12 @@ fn compute_changes(tree: &RojoTree, vfs: &Vfs, id: Ref, shallow: bool) -> Option
         }
     };
 
+    if patch_set.removed_instances.contains(&tree.get_root_id()) {
+        log::warn!(
+            "The served root source is unavailable. Keeping its last tree until the source returns."
+        );
+        return None;
+    }
     Some(patch_set)
 }
 
@@ -7116,6 +7122,53 @@ mod tests {
             message_queue: Arc::new(MessageQueue::new()),
             project: Arc::new(project).into(),
         }
+    }
+
+    #[test]
+    fn removed_served_project_preserves_root_until_its_source_returns() {
+        let project = serde_json::json!({"name":"Test", "tree":{
+            "$className":"Folder", "$path":"src"
+        }})
+        .to_string();
+        let job = project_job(
+            "default.project.json",
+            &project,
+            vec![(
+                "src",
+                VfsSnapshot::dir([("Editor.luau", VfsSnapshot::file("return 1"))]),
+            )],
+        );
+        let path = job.project().file_location.clone();
+        let snapshot = snapshot_from_vfs(&Default::default(), &job.vfs, &path)
+            .unwrap()
+            .unwrap();
+        *job.tree.lock().unwrap() = RojoTree::new(snapshot);
+        let root = job.tree.lock().unwrap().get_root_id();
+        let child = job.tree.lock().unwrap().root().children()[0];
+        let cursor = job.message_queue.cursor();
+        job.vfs.remove_file(&path).unwrap();
+        job.handle_vfs_event(VfsEvent::Remove(path.clone()));
+        {
+            let tree = job.tree.lock().unwrap();
+            assert_eq!(tree.get_root_id(), root);
+            assert_eq!(tree.root().children(), &[child]);
+            assert_eq!(job.message_queue.cursor(), cursor);
+        }
+        job.vfs
+            .write("/project/src/Editor.luau", "return 2")
+            .unwrap();
+        job.vfs.write(&path, project).unwrap();
+        job.handle_vfs_event(VfsEvent::Create(path));
+        let tree = job.tree.lock().unwrap();
+        assert_eq!(tree.get_root_id(), root);
+        assert_eq!(tree.root().children(), &[child]);
+        assert_eq!(
+            tree.get_instance(child)
+                .unwrap()
+                .properties()
+                .get(&ustr("Source")),
+            Some(&Variant::String("return 2".into()))
+        );
     }
 
     /// A relayout never moves files another instance also comes from, like a
