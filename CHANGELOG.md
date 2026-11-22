@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.9`
+
 * Allowed safe Studio moves and renames through explicit mappings equivalent to built-in
   mappings, preserving authored imports, metadata, managed identities, and relocation
   safeguards.
