@@ -378,6 +378,10 @@ impl ServeSession {
     pub fn root_project(&self) -> &Project {
         &self.root_project
     }
+
+    pub(crate) fn current_project(&self) -> Arc<Project> {
+        self.change_processor.current_project()
+    }
 }
 
 #[derive(Debug, Error)]

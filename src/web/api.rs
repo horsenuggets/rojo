@@ -267,8 +267,8 @@ impl ApiService {
                     ), StatusCode::BAD_REQUEST),
                 },
             };
-            let project = self.serve_session.root_project();
-            match descriptor.validate(project, &tree, self.serve_session.vfs()) {
+            let project = self.serve_session.current_project();
+            match descriptor.validate(&project, &tree, self.serve_session.vfs()) {
                 Ok(true) => {}
                 Ok(false) => return msgpack(
                     ErrorResponse::bad_request(
@@ -1441,6 +1441,72 @@ mod tests {
         };
         for target in targets.into_iter().chain([id, Ref::new()]) {
             assert_checkpoint_rejected(session.clone(), target).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_authorization_tracks_live_policy_for_live_and_retired_sources() {
+        for rules in [
+            serde_json::json!({"ignorePaths": ["src/**"]}),
+            serde_json::json!({"ignoreTrees": ["Editor"]}),
+            serde_json::json!({"ignoreProperties": {"LuaSourceContainer": ["Source"]}}),
+        ] {
+            for retired in [false, true] {
+                for initially_excluded in [false, true] {
+                    let initial = if initially_excluded {
+                        rules.clone()
+                    } else {
+                        serde_json::json!({})
+                    };
+                    let (directory, session, id) = recovery_session_with_rules(initial);
+                    if retired {
+                        session
+                            .vfs()
+                            .remove_file(directory.path().join("src/Editor.luau"))
+                            .unwrap();
+                        session.tree().remove(id);
+                    }
+                    let project_path = session.root_project().file_location.clone();
+                    let mut project: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+                    let excluded = !initially_excluded;
+                    project["syncbackRules"] = if excluded {
+                        rules.clone()
+                    } else {
+                        serde_json::json!({})
+                    };
+                    session
+                        .vfs()
+                        .write(&project_path, serde_json::to_vec(&project).unwrap())
+                        .unwrap();
+                    let expected =
+                        crate::Project::load_exact(session.vfs(), &project_path, Some("Recovery"))
+                            .unwrap()
+                            .syncback_rules;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while session.current_project().syncback_rules != expected {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("The watcher must reload the changed policy");
+                    let body = serde_json::json!({"sessionId": session.session_id(), "id": id,
+                        "source": "preserve the draft", "expectedSource": "baseline", "messageCursor": 0});
+                    let (status, response) = recovery_call(
+                        session.clone(),
+                        Method::POST,
+                        "/api/source-checkpoints",
+                        body,
+                    )
+                    .await;
+                    assert_eq!(status, if excluded { StatusCode::BAD_REQUEST } else { StatusCode::OK },
+                        "Retired {retired}, initially excluded {initially_excluded}, rules {rules}, response {response}");
+                    if retired {
+                        assert!(session.tree().get_instance(id).is_none());
+                        assert!(!directory.path().join("src/Editor.luau").exists());
+                    }
+                }
+            }
         }
     }
 

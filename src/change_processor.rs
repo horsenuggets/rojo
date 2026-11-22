@@ -80,6 +80,7 @@ pub struct ChangeProcessor {
     /// This channel should be signaled before dropping ChangeProcessor or we'll
     /// hang forever waiting for the message processing loop to terminate.
     shutdown_sender: Sender<()>,
+    project: Arc<Mutex<Arc<Project>>>,
 
     /// A handle to the message processing thread. When dropped, we'll block
     /// until it's done.
@@ -108,6 +109,7 @@ impl ChangeProcessor {
             message_queue,
             project: project.into(),
         };
+        let project = Arc::clone(&task.project.project);
 
         let job_thread = jod_thread::Builder::new()
             .name("ChangeProcessor thread".to_owned())
@@ -152,8 +154,13 @@ impl ChangeProcessor {
 
         Self {
             shutdown_sender,
+            project,
             job_thread,
         }
+    }
+
+    pub(crate) fn current_project(&self) -> Arc<Project> {
+        Arc::clone(&self.project.lock().unwrap())
     }
 }
 
@@ -188,7 +195,7 @@ struct JobThreadContext {
 /// The project as it is now, and what two-way sync knows about how to apply a
 /// change to its rules.
 struct LiveProject {
-    project: Mutex<Arc<Project>>,
+    project: Arc<Mutex<Arc<Project>>>,
     /// The authority of the latest write, which is the only time Studio says
     /// which side wins. `None` until the first write.
     authority: Mutex<Option<WriteAuthority>>,
@@ -213,7 +220,7 @@ struct WriteReceipts {
 impl From<Arc<Project>> for LiveProject {
     fn from(project: Arc<Project>) -> Self {
         Self {
-            project: Mutex::new(project),
+            project: Arc::new(Mutex::new(project)),
             authority: Mutex::new(None),
             relayout_pending: Default::default(),
             receipts: Mutex::new(None),
@@ -7918,9 +7925,8 @@ mod tests {
         ] {
             for class in ["Sound", "Instance"] {
                 for ignored in ["EmitterSize", "RollOffMinDistance"] {
-                    let (mut job, id, source, disk) =
-                        sound_alias_job(storage, r#""EmitterSize":5"#);
-                    Arc::get_mut(job.project.project.get_mut().unwrap())
+                    let (job, id, source, disk) = sound_alias_job(storage, r#""EmitterSize":5"#);
+                    Arc::get_mut(&mut job.project.project.lock().unwrap())
                         .unwrap()
                         .syncback_rules = Some(
                         serde_json::from_value(serde_json::json!({
@@ -10102,7 +10108,7 @@ mod tests {
     fn package_batches_report_each_excluded_or_unpersisted_property() {
         for exclusion in ["property", "tree", "path"] {
             let temp = tempfile::tempdir().unwrap();
-            let mut job = package_relocation_job(temp.path(), true);
+            let job = package_relocation_job(temp.path(), true);
             let context = job.tree.lock().unwrap().root().metadata().context.clone();
             let snapshot = snapshot_from_vfs(
                 &context,
@@ -10134,7 +10140,7 @@ mod tests {
                 "path" => serde_json::json!({ "ignorePaths": ["Local/First"] }),
                 _ => unreachable!(),
             };
-            Arc::get_mut(job.project.project.get_mut().unwrap())
+            Arc::get_mut(&mut job.project.project.lock().unwrap())
                 .unwrap()
                 .syncback_rules = Some(serde_json::from_value(rules).unwrap());
             let source = temp.path().join("Local/First/Left/Code.luau");
@@ -10343,7 +10349,7 @@ mod tests {
     #[test]
     fn package_property_batch_accepts_numeric_normalization_but_rejects_exclusions() {
         let temp = tempfile::tempdir().unwrap();
-        let mut job = package_relocation_job(temp.path(), true);
+        let job = package_relocation_job(temp.path(), true);
         job.vfs
             .write(
                 temp.path().join("Local/First/Part.model.json"),
@@ -10360,7 +10366,7 @@ mod tests {
             .find(|instance| instance.name == "Part")
             .unwrap()
             .referent();
-        Arc::get_mut(job.project.project.get_mut().unwrap())
+        Arc::get_mut(&mut job.project.project.lock().unwrap())
             .unwrap()
             .syncback_rules = Some(
             serde_json::from_value(serde_json::json!({
@@ -10414,7 +10420,7 @@ mod tests {
 
     fn check_package_batch_serialization_preserves_live_state(fail_serialization: bool) {
         let temp = tempfile::tempdir().unwrap();
-        let mut job = package_relocation_job(temp.path(), true);
+        let job = package_relocation_job(temp.path(), true);
         // Full-project serialization takes the project root, not the synthetic
         // outer root used by the relocation fixture.
         let context = job.tree.lock().unwrap().root().metadata().context.clone();
@@ -10463,7 +10469,7 @@ mod tests {
             // Model-tree patterns compile after syncback filters both DOMs.
             rules["modelTrees"] = serde_json::json!([{ "pattern": "Maps/[" }]);
         }
-        Arc::get_mut(job.project.project.get_mut().unwrap())
+        Arc::get_mut(&mut job.project.project.lock().unwrap())
             .unwrap()
             .syncback_rules = Some(serde_json::from_value(rules).unwrap());
         let disk_before = job.vfs.snapshot_tree(temp.path()).unwrap();
@@ -12913,10 +12919,9 @@ mod tests {
                 .unwrap()
                 .path()
                 .as_os_str(),
-            Path::new("/project")
-                .join("src")
-                .join("Right")
-                .join("Code.server.lua")
+            Path::new("/project/src/Right/Code.server.lua")
+                .components()
+                .collect::<PathBuf>()
                 .as_os_str()
         );
     }
@@ -14008,8 +14013,8 @@ mod tests {
 
     #[test]
     fn serialization_failure_restores_requested_studio_values() {
-        let (mut job, id) = part_job();
-        Arc::get_mut(job.project.project.get_mut().unwrap())
+        let (job, id) = part_job();
+        Arc::get_mut(&mut job.project.project.lock().unwrap())
             .unwrap()
             .syncback_rules =
             Some(serde_json::from_value(serde_json::json!({"ignorePaths":["Part/**"]})).unwrap());
@@ -14095,8 +14100,8 @@ mod tests {
     fn unscriptable_properties_are_restored_when_disabled() {
         use rbx_reflection::{PropertyKind, PropertySerialization, Scriptability};
 
-        let (mut job, id) = part_job();
-        Arc::get_mut(job.project.project.get_mut().unwrap())
+        let (job, id) = part_job();
+        Arc::get_mut(&mut job.project.project.lock().unwrap())
             .unwrap()
             .syncback_rules =
             Some(serde_json::from_value(serde_json::json!({"syncUnscriptable":false})).unwrap());
@@ -14205,8 +14210,8 @@ mod tests {
 
     #[test]
     fn pending_disk_properties_survive_a_refused_ordinary_write() {
-        let (mut job, id) = part_job();
-        Arc::get_mut(job.project.project.get_mut().unwrap())
+        let (job, id) = part_job();
+        Arc::get_mut(&mut job.project.project.lock().unwrap())
             .unwrap()
             .syncback_rules =
             Some(serde_json::from_value(serde_json::json!({"ignorePaths":["Part/**"]})).unwrap());
@@ -14282,8 +14287,8 @@ mod tests {
 
     #[test]
     fn scoped_write_respects_full_ignored_tree_path() {
-        let (mut job, id) = part_job();
-        Arc::get_mut(job.project.project.get_mut().unwrap())
+        let (job, id) = part_job();
+        Arc::get_mut(&mut job.project.project.lock().unwrap())
             .unwrap()
             .syncback_rules =
             Some(serde_json::from_value(serde_json::json!({"ignoreTrees":["Part"]})).unwrap());
@@ -14301,8 +14306,8 @@ mod tests {
     /// edit, since the write would land in that file.
     #[test]
     fn scoped_write_rejects_an_ignored_metadata_target() {
-        let (mut job, id) = part_job();
-        Arc::get_mut(job.project.project.get_mut().unwrap())
+        let (job, id) = part_job();
+        Arc::get_mut(&mut job.project.project.lock().unwrap())
             .unwrap()
             .syncback_rules = Some(
             serde_json::from_value(serde_json::json!({"ignorePaths":["Part/init.meta.json"]}))
@@ -16065,9 +16070,13 @@ mod tests {
 
     #[test]
     fn missing_dependency_entries_do_not_canonicalize_ordinary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let dependencies = root.join("dependencies");
+        let missing = root.join("Missing.luau");
         let mut fs = InMemoryFs::new();
         fs.load_snapshot(
-            "/project",
+            root,
             VfsSnapshot::dir([(
                 "dependencies",
                 VfsSnapshot::dir((0..512).map(|index| {
@@ -16085,21 +16094,21 @@ mod tests {
         assert!(filesystem_dependency_is_disjoint(
             &Default::default(),
             &vfs,
-            Path::new("/project/dependencies"),
-            Path::new("/project/Missing.luau"),
+            &dependencies,
+            &missing,
         ));
         let count = DEPENDENCY_CANONICALIZATIONS.with(std::cell::Cell::get);
         assert!(
             count <= 2,
             "Missing-entry proof canonicalized {count} paths for ordinary files"
         );
-        vfs.write("/project/Missing.luau", "return 1").unwrap();
+        vfs.write(&missing, "return 1").unwrap();
         DEPENDENCY_CANONICALIZATIONS.with(|count| count.set(0));
         assert!(filesystem_dependency_is_disjoint(
             &Default::default(),
             &vfs,
-            Path::new("/project/dependencies"),
-            Path::new("/project/Missing.luau"),
+            &dependencies,
+            &missing,
         ));
         assert_eq!(DEPENDENCY_CANONICALIZATIONS.with(std::cell::Cell::get), 513);
     }
@@ -16142,58 +16151,56 @@ mod tests {
 
     #[test]
     fn missing_dependency_proofs_recheck_entry_creation_during_traversal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let ordinary = root.join("Ordinary.luau");
+        let new_entry = root.join("New.luau");
         let mut fs = InMemoryFs::new();
         fs.load_snapshot(
-            "/project",
+            root,
             VfsSnapshot::dir([("Ordinary.luau", VfsSnapshot::file("return 0"))]),
         )
         .unwrap();
         let vfs = Vfs::new(fs);
         vfs.set_watch_enabled(false);
         BEFORE_DEPENDENCY_FILE_SHORTCUT.with_borrow_mut(|hook| {
-            *hook = Some(Box::new(|vfs| {
-                vfs.write("/project/New.luau", "return 1").unwrap();
+            let new_entry = new_entry.clone();
+            *hook = Some(Box::new(move |vfs| {
+                vfs.write(&new_entry, "return 1").unwrap();
             }));
         });
         assert!(!filesystem_dependency_is_disjoint(
             &Default::default(),
             &vfs,
-            Path::new("/project/Ordinary.luau"),
-            Path::new("/project/New.luau"),
+            &ordinary,
+            &new_entry,
         ));
         assert!(BEFORE_DEPENDENCY_FILE_SHORTCUT.with_borrow(|hook| hook.is_none()));
     }
 
     #[test]
     fn missing_dependency_scope_rechecks_entry_creation_during_traversal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(directory.path()).unwrap();
         let project = serde_json::json!({"name":"Test","tree":{"$className":"Folder",
             "Mount":{"$path":"src"},"Other":{"$path":"dependencies"}
         }});
-        let job = project_job(
-            "default.project.json",
-            &project.to_string(),
-            vec![
-                ("src", VfsSnapshot::empty_dir()),
-                (
-                    "dependencies",
-                    VfsSnapshot::dir([("Ordinary.luau", VfsSnapshot::file("return 0"))]),
-                ),
-            ],
-        );
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("dependencies")).unwrap();
+        std::fs::write(root.join("dependencies/Ordinary.luau"), "return 0").unwrap();
+        std::fs::write(root.join("default.project.json"), project.to_string()).unwrap();
+        let job = disk_job(&root);
+        let new_entry = root.join("src/New.luau");
         let parent = find(&job, &["Mount"]);
         BEFORE_DEPENDENCY_FILE_SHORTCUT.with_borrow_mut(|hook| {
-            *hook = Some(Box::new(|vfs| {
-                vfs.write("/project/src/New.luau", "return 1").unwrap();
+            let new_entry = new_entry.clone();
+            *hook = Some(Box::new(move |vfs| {
+                vfs.write(&new_entry, "return 1").unwrap();
             }));
         });
         let tree = job.tree.lock().unwrap();
         assert_eq!(
-            job.new_entry_dependency_scope(
-                &tree,
-                parent,
-                Path::new("/project/src/New.luau"),
-                false,
-            ),
+            job.new_entry_dependency_scope(&tree, parent, &new_entry, false),
             Some(tree.root().children()[0]),
         );
         assert!(BEFORE_DEPENDENCY_FILE_SHORTCUT.with_borrow(|hook| hook.is_none()));
@@ -17295,7 +17302,7 @@ mod tests {
         let tree = Arc::new(Mutex::new(RojoTree::new(
             InstanceSnapshot::new().children(vec![root]),
         )));
-        let mut job = JobThreadContext {
+        let job = JobThreadContext {
             tree: Arc::clone(&tree),
             vfs: Arc::clone(&vfs),
             message_queue: Arc::new(MessageQueue::new()),
@@ -17412,7 +17419,7 @@ mod tests {
             id,
             metadata.middleware(crate::snapshot_middleware::Middleware::Dir),
         );
-        Arc::get_mut(job.project.project.get_mut().unwrap())
+        Arc::get_mut(&mut job.project.project.lock().unwrap())
             .unwrap()
             .syncback_rules = Some(
             serde_json::from_value(serde_json::json!({
