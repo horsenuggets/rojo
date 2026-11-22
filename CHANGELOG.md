@@ -31,6 +31,41 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Allowed safe Studio moves and renames through explicit mappings equivalent to built-in
+  mappings, preserving authored imports, metadata, managed identities, and relocation
+  safeguards.
+* Protected pending script, Parent, and Name edits with captured generations and causal
+  write coverage. Older echoes and asynchronous Source completions no longer replace newer
+  editor intent, and unrelated filesystem observations retain their own authority.
+* Applied Source updates to open documents through minimal UTF-8-safe range replacements,
+  preserving selections outside the replacement without forcing the cursor over user input.
+* Preserved exact editor drafts in a bounded, project-private recovery store before genuine
+  filesystem conflicts replace them. Recovery supports explicit read, restore, and discard,
+  survives server restart, and refuses automatic replay onto a different script identity.
+* Reduced structural import-refresh work by retaining only Source and relevant metadata
+  in temporary refresh snapshots, without weakening transactional mapping validation or
+  changing native model payloads. Mapping normalization computes path depths once while
+  preserving stable alias priority and duplicate-mount validation.
+* Reused successful require-call syntax extraction for exact unchanged source within a
+  bounded process-local cache. Alias files, package ownership, and mappings are still
+  resolved afresh, and invalid source retains the same parse failures.
+* Kept sourcemap watchers safe when queued additions have already been removed, and
+  refreshed script-only maps when class changes remove the last matching script.
+* Read new entries in directory-backed project mounts independently, avoiding repeated
+  subtree snapshots for queued paths that have already disappeared. Optional aliases,
+  referenced projects, shared views, and dependent ancestors retain full reconciliation.
+* Avoided redundant ordinary-file canonicalization for verified missing entries while
+  retaining full dependency checks for project rules, uncertain paths, and unresolved
+  symlinks. Directory removals also reconcile declared aliases through chained symlinks.
+* Kept Source baseline history proportional to changed scripts rather than passive project
+  size. Genuine history pressure fails closed and establishes a fresh read revision without
+  depending on unrelated filesystem activity.
+* Preserved Source interpretation across transform-only normalizations and storage relayouts,
+  retaining own-write versus filesystem provenance and existing unsupported-layout guards.
+* Avoided repeatedly comparing derived project-wide import mappings when recording local
+  recovery structure. Ownership, storage layout, namespace, and write-policy changes retain
+  their retirement validation.
+
 ## `7.7.1-horse.2.8`
 
 * Preserved filesystem authority for every affected sibling write when an earlier write
