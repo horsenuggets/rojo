@@ -593,7 +593,8 @@ function App:sendSyncReminder(message: string, shownActions: { string })
 end
 
 --[[
-	Reads the `host:port` marker a build bakes into a live edit place. Its
+	Reads the `host:port` marker that `rojo serve --live-edit-place` writes into
+	the Workspace of a live edit place. Its
 	presence is what makes a place connect with no UI, so a malformed value is
 	reported rather than silently treated as a normal place.
 ]]

@@ -6,6 +6,7 @@ mod doc;
 mod export;
 mod fmt_project;
 mod init;
+mod live_edit_place;
 mod plugin;
 mod serve;
 mod sourcemap;

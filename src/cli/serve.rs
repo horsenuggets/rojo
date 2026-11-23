@@ -1,17 +1,26 @@
 use std::{
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, TcpListener},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
 };
 
 use clap::Parser;
+use futures::{
+    future::{pending, select},
+    StreamExt,
+};
 use memofs::Vfs;
 use termcolor::{Buffer, BufferWriter, ColorChoice, WriteColor};
 
 use crate::{serve_session::ServeSession, web::LiveServer};
 
-use super::{display, resolve_path, GlobalOptions};
+use super::{
+    display,
+    live_edit_place::{self, LiveEditPlace},
+    resolve_path, GlobalOptions,
+};
 
 const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const DEFAULT_PORT: u16 = 34872;
@@ -44,10 +53,25 @@ pub struct ServeCommand {
     /// Stop the server when standard input closes or encounters a read error.
     #[clap(long)]
     pub shutdown_on_stdin_eof: bool,
+
+    /// Write the served project to this .rbxl or .rbxlx place once listening, with
+    /// `{port}` in the path replaced by the bound port. The place's Workspace
+    /// carries the `__RojoPlus_LiveEditUrl` attribute, so the Rojo+ plugin
+    /// connects to this server as soon as Studio opens it. Any old file at the path
+    /// is removed before the start message, and the new one appears all at once,
+    /// so a caller can wait for it to exist. The served tree never gets the
+    /// attribute. A failed write stops the server with an error.
+    #[clap(long, value_name = "TEMPLATE")]
+    pub live_edit_place: Option<PathBuf>,
 }
 
 impl ServeCommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
+        let live_edit_place = self
+            .live_edit_place
+            .as_deref()
+            .map(LiveEditPlace::parse)
+            .transpose()?;
         let project_path = resolve_path(&self.project)?;
 
         let vfs = Vfs::new_default()?;
@@ -64,29 +88,94 @@ impl ServeCommand {
             self.allowed_hosts
         };
 
-        let server = LiveServer::new(session);
+        let server = LiveServer::new(Arc::clone(&session));
 
-        let on_listening = |address: std::net::SocketAddr| {
-            let _ = show_start_message(address.ip(), address.port(), global.color.into());
+        // The place writer reports here, which also stops the server, since a live
+        // edit without its place can never connect.
+        let failure: Arc<Mutex<Option<anyhow::Error>>> = Arc::default();
+        let (failed, mut on_failure) = futures::channel::mpsc::unbounded::<()>();
+        let writer: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::default();
+
+        let on_listening = {
+            let failure = Arc::clone(&failure);
+            let writer = Arc::clone(&writer);
+            move |address: SocketAddr| {
+                let report = move |error: anyhow::Error| {
+                    *failure.lock().unwrap() = Some(error);
+                    let _ = failed.unbounded_send(());
+                };
+                let path = live_edit_place
+                    .as_ref()
+                    .map(|place| place.resolve(address.port()));
+                if let Some(path) = &path {
+                    if let Err(error) = live_edit_place::remove_stale(path) {
+                        report(error);
+                        return;
+                    }
+                }
+
+                let _ = show_start_message(address.ip(), address.port(), global.color.into());
+
+                if let (Some(place), Some(path)) = (live_edit_place, path) {
+                    let marker =
+                        format!("{}:{}", display::display_host(address.ip()), address.port());
+                    *writer.lock().unwrap() = Some(thread::spawn(move || {
+                        let mut tree = session.tree();
+                        if let Err(error) =
+                            live_edit_place::write(&mut tree, &path, place.kind(), &marker)
+                        {
+                            report(error);
+                        }
+                    }));
+                }
+            }
         };
 
-        if self.shutdown_on_stdin_eof {
+        let stdin_eof = self.shutdown_on_stdin_eof.then(|| {
             let (sender, receiver) = futures::channel::oneshot::channel();
             // Keep blocking stdin reads outside Tokio so runtime teardown never waits for input.
-            std::thread::Builder::new()
+            thread::Builder::new()
                 .name("rojo-stdin-shutdown".into())
                 .spawn(move || {
                     wait_for_stdin_eof(io::stdin().lock());
                     let _ = sender.send(());
-                })?;
-            server.start_with_shutdown((ip, port).into(), allowed_hosts, on_listening, async {
-                let _ = receiver.await;
-            })?;
-        } else {
-            server.start((ip, port).into(), allowed_hosts, on_listening)?;
-        }
+                })
+                .map(|_| receiver)
+        });
+        let stdin_eof = stdin_eof.transpose()?;
 
-        Ok(())
+        let shutdown = async move {
+            let stdin_eof = async move {
+                match stdin_eof {
+                    Some(receiver) => {
+                        let _ = receiver.await;
+                    }
+                    None => pending::<()>().await,
+                }
+            };
+            // The channel closes without a message once the place is written.
+            let failed = async move {
+                if on_failure.next().await.is_none() {
+                    pending::<()>().await;
+                }
+            };
+            futures::pin_mut!(stdin_eof, failed);
+            select(stdin_eof, failed).await;
+        };
+
+        let served =
+            server.start_with_shutdown((ip, port).into(), allowed_hosts, on_listening, shutdown);
+
+        // Finish a write in progress, so shutting down never leaves a staging file.
+        if let Some(writer) = writer.lock().unwrap().take() {
+            let _ = writer.join();
+        }
+        served?;
+        let failure = failure.lock().unwrap().take();
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
