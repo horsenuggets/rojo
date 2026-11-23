@@ -31,6 +31,13 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Shortened the `rojo serve` start message to two sentences, `Rojo+ server listening on
+  localhost:PORT.` and the browser link, with the address and URL muted. The network
+  exposure warning is now plain yellow sentences.
+* Reworded `rojo build` output as `Building project NAME...` and
+  `Built project NAME as FILE.`, with the project name muted and the place or model file in
+  bright cyan bold.
+
 ## `7.7.1-horse.2.10`
 
 * Stopped queued two-way sync writes from reaching the server after the filesystem replaced

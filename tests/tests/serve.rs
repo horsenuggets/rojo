@@ -3482,7 +3482,7 @@ mod serve_lifetime {
 
     use crate::rojo_test::{
         io_util::{KillOnDrop, ROJO_PATH, SERVE_TESTS_PATH},
-        serve_util::read_server_port,
+        serve_util::{read_server_port, SERVE_PORT_PREFIX},
     };
 
     struct LifetimeServer {
@@ -3503,7 +3503,7 @@ mod serve_lifetime {
                 command.arg("--shutdown-on-stdin-eof");
             }
             let mut process = KillOnDrop(command.spawn().expect("Could not start Rojo"));
-            let port = read_server_port(process.0.stdout.take().unwrap(), "Port:");
+            let port = read_server_port(process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
             Self { process, port }
         }
 

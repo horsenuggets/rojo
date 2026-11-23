@@ -649,7 +649,7 @@ mod test {
             jobs: std::num::NonZeroUsize::new(1),
             watch: false,
         }
-        .run()
+        .run(crate::cli::ColorChoice::Never)
         .unwrap();
         let rebuilt = rbx_binary::from_reader(std::fs::read(built).unwrap().as_slice()).unwrap();
         let rebuilt_terrain = rebuilt

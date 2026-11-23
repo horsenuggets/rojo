@@ -7,11 +7,11 @@ use std::{
 
 use clap::Parser;
 use memofs::Vfs;
-use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
+use termcolor::{Buffer, BufferWriter, ColorChoice, WriteColor};
 
 use crate::{serve_session::ServeSession, web::LiveServer};
 
-use super::{resolve_path, GlobalOptions};
+use super::{display, resolve_path, GlobalOptions};
 
 const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const DEFAULT_PORT: u16 = 34872;
@@ -141,60 +141,35 @@ fn find_available_port(ip: IpAddr, starting_port: u16) -> anyhow::Result<u16> {
 }
 
 fn show_start_message(bind_address: IpAddr, port: u16, color: ColorChoice) -> io::Result<()> {
-    let mut green = ColorSpec::new();
-    green.set_fg(Some(Color::Green)).set_bold(true);
-
     let writer = BufferWriter::stdout(color);
     let mut buffer = writer.buffer();
+    write_start_message(&mut buffer, bind_address, port)?;
+    writer.print(&buffer)
+}
 
-    let address_string = if bind_address.is_loopback() {
-        "localhost".to_owned()
-    } else {
-        bind_address.to_string()
-    };
+fn write_start_message(buffer: &mut Buffer, bind_address: IpAddr, port: u16) -> io::Result<()> {
+    let host = display::display_host(bind_address);
 
-    writeln!(&mut buffer, "Rojo+ server listening:")?;
+    write!(buffer, "Rojo+ server listening on ")?;
+    display::write_muted(buffer, &format!("{host}:{port}"))?;
+    writeln!(buffer, ".")?;
 
-    write!(&mut buffer, "  Address: ")?;
-    buffer.set_color(&green)?;
-    writeln!(&mut buffer, "{}", address_string)?;
-
-    buffer.set_color(&ColorSpec::new())?;
-    write!(&mut buffer, "  Port:    ")?;
-    buffer.set_color(&green)?;
-    writeln!(&mut buffer, "{}", port)?;
-
-    writeln!(&mut buffer)?;
+    write!(buffer, "Visit ")?;
+    display::write_muted(buffer, &format!("http://{host}:{port}/"))?;
+    writeln!(buffer, " in your browser for more information.")?;
 
     if !bind_address.is_loopback() {
-        let mut warning = ColorSpec::new();
-        warning.set_fg(Some(Color::Yellow)).set_bold(true);
-
-        buffer.set_color(&warning)?;
-        writeln!(
-            &mut buffer,
-            "WARNING: This server is bound to {address_string}, which is reachable from the \
-             network.\n\
-             The serve API is unauthenticated, so anyone who can reach {address_string}:{port} \
-             can read\n\
-             and modify your project's source. Prefer binding to localhost and tunneling (e.g. \
-             SSH,\n\
-             Tailscale, or WireGuard) when you need remote access."
+        buffer.set_color(&display::warning())?;
+        write!(
+            buffer,
+            "This server is bound to {host}, which is reachable from the network. The serve \
+             API is unauthenticated, so anyone who can reach {host}:{port} can read and modify \
+             your project's source. Prefer binding to localhost and tunneling (for example \
+             over SSH, Tailscale, or WireGuard) when you need remote access."
         )?;
-        buffer.set_color(&ColorSpec::new())?;
-        writeln!(&mut buffer)?;
+        buffer.reset()?;
+        writeln!(buffer)?;
     }
-
-    buffer.set_color(&ColorSpec::new())?;
-    write!(&mut buffer, "Visit ")?;
-
-    buffer.set_color(&green)?;
-    write!(&mut buffer, "http://{}:{}/", address_string, port)?;
-
-    buffer.set_color(&ColorSpec::new())?;
-    writeln!(&mut buffer, " in your browser for more information.")?;
-
-    writer.print(&buffer)?;
 
     Ok(())
 }
@@ -215,6 +190,41 @@ mod tests {
                 .unwrap()
                 .shutdown_on_stdin_eof
         );
+    }
+
+    fn start_message(bind_address: IpAddr, port: u16, buffer: Buffer) -> String {
+        let mut buffer = buffer;
+        write_start_message(&mut buffer, bind_address, port).unwrap();
+        String::from_utf8(buffer.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn start_message_is_two_sentences_on_loopback() {
+        assert_eq!(
+            start_message(DEFAULT_BIND_ADDRESS.into(), 52876, Buffer::no_color()),
+            "Rojo+ server listening on localhost:52876.\n\
+             Visit http://localhost:52876/ in your browser for more information.\n"
+        );
+    }
+
+    #[test]
+    fn start_message_keeps_the_url_contiguous_inside_its_style() {
+        let text = start_message(DEFAULT_BIND_ADDRESS.into(), 52876, Buffer::ansi());
+        // Tools that relay this output find the address with a pattern like
+        // `http://host:port/`, so styling must surround the URL, never split it.
+        assert!(text.contains("http://localhost:52876/\x1b[0m in your browser"));
+        assert!(text.contains("localhost:52876\x1b[0m.\n"));
+        assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn start_message_warns_in_sentences_when_reachable_from_the_network() {
+        let text = start_message(Ipv4Addr::UNSPECIFIED.into(), 34872, Buffer::no_color());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Rojo+ server listening on 0.0.0.0:34872.");
+        assert!(lines[2].starts_with("This server is bound to 0.0.0.0, which is reachable"));
+        assert!(lines[2].ends_with("when you need remote access."));
+        assert!(!text.contains("WARNING"));
     }
 
     #[test]

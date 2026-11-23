@@ -1,6 +1,7 @@
 //! Defines Rojo's CLI through clap types.
 
 mod build;
+mod display;
 mod doc;
 mod export;
 mod fmt_project;
@@ -45,7 +46,7 @@ impl Options {
         match self.subcommand {
             Subcommand::Init(subcommand) => subcommand.run(),
             Subcommand::Serve(subcommand) => subcommand.run(self.global),
-            Subcommand::Build(subcommand) => subcommand.run(),
+            Subcommand::Build(subcommand) => subcommand.run(self.global.color),
             Subcommand::Export(subcommand) => subcommand.run(),
             Subcommand::Upload(subcommand) => subcommand.run(),
             Subcommand::Sourcemap(subcommand) => subcommand.run(),
