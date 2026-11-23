@@ -11,9 +11,13 @@ use std::{
 
 use termcolor::{Buffer, Color, ColorSpec, WriteColor};
 
+/// The commandline-luau theme's muted gray (`#a8a8a8`), shared by addresses, links, and
+/// paths so they stay readable next to normal text.
+const MUTED_GRAY: Color = Color::Rgb(0xa8, 0xa8, 0xa8);
+
 fn muted() -> ColorSpec {
     let mut spec = ColorSpec::new();
-    spec.set_fg(Some(Color::Black)).set_intense(true);
+    spec.set_fg(Some(MUTED_GRAY));
     spec
 }
 
