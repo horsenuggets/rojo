@@ -6,6 +6,7 @@
 
 use std::{
     io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -64,6 +65,17 @@ impl LiveEditPlace {
     pub(super) fn kind(&self) -> OutputKind {
         self.kind
     }
+}
+
+/// A connection marker preserves the actual bind address, not its presentation label.
+/// Wildcard listeners are reached through the loopback address of the same family.
+pub(super) fn connection_address(address: SocketAddr) -> String {
+    let ip = match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, address.port()).to_string()
 }
 
 /// Deletes a place left over from an earlier server on the same port. A consumer
@@ -161,6 +173,19 @@ mod tests {
         match workspace.properties.get(&ustr("Attributes")) {
             Some(Variant::Attributes(attributes)) => attributes.clone(),
             _ => Attributes::new(),
+        }
+    }
+
+    #[test]
+    fn connection_markers_preserve_specific_binds_and_bracket_ipv6() {
+        for (bound, expected) in [
+            ("127.0.0.1:52876", "127.0.0.1:52876"),
+            ("127.0.0.2:52876", "127.0.0.2:52876"),
+            ("[::1]:52876", "[::1]:52876"),
+            ("0.0.0.0:52876", "127.0.0.1:52876"),
+            ("[::]:52876", "[::1]:52876"),
+        ] {
+            assert_eq!(connection_address(bound.parse().unwrap()), expected);
         }
     }
 

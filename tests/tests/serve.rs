@@ -3746,7 +3746,7 @@ mod serve_live_edit_place {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(marker(&place), Some(format!("localhost:{port}")));
+        assert_eq!(marker(&place), Some(format!("127.0.0.1:{port}")));
         assert!(process.0.try_wait().unwrap().is_none());
     }
 

@@ -117,8 +117,7 @@ impl ServeCommand {
                 let _ = show_start_message(address.ip(), address.port(), global.color.into());
 
                 if let (Some(place), Some(path)) = (live_edit_place, path) {
-                    let marker =
-                        format!("{}:{}", display::display_host(address.ip()), address.port());
+                    let marker = live_edit_place::connection_address(address);
                     *writer.lock().unwrap() = Some(thread::spawn(move || {
                         let mut tree = session.tree();
                         if let Err(error) =
