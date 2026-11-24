@@ -31,6 +31,22 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.11`
+
+* Shortened the `rojo serve` start message to two sentences, `Rojo+ server listening on
+  localhost:PORT.` and the browser link, with the address and URL muted. The network
+  exposure warning is now plain yellow sentences.
+* Reworded `rojo build` output as `Building project NAME...` and
+  `Built project NAME as FILE.`, with the project name muted and the place or model file in
+  bright cyan bold.
+* Added `rojo serve --live-edit-place <TEMPLATE>`, which writes the served project to a
+  `.rbxl` or `.rbxlx` place once the server is listening, replacing `{port}` in the path
+  with the bound port. The place's Workspace carries the `__RojoPlus_LiveEditUrl` marker,
+  so the plugin connects as soon as Studio opens it, while the served tree never gets the
+  attribute. Old files at the path are removed before the start message, the new file
+  appears atomically, and a failed write stops the server with an error. Live edits no
+  longer need a separate `rojo build` and marking pass.
+
 ## `7.7.1-horse.2.10`
 
 * Stopped queued two-way sync writes from reaching the server after the filesystem replaced

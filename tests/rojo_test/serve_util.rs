@@ -122,7 +122,7 @@ impl TestServeSession {
                 .spawn()
                 .expect("Couldn't start Rojo"),
         );
-        let port = read_server_port(rojo_process.0.stdout.take().unwrap(), "Port:");
+        let port = read_server_port(rojo_process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
 
         TestServeSession {
             rojo_process,
@@ -330,6 +330,9 @@ pub fn deserialize_msgpack<'a, T: Deserialize<'a>>(
     T::deserialize(&mut deserializer)
 }
 
+/// The start of the line `rojo serve` prints once it is listening.
+pub const SERVE_PORT_PREFIX: &str = "Rojo+ server listening on localhost:";
+
 /// Reads the bound port from a child started with `--port 0`. The child retains
 /// its listener throughout startup, avoiding any probe-and-release port race.
 pub fn read_server_port(output: impl Read + Send + 'static, prefix: &'static str) -> usize {
@@ -355,8 +358,11 @@ pub fn read_server_port(output: impl Read + Send + 'static, prefix: &'static str
 fn startup_ports_are_read_from_actual_listening_messages() {
     assert_eq!(
         read_server_port(
-            std::io::Cursor::new("Starting\n  Port:    12345\nReady\n"),
-            "Port:"
+            std::io::Cursor::new(
+                "Rojo+ server listening on localhost:12345.\nVisit http://localhost:12345/ in \
+                 your browser for more information.\n"
+            ),
+            SERVE_PORT_PREFIX
         ),
         12345
     );

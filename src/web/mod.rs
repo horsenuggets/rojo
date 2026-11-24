@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use futures::future::{pending, select, Either};
+use futures::future::{select, Either};
 use hyper::{
     server::{conn::AddrStream, Server},
     service::{make_service_fn, service_fn},
@@ -37,7 +37,8 @@ impl LiveServer {
         LiveServer { serve_session }
     }
 
-    /// Starts the server on the given address, blocking until it stops.
+    /// Starts the server on the given address, blocking until it fails or
+    /// `shutdown` resolves.
     ///
     /// `allowed_hosts` are extra `Host`/`Origin` values to accept in addition to
     /// localhost and the bind address (see [`origin::allowed_hosts`]).
@@ -45,16 +46,6 @@ impl LiveServer {
     /// `on_listening` is invoked once the server has successfully bound to the
     /// address, so callers can defer printing any "listening" message until
     /// after binding can no longer fail (e.g. due to the port being in use).
-    pub fn start(
-        self,
-        address: SocketAddr,
-        allowed_hosts: Vec<String>,
-        on_listening: impl FnOnce(SocketAddr),
-    ) -> anyhow::Result<()> {
-        self.start_with_shutdown(address, allowed_hosts, on_listening, pending())
-    }
-
-    /// Starts the server until it fails or `shutdown` resolves.
     ///
     /// Shutdown drops active connections instead of waiting for clients to disconnect.
     pub fn start_with_shutdown(

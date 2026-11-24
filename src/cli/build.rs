@@ -12,11 +12,12 @@ use clap::{CommandFactory, Parser};
 use fs_err::File;
 use memofs::Vfs;
 use roblox_install::RobloxStudio;
+use termcolor::BufferWriter;
 use tokio::runtime::Runtime;
 
-use crate::serve_session::ServeSession;
+use crate::{serve_session::ServeSession, snapshot::RojoTree};
 
-use super::resolve_path;
+use super::{display, resolve_path, ColorChoice};
 
 const UNKNOWN_OUTPUT_KIND_ERR: &str = "Could not detect what kind of file to build. \
                                        Expected output file to end in .rbxl, .rbxlx, .rbxm, or .rbxmx.";
@@ -52,7 +53,7 @@ pub struct BuildCommand {
 }
 
 impl BuildCommand {
-    pub fn run(self) -> anyhow::Result<()> {
+    pub fn run(self, color: ColorChoice) -> anyhow::Result<()> {
         let workers = self
             .jobs
             .map(NonZeroUsize::get)
@@ -61,10 +62,10 @@ impl BuildCommand {
             .num_threads(workers)
             .build()
             .context("Failed to create the build worker pool")?;
-        self.run_with_pool(Arc::new(pool))
+        self.run_with_pool(Arc::new(pool), color)
     }
 
-    fn run_with_pool(self, pool: Arc<rayon::ThreadPool>) -> anyhow::Result<()> {
+    fn run_with_pool(self, pool: Arc<rayon::ThreadPool>, color: ColorChoice) -> anyhow::Result<()> {
         let (output_path, output_kind) = match (self.output, self.plugin) {
             (None, None) => {
                 BuildCommand::command()
@@ -109,7 +110,7 @@ impl BuildCommand {
         log::debug!("Loaded project in {:?}", started.elapsed());
         let mut cursor = session.message_queue().cursor();
 
-        write_model(&session, &output_path, output_kind)?;
+        write_model(&session, &output_path, output_kind, color)?;
 
         if self.watch {
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;
@@ -124,7 +125,7 @@ impl BuildCommand {
                 };
                 cursor = new_cursor;
 
-                write_model(&session, &output_path, output_kind)?;
+                write_model(&session, &output_path, output_kind, color)?;
             }
         }
 
@@ -185,43 +186,21 @@ fn write_model(
     session: &ServeSession,
     output: &Path,
     output_kind: OutputKind,
+    color: ColorChoice,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
-    println!("Building project '{}'", session.project_name());
+    let writer = BufferWriter::stdout(color.into());
+    let project_name = session.project_name();
 
-    let tree = session.tree();
-    let root_id = tree.get_root_id();
+    let mut buffer = writer.buffer();
+    write!(buffer, "Building project ")?;
+    display::write_muted(&mut buffer, project_name)?;
+    writeln!(buffer, "...")?;
+    writer.print(&buffer)?;
 
     log::trace!("Opening output file for write");
     let mut file = BufWriter::new(File::create(output)?);
-
-    match output_kind {
-        OutputKind::Rbxm => {
-            rbx_binary::to_writer(&mut file, tree.inner(), &[root_id])?;
-        }
-        OutputKind::Rbxl => {
-            let root_instance = tree.get_instance(root_id).unwrap();
-            let top_level_ids = root_instance.children();
-
-            rbx_binary::to_writer(&mut file, tree.inner(), top_level_ids)?;
-        }
-        OutputKind::Rbxmx => {
-            // Model files include the root instance of the tree and all its
-            // descendants.
-
-            rbx_xml::to_writer(&mut file, tree.inner(), &[root_id], xml_encode_config())?;
-        }
-        OutputKind::Rbxlx => {
-            // Place files don't contain an entry for the DataModel, but our
-            // WeakDom representation does.
-
-            let root_instance = tree.get_instance(root_id).unwrap();
-            let top_level_ids = root_instance.children();
-
-            rbx_xml::to_writer(&mut file, tree.inner(), top_level_ids, xml_encode_config())?;
-        }
-    }
-
+    write_tree(&session.tree(), &mut file, output_kind)?;
     file.flush()?;
     log::debug!("Serialized project in {:?}", started.elapsed());
 
@@ -229,7 +208,42 @@ fn write_model(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("<invalid utf-8>");
-    println!("Built project to {}", filename);
+    let mut buffer = writer.buffer();
+    write!(buffer, "Built project ")?;
+    display::write_muted(&mut buffer, project_name)?;
+    write!(buffer, " as ")?;
+    display::write_roblox_path(&mut buffer, filename)?;
+    writeln!(buffer, ".")?;
+    writer.print(&buffer)?;
+
+    Ok(())
+}
+
+/// Serializes the tree in the given format. Place formats leave out the DataModel
+/// itself, while model formats include the root instance and its descendants.
+pub(super) fn write_tree(
+    tree: &RojoTree,
+    output: &mut impl Write,
+    output_kind: OutputKind,
+) -> anyhow::Result<()> {
+    let root_id = tree.get_root_id();
+
+    match output_kind {
+        OutputKind::Rbxm => {
+            rbx_binary::to_writer(output, tree.inner(), &[root_id])?;
+        }
+        OutputKind::Rbxl => {
+            let top_level_ids = tree.get_instance(root_id).unwrap().children();
+            rbx_binary::to_writer(output, tree.inner(), top_level_ids)?;
+        }
+        OutputKind::Rbxmx => {
+            rbx_xml::to_writer(output, tree.inner(), &[root_id], xml_encode_config())?;
+        }
+        OutputKind::Rbxlx => {
+            let top_level_ids = tree.get_instance(root_id).unwrap().children();
+            rbx_xml::to_writer(output, tree.inner(), top_level_ids, xml_encode_config())?;
+        }
+    }
 
     Ok(())
 }
@@ -261,7 +275,7 @@ mod tests {
             jobs: None,
             watch: false,
         }
-        .run_with_pool(pool)
+        .run_with_pool(pool, ColorChoice::Never)
         .unwrap();
         assert!(weak_pool.upgrade().is_none());
     }
