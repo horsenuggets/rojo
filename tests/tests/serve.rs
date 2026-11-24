@@ -3482,7 +3482,7 @@ mod serve_lifetime {
 
     use crate::rojo_test::{
         io_util::{KillOnDrop, ROJO_PATH, SERVE_TESTS_PATH},
-        serve_util::read_server_port,
+        serve_util::{read_server_port, SERVE_PORT_PREFIX},
     };
 
     struct LifetimeServer {
@@ -3503,7 +3503,7 @@ mod serve_lifetime {
                 command.arg("--shutdown-on-stdin-eof");
             }
             let mut process = KillOnDrop(command.spawn().expect("Could not start Rojo"));
-            let port = read_server_port(process.0.stdout.take().unwrap(), "Port:");
+            let port = read_server_port(process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
             Self { process, port }
         }
 
@@ -3652,5 +3652,225 @@ mod serve_lifetime {
         other.assert_serving();
         other.close_stdin();
         other.assert_exited();
+    }
+}
+
+mod serve_live_edit_place {
+    use std::{
+        io::Read,
+        path::Path,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use rbx_dom_weak::{types::Variant, ustr};
+
+    use crate::rojo_test::{
+        io_util::{KillOnDrop, ROJO_PATH},
+        serve_util::{read_server_port, SERVE_PORT_PREFIX},
+    };
+
+    const PLACE_PROJECT: &str = r#"{"name":"Live","tree":{"$className":"DataModel","Workspace":{"$className":"Workspace"}}}"#;
+
+    fn command(project: &Path, template: &Path) -> Command {
+        command_at(project, template, "127.0.0.1", "0")
+    }
+
+    fn command_at(project: &Path, template: &Path, address: &str, port: &str) -> Command {
+        let mut command = Command::new(ROJO_PATH);
+        command
+            .args(["--color", "never", "serve"])
+            .arg(project)
+            .args(["--address", address, "--port", port, "--live-edit-place"])
+            .arg(template)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn marker(place: &Path) -> Option<String> {
+        let dom = rbx_binary::from_reader(std::fs::read(place).unwrap().as_slice()).unwrap();
+        let workspace = dom
+            .descendants()
+            .find(|instance| instance.class == "Workspace")
+            .unwrap();
+        let Some(Variant::Attributes(attributes)) = workspace.properties.get(&ustr("Attributes"))
+        else {
+            return None;
+        };
+        match attributes.get("__RojoPlus_LiveEditUrl")? {
+            Variant::String(value) => Some(value.clone()),
+            Variant::BinaryString(value) => {
+                std::str::from_utf8(value.as_ref()).ok().map(str::to_owned)
+            }
+            _ => None,
+        }
+    }
+
+    fn wait_for_place(place: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !place.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "The live edit place never appeared"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_exit(process: &mut KillOnDrop) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "Server kept running");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits for a server that should stop by itself and returns its stderr.
+    fn wait_for_failure(process: &mut KillOnDrop) -> String {
+        assert!(!wait_for_exit(process).success());
+        let mut stderr = String::new();
+        process
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        stderr
+    }
+
+    #[test]
+    fn serve_writes_a_marked_place_named_after_its_port() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("default.project.json");
+        std::fs::write(&project, PLACE_PROJECT).unwrap();
+        let template = directory.path().join("Live.{port}.rbxl");
+
+        let mut process = KillOnDrop(command(&project, &template).spawn().unwrap());
+        let port = read_server_port(process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
+        let place = directory.path().join(format!("Live.{port}.rbxl"));
+
+        wait_for_place(&place);
+        assert_eq!(marker(&place), Some(format!("127.0.0.1:{port}")));
+        assert!(process.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn serve_preserves_literal_placeholder_parent_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("default.project.json");
+        std::fs::write(&project, PLACE_PROJECT).unwrap();
+        let parent = directory.path().join("{port}");
+        std::fs::create_dir(&parent).unwrap();
+        let template = parent.join("Live.{port}.rbxl");
+        let mut process = KillOnDrop(command(&project, &template).spawn().unwrap());
+        let port = read_server_port(process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
+        let place = parent.join(format!("Live.{port}.rbxl"));
+        wait_for_place(&place);
+        assert_eq!(marker(&place), Some(format!("127.0.0.1:{port}")));
+        assert!(process.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn serve_owns_the_output_until_shutdown_and_releases_it_after_exit() {
+        for crash in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let project = directory.path().join("default.project.json");
+            std::fs::write(&project, PLACE_PROJECT).unwrap();
+            let template = directory.path().join("Live.{port}.rbxl");
+            let mut owner = KillOnDrop(
+                command(&project, &template)
+                    .arg("--shutdown-on-stdin-eof")
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let port = read_server_port(owner.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
+            let port = port.to_string();
+            let place = directory.path().join(format!("Live.{port}.rbxl"));
+            let lock_path = directory.path().join(format!("Live.{port}.rbxl.lock"));
+            wait_for_place(&place);
+            let original = std::fs::read(&place).unwrap();
+            // The writer is done, but the server still owns the output. IPv4 and
+            // IPv6 loopback can listen on the same port without sharing a socket.
+            let mut contender = KillOnDrop(
+                command_at(&project, &template, "::1", &port)
+                    .spawn()
+                    .unwrap(),
+            );
+            let error = wait_for_failure(&mut contender);
+            assert!(error.contains("already owned by another server"), "{error}");
+            let mut stdout = String::new();
+            contender
+                .0
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            assert!(
+                stdout.is_empty(),
+                "Rejected server announced it was listening"
+            );
+            assert_eq!(std::fs::read(&place).unwrap(), original);
+            assert!(owner.0.try_wait().unwrap().is_none());
+
+            if crash {
+                owner.0.kill().unwrap();
+                assert!(!wait_for_exit(&mut owner).success());
+            } else {
+                drop(owner.0.stdin.take().unwrap());
+                assert!(wait_for_exit(&mut owner).success());
+            }
+            assert!(lock_path.exists());
+            assert_eq!(std::fs::read(&place).unwrap(), original);
+
+            let mut next = KillOnDrop(
+                command_at(&project, &template, "::1", &port)
+                    .arg("--shutdown-on-stdin-eof")
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            assert_eq!(
+                read_server_port(next.0.stdout.take().unwrap(), SERVE_PORT_PREFIX).to_string(),
+                port
+            );
+            wait_for_place(&place);
+            assert_eq!(marker(&place), Some(format!("[::1]:{port}")));
+            drop(next.0.stdin.take().unwrap());
+            assert!(wait_for_exit(&mut next).success());
+        }
+    }
+
+    #[test]
+    fn serve_fails_when_the_place_cannot_be_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("default.project.json");
+        std::fs::write(
+            &project,
+            r#"{"name":"Live","tree":{"$className":"DataModel"}}"#,
+        )
+        .unwrap();
+        let template = directory.path().join("Live.{port}.rbxl");
+
+        let mut process = KillOnDrop(command(&project, &template).spawn().unwrap());
+        assert!(wait_for_failure(&mut process).contains("no Workspace"));
+    }
+
+    #[test]
+    fn serve_rejects_templates_without_a_port_before_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = command(Path::new("missing"), &directory.path().join("Live.rbxl"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("must contain \"{port}\""));
     }
 }

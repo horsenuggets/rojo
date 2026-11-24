@@ -158,6 +158,26 @@ impl RojoTree {
         }
     }
 
+    /// Lets `read` see the tree with one property replaced, then restores the
+    /// original value. Changes nothing else, so metadata and source tracking stay
+    /// as they were, and holding `&mut self` keeps anyone else from observing it.
+    pub fn with_property_override<R>(
+        &mut self,
+        id: Ref,
+        key: Ustr,
+        value: Variant,
+        read: impl FnOnce(&RojoTree) -> R,
+    ) -> Option<R> {
+        let original = self.inner.get_by_ref_mut(id)?.properties.insert(key, value);
+        let result = read(self);
+        let properties = &mut self.inner.get_by_ref_mut(id).unwrap().properties;
+        match original {
+            Some(original) => properties.insert(key, original),
+            None => properties.remove(&key),
+        };
+        Some(result)
+    }
+
     pub fn get_instance_mut(&mut self, id: Ref) -> Option<InstanceWithMetaMut<'_>> {
         self.inner.get_by_ref(id)?;
         let pending_source = self
@@ -666,6 +686,40 @@ mod test {
 
     use super::{RojoTree, SnapshotReferents};
     use std::path::PathBuf;
+
+    #[test]
+    fn property_overrides_are_visible_only_while_reading() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root").children(vec![
+            InstanceSnapshot::new()
+                .name("Kept")
+                .properties(UstrMap::from_iter([(ustr("Value"), Variant::Int32(1))])),
+            InstanceSnapshot::new().name("Absent"),
+        ]));
+        let [kept, absent] = [tree.root().children()[0], tree.root().children()[1]];
+
+        for (id, original) in [(kept, Some(Variant::Int32(1))), (absent, None)] {
+            let seen = tree
+                .with_property_override(id, ustr("Value"), Variant::Int32(2), |tree| {
+                    tree.get_instance(id)
+                        .unwrap()
+                        .properties()
+                        .get(&ustr("Value"))
+                        .cloned()
+                })
+                .unwrap();
+            assert_eq!(seen, Some(Variant::Int32(2)));
+            assert_eq!(
+                tree.get_instance(id)
+                    .unwrap()
+                    .properties()
+                    .get(&ustr("Value")),
+                original.as_ref()
+            );
+        }
+        assert!(tree
+            .with_property_override(Ref::new(), ustr("Value"), Variant::Int32(2), |_| ())
+            .is_none());
+    }
 
     #[test]
     fn ordinary_edits_do_not_retain_sources_and_serialization_disables_retirement() {
