@@ -5,6 +5,7 @@
 //! saves a second project load and a separate marking pass.
 
 use std::{
+    fs::{File, TryLockError},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -32,7 +33,7 @@ pub(super) struct LiveEditPlace {
 
 impl LiveEditPlace {
     /// Validates a path template before the project loads, so a bad flag fails
-    /// fast. The port is part of the name so several servers never share a file.
+    /// fast. The port separates most servers; output ownership rejects collisions.
     pub(super) fn parse(template: &Path) -> anyhow::Result<Self> {
         let shown = display::display_path(
             &template.to_string_lossy(),
@@ -67,6 +68,46 @@ impl LiveEditPlace {
     }
 }
 
+/// Owns an output until the server stops and its place writer has joined.
+/// The OS releases the lock on drop or process exit, including crashes.
+#[derive(Debug)]
+#[must_use]
+pub(super) struct OutputOwnership {
+    _lock: File,
+}
+
+impl OutputOwnership {
+    pub(super) fn acquire(path: &Path) -> anyhow::Result<Self> {
+        let shown = display::display_path(
+            &path.to_string_lossy(),
+            display::home_dir().as_deref(),
+            false,
+        );
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        // Never truncate, replace, or unlink the sidecar, even after unlocking. All
+        // contenders must lock the same inode across output replacement and takeover.
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("Could not open the ownership lock for live edit place \"{shown}\".")
+            })?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Self { _lock: lock }),
+            Err(TryLockError::WouldBlock) => bail!(
+                "The live edit place \"{shown}\" is already owned by another server. \
+                 Choose a different --live-edit-place template or stop that server."
+            ),
+            Err(TryLockError::Error(error)) => Err(error)
+                .with_context(|| format!("Could not lock the live edit place \"{shown}\".")),
+        }
+    }
+}
+
 /// A connection marker preserves the actual bind address, not its presentation label.
 /// Wildcard listeners are reached through the loopback address of the same family.
 pub(super) fn connection_address(address: SocketAddr) -> String {
@@ -80,6 +121,7 @@ pub(super) fn connection_address(address: SocketAddr) -> String {
 
 /// Deletes a place left over from an earlier server on the same port. A consumer
 /// waits for the file to appear, so an old copy would open with a stale tree.
+/// The caller must hold output ownership before removing it.
 pub(super) fn remove_stale(path: &Path) -> anyhow::Result<()> {
     match fs_err::remove_file(path) {
         Ok(()) => Ok(()),
@@ -174,6 +216,51 @@ mod tests {
             Some(Variant::Attributes(attributes)) => attributes.clone(),
             _ => Attributes::new(),
         }
+    }
+
+    #[test]
+    fn output_ownership_refuses_a_second_owner_without_touching_the_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Live.34872.rbxl");
+        std::fs::write(&path, b"an active place").unwrap();
+        let _owner = OutputOwnership::acquire(&path).unwrap();
+
+        let error = OutputOwnership::acquire(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("already owned by another server"));
+        assert!(error.to_string().contains("Live.34872.rbxl"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"an active place");
+    }
+
+    #[test]
+    fn output_ownership_can_be_reacquired_without_replacing_the_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Live.34872.rbxl");
+        let lock_path = directory.path().join("Live.34872.rbxl.lock");
+        let owner = OutputOwnership::acquire(&path).unwrap();
+        let original = File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        drop(owner);
+        assert!(lock_path.exists());
+
+        let _next_owner = OutputOwnership::acquire(&path).unwrap();
+        // An already-open handle still sees the next owner's lock, proving that
+        // takeover did not unlink or replace the sidecar with a different inode.
+        assert!(matches!(original.try_lock(), Err(TryLockError::WouldBlock)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn output_ownership_allows_different_outputs_at_the_same_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let _binary = OutputOwnership::acquire(&directory.path().join("Live.34872.rbxl")).unwrap();
+        let _xml = OutputOwnership::acquire(&directory.path().join("Live.34872.rbxlx")).unwrap();
+        let _other_port =
+            OutputOwnership::acquire(&directory.path().join("Live.34873.rbxl")).unwrap();
     }
 
     #[test]
