@@ -3674,11 +3674,15 @@ mod serve_live_edit_place {
     const PLACE_PROJECT: &str = r#"{"name":"Live","tree":{"$className":"DataModel","Workspace":{"$className":"Workspace"}}}"#;
 
     fn command(project: &Path, template: &Path) -> Command {
+        command_at(project, template, "127.0.0.1", "0")
+    }
+
+    fn command_at(project: &Path, template: &Path, address: &str, port: &str) -> Command {
         let mut command = Command::new(ROJO_PATH);
         command
             .args(["--color", "never", "serve"])
             .arg(project)
-            .args(["--address", "127.0.0.1", "--port", "0", "--live-edit-place"])
+            .args(["--address", address, "--port", port, "--live-edit-place"])
             .arg(template)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -3705,17 +3709,31 @@ mod serve_live_edit_place {
         }
     }
 
-    /// Waits for a server that should stop by itself and returns its stderr.
-    fn wait_for_failure(process: &mut KillOnDrop) -> String {
+    fn wait_for_place(place: &Path) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
+        while !place.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "The live edit place never appeared"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_exit(process: &mut KillOnDrop) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             if let Some(status) = process.0.try_wait().unwrap() {
-                break status;
+                return status;
             }
             assert!(Instant::now() < deadline, "Server kept running");
             thread::sleep(Duration::from_millis(10));
-        };
-        assert!(!status.success());
+        }
+    }
+
+    /// Waits for a server that should stop by itself and returns its stderr.
+    fn wait_for_failure(process: &mut KillOnDrop) -> String {
+        assert!(!wait_for_exit(process).success());
         let mut stderr = String::new();
         process
             .0
@@ -3738,16 +3756,97 @@ mod serve_live_edit_place {
         let port = read_server_port(process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
         let place = directory.path().join(format!("Live.{port}.rbxl"));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !place.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "The live edit place never appeared"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_place(&place);
         assert_eq!(marker(&place), Some(format!("127.0.0.1:{port}")));
         assert!(process.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn serve_preserves_literal_placeholder_parent_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("default.project.json");
+        std::fs::write(&project, PLACE_PROJECT).unwrap();
+        let parent = directory.path().join("{port}");
+        std::fs::create_dir(&parent).unwrap();
+        let template = parent.join("Live.{port}.rbxl");
+        let mut process = KillOnDrop(command(&project, &template).spawn().unwrap());
+        let port = read_server_port(process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
+        let place = parent.join(format!("Live.{port}.rbxl"));
+        wait_for_place(&place);
+        assert_eq!(marker(&place), Some(format!("127.0.0.1:{port}")));
+        assert!(process.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn serve_owns_the_output_until_shutdown_and_releases_it_after_exit() {
+        for crash in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let project = directory.path().join("default.project.json");
+            std::fs::write(&project, PLACE_PROJECT).unwrap();
+            let template = directory.path().join("Live.{port}.rbxl");
+            let mut owner = KillOnDrop(
+                command(&project, &template)
+                    .arg("--shutdown-on-stdin-eof")
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let port = read_server_port(owner.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
+            let port = port.to_string();
+            let place = directory.path().join(format!("Live.{port}.rbxl"));
+            let lock_path = directory.path().join(format!("Live.{port}.rbxl.lock"));
+            wait_for_place(&place);
+            let original = std::fs::read(&place).unwrap();
+            // The writer is done, but the server still owns the output. IPv4 and
+            // IPv6 loopback can listen on the same port without sharing a socket.
+            let mut contender = KillOnDrop(
+                command_at(&project, &template, "::1", &port)
+                    .spawn()
+                    .unwrap(),
+            );
+            let error = wait_for_failure(&mut contender);
+            assert!(error.contains("already owned by another server"), "{error}");
+            let mut stdout = String::new();
+            contender
+                .0
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            assert!(
+                stdout.is_empty(),
+                "Rejected server announced it was listening"
+            );
+            assert_eq!(std::fs::read(&place).unwrap(), original);
+            assert!(owner.0.try_wait().unwrap().is_none());
+
+            if crash {
+                owner.0.kill().unwrap();
+                assert!(!wait_for_exit(&mut owner).success());
+            } else {
+                drop(owner.0.stdin.take().unwrap());
+                assert!(wait_for_exit(&mut owner).success());
+            }
+            assert!(lock_path.exists());
+            assert_eq!(std::fs::read(&place).unwrap(), original);
+
+            let mut next = KillOnDrop(
+                command_at(&project, &template, "::1", &port)
+                    .arg("--shutdown-on-stdin-eof")
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            assert_eq!(
+                read_server_port(next.0.stdout.take().unwrap(), SERVE_PORT_PREFIX).to_string(),
+                port
+            );
+            wait_for_place(&place);
+            assert_eq!(marker(&place), Some(format!("[::1]:{port}")));
+            drop(next.0.stdin.take().unwrap());
+            assert!(wait_for_exit(&mut next).success());
+        }
     }
 
     #[test]

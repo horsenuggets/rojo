@@ -18,7 +18,7 @@ use crate::{serve_session::ServeSession, web::LiveServer};
 
 use super::{
     display,
-    live_edit_place::{self, LiveEditPlace},
+    live_edit_place::{self, LiveEditPlace, OutputOwnership},
     resolve_path, GlobalOptions,
 };
 
@@ -55,7 +55,8 @@ pub struct ServeCommand {
     pub shutdown_on_stdin_eof: bool,
 
     /// Write the served project to this .rbxl or .rbxlx place once listening, with
-    /// `{port}` in the path replaced by the bound port. The place's Workspace
+    /// `{port}` in the filename replaced by the bound port. Parent directory names
+    /// are literal. The place's Workspace
     /// carries the `__RojoPlus_LiveEditUrl` attribute, so the Rojo+ plugin
     /// connects to this server as soon as Studio opens it. Any old file at the path
     /// is removed before the start message, and the new one appears all at once,
@@ -95,8 +96,12 @@ impl ServeCommand {
         let failure: Arc<Mutex<Option<anyhow::Error>>> = Arc::default();
         let (failed, mut on_failure) = futures::channel::mpsc::unbounded::<()>();
         let writer: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::default();
+        let mut output_ownership = None;
 
         let on_listening = {
+            // Borrow the run-scope guard, rather than moving it into the callback
+            // or writer, so finishing the place never releases a live server's output.
+            let output_ownership = &mut output_ownership;
             let failure = Arc::clone(&failure);
             let writer = Arc::clone(&writer);
             move |address: SocketAddr| {
@@ -108,6 +113,13 @@ impl ServeCommand {
                     .as_ref()
                     .map(|place| place.resolve(address.port()));
                 if let Some(path) = &path {
+                    match OutputOwnership::acquire(path) {
+                        Ok(ownership) => *output_ownership = Some(ownership),
+                        Err(error) => {
+                            report(error);
+                            return;
+                        }
+                    }
                     if let Err(error) = live_edit_place::remove_stale(path) {
                         report(error);
                         return;
@@ -169,6 +181,7 @@ impl ServeCommand {
         if let Some(writer) = writer.lock().unwrap().take() {
             let _ = writer.join();
         }
+        drop(output_ownership);
         served?;
         let failure = failure.lock().unwrap().take();
         match failure {
