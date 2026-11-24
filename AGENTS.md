@@ -47,7 +47,7 @@ If you have modified Rojo's server, you may need to update test snapshots. You m
 
 - `cargo fmt` - Format the server's source
 - `cargo clippy` - Lint the server's source
-- `stylua plugin/src` - Format the client's source
+- `styluau plugin/src` - Format the client's source
 - `selene plugin/src` - Lint the client's source
 
 Follow Rust's style guide for Rojo's server. Follow the style established in other code for Rojo's client.
