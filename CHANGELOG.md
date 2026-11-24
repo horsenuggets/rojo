@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.11`
+
 * Shortened the `rojo serve` start message to two sentences, `Rojo+ server listening on
   localhost:PORT.` and the browser link, with the address and URL muted. The network
   exposure warning is now plain yellow sentences.
