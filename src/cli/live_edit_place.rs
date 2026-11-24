@@ -43,10 +43,13 @@ impl LiveEditPlace {
         let Some(text) = template.to_str() else {
             bail!("The live edit place path \"{shown}\" is not valid UTF-8.");
         };
-        if !text.contains(PORT_PLACEHOLDER) {
+        if !template
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains(PORT_PLACEHOLDER))
+        {
             bail!(
                 "The live edit place path \"{shown}\" must contain \"{PORT_PLACEHOLDER}\", which \
-                 is replaced by the server's port."
+                 is replaced by the server's port in the filename."
             );
         }
         let kind = match OutputKind::from_output_path(template) {
@@ -60,7 +63,9 @@ impl LiveEditPlace {
     }
 
     pub(super) fn resolve(&self, port: u16) -> PathBuf {
-        PathBuf::from(self.template.replace(PORT_PLACEHOLDER, &port.to_string()))
+        let path = Path::new(&self.template);
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        path.with_file_name(filename.replace(PORT_PLACEHOLDER, &port.to_string()))
     }
 
     pub(super) fn kind(&self) -> OutputKind {
@@ -286,9 +291,16 @@ mod tests {
         assert_eq!(place.kind(), OutputKind::Rbxl);
         let xml = LiveEditPlace::parse(Path::new("Live.{port}.rbxlx")).unwrap();
         assert_eq!(xml.kind(), OutputKind::Rbxlx);
+        let literal_parent =
+            LiveEditPlace::parse(Path::new("/tmp/{port}/Live.{port}.rbxl")).unwrap();
+        assert_eq!(
+            literal_parent.resolve(52876),
+            PathBuf::from("/tmp/{port}/Live.52876.rbxl")
+        );
 
         for invalid in [
             "/tmp/ae/Live.rbxl",
+            "/tmp/{port}/Live.rbxl",
             "Live.{port}.rbxm",
             "Live.{port}.rbxmx",
             "{port}",

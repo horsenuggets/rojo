@@ -55,7 +55,8 @@ pub struct ServeCommand {
     pub shutdown_on_stdin_eof: bool,
 
     /// Write the served project to this .rbxl or .rbxlx place once listening, with
-    /// `{port}` in the path replaced by the bound port. The place's Workspace
+    /// `{port}` in the filename replaced by the bound port. Parent directory names
+    /// are literal. The place's Workspace
     /// carries the `__RojoPlus_LiveEditUrl` attribute, so the Rojo+ plugin
     /// connects to this server as soon as Studio opens it. Any old file at the path
     /// is removed before the start message, and the new one appears all at once,

@@ -3762,6 +3762,22 @@ mod serve_live_edit_place {
     }
 
     #[test]
+    fn serve_preserves_literal_placeholder_parent_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("default.project.json");
+        std::fs::write(&project, PLACE_PROJECT).unwrap();
+        let parent = directory.path().join("{port}");
+        std::fs::create_dir(&parent).unwrap();
+        let template = parent.join("Live.{port}.rbxl");
+        let mut process = KillOnDrop(command(&project, &template).spawn().unwrap());
+        let port = read_server_port(process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
+        let place = parent.join(format!("Live.{port}.rbxl"));
+        wait_for_place(&place);
+        assert_eq!(marker(&place), Some(format!("127.0.0.1:{port}")));
+        assert!(process.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
     fn serve_owns_the_output_until_shutdown_and_releases_it_after_exit() {
         for crash in [false, true] {
             let directory = tempfile::tempdir().unwrap();
