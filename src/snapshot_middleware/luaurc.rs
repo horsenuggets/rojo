@@ -64,9 +64,8 @@ pub struct ResolveInfo<'a> {
     pub file_path: &'a Path,
     /// The VFS for reading .luaurc files.
     pub vfs: &'a Vfs,
-    /// Project tree `$path` mappings for DataModel-aware path
-    /// computation. Maps filesystem paths (relative to project root)
-    /// to DataModel path segments.
+    /// Project tree `$path` mappings for DataModel-aware path computation. Collected
+    /// mounts are normalized absolute paths; relative inputs resolve from project_root.
     pub path_mappings: &'a [(PathBuf, Vec<String>)],
     /// The project root directory.
     pub project_root: &'a Path,
@@ -81,23 +80,26 @@ pub(super) struct PathMappingIndex<'a> {
 }
 
 impl<'a> PathMappingIndex<'a> {
-    pub(super) fn new(mappings: &'a [(PathBuf, Vec<String>)]) -> Self {
+    pub(super) fn new(mappings: &'a [(PathBuf, Vec<String>)], root: &Path) -> Self {
         profiling::scope!(
             "Rojo.BuildImportMappingIndex",
             format!("Mappings {}", mappings.len()).as_str()
         );
         let mut prefixes = HashMap::with_capacity(mappings.len());
         for (ordinal, (path, _)) in mappings.iter().enumerate() {
-            prefixes
-                .entry(Cow::Borrowed(path.as_path()))
-                .or_insert(ordinal);
-            if path
+            let normalized = crate::package_sources::normalize(&root.join(path));
+            let prefix = if normalized == *path {
+                Cow::Borrowed(path.as_path())
+            } else {
+                Cow::Owned(normalized)
+            };
+            let extensionless = prefix
                 .extension()
-                .is_some_and(|extension| extension == "lua" || extension == "luau")
-            {
-                prefixes
-                    .entry(Cow::Owned(path.with_extension("")))
-                    .or_insert(ordinal);
+                .filter(|extension| *extension == "lua" || *extension == "luau")
+                .map(|_| prefix.with_extension(""));
+            prefixes.entry(prefix).or_insert(ordinal);
+            if let Some(extensionless) = extensionless {
+                prefixes.entry(Cow::Owned(extensionless)).or_insert(ordinal);
             }
         }
         Self { mappings, prefixes }
@@ -117,25 +119,23 @@ impl<'a> PathMappingIndex<'a> {
         (selected, candidates)
     }
 
-    fn resolve(&self, fs_path: &Path, root: &Path) -> Vec<String> {
-        let normalized = crate::package_sources::normalize(fs_path);
-        let relative = normalized.strip_prefix(root).unwrap_or(&normalized);
-        if let Some((ordinal, prefix)) = self.matching_prefix(relative).0 {
-            let mut result = self.mappings[ordinal].1.clone();
-            result.extend(
-                relative
-                    .strip_prefix(prefix)
-                    .unwrap()
-                    .components()
-                    .map(|component| component.as_os_str().to_string_lossy().into_owned()),
-            );
-            result
-        } else {
-            relative
+    fn mapped(&self, fs_path: &Path, root: &Path) -> Option<Vec<String>> {
+        let normalized = crate::package_sources::normalize(&root.join(fs_path));
+        let (ordinal, prefix) = self.matching_prefix(&normalized).0?;
+        let mut result = self.mappings[ordinal].1.clone();
+        result.extend(
+            normalized
+                .strip_prefix(prefix)
+                .unwrap()
                 .components()
-                .map(|component| component.as_os_str().to_string_lossy().into_owned())
-                .collect()
-        }
+                .map(|component| component.as_os_str().to_string_lossy().into_owned()),
+        );
+        Some(result)
+    }
+
+    fn resolve(&self, fs_path: &Path, root: &Path) -> Vec<String> {
+        self.mapped(fs_path, root)
+            .unwrap_or_else(|| filesystem_path_segments(fs_path, root))
     }
 }
 
@@ -147,6 +147,13 @@ struct PathMappings<'a> {
 }
 
 impl PathMappings<'_> {
+    fn mapped(self, path: &Path) -> Option<Vec<String>> {
+        match self.index {
+            Some(index) => index.mapped(path, self.root),
+            None => mapped_datamodel_path(path, self.paths, self.root),
+        }
+    }
+
     fn resolve(self, path: &Path) -> Vec<String> {
         match self.index {
             Some(index) => index.resolve(path, self.root),
@@ -272,29 +279,13 @@ pub(super) fn resolve_requires_with_mapping_index(
 
     for mut replacement in sorted {
         if datamodel {
-            if let Some(relative) = replacement
-                .new_text
-                .strip_prefix("require(\"")
-                .and_then(|s| s.strip_suffix("\")"))
-            {
-                let mut target = mappings.resolve(file_dir);
-                if is_init {
-                    target.pop();
-                }
-                for part in relative.split('/') {
-                    match part {
-                        "." => {}
-                        ".." => {
-                            anyhow::ensure!(
-                                target.pop().is_some(),
-                                "Alias require escapes the DataModel"
-                            );
-                        }
-                        part => target.push(part.to_owned()),
-                    }
-                }
-                replacement.new_text = format!("require(\"@game/{}\")", target.join("/"));
-            }
+            let target =
+                mappings
+                    .mapped(&replacement.target)
+                    .ok_or_else(|| UnmappedDataModelImport {
+                        target: replacement.target.clone(),
+                    })?;
+            replacement.new_text = format!("require(\"@game/{}\")", target.join("/"));
         }
         result.replace_range(replacement.start..replacement.end, &replacement.new_text);
     }
@@ -376,6 +367,13 @@ struct Replacement {
     start: usize,
     end: usize,
     new_text: String,
+    target: PathBuf,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Alias target \"{}\" is not mounted in the DataModel", .target.display())]
+pub(crate) struct UnmappedDataModelImport {
+    target: PathBuf,
 }
 
 /// Compute the relative require-by-string path from a script's
@@ -475,32 +473,44 @@ fn to_datamodel_path(
     path_mappings: &[(PathBuf, Vec<String>)],
     project_root: &Path,
 ) -> Vec<String> {
-    let normalized = crate::package_sources::normalize(fs_path);
-    let relative = normalized.strip_prefix(project_root).unwrap_or(&normalized);
+    mapped_datamodel_path(fs_path, path_mappings, project_root)
+        .unwrap_or_else(|| filesystem_path_segments(fs_path, project_root))
+}
 
-    // Find the best matching $path mapping (longest match first,
-    // since mappings are sorted by length descending)
+fn mapped_datamodel_path(
+    fs_path: &Path,
+    path_mappings: &[(PathBuf, Vec<String>)],
+    project_root: &Path,
+) -> Option<Vec<String>> {
+    let normalized = crate::package_sources::normalize(&project_root.join(fs_path));
     for (mount_fs, mount_dm) in path_mappings {
+        let mount_fs = crate::package_sources::normalize(&project_root.join(mount_fs));
         let without_extension = mount_fs
             .extension()
             .filter(|extension| *extension == "lua" || *extension == "luau")
             .map(|_| mount_fs.with_extension(""));
-        if let Ok(remainder) = relative
-            .strip_prefix(mount_fs)
-            .or_else(|_| relative.strip_prefix(without_extension.as_deref().unwrap_or(mount_fs)))
+        if let Ok(remainder) = normalized
+            .strip_prefix(&mount_fs)
+            .or_else(|_| normalized.strip_prefix(without_extension.as_deref().unwrap_or(&mount_fs)))
         {
             let mut dm_path = mount_dm.clone();
             for component in remainder.components() {
                 dm_path.push(component.as_os_str().to_string_lossy().into_owned());
             }
-            return dm_path;
+            return Some(dm_path);
         }
     }
+    None
+}
 
-    // Fallback: use the filesystem path as-is
-    relative
+fn filesystem_path_segments(fs_path: &Path, project_root: &Path) -> Vec<String> {
+    let normalized = crate::package_sources::normalize(&project_root.join(fs_path));
+    let root = crate::package_sources::normalize(project_root);
+    normalized
+        .strip_prefix(&root)
+        .unwrap_or(&normalized)
         .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect()
 }
 
@@ -995,6 +1005,7 @@ fn resolve_alias_require(
             start: call_range.start,
             end: call_range.end,
             new_text: format!(r#"require("{require_path}")"#),
+            target: sub_path.map_or_else(|| alias_fs_path.clone(), |sub| alias_fs_path.join(sub)),
         })
     } else {
         log::warn!("Unknown alias @{} in {}", alias_name, script_dir.display());
@@ -1110,7 +1121,7 @@ mod test {
                     mappings.reverse();
                 }
                 for _ in 0..length.max(1) {
-                    let index = PathMappingIndex::new(&mappings);
+                    let index = PathMappingIndex::new(&mappings, Path::new("/root"));
                     for query in queries {
                         assert_eq!(
                             index.resolve(Path::new(query), root),
@@ -1126,10 +1137,41 @@ mod test {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_external_mappings_match_verbatim_and_compatible_targets() {
+        let root = Path::new(r"C:\checkout with spaces\.local\config");
+        for mount in [
+            r"C:\checkout with spaces\Packages",
+            r"\\?\C:\checkout with spaces\Packages",
+        ] {
+            let mappings = vec![(
+                PathBuf::from(mount),
+                vec!["ReplicatedStorage".into(), "Packages".into()],
+            )];
+            let index = PathMappingIndex::new(&mappings, root);
+            for query in [
+                r"C:\checkout with spaces\Packages\Maid",
+                r"\\?\C:\checkout with spaces\Packages\Maid",
+            ] {
+                let expected = Some(vec![
+                    "ReplicatedStorage".into(),
+                    "Packages".into(),
+                    "Maid".into(),
+                ]);
+                assert_eq!(index.mapped(Path::new(query), root), expected);
+                assert_eq!(
+                    mapped_datamodel_path(Path::new(query), &mappings, root),
+                    expected
+                );
+            }
+        }
+    }
+
     #[test]
     fn indexed_lookup_work_is_bounded_by_path_depth_not_mapping_count() {
         let root = Path::new("/root");
-        let query = Path::new("Source/Shared/Target/Child");
+        let query = root.join("Source/Shared/Target/Child");
         let expected_probes = query.ancestors().count() + 1;
         for count in [0, 10, 10_000] {
             let mut mappings = (0..count)
@@ -1141,9 +1183,9 @@ mod test {
                 })
                 .collect::<Vec<_>>();
             mappings.push(("Source/Shared/Target.luau".into(), vec!["Mapped".into()]));
-            let index = PathMappingIndex::new(&mappings);
-            assert_eq!(index.matching_prefix(query).1, expected_probes);
-            assert_eq!(index.resolve(&root.join(query), root), ["Mapped", "Child"]);
+            let index = PathMappingIndex::new(&mappings, Path::new("/root"));
+            assert_eq!(index.matching_prefix(&query).1, expected_probes);
+            assert_eq!(index.resolve(&query, root), ["Mapped", "Child"]);
         }
     }
 
@@ -1171,7 +1213,7 @@ mod test {
                 vec!["ServerScriptService".into(), "App".into()],
             ),
         ];
-        let index = PathMappingIndex::new(&mappings);
+        let index = PathMappingIndex::new(&mappings, Path::new("/root"));
         let source = "return require(\"@shared/Util\"), 1\n";
         for datamodel in [false, true] {
             for path in ["/root/Source/App/Code.luau", "/root/Source/App/init.luau"] {
@@ -1598,7 +1640,7 @@ mod test {
             project_root: Path::new("/project"),
             vfs: &vfs,
         };
-        let index = PathMappingIndex::new(info.path_mappings);
+        let index = PathMappingIndex::new(info.path_mappings, info.project_root);
         for ordinary in [
             "",
             "é",
@@ -1696,6 +1738,170 @@ mod test {
         }
         let vfs = Vfs::new(imfs);
         ServeSession::new(vfs, Path::new("/project")).unwrap()
+    }
+
+    #[test]
+    fn integration_private_projects_map_external_runtime_imports() {
+        for absolute in [false, true] {
+            for initializer in [false, true] {
+                let root = Path::new("/checkout with spaces");
+                let private = root.join(".local/config");
+                let mounted = |name: &str| {
+                    if absolute {
+                        root.join(name).to_string_lossy().into_owned()
+                    } else {
+                        format!("../../{name}")
+                    }
+                };
+                let project = serde_json::json!({
+                    "name": "private-place",
+                    "tree": {
+                        "$className": "DataModel",
+                        "ReplicatedStorage": {
+                            "$className": "ReplicatedStorage",
+                            "Packages": { "$path": mounted("Packages") }
+                        },
+                        "ServerScriptService": { "$path": mounted("Source") }
+                    }
+                });
+                let consumer = VfsSnapshot::file("return require('@packages/Maid')");
+                let source = if initializer {
+                    VfsSnapshot::dir([("Consumer", VfsSnapshot::dir([("init.luau", consumer)]))])
+                } else {
+                    VfsSnapshot::dir([("Consumer.luau", consumer)])
+                };
+                let mut memory = InMemoryFs::new();
+                memory
+                    .load_snapshot(
+                        root,
+                        VfsSnapshot::dir([
+                            (
+                                ".luaurc",
+                                VfsSnapshot::file(r#"{"aliases":{"packages":"Packages"}}"#),
+                            ),
+                            (
+                                ".local",
+                                VfsSnapshot::dir([(
+                                    "config",
+                                    VfsSnapshot::dir([(
+                                        "default.project.json",
+                                        VfsSnapshot::file(project.to_string()),
+                                    )]),
+                                )]),
+                            ),
+                            (
+                                "Packages",
+                                VfsSnapshot::dir([("Maid.luau", VfsSnapshot::file("return {}"))]),
+                            ),
+                            ("Source", source),
+                        ]),
+                    )
+                    .unwrap();
+                let session = ServeSession::new(Vfs::new(memory), &private).unwrap();
+                let source = find_source_by_name(&session, "Consumer").unwrap();
+                assert_eq!(
+                    source, r#"return require("@game/ReplicatedStorage/Packages/Maid")"#,
+                    "absolute {absolute}, initializer {initializer}"
+                );
+                let require_context = crate::serve_session::build_require_context_from_tree(
+                    &session.tree(),
+                    &private,
+                )
+                .unwrap();
+                let mut context = crate::snapshot::InstanceContext::default();
+                context.require_context = Some(require_context);
+                let path = root.join(if initializer {
+                    "Source/Consumer"
+                } else {
+                    "Source/Consumer.luau"
+                });
+                let live = super::super::snapshot_from_vfs(&context, session.vfs(), &path)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    live.properties.get(&rbx_dom_weak::ustr("Source")),
+                    Some(&rbx_dom_weak::types::Variant::String(source))
+                );
+                assert_eq!(
+                    live.metadata.source_transform.unwrap().original,
+                    "return require('@packages/Maid')"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn datamodel_aliases_without_runtime_mounts_fail_instead_of_emitting_filesystem_paths() {
+        let root = Path::new("/checkout");
+        let vfs = make_test_vfs(&[(
+            "/checkout/.luaurc",
+            r#"{"aliases":{"unmounted":"Unmapped"}}"#,
+        )]);
+        let info = ResolveInfo {
+            file_path: Path::new("/checkout/Source/Consumer.luau"),
+            vfs: &vfs,
+            path_mappings: &[],
+            project_root: root,
+        };
+        let error = resolve_requires_in_context("return require('@unmounted/Value')", &info, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("DataModel"));
+    }
+
+    #[test]
+    fn unmapped_datamodel_aliases_fail_initial_and_live_snapshots() {
+        use crate::snapshot::{InstanceContext, RequireContext};
+        use std::sync::Arc;
+
+        let root = Path::new("/checkout");
+        let path = root.join("Source/Consumer.luau");
+        let mut memory = InMemoryFs::new();
+        memory
+            .load_snapshot(
+                root,
+                VfsSnapshot::dir([
+                    (
+                        "default.project.json",
+                        VfsSnapshot::file(
+                            r#"{"name":"test","tree":{"$className":"DataModel","ServerScriptService":{"$path":"Source"}}}"#,
+                        ),
+                    ),
+                    (
+                        ".luaurc",
+                        VfsSnapshot::file(r#"{"aliases":{"unmounted":"Unmapped"}}"#),
+                    ),
+                    (
+                        "Source",
+                        VfsSnapshot::dir([(
+                            "Consumer.luau",
+                            VfsSnapshot::file("return require('@unmounted/Value')"),
+                        )]),
+                    ),
+                ]),
+            )
+            .unwrap();
+        let vfs = Vfs::new(memory.clone());
+        let error = match ServeSession::new(Vfs::new(memory), root) {
+            Ok(_) => panic!("An unmapped DataModel import must fail the initial build"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("not mounted in the DataModel"));
+        let mut context = InstanceContext::default();
+        context.require_context = Some(Arc::new(RequireContext {
+            datamodel: true,
+            path_mappings: vec![(root.join("Source"), vec!["ServerScriptService".into()])],
+            project_root: root.to_path_buf(),
+        }));
+        let error = super::super::lua::snapshot_lua(
+            &context,
+            &vfs,
+            &path,
+            "Consumer",
+            super::super::lua::ScriptType::Module,
+        )
+        .unwrap_err();
+        assert!(error.is::<UnmappedDataModelImport>());
+        assert!(format!("{error:#}").contains("Consumer.luau"));
     }
 
     #[test]

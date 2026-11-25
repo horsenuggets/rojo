@@ -18,8 +18,8 @@ use crate::{
     rojo_ref::merge_link_attributes,
     snapshot::{
         apply_patch_set, compute_patch_set, compute_saved_patch_set, compute_shallow_patch_set,
-        AppliedPatchSet, AppliedPatchUpdate, InstanceSnapshot, InstanceWithMeta, InstigatingSource,
-        PatchAdd, PatchSet, PatchUpdate, RojoTree, SnapshotReferents,
+        AppliedPatchSet, AppliedPatchUpdate, InstanceContext, InstanceSnapshot, InstanceWithMeta,
+        InstigatingSource, PatchAdd, PatchSet, PatchUpdate, RojoTree, SnapshotReferents,
     },
     snapshot_middleware::{
         snapshot_from_vfs, snapshot_project_node, snapshot_shallow_from_vfs, Middleware,
@@ -440,8 +440,20 @@ impl JobThreadContext {
             Some(snapshot)
         }
         let context = crate::serve_session::build_require_context_from_tree(tree, project_root)?;
-        if tree.root().metadata().context.require_context.as_deref() == Some(context.as_ref()) {
-            return Ok(None);
+        if let Some(previous) = tree.root().metadata().context.require_context.as_ref() {
+            if previous.as_ref() == context.as_ref()
+                && tree.descendants(tree.get_root_id()).all(|instance| {
+                    instance.metadata().context.reserved_cache_path().is_none()
+                        || instance
+                            .metadata()
+                            .context
+                            .require_context
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, previous))
+                })
+            {
+                return Ok(None);
+            }
         }
         let mut snapshot = {
             profiling::scope!("Rojo.SnapshotChangedMappings");
@@ -609,7 +621,9 @@ impl JobThreadContext {
                     .get_metadata(id)
                     .and_then(|metadata| metadata.instigating_source.as_ref())
                     .is_some_and(|source| source.path() != current_path);
-            if let Some(patch) = compute_changes(tree, &self.vfs, refresh_id, own_file) {
+            if let Some(patch) =
+                compute_changes_with_import_validation(tree, &self.vfs, refresh_id, own_file, true)
+            {
                 process(tree, patch);
             }
         }
@@ -735,7 +749,10 @@ impl JobThreadContext {
             } else {
                 // A directory-only fallback would still omit the external alias. A
                 // failed broader snapshot must not publish a partial local addition.
-                Some(compute_changes(tree, &self.vfs, scope, false).unwrap_or_default())
+                Some(
+                    compute_changes_with_import_validation(tree, &self.vfs, scope, false, true)
+                        .unwrap_or_default(),
+                )
             };
         }
         let mut context = metadata.context.clone();
@@ -751,7 +768,9 @@ impl JobThreadContext {
                 .get_or_insert_with(Default::default),
         )
         .push(canonical);
-        let snapshot = match snapshot_from_vfs(&context, &self.vfs, &entry) {
+        let snapshot = match snapshot_for_mapping_update(&context, true, |context| {
+            snapshot_from_vfs(context, &self.vfs, &entry)
+        }) {
             Ok(Some(snapshot)) => snapshot,
             // Gone again, or not something Rojo reads.
             Ok(None) => return Some(PatchSet::new()),
@@ -6888,11 +6907,41 @@ fn compute_and_apply_changes(
     })
 }
 
+fn snapshot_for_mapping_update(
+    context: &InstanceContext,
+    defer_import_validation: bool,
+    snapshot: impl Fn(&InstanceContext) -> anyhow::Result<Option<InstanceSnapshot>>,
+) -> anyhow::Result<Option<InstanceSnapshot>> {
+    match snapshot(context) {
+        Err(error)
+            if defer_import_validation
+                && error.is::<crate::snapshot_middleware::UnmappedDataModelImport>() =>
+        {
+            // A project edit can introduce mounts absent from the previous revision.
+            // Missing context forces candidate validation before anything is published.
+            let mut deferred = context.clone();
+            deferred.require_context = None;
+            snapshot(&deferred)
+        }
+        result => result,
+    }
+}
+
 /// Re-reads only the affected source. A shallow refresh leaves independently
 /// stored children to their own events. Preparing a diff must not mutate the tree,
 /// so mapping validation can still fail without exposing a partial revision.
 #[profiling::function]
 fn compute_changes(tree: &RojoTree, vfs: &Vfs, id: Ref, shallow: bool) -> Option<PatchSet> {
+    compute_changes_with_import_validation(tree, vfs, id, shallow, false)
+}
+
+fn compute_changes_with_import_validation(
+    tree: &RojoTree,
+    vfs: &Vfs,
+    id: Ref,
+    shallow: bool,
+    defer_import_validation: bool,
+) -> Option<PatchSet> {
     let metadata = tree
         .get_metadata(id)
         .expect("metadata missing for instance present in tree");
@@ -6918,11 +6967,17 @@ fn compute_changes(tree: &RojoTree, vfs: &Vfs, id: Ref, shallow: bool) -> Option
                 // path still exists. We can generate a snapshot starting at
                 // that path and use it as the source for our patch.
 
-                let snapshot = if shallow {
-                    snapshot_shallow_from_vfs(&metadata.context, vfs, path)
-                } else {
-                    snapshot_from_vfs(&metadata.context, vfs, path)
-                };
+                let snapshot = snapshot_for_mapping_update(
+                    &metadata.context,
+                    defer_import_validation,
+                    |context| {
+                        if shallow {
+                            snapshot_shallow_from_vfs(context, vfs, path)
+                        } else {
+                            snapshot_from_vfs(context, vfs, path)
+                        }
+                    },
+                );
                 let snapshot = match snapshot {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
@@ -6964,13 +7019,19 @@ fn compute_changes(tree: &RojoTree, vfs: &Vfs, id: Ref, shallow: bool) -> Option
             // there might be information associated with our instance from
             // the project file, we snapshot the entire project node again.
 
-            let snapshot_result = snapshot_project_node(
+            let snapshot_result = snapshot_for_mapping_update(
                 &metadata.context,
-                path,
-                name,
-                node,
-                vfs,
-                parent_class.as_ref().map(|name| name.as_str()),
+                defer_import_validation,
+                |context| {
+                    snapshot_project_node(
+                        context,
+                        path,
+                        name,
+                        node,
+                        vfs,
+                        parent_class.as_ref().map(|name| name.as_str()),
+                    )
+                },
             );
 
             let snapshot = match snapshot_result {
@@ -8603,6 +8664,150 @@ mod tests {
             .unwrap();
         *job.tree.lock().unwrap() = RojoTree::new(snapshot);
         job
+    }
+
+    #[test]
+    fn live_project_adds_external_import_mounts_before_validating_and_rejects_unmapped_edits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let external_temp = tempfile::tempdir().unwrap();
+        let external = external_temp.path().canonicalize().unwrap();
+        let job = mapping_refresh_job(&root);
+        let project_path = job.project().file_location.clone();
+        let mut project = serde_json::json!({
+            "name": "Test",
+            "tree": {
+                "$className": "DataModel",
+                "ServerScriptService": { "$path": "Source" }
+            }
+        });
+        job.vfs.write(&project_path, project.to_string()).unwrap();
+        job.handle_vfs_event(VfsEvent::Write(project_path.clone()));
+        assert!(
+            job.tree
+                .lock()
+                .unwrap()
+                .root()
+                .metadata()
+                .context
+                .require_context
+                .as_ref()
+                .unwrap()
+                .datamodel
+        );
+        job.vfs
+            .write(
+                external.join(".luaurc"),
+                serde_json::json!({
+                    "aliases": {
+                        "external": external,
+                        "unmounted": root.join("Unmapped")
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let entry = external.join("Entry.luau");
+        job.vfs
+            .write(&entry, "return require('@external/Value')")
+            .unwrap();
+        job.vfs
+            .write(external.join("Value.luau"), "return 42")
+            .unwrap();
+        // Direct internal calls receive the same canonical paths as watcher events.
+        let entry = job.vfs.canonicalize(&entry).unwrap();
+        let value_path = job.vfs.canonicalize(external.join("Value.luau")).unwrap();
+        project["tree"]["ReplicatedStorage"] = serde_json::json!({
+            "$className": "ReplicatedStorage",
+            "External": { "$path": external }
+        });
+        job.vfs.write(&project_path, project.to_string()).unwrap();
+        let cursor = job.message_queue.cursor();
+        job.handle_vfs_event(VfsEvent::Write(project_path));
+        let id = {
+            let tree = job.tree.lock().unwrap();
+            let instance = tree
+                .descendants(tree.get_root_id())
+                .find(|instance| instance.name() == "Entry")
+                .expect("The updated project must publish the new external mount");
+            assert_eq!(
+                instance.properties()[&ustr("Source")],
+                Variant::String(
+                    "return require(\"@game/ReplicatedStorage/External/Value\")".into()
+                )
+            );
+            assert!(job.message_queue.cursor() > cursor);
+            instance.id()
+        };
+        let cursor = job.message_queue.cursor();
+        job.vfs
+            .write(&value_path, "return require('@unmounted/Value')")
+            .unwrap();
+        {
+            let mut tree = job.tree.lock().unwrap();
+            let value_id = tree
+                .descendants(tree.get_root_id())
+                .find(|instance| instance.name() == "Value")
+                .unwrap()
+                .id();
+            assert!(tree
+                .get_instance(value_id)
+                .unwrap()
+                .metadata()
+                .source_transform
+                .is_none());
+            assert!(compute_and_apply_changes(
+                &job.message_queue,
+                &mut tree,
+                &job.vfs,
+                value_id,
+                false,
+            )
+            .is_none());
+            assert_eq!(
+                tree.get_instance(value_id).unwrap().properties()[&ustr("Source")],
+                Variant::String("return 42".into())
+            );
+            assert!(tree
+                .get_instance(value_id)
+                .unwrap()
+                .metadata()
+                .context
+                .require_context
+                .is_some());
+        }
+        assert_eq!(job.message_queue.cursor(), cursor);
+        job.vfs.write(&value_path, "return 42").unwrap();
+        job.vfs
+            .write(&entry, "return require('@unmounted/Value')")
+            .unwrap();
+        let error = job
+            .try_apply_patches_with_publication(entry.clone(), |_, _| {})
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("not mounted in the DataModel"));
+        assert_eq!(job.message_queue.cursor(), cursor);
+        assert_eq!(
+            job.tree
+                .lock()
+                .unwrap()
+                .get_instance(id)
+                .unwrap()
+                .properties()[&ustr("Source")],
+            Variant::String("return require(\"@game/ReplicatedStorage/External/Value\")".into())
+        );
+        job.vfs
+            .write(&entry, "return require('@external/Value'), 2")
+            .unwrap();
+        job.handle_vfs_event(VfsEvent::Write(entry));
+        assert_eq!(
+            job.tree
+                .lock()
+                .unwrap()
+                .get_instance(id)
+                .unwrap()
+                .properties()[&ustr("Source")],
+            Variant::String("return require(\"@game/ReplicatedStorage/External/Value\"), 2".into())
+        );
     }
 
     #[test]

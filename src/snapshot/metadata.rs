@@ -200,16 +200,15 @@ pub struct RequireContext {
     #[serde(serialize_with = "path_serializer::serialize_absolute")]
     pub project_root: PathBuf,
 
-    /// Maps filesystem paths (relative to project root) to their
-    /// DataModel path segments. Used to compute relative require
-    /// paths that match the DataModel tree structure rather than
-    /// the filesystem layout.
+    /// Maps normalized absolute filesystem paths to their DataModel path segments,
+    /// including mounts outside the project root. Used to compute require paths that
+    /// match the DataModel tree structure rather than the filesystem layout.
     ///
     /// For example, a project tree like:
     /// ```json
     /// { "Plugin": { "$path": "Source/Plugin" } }
     /// ```
-    /// produces: `("Source/Plugin", ["Plugin"])`
+    /// produces: `("<project-root>/Source/Plugin", ["Plugin"])`
     pub path_mappings: Vec<(PathBuf, Vec<String>)>,
     pub datamodel: bool,
 }
