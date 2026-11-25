@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.12`
+
 * Fixed runtime alias imports for projects with filesystem mounts outside their project
   directory, including relocated private build projects. Build and live-update resolution
   now retain external mounts and reject unmapped DataModel alias targets instead of
