@@ -8714,6 +8714,9 @@ mod tests {
         job.vfs
             .write(external.join("Value.luau"), "return 42")
             .unwrap();
+        // Direct internal calls receive the same canonical paths as watcher events.
+        let entry = job.vfs.canonicalize(&entry).unwrap();
+        let value_path = job.vfs.canonicalize(external.join("Value.luau")).unwrap();
         project["tree"]["ReplicatedStorage"] = serde_json::json!({
             "$className": "ReplicatedStorage",
             "External": { "$path": external }
@@ -8737,7 +8740,6 @@ mod tests {
             instance.id()
         };
         let cursor = job.message_queue.cursor();
-        let value_path = external.join("Value.luau");
         job.vfs
             .write(&value_path, "return require('@unmounted/Value')")
             .unwrap();
