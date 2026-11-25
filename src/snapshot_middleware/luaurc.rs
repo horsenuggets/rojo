@@ -279,18 +279,52 @@ pub(super) fn resolve_requires_with_mapping_index(
 
     for mut replacement in sorted {
         if datamodel {
-            let target =
-                mappings
-                    .mapped(&replacement.target)
-                    .ok_or_else(|| UnmappedDataModelImport {
+            let canonical =
+                canonicalize_alias_target(info.vfs, &replacement.target).map_err(|error| {
+                    anyhow::Error::new(UnmappedDataModelImport {
                         target: replacement.target.clone(),
-                    })?;
+                    })
+                    .context(error)
+                })?;
+            let target = mappings
+                .mapped(&canonical)
+                .ok_or_else(|| UnmappedDataModelImport {
+                    target: replacement.target.clone(),
+                })?;
             replacement.new_text = format!("require(\"@game/{}\")", target.join("/"));
         }
         result.replace_range(replacement.start..replacement.end, &replacement.new_text);
     }
 
     Ok(result)
+}
+
+// Extensionless module names are not filesystem entries. Resolve their script file or
+// closest existing ancestor so symlinks use the same spelling as collected mount paths.
+fn canonicalize_alias_target(vfs: &Vfs, target: &Path) -> std::io::Result<PathBuf> {
+    for suffix in ["", ".luau", ".lua"] {
+        let mut candidate = target.as_os_str().to_owned();
+        candidate.push(suffix);
+        match vfs.canonicalize(Path::new(&candidate)) {
+            Ok(canonical) => {
+                return Ok(if suffix.is_empty() {
+                    canonical
+                } else {
+                    canonical.with_extension("")
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for ancestor in target.ancestors().skip(1) {
+        match vfs.canonicalize(ancestor) {
+            Ok(canonical) => return Ok(canonical.join(target.strip_prefix(ancestor).unwrap())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(target.to_path_buf())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1827,6 +1861,80 @@ mod test {
                     "return require('@packages/Maid')"
                 );
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_external_mounts_resolve_extensionless_aliases() {
+        use std::{fs, os::unix::fs::symlink};
+
+        for (module, link_file) in [
+            ("Maid.luau", false),
+            ("Maid.lua", false),
+            ("Maid/init.luau", false),
+            ("Maid.luau", true),
+            ("Maid.lua", true),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("checkout with spaces");
+            let external = temporary.path().join("external packages");
+            fs::create_dir_all(root.join("Source")).unwrap();
+            fs::create_dir_all(external.join(module).parent().unwrap()).unwrap();
+            fs::write(external.join(module), "return {}").unwrap();
+            if link_file {
+                fs::create_dir(root.join("Packages")).unwrap();
+                symlink(external.join(module), root.join("Packages").join(module)).unwrap();
+            } else {
+                symlink(&external, root.join("Packages")).unwrap();
+            }
+            fs::create_dir(root.join("Unmapped")).unwrap();
+            fs::write(root.join("Unmapped/Maid.luau"), "return {}").unwrap();
+            fs::write(
+                root.join(".luaurc"),
+                r#"{"aliases":{"packages":"Packages","unmounted":"Unmapped"}}"#,
+            )
+            .unwrap();
+            let original = "return require('@packages/Maid')";
+            let consumer = root.join("Source/Consumer.luau");
+            fs::write(&consumer, original).unwrap();
+            fs::write(
+                root.join("default.project.json"),
+                r#"{"name":"test","tree":{"$className":"DataModel","ReplicatedStorage":{"$className":"ReplicatedStorage","Packages":{"$path":"Packages"}},"ServerScriptService":{"$path":"Source"}}}"#,
+            )
+            .unwrap();
+            let session =
+                ServeSession::new(Vfs::new(memofs::StdBackend::new().unwrap()), &root).unwrap();
+            let expected = r#"return require("@game/ReplicatedStorage/Packages/Maid")"#;
+            assert_eq!(find_source_by_name(&session, "Consumer").unwrap(), expected);
+            let context =
+                crate::serve_session::build_require_context_from_tree(&session.tree(), &root)
+                    .unwrap();
+            let consumer = session.vfs().canonicalize(consumer).unwrap();
+            let info = ResolveInfo {
+                file_path: &consumer,
+                vfs: session.vfs(),
+                path_mappings: &context.path_mappings,
+                project_root: &root,
+            };
+            assert_eq!(
+                resolve_requires_in_context(original, &info, true).unwrap(),
+                expected
+            );
+            let mut live_context = crate::snapshot::InstanceContext::default();
+            live_context.require_context = Some(context.clone());
+            let live = super::super::snapshot_from_vfs(&live_context, session.vfs(), &consumer)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                live.properties.get(&ustr("Source")),
+                Some(&Variant::String(expected.into()))
+            );
+            assert_eq!(live.metadata.source_transform.unwrap().original, original);
+            let error =
+                resolve_requires_in_context("return require('@unmounted/Maid')", &info, true)
+                    .unwrap_err();
+            assert!(error.is::<UnmappedDataModelImport>());
         }
     }
 
