@@ -147,6 +147,21 @@ struct PathMappings<'a> {
 }
 
 impl PathMappings<'_> {
+    fn contains_mount(self, path: &Path) -> bool {
+        let normalized = crate::package_sources::normalize(&self.root.join(path));
+        if let Some(index) = self.index {
+            return index.prefixes.contains_key(normalized.as_path());
+        }
+        self.paths.iter().any(|(mount, _)| {
+            let mount = crate::package_sources::normalize(&self.root.join(mount));
+            mount == normalized
+                || (matches!(
+                    mount.extension().and_then(|extension| extension.to_str()),
+                    Some("lua" | "luau")
+                ) && mount.with_extension("") == normalized)
+        })
+    }
+
     fn mapped(self, path: &Path) -> Option<Vec<String>> {
         match self.index {
             Some(index) => index.mapped(path, self.root),
@@ -279,8 +294,8 @@ pub(super) fn resolve_requires_with_mapping_index(
 
     for mut replacement in sorted {
         if datamodel {
-            let canonical =
-                canonicalize_alias_target(info.vfs, &replacement.target).map_err(|error| {
+            let canonical = canonicalize_alias_target(info.vfs, &replacement.target, mappings)
+                .map_err(|error| {
                     anyhow::Error::new(UnmappedDataModelImport {
                         target: replacement.target.clone(),
                     })
@@ -301,17 +316,44 @@ pub(super) fn resolve_requires_with_mapping_index(
 
 // Extensionless module names are not filesystem entries. Resolve their script file or
 // closest existing ancestor so symlinks use the same spelling as collected mount paths.
-fn canonicalize_alias_target(vfs: &Vfs, target: &Path) -> std::io::Result<PathBuf> {
+// Init files retain their directory-owned watch identity instead of their link destination.
+fn canonicalize_alias_target(
+    vfs: &Vfs,
+    target: &Path,
+    mappings: PathMappings,
+) -> std::io::Result<PathBuf> {
     for suffix in ["", ".luau", ".lua"] {
         let mut candidate = target.as_os_str().to_owned();
         candidate.push(suffix);
-        match vfs.canonicalize(Path::new(&candidate)) {
+        let candidate = Path::new(&candidate);
+        if let (Some(parent), Some(name)) = (candidate.parent(), candidate.file_name()) {
+            match vfs.canonicalize(parent) {
+                Ok(parent) => {
+                    let owned = parent.join(name);
+                    if mappings.contains_mount(&owned) {
+                        return Ok(owned);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match vfs.canonicalize(candidate) {
             Ok(canonical) => {
-                return Ok(if suffix.is_empty() {
-                    canonical
-                } else {
-                    canonical.with_extension("")
-                });
+                return Ok(
+                    if !suffix.is_empty()
+                        && matches!(
+                            canonical
+                                .extension()
+                                .and_then(|extension| extension.to_str()),
+                            Some("lua" | "luau")
+                        )
+                    {
+                        canonical.with_extension("")
+                    } else {
+                        canonical
+                    },
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -1869,22 +1911,39 @@ mod test {
     fn symlinked_external_mounts_resolve_extensionless_aliases() {
         use std::{fs, os::unix::fs::symlink};
 
-        for (module, link_file) in [
-            ("Maid.luau", false),
-            ("Maid.lua", false),
-            ("Maid/init.luau", false),
-            ("Maid.luau", true),
-            ("Maid.lua", true),
+        for (module, destination, link_file, import) in [
+            ("Maid.luau", "Maid.luau", false, "@packages/Maid"),
+            ("Maid.lua", "Maid.lua", false, "@packages/Maid"),
+            ("Maid/init.luau", "Maid/init.luau", false, "@packages/Maid"),
+            ("Maid.luau", "Maid.luau", true, "@packages/Maid"),
+            ("Maid.lua", "Maid.lua", true, "@packages/Maid"),
+            ("Maid.luau", "implementation.txt", true, "@packages/Maid"),
+            (
+                "Maid/init.luau",
+                "implementation.luau",
+                true,
+                "@packages/Maid/init",
+            ),
+            (
+                "Maid/init.luau",
+                "implementation.luau",
+                true,
+                "@packages/Maid/init.luau",
+            ),
         ] {
             let temporary = tempfile::tempdir().unwrap();
             let root = temporary.path().join("checkout with spaces");
             let external = temporary.path().join("external packages");
             fs::create_dir_all(root.join("Source")).unwrap();
-            fs::create_dir_all(external.join(module).parent().unwrap()).unwrap();
-            fs::write(external.join(module), "return {}").unwrap();
+            fs::create_dir_all(external.join(destination).parent().unwrap()).unwrap();
+            fs::write(external.join(destination), "return {}").unwrap();
             if link_file {
-                fs::create_dir(root.join("Packages")).unwrap();
-                symlink(external.join(module), root.join("Packages").join(module)).unwrap();
+                fs::create_dir_all(root.join("Packages").join(module).parent().unwrap()).unwrap();
+                symlink(
+                    external.join(destination),
+                    root.join("Packages").join(module),
+                )
+                .unwrap();
             } else {
                 symlink(&external, root.join("Packages")).unwrap();
             }
@@ -1895,9 +1954,9 @@ mod test {
                 r#"{"aliases":{"packages":"Packages","unmounted":"Unmapped"}}"#,
             )
             .unwrap();
-            let original = "return require('@packages/Maid')";
+            let original = format!("return require('{import}')");
             let consumer = root.join("Source/Consumer.luau");
-            fs::write(&consumer, original).unwrap();
+            fs::write(&consumer, &original).unwrap();
             fs::write(
                 root.join("default.project.json"),
                 r#"{"name":"test","tree":{"$className":"DataModel","ReplicatedStorage":{"$className":"ReplicatedStorage","Packages":{"$path":"Packages"}},"ServerScriptService":{"$path":"Source"}}}"#,
@@ -1918,7 +1977,7 @@ mod test {
                 project_root: &root,
             };
             assert_eq!(
-                resolve_requires_in_context(original, &info, true).unwrap(),
+                resolve_requires_in_context(&original, &info, true).unwrap(),
                 expected
             );
             let mut live_context = crate::snapshot::InstanceContext::default();
