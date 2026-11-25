@@ -107,6 +107,10 @@ fn snapshot_lua_source(
             package_dependencies,
         ) {
             Ok(resolved) => resolved,
+            Err(err) if err.is::<luaurc::UnmappedDataModelImport>() => {
+                return Err(err)
+                    .with_context(|| format!("Cannot resolve imports in {}", path.display()));
+            }
             Err(err) => {
                 log::warn!("Failed to resolve requires in {}: {}", path.display(), err);
                 contents.as_str().to_string()

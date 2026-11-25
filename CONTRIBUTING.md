@@ -26,7 +26,7 @@ You'll want these tools to work on Rojo:
 * [Rokit](https://github.com/rojo-rbx/rokit)
 * [Luau Language Server](https://github.com/JohnnyMorganz/luau-lsp) (Only needed if working on the Studio plugin.)
 
-Rokit installs the pinned Rojo, Selene, StyLua, Lune, and run-in-roblox versions listed in [`rokit.toml`](rokit.toml):
+Rokit installs the pinned Rojo, Selene, StyLuau, Lune, and run-in-roblox versions listed in [`rokit.toml`](rokit.toml):
 
 ```bash
 rokit install
@@ -38,7 +38,7 @@ Before opening a pull request, run the relevant checks:
 cargo test
 cargo fmt -- --check
 cargo clippy
-stylua --check plugin/src
+styluau --check plugin/src
 selene plugin/src
 ```
 

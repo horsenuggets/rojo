@@ -2,6 +2,6 @@
 luau-lsp = "horsenuggets/luau-lsp@1.70.1-horse.2.0"
 rojo = "horsenuggets/rojo@7.7.1-horse.2.10"
 selene = "kampfkarren/selene@0.32.0"
-stylua = "johnnymorganz/stylua@2.6.0"
+styluau = "horsenuggets/styluau@2.6.0-horse.1.0"
 run-in-roblox = "rojo-rbx/run-in-roblox@0.3.0"
 lune = "lune-org/lune@0.10.4"

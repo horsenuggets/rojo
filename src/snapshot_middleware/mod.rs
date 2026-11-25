@@ -20,7 +20,7 @@ mod txt;
 mod util;
 mod yaml;
 
-pub(crate) use luaurc::SourceSerializationDeferred;
+pub(crate) use luaurc::{SourceSerializationDeferred, UnmappedDataModelImport};
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -66,7 +66,10 @@ pub(crate) fn prepare_requires(
     require_context: &std::sync::Arc<crate::snapshot::RequireContext>,
 ) -> anyhow::Result<()> {
     profiling::scope!("Rojo.PrepareProjectImports");
-    let mappings = luaurc::PathMappingIndex::new(&require_context.path_mappings);
+    let mappings = luaurc::PathMappingIndex::new(
+        &require_context.path_mappings,
+        &require_context.project_root,
+    );
     prepare_requires_with_index(snapshot, vfs, require_context, &mappings)
 }
 
@@ -115,6 +118,10 @@ fn prepare_requires_with_index(
                     *source = emitted.clone();
                     snapshot.metadata.source_transform = (emitted != original)
                         .then_some(crate::snapshot::SourceTransform { original, emitted });
+                }
+                Err(error) if error.is::<luaurc::UnmappedDataModelImport>() => {
+                    return Err(error)
+                        .with_context(|| format!("Cannot resolve imports in {}", path.display()));
                 }
                 Err(error) => {
                     resolved = false;
