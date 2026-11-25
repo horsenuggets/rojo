@@ -1137,6 +1137,37 @@ mod test {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_external_mappings_match_verbatim_and_compatible_targets() {
+        let root = Path::new(r"C:\checkout with spaces\.local\config");
+        for mount in [
+            r"C:\checkout with spaces\Packages",
+            r"\\?\C:\checkout with spaces\Packages",
+        ] {
+            let mappings = vec![(
+                PathBuf::from(mount),
+                vec!["ReplicatedStorage".into(), "Packages".into()],
+            )];
+            let index = PathMappingIndex::new(&mappings, root);
+            for query in [
+                r"C:\checkout with spaces\Packages\Maid",
+                r"\\?\C:\checkout with spaces\Packages\Maid",
+            ] {
+                let expected = Some(vec![
+                    "ReplicatedStorage".into(),
+                    "Packages".into(),
+                    "Maid".into(),
+                ]);
+                assert_eq!(index.mapped(Path::new(query), root), expected);
+                assert_eq!(
+                    mapped_datamodel_path(Path::new(query), &mappings, root),
+                    expected
+                );
+            }
+        }
+    }
+
     #[test]
     fn indexed_lookup_work_is_bounded_by_path_depth_not_mapping_count() {
         let root = Path::new("/root");
