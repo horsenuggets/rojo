@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.13`
+
 * Added `rojo serve --sync-direction` with `fs-to-studio`, `studio-to-fs`, and
   `bidirectional` modes. Filesystem-only sessions refuse Studio writes. Studio-only
   sessions save Studio edits with Studio authority, keep editor state across reconnects,
