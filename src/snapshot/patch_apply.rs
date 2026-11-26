@@ -81,28 +81,44 @@ pub fn validate_patch_set(tree: &RojoTree, patch_set: &PatchSet) -> anyhow::Resu
     };
 
     // Any cycle in the final graph runs through a reparented instance, so walking
-    // up from each of them finds every cycle.
+    // up from each of them finds every cycle. Instances already proven to reach the
+    // root end later walks, so a batch visits each ancestor at most once.
+    let mut reaches_root: HashSet<Ref> = HashSet::new();
     for &start in parents.keys() {
+        let mut path = Vec::new();
         let mut visiting = HashSet::new();
         let mut current = start;
-        while current != root {
+        while current != root && !reaches_root.contains(&current) {
             anyhow::ensure!(visiting.insert(current), "Patch would create a cycle");
+            path.push(current);
             current = final_parent(current);
         }
+        reaches_root.extend(path);
     }
 
-    // Resolve against the final graph, not update order or the old ancestry.
-    let survives = |id: Ref| -> bool {
+    // Resolve against the final graph, not update order or the old ancestry. Each
+    // ancestor's answer is cached, so siblings share one walk instead of repeating it.
+    let mut survival: HashMap<Ref, bool> = HashMap::new();
+    let mut survives = |id: Ref| -> bool {
+        let mut path = Vec::new();
         let mut current = id;
-        loop {
+        let result = loop {
+            if let Some(&known) = survival.get(&current) {
+                break known;
+            }
             if removed.contains(&current) {
-                return false;
+                break false;
             }
             if current == root {
-                return true;
+                break true;
             }
+            path.push(current);
             current = final_parent(current);
+        };
+        for visited in path {
+            survival.insert(visited, result);
         }
+        result
     };
     for update in &patch_set.updated_instances {
         anyhow::ensure!(
@@ -649,6 +665,46 @@ mod test {
             accepted > 1_000 && rejected > 1_000,
             "{accepted} {rejected}"
         );
+    }
+
+    #[test]
+    fn deep_batches_validate_siblings_and_removed_subtrees_correctly() {
+        // Many updates under one deep chain share ancestry. Caching must neither
+        // repeat those walks nor carry a removed ancestor's answer to survivors.
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root"));
+        let mut parent = tree.get_root_id();
+        let mut chain = Vec::new();
+        for depth in 0..400 {
+            parent =
+                tree.insert_instance(parent, InstanceSnapshot::new().name(format!("D{depth}")));
+            chain.push(parent);
+        }
+        let leaves: Vec<_> = (0..400)
+            .map(|index| {
+                tree.insert_instance(parent, InstanceSnapshot::new().name(format!("L{index}")))
+            })
+            .collect();
+        let update = |id| PatchUpdate {
+            id,
+            changed_name: None,
+            changed_class_name: None,
+            changed_parent: None,
+            changed_properties: UstrMap::default(),
+            changed_metadata: None,
+        };
+        let mut patch = PatchSet::new();
+        patch.removed_instances.push(leaves[0]);
+        patch.updated_instances = leaves[1..].iter().map(|&id| update(id)).collect();
+        assert!(validate_patch_set(&tree, &patch).is_ok());
+        assert_eq!(
+            validate_patch_set(&tree, &patch).is_ok(),
+            validate_against_whole_tree(&tree, &patch)
+        );
+
+        // Removing a middle ancestor removes every leaf, including the cached siblings.
+        patch.removed_instances = vec![chain[200]];
+        assert!(validate_patch_set(&tree, &patch).is_err());
+        assert!(!validate_against_whole_tree(&tree, &patch));
     }
 
     #[test]
