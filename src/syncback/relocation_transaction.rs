@@ -3862,14 +3862,17 @@ mod tests {
     #[test]
     fn startup_refuses_only_unfinished_journals_that_write_outside_their_project() {
         for real in [false, true] {
-            let (fs, temp, directory, mut journal) =
+            let (fs, _temp, directory, mut journal) =
                 prepared_script_migration_fixture(real, false, false);
             let commit = fs.read(directory.join("commit")).unwrap();
             let truth = [(true, false), (false, false), (true, true), (false, true)];
             for (finished, outside) in truth {
                 if outside {
                     let root = journal.script.as_ref().unwrap().project.parent().unwrap();
-                    let elsewhere = temp.path().join("elsewhere");
+                    // A sibling of the project root is outside it on every platform.
+                    let mut name = root.file_name().unwrap().to_owned();
+                    name.push("-elsewhere");
+                    let elsewhere = root.parent().unwrap().join(name);
                     for entry in &mut journal.entries {
                         if entry.path.starts_with(root) {
                             let name = entry.path.file_name().unwrap().to_owned();
