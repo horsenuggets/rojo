@@ -12,7 +12,7 @@ use reqwest::blocking::{Client, Response};
 
 use crate::web::{
     export::{CaptureResult, ExportRequest, Scope, CAPTURE_TIMEOUT},
-    interface::{ServerInfoResponse, PROTOCOL_VERSION},
+    interface::{ServerInfoResponse, DIRECTIONAL_PROTOCOL_VERSION, PROTOCOL_VERSION},
     util::{deserialize_msgpack, serialize_msgpack},
 };
 
@@ -81,8 +81,8 @@ impl ExportCommand {
             1024 * 1024,
         )?)
         .context("Could not read Rojo+ server information")?;
-        if info.protocol_version != PROTOCOL_VERSION {
-            bail!("Live export needs matching plugin and server protocol versions. Expected {PROTOCOL_VERSION}, received {}.", info.protocol_version);
+        if !supports_export_protocol(info.protocol_version) {
+            bail!("Live export needs a server speaking protocol {PROTOCOL_VERSION} or {DIRECTIONAL_PROTOCOL_VERSION}. Received {}.", info.protocol_version);
         }
         let request = ExportRequest {
             session_id: info.session_id,
@@ -119,6 +119,11 @@ impl ExportCommand {
         );
         Ok(())
     }
+}
+
+/// Direction sessions only change live-sync traffic, so export works with both protocols.
+fn supports_export_protocol(version: u64) -> bool {
+    version == PROTOCOL_VERSION || version == DIRECTIONAL_PROTOCOL_VERSION
 }
 
 /// Replaces `output` atomically with `bytes`, so readers see either the old file
@@ -735,6 +740,35 @@ mod tests {
         assert!(blocked.is_dir());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
         assert_eq!(std::fs::read(&output).unwrap(), b"new export");
+    }
+
+    #[test]
+    fn export_accepts_ordinary_and_directional_protocols_only() {
+        for version in 0..=20 {
+            assert_eq!(
+                supports_export_protocol(version),
+                version == PROTOCOL_VERSION || version == DIRECTIONAL_PROTOCOL_VERSION
+            );
+        }
+        assert!(supports_export_protocol(12) && supports_export_protocol(13));
+    }
+
+    #[test]
+    fn server_info_without_direction_fields_still_parses() {
+        let info: ServerInfoResponse = serde_json::from_value(serde_json::json!({
+            "sessionId": crate::session_id::SessionId::new(),
+            "serverVersion": "7.7.1",
+            "protocolVersion": 12,
+            "projectName": "Older",
+            "expectedPlaceIds": null,
+            "unexpectedPlaceIds": null,
+            "gameId": null,
+            "placeId": null,
+            "rootInstanceId": rbx_dom_weak::types::Ref::new(),
+        }))
+        .unwrap();
+        assert!(info.sync_direction.is_none());
+        assert!(info.supported_sync_directions.is_empty());
     }
 
     #[test]

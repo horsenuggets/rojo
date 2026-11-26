@@ -1,6 +1,6 @@
 [package]
 name = "rojo"
-version = "7.7.1-horse.2.12"
+version = "7.7.1-horse.2.13"
 rust-version = "1.89"
 authors = [
     "Lucien Greathouse <me@lpghatguy.com>",
@@ -139,6 +139,7 @@ maplit = "1.0.2"
 semver = "1.0.22"
 
 [dev-dependencies]
+memofs = { version = "0.4.0", path = "crates/memofs", features = ["test-support"] }
 rojo-insta-ext = { path = "crates/rojo-insta-ext" }
 
 criterion = "0.3.6"

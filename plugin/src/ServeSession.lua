@@ -15,6 +15,8 @@ local Promise = require(Packages.Promise)
 local Timer = require(script.Parent.Timer)
 
 local ChangeBatcher = require(script.Parent.ChangeBatcher)
+local Config = require(script.Parent.Config)
+local DirectionPolicy = require(script.Parent.DirectionPolicy)
 local encodePatchUpdate = require(script.Parent.ChangeBatcher.encodePatchUpdate)
 local getWritablePropertyDescriptor = require(script.Parent.ChangeBatcher.getWritablePropertyDescriptor)
 local InstanceMap = require(script.Parent.InstanceMap)
@@ -200,6 +202,7 @@ local validateServeOptions = t.strictInterface({
 	-- Pins the authority for this session, so a live edit place always resolves
 	-- conflicts in favor of the filesystem without changing the user's setting.
 	twoWaySyncAuthority = t.optional(t.string),
+	liveEditMarker = t.optional(t.table),
 })
 
 function ServeSession.new(options)
@@ -215,13 +218,46 @@ function ServeSession.new(options)
 		self:__onChildAdded(child)
 	end
 
-	-- Each batch keeps the cursor it started from, taken before preparing it
-	-- yields, since an edit made meanwhile starts the next batch.
-	local function onBatchTaken(changes)
-		local cursor = self.__pendingWriteCursor
-		self.__pendingWriteCursor = nil
-		local dependencies = self.__pendingWriteDependencies or {}
-		self.__pendingWriteDependencies = nil
+	-- Capture before detachments are held, even if nothing is ready to send. Held
+	-- intent must not acquire a newer publication cursor or predecessor on expiry.
+	local function takeBatchContext()
+		local cursor, dependencies = self.__pendingWriteCursor, self.__pendingWriteDependencies
+		self.__pendingWriteCursor, self.__pendingWriteDependencies = nil, nil
+		if cursor == nil and dependencies == nil then
+			return nil
+		end
+		return { cursor = cursor, dependencies = dependencies or {} }
+	end
+
+	local function mergeBatchContexts(previous, current)
+		if previous == nil then
+			return current
+		elseif current == nil then
+			return previous
+		end
+		-- Tickets intersect these predecessors' lineages, so merging cannot grant
+		-- effects from a later write that the held intent never depended on.
+		local dependencies = table.clone(previous.dependencies)
+		for _, dependency in current.dependencies do
+			if not table.find(dependencies, dependency) then
+				table.insert(dependencies, dependency)
+			end
+		end
+		return {
+			cursor = if previous.cursor == nil
+				then current.cursor
+				elseif current.cursor == nil then previous.cursor
+				else math.min(previous.cursor, current.cursor),
+			dependencies = dependencies,
+		}
+	end
+
+	-- Only a batch ready for encoding reserves a write ticket. Capturing a held
+	-- context cannot grant a capability for changes that were never sent.
+	local function onBatchTaken(changes, context)
+		context = context or takeBatchContext()
+		local cursor = context and context.cursor
+		local dependencies = if context then context.dependencies else {}
 		-- Install before encoding can yield. Edits during preparation depend on this
 		-- placeholder, not on whichever HTTP response happens to arrive next.
 		local ticket = self:__newWriteTicket(dependencies)
@@ -229,6 +265,9 @@ function ServeSession.new(options)
 	end
 
 	local function onBatchPrepared(patch, context)
+		if self.__suspended then
+			return
+		end
 		-- Encoding just finished. Replaying omitted properties below runs precommit
 		-- hooks that may yield while a publication replaces or removes a target.
 		if patch ~= nil then
@@ -246,7 +285,10 @@ function ServeSession.new(options)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged, onChildAdded)
-	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken, onBatchPrepared)
+	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed, onBatchTaken, onBatchPrepared, nil, {
+		take = takeBatchContext,
+		merge = mergeBatchContexts,
+	})
 	local reconciler = Reconciler.new(instanceMap)
 
 	local connections = {}
@@ -264,7 +306,9 @@ function ServeSession.new(options)
 		__status = Status.NotStarted,
 		__apiContext = options.apiContext,
 		__twoWaySync = options.twoWaySync,
+		__configuredTwoWaySync = options.twoWaySync,
 		__twoWaySyncAuthority = options.twoWaySyncAuthority,
+		__liveEditMarker = options.liveEditMarker,
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
 		__changeBatcher = changeBatcher,
@@ -325,6 +369,90 @@ function ServeSession:getStatus()
 	return self.__status
 end
 
+function ServeSession:getSyncDirection()
+	return self.__syncDirection
+end
+
+function ServeSession:getResumeKey()
+	return self.__resumeKey
+end
+
+-- The retained object owns real references and live Source observation generations.
+-- Reconstructing a map by names here would lose moves, detachments and editor-only nodes.
+function ServeSession:resume(apiContext, marker)
+	assert(self.__suspended, "Only a suspended directional session can resume.")
+	self.__apiContext = apiContext
+	self.__liveEditMarker = marker
+end
+
+function ServeSession:__negotiateDirection(serverInfo)
+	local direction = DirectionPolicy.negotiate(
+		serverInfo,
+		self.__liveEditMarker,
+		if self.__configuredTwoWaySync ~= nil then self.__configuredTwoWaySync else self.__twoWaySync
+	)
+	if self.__resumeKey ~= nil then
+		local key = DirectionPolicy.resumeKey(self.__apiContext:getBaseUrl(), serverInfo.sessionId, direction)
+		assert(
+			key == self.__resumeKey,
+			"The resumable server identity or direction changed. Drafts were preserved. Rebuild a fresh place."
+		)
+		if direction == "studio-to-fs" then
+			assert(
+				workspace:GetAttribute(Config.liveEditBootstrapAttribute) == serverInfo.sessionId,
+				"The place's Studio-only bootstrap identity changed. Drafts were preserved; automatic takeover was refused."
+			)
+		end
+		assert(
+			self.__initialSyncComplete and not self.__resumeBlocked,
+			"This directional session has an ambiguous unfinished operation. Drafts and instance identities were retained. Preserve this place and export the drafts before rebuilding a fresh live edit place; automatic replay is unsafe."
+		)
+	end
+	self.__syncDirection = direction
+	self.__twoWaySync = direction ~= "fs-to-studio"
+	self.__apiContext.__syncDirection = direction
+	if self.__resumeKey == nil and self.__liveEditMarker and self.__liveEditMarker.sessionId ~= nil then
+		if direction == "studio-to-fs" then
+			assert(
+				workspace:GetAttribute(Config.liveEditBootstrapAttribute) == nil,
+				"This Studio-only place was already bootstrapped, but its in-memory instance identities are unavailable. Preserve or export its drafts, then generate a fresh live edit place. Automatic takeover was refused."
+			)
+		end
+		self.__resumeKey = DirectionPolicy.resumeKey(self.__apiContext:getBaseUrl(), serverInfo.sessionId, direction)
+		if direction == "studio-to-fs" then
+			-- Claim before hydration, including a startup interrupted mid-walk.
+			workspace:SetAttribute(Config.liveEditBootstrapAttribute, serverInfo.sessionId)
+		end
+	end
+	if self.__suspended then
+		for instance in self.__instanceMap.sourceConnections or {} do
+			assert(
+				self.__instanceMap:getSourceRevision(instance) ~= nil,
+				"A retained Source observation lease was replaced. Drafts were preserved; automatic identity takeover is unsafe. Preserve/export this place before rebuilding."
+			)
+		end
+		self.__apiContext:setMessageCursor(self.__resumeCursor)
+	end
+end
+
+-- Permanent teardown is distinct from a resumable disconnect. App unload must release
+-- all retained references, leaving only the saved bootstrap refusal marker in the place.
+function ServeSession:destroy()
+	self.__resumeKey = nil
+	self.__suspended = nil
+	if self.__status ~= Status.Disconnected then
+		self:__stopInternal()
+	else
+		self.__instanceMap:stop()
+		self.__changeBatcher:stop()
+		for _, connection in self.__connections do
+			connection:Disconnect()
+		end
+		self.__connections = {}
+		self.__localPropertyEdits = nil
+	end
+end
+
 --[[
 	The initial sync yields while it walks the place, so Studio edits can arrive
 	while only part of it is known. Sending one then would judge it against a
@@ -349,7 +477,7 @@ function ServeSession:__onSourceScheduled(instance, operation)
 		Instance = instance,
 		BeforeDraft = self.__sourceDrafts[id],
 		BeforeEntry = properties and properties.Source,
-		BeforeRevision = self:__sourceRevision(id, instance),
+		BeforeRevision = if self.__syncDirection ~= "fs-to-studio" then self:__sourceRevision(id, instance) else nil,
 		Operation = operation,
 	}
 	pending.Promise = Promise.new(function(resolve)
@@ -396,7 +524,12 @@ function ServeSession:__onSourceOutcome(instance, operation)
 	local remaining = self.__sourcePendingCounts[instance] - 1
 	self.__sourcePendingCounts[instance] = if remaining > 0 then remaining else nil
 	local id = pending.Id
-	if self.__status ~= Status.Disconnected and self.__instanceMap.fromIds[id] == instance then
+	if
+		self.__syncDirection ~= "fs-to-studio"
+		and not self.__suspended
+		and self.__status ~= Status.Disconnected
+		and self.__instanceMap.fromIds[id] == instance
+	then
 		local properties = self.__localPropertyEdits and self.__localPropertyEdits[id]
 		local observed = pending.Observation
 		local visible, current = pcall(self.__readEditorSource, self, instance)
@@ -468,7 +601,8 @@ function ServeSession:__awaitSourceOperations(operations)
 				end
 				local instance = self.__instanceMap.fromIds[pending.Id]
 				if
-					instance == pending.Instance
+					self.__syncDirection ~= "fs-to-studio"
+					and instance == pending.Instance
 					and self.__sourceHistory:classify(
 							pending.Id,
 							operation.ServerOperation,
@@ -523,6 +657,8 @@ function ServeSession:__onInstanceChanged(instance, propertyName, observation)
 			return
 		end
 		if observation.Error ~= nil then
+			-- An unreadable offline observation cannot be recovered by name hydration.
+			self.__resumeBlocked = true
 			self:__stopInternal("The current editor Source could not be read safely.")
 			return
 		end
@@ -610,6 +746,175 @@ function ServeSession:__markBatchStart()
 	end
 end
 
+--[[
+	Studio-only sync never applies a withheld disk change, and Studio wins its writes.
+	Remember which instances differ on disk so a save that replaces one says so.
+]]
+function ServeSession:__withholdPublication(patch, publicationCursor)
+	if self.__syncDirection ~= "studio-to-fs" then
+		return
+	end
+	local withheld = self.__withheldFilesystemTargets or {}
+	self.__withheldFilesystemTargets = withheld
+	for id, entry in withheld do
+		if self.__instanceMap.fromIds[id] ~= entry.Instance then
+			withheld[id] = nil
+		end
+	end
+	local cursor = publicationCursor or self.__apiContext:getMessageCursor()
+	local function target(id)
+		local instance = self.__instanceMap.fromIds[id]
+		if instance == nil then
+			return nil
+		end
+		local entry = withheld[id]
+		if entry == nil then
+			entry = { Instance = instance, Fields = {} }
+			withheld[id] = entry
+		end
+		return entry
+	end
+	for _, update in patch.updated do
+		local changed = update.changedName ~= nil
+			or update.changedClassName ~= nil
+			or update.changedParent ~= nil
+			or (update.changedProperties ~= nil and next(update.changedProperties) ~= nil)
+		local entry = if changed then target(update.id) else nil
+		if entry ~= nil then
+			if update.changedName ~= nil then
+				entry.Fields.Name = cursor
+			end
+			if update.changedClassName ~= nil then
+				entry.Fields.ClassName = cursor
+			end
+			if update.changedParent ~= nil then
+				entry.Fields.Parent = cursor
+			end
+			for property in update.changedProperties or {} do
+				entry.Fields[property] = cursor
+			end
+		end
+	end
+	for _, id in patch.removed do
+		local entry = target(id)
+		if entry ~= nil then
+			entry.Removed = cursor
+		end
+	end
+end
+
+-- Receipt, not application, orders notices against HTTP acknowledgements. Applying a
+-- Studio publication can itself wait for the write acknowledgement to release drafts.
+function ServeSession:__receiveNoticePublications(cursor)
+	if self.__syncDirection ~= "studio-to-fs" then
+		return
+	end
+	self.__noticePublicationCursor = math.max(self.__noticePublicationCursor or 0, cursor)
+	local waiters = self.__noticePublicationWaiters
+	if waiters == nil then
+		return
+	end
+	local ready = {}
+	for waiter in waiters do
+		if waiter.Cursor <= self.__noticePublicationCursor then
+			waiters[waiter] = nil
+			table.insert(ready, waiter)
+		end
+	end
+	if next(waiters) == nil then
+		self.__noticePublicationWaiters = nil
+	end
+	for _, waiter in ready do
+		waiter.Resolve()
+	end
+end
+
+function ServeSession:__awaitNoticePublications(cursor)
+	if self.__syncDirection ~= "studio-to-fs" or (self.__noticePublicationCursor or 0) >= cursor then
+		return nil
+	end
+	return Promise.new(function(resolve, reject, onCancel)
+		local waiters = self.__noticePublicationWaiters or {}
+		self.__noticePublicationWaiters = waiters
+		local waiter = { Cursor = cursor, Resolve = resolve, Reject = reject }
+		waiters[waiter] = true
+		onCancel(function()
+			waiters[waiter] = nil
+			if self.__noticePublicationWaiters == waiters and next(waiters) == nil then
+				self.__noticePublicationWaiters = nil
+			end
+		end)
+	end)
+end
+
+-- Only acknowledged fields count. A newer disk publication must survive an older
+-- write response, and writing Source does not mean a disk rename was replaced.
+function ServeSession:__replacedFilesystemNotices(result)
+	local withheld = self.__withheldFilesystemTargets
+	if
+		self.__syncDirection ~= "studio-to-fs"
+		or withheld == nil
+		or next(withheld) == nil
+		or ServeSession.getWriteStatus(result) ~= "Saved"
+	then
+		return nil
+	end
+	for id, entry in withheld do
+		if self.__instanceMap.fromIds[id] ~= entry.Instance then
+			withheld[id] = nil
+		end
+	end
+	local replaced, seen = {}, {}
+	local cursor = result.messageCursor
+	local function consider(id, update)
+		local entry = withheld[id]
+		if entry == nil then
+			return
+		end
+		local changed = false
+		if entry.Removed ~= nil and entry.Removed <= cursor then
+			entry.Removed = nil
+			changed = true
+		end
+		for property, revision in entry.Fields do
+			local writes = update == nil
+				or (property == "Name" and update.changed_name ~= nil)
+				or (property == "ClassName" and update.changed_class_name ~= nil)
+				or (property == "Parent" and update.changedParent ~= nil)
+				or (update.changed_properties ~= nil and update.changed_properties[property] ~= nil)
+			if writes and revision <= cursor then
+				entry.Fields[property] = nil
+				changed = true
+			end
+		end
+		if next(entry.Fields) == nil and entry.Removed == nil then
+			withheld[id] = nil
+		end
+		if changed and not seen[id] then
+			seen[id] = true
+			table.insert(replaced, id)
+		end
+	end
+	for _, update in result.accepted.updated_instances do
+		consider(update.id, update)
+	end
+	for _, id in result.accepted.removed_instances do
+		consider(id)
+	end
+	if #replaced == 0 then
+		return nil
+	end
+	local message
+	if #replaced == 1 then
+		local instance = self.__instanceMap.fromIds[replaced[1]]
+		local name = if instance ~= nil then instance:GetFullName() else replaced[1]
+		message = `Studio replaced a filesystem change to "{name}".`
+	else
+		message = `Studio replaced filesystem changes to {#replaced} instances.`
+	end
+	return { { ids = replaced, message = message } }
+end
+
 -- Collects every id an addition gave out, root first.
 local function collectAddedIds(entry, out)
 	table.insert(out, entry.id)
@@ -662,15 +967,22 @@ function ServeSession:__untrackRejectedAdditions(patch, result)
 	end
 end
 
+function ServeSession:__isStartupCurrent(startup, apiContext)
+	return self.__startup == startup
+		and self.__apiContext == apiContext
+		and self.__status ~= Status.Disconnected
+		and (apiContext == nil or apiContext.__connected ~= false)
+end
+
 --[[
-	Builds the function the initial sync calls as it walks the place. `budget`
-	yields when it is due and reports whether it did. A session stopped during
-	that yield has had its instance map cleared, so the walk must not touch it
-	again, and unwinding with an error is what stops it.
+	Builds the function the initial sync calls as it walks the place. A stop,
+	replacement startup, or closed API during a budget yield invalidates the
+	walk's instance map, so it must unwind before touching the map again.
 ]]
 function ServeSession:__syncStep(budget)
+	local startup, apiContext = self.__startup, self.__apiContext
 	return function()
-		if budget() and self.__status == Status.Disconnected then
+		if budget() and not self:__isStartupCurrent(startup, apiContext) then
 			error(ServeSession.SYNC_CANCELLED, 0)
 		end
 	end
@@ -775,7 +1087,7 @@ function ServeSession:__sourceRevision(id, instance)
 end
 
 function ServeSession:__filterSourceEchoes(patch)
-	if patch.sourceOperations == nil and patch.sourceReplays == nil then
+	if self.__syncDirection == "fs-to-studio" or (patch.sourceOperations == nil and patch.sourceReplays == nil) then
 		return patch
 	end
 	local filtered = table.clone(patch)
@@ -1160,6 +1472,9 @@ function ServeSession:__beforeStructuralAssignment(instance, propertyName, value
 end
 
 function ServeSession:__protectLocalProperties(patch, publicationCursor)
+	if self.__syncDirection == "fs-to-studio" then
+		return patch
+	end
 	self:__captureStructuralChanges(patch)
 	if self.__status == Status.Disconnected then
 		error(ServeSession.SYNC_CANCELLED, 0)
@@ -1533,6 +1848,14 @@ function ServeSession:__captureWriteDependency(dependency)
 end
 
 function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket, targets)
+	if self.__syncDirection == "fs-to-studio" or self.__suspended then
+		if ticket ~= nil then
+			self:__resolveWriteTicket(ticket)
+			self:__completeWriteTicket(ticket)
+		end
+		return Promise.reject("The current directional session does not permit Studio writes.")
+	end
+	local writeApi = self.__apiContext
 	if ticket == nil then
 		local dependencies = {}
 		if localProperties ~= nil then
@@ -1556,9 +1879,10 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 	targets = targets
 		or ServeSession.captureOperationTargets(patch, if self.__instanceMap then self.__instanceMap.fromIds else {})
 	local dependency = ticket.Dependency or Promise.resolve({})
-	-- Read when each batch is sent, so changing it applies to the next write
-	-- without reconnecting. A pinned session authority wins over the setting.
-	local authority = self.__twoWaySyncAuthority or Settings:get("twoWaySyncAuthority")
+	-- A directional session never changes persistent user preferences.
+	local authority = if self.__syncDirection == "studio-to-fs"
+		then "Studio"
+		else self.__twoWaySyncAuthority or Settings:get("twoWaySyncAuthority")
 	local operationId = HttpService:GenerateGUID(false)
 	local sources = {}
 	local baselinePromises = {}
@@ -1676,16 +2000,12 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 				self.__sourceHistory:begin(operationId, sources)
 			end
 			local lineage = resolved[1]
-			return self.__apiContext:write(
-				sent,
-				messageCursor,
-				authority,
-				operationId,
-				lineage[#lineage],
-				sourceBaselines
-			)
+			return writeApi:write(sent, messageCursor, authority, operationId, lineage[#lineage], sourceBaselines)
 		end)
 		:andThen(function(result)
+			if self.__suspended or self.__apiContext ~= writeApi then
+				return Promise.reject("The write outcome arrived after its session disconnected. Drafts were retained.")
+			end
 			settled = true
 			if allSuperseded then
 				-- Nothing was sent, so nothing was acknowledged. Dependents keep the
@@ -1705,8 +2025,39 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 				self.__sourceHistory:consume(self.__apiContext:getMessageCursor())
 				self.__sourceHistory:acknowledge(operationId, result.messageCursor)
 			end
+			if self.__syncDirection == "studio-to-fs" and ServeSession.getWriteStatus(result) ~= "Saved" then
+				-- Disk conflicts are not permission to overwrite editor intent in this mode.
+				-- A partial result also cannot safely grant automatic replay on reconnect.
+				self.__resumeBlocked = true
+				finish(ServeSession.getWriteStatus(result), result)
+				self:__stopInternal(
+					"Studio changes were not fully accepted. Drafts were retained without applying disk corrections. Resolve the reported ownership or collision error and preserve/export the place before starting a fresh session."
+				)
+				return result
+			end
 			self:__acknowledgeSourceDrafts(sources, result)
 			forgetDeletions()
+			return Promise.resolve(self:__awaitNoticePublications(result.messageCursor)):andThen(function()
+				if self.__suspended or self.__status == Status.Disconnected or self.__apiContext ~= writeApi then
+					return Promise.reject(
+						"The session disconnected before save publications arrived. Drafts were retained."
+					)
+				end
+				return result
+			end)
+		end)
+		:andThen(function(result)
+			if
+				allSuperseded
+				or (self.__syncDirection == "studio-to-fs" and ServeSession.getWriteStatus(result) ~= "Saved")
+			then
+				return result
+			end
+			local notices = self:__replacedFilesystemNotices(result)
+			if notices ~= nil then
+				result = table.clone(result)
+				result.notices = notices
+			end
 			self:__untrackRejectedAdditions(patch, result)
 			self:__untrackSavedRemovals(result)
 			finish(ServeSession.getWriteStatus(result), result)
@@ -1721,6 +2072,15 @@ function ServeSession:__writePatch(patch, messageCursor, localProperties, ticket
 		end)
 		:catch(function(err)
 			self:__resolveWriteTicket(ticket)
+			if self.__syncDirection == "studio-to-fs" then
+				self.__resumeBlocked = true
+				self:__stopInternal(
+					"A Studio write has no safe acknowledgement. Drafts were retained; preserve/export them before rebuilding a fresh live edit place. "
+						.. tostring(err)
+				)
+				finish("Failed", { errors = { { message = tostring(err) } } })
+				return
+			end
 			forgetDeletions()
 			if
 				settled
@@ -1763,6 +2123,9 @@ function ServeSession:discardSourceCheckpoint(checkpointId)
 end
 
 function ServeSession:restoreSourceCheckpoint(checkpointId, instanceId, expectedSource)
+	if self.__syncDirection == "fs-to-studio" then
+		return Promise.reject("The filesystem-only policy prohibits restoring editor Source checkpoints.")
+	end
 	assert(
 		type(instanceId) == "string" and type(expectedSource) == "string",
 		"Restoration requires a script identity and its exact current editor text."
@@ -1883,21 +2246,71 @@ function ServeSession:hookPostcommit(callback)
 end
 
 function ServeSession:start()
+	self.__changeBatcher.__suspended = true
+	local startup, apiContext = {}, self.__apiContext
+	self.__startup = startup
+	local function ownsStartup()
+		return self.__startup == startup and self.__apiContext == apiContext
+	end
+	local function isCurrent()
+		return self:__isStartupCurrent(startup, apiContext)
+	end
 	self:__setStatus(Status.Connecting)
+	if not isCurrent() then
+		if ownsStartup() then
+			self:__stopInternal()
+		end
+		return
+	end
 	self:setLoadingText("Connecting to server...")
+	if not isCurrent() then
+		if ownsStartup() then
+			self:__stopInternal()
+		end
+		return
+	end
 
-	self.__apiContext
+	apiContext
 		:connect()
 		:andThen(function(serverInfo)
+			if not isCurrent() then
+				return Promise.reject(ServeSession.SYNC_CANCELLED)
+			end
+			self:__negotiateDirection(serverInfo)
+			if not isCurrent() then
+				return Promise.reject(ServeSession.SYNC_CANCELLED)
+			end
 			self:setLoadingText("Loading initial data from server...")
-			return self:__initialSync(serverInfo):andThen(function()
+			if not isCurrent() then
+				return Promise.reject(ServeSession.SYNC_CANCELLED)
+			end
+			local resuming = self.__suspended == true
+			local initial = if resuming then Promise.resolve() else self:__initialSync(serverInfo)
+			return initial:andThen(function()
+				if not isCurrent() then
+					return Promise.reject(ServeSession.SYNC_CANCELLED)
+				end
 				self:setLoadingText("Starting sync loop...")
+				if not isCurrent() then
+					return Promise.reject(ServeSession.SYNC_CANCELLED)
+				end
+				self.__initialSyncComplete = true
+				self.__suspended = nil
+				self.__changeBatcher.__suspended = not self.__twoWaySync
 				self:__setStatus(Status.Connected, serverInfo.projectName)
-				self:__applyGameAndPlaceId(serverInfo)
+				if not isCurrent() then
+					return Promise.reject(ServeSession.SYNC_CANCELLED)
+				end
+				if not resuming then
+					self:__applyGameAndPlaceId(serverInfo)
+				end
+				if not isCurrent() then
+					return Promise.reject(ServeSession.SYNC_CANCELLED)
+				end
 
-				return self.__apiContext:connectWebSocket({
+				return apiContext:connectWebSocket({
 					["export"] = function(body)
-						if self.__status == Status.Disconnected then
+						if not isCurrent() then
 							return
 						end
 						-- Independent capture never flushes or writes syncback patches.
@@ -1908,39 +2321,112 @@ function ServeSession:start()
 						end)
 					end,
 					["messages"] = function(messagesPacket)
-						if self.__status == Status.Disconnected then
+						if not isCurrent() then
 							return
 						end
 
 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
+						local permissions
+						if self.__syncDirection == "studio-to-fs" then
+							permissions = {}
+							-- A malformed later message cannot release an earlier save in this packet.
+							for index, message in messagesPacket.messages do
+								local valid, allowed = pcall(
+									DirectionPolicy.allowsPublication,
+									self.__syncDirection,
+									if type(message) == "table" then message.origin else nil
+								)
+								if not valid then
+									self.__resumeBlocked = true
+									self:__stopInternal(allowed)
+									return
+								end
+								permissions[index] = allowed
+							end
+						end
 						local chain = self.__lastPublication or Promise.resolve()
 						for index, message in messagesPacket.messages do
 							local publicationCursor = messagesPacket.messageCursor - #messagesPacket.messages + index
-							self:__rememberSourcePublication(message, publicationCursor)
-							self:__rememberStructuralPublication(message, publicationCursor)
-							chain = chain:andThen(function()
-								return self:__applyPatch(message, publicationCursor)
-							end)
+							-- Filter before recording consumption evidence or buffered corrections.
+							local valid, allowed = true, nil
+							if permissions ~= nil then
+								allowed = permissions[index]
+							else
+								valid, allowed = pcall(
+									DirectionPolicy.allowsPublication,
+									self.__syncDirection,
+									if type(message) == "table" then message.origin else nil
+								)
+							end
+							if not valid then
+								self.__resumeBlocked = true
+								self:__stopInternal(allowed)
+								return
+							end
+							if permissions ~= nil then
+								if not allowed then
+									self:__withholdPublication(message, publicationCursor)
+								end
+								self:__receiveNoticePublications(publicationCursor)
+								if not isCurrent() then
+									return
+								end
+							end
+							if allowed then
+								if self.__syncDirection ~= "fs-to-studio" then
+									self:__rememberSourcePublication(message, publicationCursor)
+									self:__rememberStructuralPublication(message, publicationCursor)
+								end
+								chain = chain:andThen(function()
+									if not isCurrent() then
+										return Promise.reject(ServeSession.SYNC_CANCELLED)
+									end
+									-- The ownership fence must survive yielding hooks, since a
+									-- resumable disconnect retains the live instances it maps.
+									return self:__applyPatch(message, publicationCursor, isCurrent)
+								end)
+							end
+						end
+						if permissions ~= nil then
+							self:__receiveNoticePublications(messagesPacket.messageCursor)
+							if not isCurrent() then
+								return
+							end
 						end
 						self.__lastPublication = chain
 							:andThen(function()
-								self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+								if not isCurrent() then
+									return Promise.reject(ServeSession.SYNC_CANCELLED)
+								end
+								apiContext:setMessageCursor(messagesPacket.messageCursor)
+								if self.__syncDirection == "fs-to-studio" then
+									return nil
+								end
 								return Promise.resolve(self:__releaseLocalProperties(messagesPacket.messageCursor))
 									:andThen(function()
 										self.__sourceHistory:consume(messagesPacket.messageCursor)
 									end)
 							end)
 							:catch(function(err)
-								self:__stopInternal(err)
+								if isCurrent() then
+									self.__resumeBlocked = true
+									self:__stopInternal(err)
+								end
 							end)
 					end,
 				})
 			end)
 		end)
 		:catch(function(err)
-			if self.__status ~= Status.Disconnected then
+			-- API usability fences work, not cleanup of the startup that still owns it.
+			if ownsStartup() then
 				self:__stopInternal(err)
+			end
+		end)
+		:finally(function(status)
+			if status == Promise.Status.Cancelled and ownsStartup() then
+				self:__stopInternal()
 			end
 		end)
 end
@@ -1998,7 +2484,14 @@ function ServeSession:__onActiveScriptChanged(activeScript)
 	self.__apiContext:open(scriptId)
 end
 
-function ServeSession:__replaceInstances(idList)
+function ServeSession:__replaceInstances(idList, checkCurrent)
+	local apiContext = self.__apiContext
+	local function check()
+		if checkCurrent ~= nil then
+			checkCurrent()
+		end
+	end
+	check()
 	if #idList == 0 then
 		return true, PatchSet.newEmpty()
 	end
@@ -2010,11 +2503,13 @@ function ServeSession:__replaceInstances(idList)
 	end
 
 	-- TODO: Should we do this in multiple requests so we can more granularly mark failures?
-	local modelSuccess, replacements = self.__apiContext
+	local modelSuccess, replacements = apiContext
 		:serialize(idList)
 		:andThen(function(response)
+			check()
 			Log.debug("Deserializing results from serialize endpoint")
 			local objects = SerializationService:DeserializeInstancesAsync(response.modelContents)
+			check()
 			if not objects[1] then
 				return Promise.reject("Serialize endpoint did not deserialize into any Instances")
 			end
@@ -2030,13 +2525,15 @@ function ServeSession:__replaceInstances(idList)
 		end)
 		:await()
 
-	local refSuccess, refPatch = self.__apiContext
+	check()
+	local refSuccess, refPatch = apiContext
 		:refPatch(idList)
 		:andThen(function(response)
 			return response.patch
 		end)
 		:await()
 
+	check()
 	if not (modelSuccess and refSuccess) then
 		return false
 	end
@@ -2177,10 +2674,67 @@ function ServeSession:__notifySourceRecovery(id, checkpointId)
 	end
 end
 
-function ServeSession:__checkpointDisplacedSources(patch, publicationCursor)
+function ServeSession:__checkpointDisplacedSources(patch, publicationCursor, isCurrent)
+	local apiContext = self.__apiContext
+	local function checkCurrent()
+		if isCurrent ~= nil and not isCurrent() then
+			error(ServeSession.SYNC_CANCELLED, 0)
+		end
+	end
+	checkCurrent()
+	if self.__syncDirection == "fs-to-studio" then
+		if not self.__initialSourceRecovery then
+			return nil
+		end
+		-- A read-only session cannot store a server checkpoint. Refuse initial
+		-- takeover of an open draft rather than overwrite it or issue a forbidden write.
+		local preservationError = "An open script document would be replaced during filesystem-only startup. "
+			.. "Save or copy its draft before reconnecting; the document was retained without writing a recovery checkpoint."
+		local step = self:__syncStep(yieldBudget())
+		local function displacesDocument(instance, expected)
+			step()
+			checkCurrent()
+			if instance:IsA("LuaSourceContainer") and self:__hasOpenScriptDocument(instance) then
+				local source = self:__readEditorSource(instance)
+				checkCurrent()
+				return expected == nil or source ~= expected
+			end
+			return false
+		end
+		for _, update in patch.updated do
+			local instance = self.__instanceMap.fromIds[update.id]
+			local source = update.changedProperties and update.changedProperties.Source
+			if instance ~= nil then
+				if update.changedClassName ~= nil and update.changedClassName ~= instance.ClassName then
+					if displacesDocument(instance) then
+						return Promise.reject(preservationError)
+					end
+				elseif source ~= nil and displacesDocument(instance, source.String) then
+					return Promise.reject(preservationError)
+				end
+			end
+			checkCurrent()
+		end
+		for _, id in patch.removed do
+			local root = if typeof(id) == "Instance" then id else self.__instanceMap.fromIds[id]
+			if root ~= nil then
+				if displacesDocument(root) then
+					return Promise.reject(preservationError)
+				end
+				for _, instance in root:GetDescendants() do
+					if displacesDocument(instance) then
+						return Promise.reject(preservationError)
+					end
+				end
+			end
+			checkCurrent()
+		end
+		return nil
+	end
 	local targets = {}
 	local untrackedDocument = false
 	local function discover(instance)
+		checkCurrent()
 		if
 			not self.__initialSourceRecovery
 			or not instance:IsA("LuaSourceContainer")
@@ -2193,11 +2747,15 @@ function ServeSession:__checkpointDisplacedSources(patch, publicationCursor)
 			untrackedDocument = true
 			return
 		end
+		checkCurrent()
 		if self.__sourceDrafts[id] == nil then
+			local revision = self:__sourceRevision(id, instance)
+			local source = self:__readEditorSource(instance)
+			checkCurrent()
 			self.__sourceDrafts[id] = {
 				Instance = instance,
-				Revision = self:__sourceRevision(id, instance),
-				Source = self:__readEditorSource(instance),
+				Revision = revision,
+				Source = source,
 			}
 		end
 	end
@@ -2263,14 +2821,16 @@ function ServeSession:__checkpointDisplacedSources(patch, publicationCursor)
 	end
 	local requests = {}
 	for id, target in targets do
+		checkCurrent()
 		local draft = target.Draft
 		local source = self:__readEditorSource(draft.Instance)
+		checkCurrent()
 		if draft.CheckpointSource == source then
 			continue
 		end
 		table.insert(
 			requests,
-			self.__apiContext
+			apiContext
 				:createSourceCheckpoint(
 					id,
 					source,
@@ -2278,6 +2838,7 @@ function ServeSession:__checkpointDisplacedSources(patch, publicationCursor)
 					publicationCursor or self.__apiContext:getMessageCursor()
 				)
 				:andThen(function(response)
+					checkCurrent()
 					if self.__status == Status.Disconnected then
 						return Promise.reject("The session stopped while securing a Source recovery checkpoint.")
 					end
@@ -2290,6 +2851,7 @@ function ServeSession:__checkpointDisplacedSources(patch, publicationCursor)
 							"The script changed while its recovery checkpoint was being stored. The current editor draft was retained."
 						)
 					end
+					checkCurrent()
 					draft.CheckpointSource = source
 					draft.CheckpointId = response.checkpointId
 					self:__notifySourceRecovery(id, response.checkpointId)
@@ -2300,110 +2862,173 @@ function ServeSession:__checkpointDisplacedSources(patch, publicationCursor)
 	return if #requests > 0 then Promise.all(requests) else nil
 end
 
-function ServeSession:__applyPatch(patch, publicationCursor)
-	if publicationCursor ~= nil then
+function ServeSession:__applyPatch(patch, publicationCursor, isCurrent, normalization)
+	-- Initial normalization and local replays are not subscriptions. Every actual
+	-- Studio-only subscription must prove provenance before touching baselines, even
+	-- when it carries an ownership predicate.
+	if publicationCursor ~= nil and not normalization then
+		local valid, allowed = pcall(DirectionPolicy.allowsPublication, self.__syncDirection, patch.origin)
+		if not valid then
+			self.__resumeBlocked = true
+			self:__stopInternal(allowed)
+			return Promise.reject(allowed)
+		elseif not allowed then
+			self:__withholdPublication(patch, publicationCursor)
+			return Promise.resolve()
+		end
+	end
+	if isCurrent ~= nil and not isCurrent() then
+		return Promise.reject(ServeSession.SYNC_CANCELLED)
+	end
+	if publicationCursor ~= nil and self.__syncDirection ~= "fs-to-studio" then
 		self:__rememberSourcePublication(patch, publicationCursor)
 		self:__rememberStructuralPublication(patch, publicationCursor)
 	end
 	local function apply()
+		if isCurrent ~= nil and not isCurrent() then
+			return Promise.reject(ServeSession.SYNC_CANCELLED)
+		end
 		if self.__status == Status.Disconnected then
 			return Promise.reject("The session stopped before applying this publication.")
 		end
-		return self:__applyPatchNow(self:__filterSourceEchoes(patch), publicationCursor)
+		return self:__applyPatchNow(self:__filterSourceEchoes(patch), publicationCursor, nil, isCurrent)
 	end
 	local pending = self.__pendingSourcePatch
+	-- A replacement startup must not inherit an obsolete startup's queue rejection.
+	local pendingIsCurrent = self.__pendingSourcePatchIsCurrent
+	if pendingIsCurrent ~= nil and not pendingIsCurrent() then
+		pending = nil
+	end
 	local success, result = pcall(function()
 		return if pending ~= nil then pending:andThen(apply) else apply()
 	end)
 	if not success then
-		self:__stopInternal(result)
+		if isCurrent == nil or isCurrent() then
+			self.__resumeBlocked = true
+			self:__stopInternal(result)
+		end
 		return Promise.reject(result)
 	end
 	if result == nil then
 		return nil
 	end
-	local token = {}
-	self.__pendingSourcePatchToken = token
 	local guarded = result:catch(function(err)
-		self:__stopInternal(err)
+		if isCurrent == nil or isCurrent() then
+			self.__resumeBlocked = true
+			self:__stopInternal(err)
+		end
 		return Promise.reject(err)
 	end)
+	if isCurrent ~= nil and not isCurrent() then
+		return guarded
+	end
+	local token = {}
+	self.__pendingSourcePatchToken = token
+	self.__pendingSourcePatchIsCurrent = isCurrent
 	self.__pendingSourcePatch = guarded
 	guarded
 		:finally(function()
 			if self.__pendingSourcePatchToken == token then
 				self.__pendingSourcePatch = nil
 				self.__pendingSourcePatchToken = nil
+				self.__pendingSourcePatchIsCurrent = nil
 			end
 		end)
 		:catch(function() end)
 	return guarded
 end
 
-function ServeSession:__applyPatchNow(patch, publicationCursor, prepared)
-	local cursors = {}
-	for id in patch.added do
-		cursors[id] = publicationCursor
+function ServeSession:__applyPatchNow(patch, publicationCursor, prepared, isCurrent)
+	if isCurrent ~= nil and not isCurrent() then
+		return Promise.reject(ServeSession.SYNC_CANCELLED)
 	end
-	for _, update in patch.updated do
-		local replay = patch.sourceReplays and patch.sourceReplays[update.id]
-		cursors[update.id] = if replay then replay.Cursor else publicationCursor
+	local cursors = {}
+	if self.__syncDirection ~= "fs-to-studio" then
+		for id in patch.added do
+			cursors[id] = publicationCursor
+		end
+		for _, update in patch.updated do
+			local replay = patch.sourceReplays and patch.sourceReplays[update.id]
+			cursors[update.id] = if replay then replay.Cursor else publicationCursor
+		end
 	end
 	local operations = { Cursors = cursors }
 	local thread = coroutine.running()
 	local previous = self.__sourceApplyBatches[thread]
 	self.__sourceApplyBatches[thread] = operations
-	local success, result = pcall(self.__applyPatchBody, self, patch, publicationCursor, prepared)
+	local success, result = pcall(self.__applyPatchBody, self, patch, publicationCursor, prepared, isCurrent)
 	self.__sourceApplyBatches[thread] = previous
 	if not success then
 		error(result, 0)
 	end
-	if result ~= nil then
-		return result:andThen(function()
-			return self:__awaitSourceOperations(operations)
-		end)
+	local function awaitOperations()
+		if isCurrent ~= nil and not isCurrent() then
+			return Promise.reject(ServeSession.SYNC_CANCELLED)
+		end
+		return self:__awaitSourceOperations(operations)
 	end
-	return self:__awaitSourceOperations(operations)
+	if result ~= nil then
+		return result:andThen(awaitOperations)
+	end
+	return awaitOperations()
 end
 
-function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
+function ServeSession:__applyPatchBody(patch, publicationCursor, prepared, isCurrent)
+	local historyRecording
+	local function checkCurrent()
+		if isCurrent ~= nil and not isCurrent() then
+			if historyRecording then
+				ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+			end
+			error(ServeSession.SYNC_CANCELLED, 0)
+		end
+	end
+	checkCurrent()
 	self:__keepUndoneDeletions(patch)
 	patch = self:__protectLocalProperties(patch, publicationCursor)
+	checkCurrent()
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
-	local historyRecording =
-		ChangeHistoryService:TryBeginRecording(ServeSession.PATCH_RECORDING_PREFIX .. patchTimestamp)
+	historyRecording = ChangeHistoryService:TryBeginRecording(ServeSession.PATCH_RECORDING_PREFIX .. patchTimestamp)
 	if not historyRecording then
 		-- There can only be one recording at a time
 		Log.debug("Failed to begin history recording for " .. patchTimestamp .. ". Another recording is in progress.")
 	end
 
 	if not prepared then
-		Timer.start("precommitCallbacks", "wall")
-		-- Hooks may yield or edit documents. Revalidate intent after they return.
-		for _, callback in self.__precommitCallbacks do
-			local success, err = pcall(callback, patch, self.__instanceMap)
-			if not success then
-				Log.warn("Precommit hook errored: {}", err)
+		Timer.measure("precommitCallbacks", "wall", function()
+			-- Hooks may yield or edit documents. Revalidate intent after they return.
+			for _, callback in self.__precommitCallbacks do
+				checkCurrent()
+				local success, err = pcall(callback, patch, self.__instanceMap)
+				if not success then
+					Log.warn("Precommit hook errored: {}", err)
+				end
+				checkCurrent()
 			end
-		end
-		Timer.stop()
+		end)
 	end
+	checkCurrent()
 	patch = self:__protectLocalProperties(patch, publicationCursor)
-	local checkpoint = self:__checkpointDisplacedSources(patch, publicationCursor)
+	checkCurrent()
+	local checkpoint = self:__checkpointDisplacedSources(patch, publicationCursor, isCurrent)
+	checkCurrent()
 	if checkpoint ~= nil then
 		if historyRecording then
 			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
 		end
 		return checkpoint:andThen(function()
-			return self:__applyPatchNow(patch, publicationCursor, true)
+			return self:__applyPatchNow(patch, publicationCursor, true, isCurrent)
 		end)
 	end
 
 	local addedBefore = {}
-	for id in patch.added do
-		addedBefore[id] = self.__instanceMap.fromIds[id] or false
+	if self.__syncDirection ~= "fs-to-studio" then
+		for id in patch.added do
+			addedBefore[id] = self.__instanceMap.fromIds[id] or false
+		end
 	end
 	local patchApplySuccess, unappliedPatch = pcall(self.__reconciler.applyPatch, self.__reconciler, patch)
+	checkCurrent()
 	if not patchApplySuccess then
 		if historyRecording then
 			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
@@ -2411,6 +3036,18 @@ function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
 		-- This might make a weird stack trace but the only way applyPatch can
 		-- fail is if a bug occurs so it's probably fine.
 		error(unappliedPatch)
+	end
+
+	if self.__syncDirection == "studio-to-fs" and not PatchSet.isEmpty(unappliedPatch) then
+		-- Fallback serializes the current disk tree, not this accepted publication.
+		-- It could import independent filesystem corrections across the direction gate.
+		if historyRecording then
+			ChangeHistoryService:FinishRecording(historyRecording, Enum.FinishRecordingOperation.Commit)
+		end
+		error(
+			"Studio-only normalization could not be applied safely. Drafts were retained without fetching live filesystem replacements. Preserve/export this place before rebuilding.",
+			0
+		)
 	end
 
 	if Settings:get("enableSyncFallback") and not PatchSet.isEmpty(unappliedPatch) then
@@ -2429,8 +3066,10 @@ function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
 			"wall",
 			self.__replaceInstances,
 			self,
-			addedIdList
+			addedIdList,
+			checkCurrent
 		)
+		checkCurrent()
 
 		Log.debug("ServeSession:__replaceInstances(unappliedPatch.updated)")
 		local updateSuccess, unappliedUpdateRefs = Timer.measure(
@@ -2438,8 +3077,10 @@ function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
 			"wall",
 			self.__replaceInstances,
 			self,
-			updatedIdList
+			updatedIdList,
+			checkCurrent
 		)
+		checkCurrent()
 
 		-- Update the unapplied patch to reflect which Instances were replaced successfully
 		if addSuccess then
@@ -2465,7 +3106,7 @@ function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
 	-- A metadata-only context refresh may change authored/emitted transforms without
 	-- changing bytes. It can advance an unchanged, proven document, never an older
 	-- captured draft, a suppressed echo, or a pending/failed Source proposal.
-	if publicationCursor ~= nil and self.__status ~= Status.Disconnected then
+	if self.__syncDirection ~= "fs-to-studio" and publicationCursor ~= nil and self.__status ~= Status.Disconnected then
 		local failedSource = {}
 		for id in unappliedPatch.added do
 			failedSource[id] = true
@@ -2525,6 +3166,9 @@ function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
 	-- guaranteed to be called after the commit
 	for _, callback in self.__postcommitCallbacks do
 		task.spawn(function()
+			if isCurrent ~= nil and not isCurrent() then
+				return
+			end
 			local success, err = pcall(callback, patch, self.__instanceMap, unappliedPatch)
 			if not success then
 				Log.warn("Postcommit hook errored: {}", err)
@@ -2534,20 +3178,23 @@ function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
 	Timer.stop()
 
 	-- Fallback reconciliation can replace identity even for a scalar-only packet.
-	self:__pruneStructuralGuards()
-	local structural = #patch.removed > 0
-	for _, update in patch.updated do
-		structural = structural or update.changedClassName ~= nil
-	end
-	if structural then
-		for id, revision in self.__sourceRevisions do
-			if self.__instanceMap.fromIds[id] ~= revision.Instance then
-				self.__sourceRevisions[id] = nil
-			end
+	checkCurrent()
+	if self.__syncDirection ~= "fs-to-studio" then
+		self:__pruneStructuralGuards()
+		local structural = #patch.removed > 0
+		for _, update in patch.updated do
+			structural = structural or update.changedClassName ~= nil
 		end
-		for id, draft in self.__sourceDrafts do
-			if self.__instanceMap.fromIds[id] ~= draft.Instance then
-				self.__sourceDrafts[id] = nil
+		if structural then
+			for id, revision in self.__sourceRevisions do
+				if self.__instanceMap.fromIds[id] ~= revision.Instance then
+					self.__sourceRevisions[id] = nil
+				end
+			end
+			for id, draft in self.__sourceDrafts do
+				if self.__instanceMap.fromIds[id] ~= draft.Instance then
+					self.__sourceDrafts[id] = nil
+				end
 			end
 		end
 	end
@@ -2558,41 +3205,68 @@ function ServeSession:__applyPatchBody(patch, publicationCursor, prepared)
 end
 
 function ServeSession:__initialSync(serverInfo)
-	return self.__apiContext:read({ serverInfo.rootInstanceId }):andThen(function(readResponseBody)
+	local startup, apiContext = self.__startup, self.__apiContext
+	local function isCurrent()
+		return self:__isStartupCurrent(startup, apiContext)
+	end
+	local function checkCurrent()
+		if not isCurrent() then
+			error(ServeSession.SYNC_CANCELLED, 0)
+		end
+	end
+	if not isCurrent() then
+		return Promise.reject(ServeSession.SYNC_CANCELLED)
+	end
+	return apiContext:read({ serverInfo.rootInstanceId }):andThen(function(readResponseBody)
+		checkCurrent()
 		-- Tell the API Context that we're up-to-date with the version of
 		-- the tree defined in this response.
-		self.__apiContext:setMessageCursor(readResponseBody.messageCursor)
+		apiContext:setMessageCursor(readResponseBody.messageCursor)
+		self:__receiveNoticePublications(readResponseBody.messageCursor)
+		checkCurrent()
 
 		-- For any instances that line up with the Rojo server's view, start
 		-- tracking them in the reconciler.
 		Log.trace("Matching existing Roblox instances to Rojo IDs")
 		self:setLoadingText("Hydrating instance map...")
+		checkCurrent()
 		-- Both walks cover the whole place, which on a large one outlasts
 		-- Studio's script timeout unless they yield along the way.
 		local step = self:__syncStep(yieldBudget())
 		self.__reconciler:hydrate(readResponseBody.instances, serverInfo.rootInstanceId, game, step)
+		checkCurrent()
 
 		-- Calculate the initial patch to apply to the DataModel to catch us
 		-- up to what Rojo thinks the place should look like.
 		Log.trace("Computing changes that plugin needs to make to catch up to server...")
 		self:setLoadingText("Finding differences between server and Studio...")
+		checkCurrent()
 		local success, catchUpPatch =
 			self.__reconciler:diff(readResponseBody.instances, serverInfo.rootInstanceId, step)
+		checkCurrent()
 
-		-- This is the only hydration-wide baseline pass. Mere map hydration is not
-		-- Source consumption, especially for open documents with older unsaved text.
-		for id, virtual in readResponseBody.instances do
-			local instance = self.__instanceMap.fromIds[id]
-			local source = virtual.Properties and virtual.Properties.Source
-			if instance ~= nil and source ~= nil and instance:IsA("LuaSourceContainer") then
-				local revision = self:__sourceRevision(id, instance)
-				if self:__readEditorSource(instance) == source.String then
-					self.__sourceBaselines[instance] = { Cursor = readResponseBody.messageCursor, Revision = revision }
+		-- Read-only sessions never submit a Source baseline. Hydration itself is not
+		-- consumption evidence for writable sessions with older unsaved documents.
+		if self.__syncDirection ~= "fs-to-studio" then
+			for id, virtual in readResponseBody.instances do
+				checkCurrent()
+				local instance = self.__instanceMap.fromIds[id]
+				local source = virtual.Properties and virtual.Properties.Source
+				if instance ~= nil and source ~= nil and instance:IsA("LuaSourceContainer") then
+					local revision = self:__sourceRevision(id, instance)
+					local matches = self:__readEditorSource(instance) == source.String
+					checkCurrent()
+					if matches then
+						self.__sourceBaselines[instance] =
+							{ Cursor = readResponseBody.messageCursor, Revision = revision }
+					end
 				end
+				step()
 			end
-			step()
 		end
+		checkCurrent()
 		self:__releaseDeferredChanges()
+		checkCurrent()
 
 		if not success then
 			Log.error("Could not compute a diff to catch up to the Rojo server: {:#?}", catchUpPatch)
@@ -2617,10 +3291,16 @@ function ServeSession:__initialSync(serverInfo)
 		if self.__userConfirmCallback ~= nil then
 			userDecision = self.__userConfirmCallback(self.__instanceMap, catchUpPatch, serverInfo)
 		end
+		checkCurrent()
 
 		if userDecision == "Abort" then
 			return Promise.reject("Aborted Rojo+ sync operation")
 		elseif userDecision == "Reject" then
+			if self.__syncDirection == "studio-to-fs" then
+				return Promise.reject(
+					"Studio-only sync requires the generated place's one-time initial normalization. Inverse initial sync is not supported; drafts were preserved."
+				)
+			end
 			if not self.__twoWaySync then
 				return Promise.reject("Cannot reject sync operation without two-way sync enabled")
 			end
@@ -2631,6 +3311,7 @@ function ServeSession:__initialSync(serverInfo)
 
 			-- Send back the current properties
 			for _, change in catchUpPatch.updated do
+				checkCurrent()
 				local instance = self.__instanceMap.fromIds[change.id]
 				if not instance then
 					continue
@@ -2651,6 +3332,7 @@ function ServeSession:__initialSync(serverInfo)
 					properties.Parent = true
 				end
 				local update = encodePatchUpdate(instance, change.id, properties, self.__instanceMap)
+				checkCurrent()
 				if update ~= nil then
 					table.insert(inversePatch.updated, update)
 				end
@@ -2667,11 +3349,18 @@ function ServeSession:__initialSync(serverInfo)
 
 			-- Rejecting is an explicit choice to keep Studio's version, so Studio
 			-- wins even if the disk changes again before this write lands.
-			return self.__apiContext:write(inversePatch, nil, "Studio")
+			checkCurrent()
+			return apiContext:write(inversePatch, nil, "Studio")
 		elseif userDecision == "Accept" then
-			self.__initialSourceRecovery = true
-			return Promise.resolve(self:__applyPatch(catchUpPatch, readResponseBody.messageCursor)):finally(function()
-				self.__initialSourceRecovery = nil
+			local recovery = {}
+			self.__initialSourceRecovery = recovery
+			return Promise.try(function()
+				checkCurrent()
+				return self:__applyPatch(catchUpPatch, readResponseBody.messageCursor, isCurrent, true)
+			end):finally(function()
+				if self.__initialSourceRecovery == recovery then
+					self.__initialSourceRecovery = nil
+				end
 			end)
 		else
 			return Promise.reject("Invalid user decision: " .. userDecision)
@@ -2684,7 +3373,22 @@ function ServeSession:__stopInternal(err)
 		return
 	end
 	self.__status = Status.Disconnected
-	self.__localPropertyEdits = nil
+	local resumable = self.__resumeKey ~= nil
+	if resumable then
+		if not self.__suspended then
+			self.__resumeCursor = self.__apiContext:getMessageCursor()
+		end
+		self.__suspended = true
+		self.__changeBatcher.__suspended = true
+		self.__resumeBlocked = self.__resumeBlocked
+			or next(self.__writeTickets or {}) ~= nil
+			or self.__changeBatcher.__flushing
+			or next(self.__remoteSources) ~= nil
+			or self.__pendingSourcePatch ~= nil
+			or (self.__lastPublication ~= nil and self.__lastPublication:getStatus() == Promise.Status.Started)
+	else
+		self.__localPropertyEdits = nil
+	end
 	for ticket in table.clone(self.__writeTickets or {}) do
 		local resolve, complete = ticket.Resolve, ticket.Complete
 		ticket.Parent, ticket.Resolve, ticket.Dependency, ticket.PreviousWrite, ticket.Complete =
@@ -2697,20 +3401,34 @@ function ServeSession:__stopInternal(err)
 		end
 	end
 	self.__writeTickets = {}
-	self.__writeHead, self.__pendingWriteDependencies = nil, nil
-	for _, pending in self.__remoteSources do
+	local noticeWaiters = self.__noticePublicationWaiters
+	self.__noticePublicationWaiters = nil
+	for waiter in noticeWaiters or {} do
+		waiter.Reject("The session disconnected before save publications arrived. Drafts were retained.")
+	end
+	if not resumable then
+		self.__writeHead, self.__pendingWriteDependencies = nil, nil
+	end
+	for operation, pending in self.__remoteSources do
+		if resumable and type(operation) == "table" then
+			-- Revoke pending proposals without replacing their live observation lease.
+			operation.CancellationRequested = true
+			operation.Reason = "disconnected"
+		end
 		if pending.BaselineToken ~= nil then
 			self:__resolveSourceBaseline(pending.BaselineToken)
 		end
 	end
 	self.__apiContext:disconnect()
-	self.__instanceMap:stop()
-	self.__changeBatcher:stop()
+	if not resumable then
+		self.__instanceMap:stop()
+		self.__changeBatcher:stop()
 
-	for _, connection in ipairs(self.__connections) do
-		connection:Disconnect()
+		for _, connection in ipairs(self.__connections) do
+			connection:Disconnect()
+		end
+		self.__connections = {}
 	end
-	self.__connections = {}
 
 	-- Callbacks can reenter stop or throw. Notify only after cleanup, and keep a
 	-- callback failure from interrupting the write queue's failure handling.

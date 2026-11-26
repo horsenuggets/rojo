@@ -75,7 +75,9 @@ end
 function Error.fromResponse(response)
 	local lower = (response.body or ""):lower()
 	if response.code == 408 or response.code == 504 or lower:find("timed? ?out") then
-		return Error.new(Error.Kind.Timeout)
+		local err = Error.new(Error.Kind.Timeout)
+		err.response = response
+		return err
 	end
 
 	-- Rojo servers send errors as MessagePack with a readable `details` field,

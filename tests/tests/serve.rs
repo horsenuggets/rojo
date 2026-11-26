@@ -22,6 +22,831 @@ use librojo::web_api::{
 };
 
 #[test]
+fn studio_run_context_migration_allows_unrelated_optional_project_with_missing_parent() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use rbx_dom_weak::types::Enum;
+
+    for authority in [WriteAuthority::Filesystem, WriteAuthority::Studio] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fs::write(
+                root.join("default.project.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "OptionalMigration",
+                    "tree": {
+                        "$className": "Folder", "$path": "src",
+                        "Optional": {"$path": {"optional": "missing/nested.project.json"}}
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(root.join("src/Code.server.luau"), "print('retained')\n").unwrap();
+        });
+        let info = session.wait_to_come_online();
+        let initial = session.get_api_read(info.root_instance_id).unwrap();
+        let id = initial
+            .instances
+            .values()
+            .find(|instance| instance.name == "Code")
+            .unwrap()
+            .id;
+        let original_ids: std::collections::HashSet<_> =
+            initial.instances.keys().copied().collect();
+        let cursor = initial.message_cursor;
+        drop(initial);
+        let context = rbx_reflection_database::get().unwrap().enums["RunContext"].items["Client"];
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
+            message_cursor: Some(cursor),
+            authority,
+            removed: Vec::new(),
+            added: Default::default(),
+            updated: vec![InstanceUpdate {
+                changed_properties: UstrMap::from_iter([(
+                    ustr("RunContext"),
+                    Some(Variant::Enum(Enum::from_u32(context))),
+                )]),
+                ..shared_update(id)
+            }],
+        });
+        assert!(
+            response.errors.is_empty(),
+            "{authority:?}. {:?}",
+            response.errors
+        );
+        assert!(response.conflicts.updated_instances.is_empty());
+        assert_eq!(response.accepted.updated_instances.len(), 1);
+        assert_eq!(
+            fs::read_to_string(session.path().join("src/Code.client.luau")).unwrap(),
+            "print('retained')\n"
+        );
+        assert!(!session.path().join("src/Code.server.luau").exists());
+        assert!(!session.path().join("missing").exists());
+        let after = session.get_api_read(info.root_instance_id).unwrap();
+        assert_eq!(
+            after
+                .instances
+                .keys()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            original_ids
+        );
+    }
+}
+
+#[test]
+fn studio_run_context_changes_migrate_source_suffixes_without_replacing_instances() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use rbx_dom_weak::types::Enum;
+
+    let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+    let cases = [
+        ("Legacy", "legacy"),
+        ("Server", "server"),
+        ("Client", "client"),
+        ("Plugin", "plugin"),
+    ];
+    let authored = b"-- Preserve authored formatting.\r\nprint('unchanged')\r\n";
+    for directory in [false, true] {
+        for extension in ["lua", "luau"] {
+            let mut session = TestServeSession::with_setup("add_folder", |root| {
+                fs::write(
+                    root.join("default.project.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "ContextMigration",
+                        "tree": {"$className": "Folder", "$path": "src"}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let (source, metadata) = if directory {
+                    fs::create_dir_all(root.join("src/Physical/Nested")).unwrap();
+                    fs::write(root.join("src/Physical/Helper.luau"), "return 17\n").unwrap();
+                    fs::write(root.join("src/Physical/Nested/Child.luau"), "return 23\n").unwrap();
+                    (
+                        format!("src/Physical/init.server.{extension}"),
+                        "src/Physical/init.meta.jsonc",
+                    )
+                } else {
+                    (
+                        format!("src/Physical.server.{extension}"),
+                        "src/Physical.meta.jsonc",
+                    )
+                };
+                fs::write(root.join(source), authored).unwrap();
+                fs::write(root.join(metadata), r#"{"name":"Visible","properties":{"Disabled":true},"attributes":{"TestLabel":"retained"}}"#).unwrap();
+            });
+            let info = session.wait_to_come_online();
+            let initial = session.get_api_read(info.root_instance_id).unwrap();
+            let id = initial
+                .instances
+                .values()
+                .find(|instance| instance.name == "Visible")
+                .unwrap()
+                .id;
+            let original_ids: std::collections::HashSet<_> =
+                initial.instances.keys().copied().collect();
+            let original_children: Vec<_> = initial
+                .instances
+                .values()
+                .filter(|instance| instance.parent == id)
+                .map(|instance| instance.id)
+                .collect();
+            let source_path = |suffix: &str| {
+                session.path().join(if directory {
+                    format!("src/Physical/init.{suffix}.{extension}")
+                } else {
+                    format!("src/Physical.{suffix}.{extension}")
+                })
+            };
+            for (from, from_suffix) in cases {
+                for (to, to_suffix) in cases {
+                    for (target, suffix) in [(from, from_suffix), (to, to_suffix)] {
+                        let read = session.get_api_read(info.root_instance_id).unwrap();
+                        let response = session.post_api_write(&WriteRequest {
+                            session_id: info.session_id,
+                            operation_id: None,
+                            predecessor: None,
+                            source_baselines: Default::default(),
+                            message_cursor: Some(read.message_cursor),
+                            authority: WriteAuthority::Filesystem,
+                            removed: Vec::new(),
+                            added: Default::default(),
+                            updated: vec![InstanceUpdate {
+                                changed_properties: UstrMap::from_iter([(
+                                    ustr("RunContext"),
+                                    Some(Variant::Enum(Enum::from_u32(contexts[target]))),
+                                )]),
+                                ..shared_update(id)
+                            }],
+                        });
+                        assert!(
+                            response.errors.is_empty(),
+                            "Directory {directory}, extension {extension}, target {target}. {:?}",
+                            response.errors
+                        );
+                        assert!(
+                            response.conflicts.updated_instances.is_empty(),
+                            "{:?}",
+                            response.conflicts
+                        );
+                        assert!(response.accepted.added_instances.is_empty());
+                        assert!(response.accepted.removed_instances.is_empty());
+                        assert_eq!(fs::read(source_path(suffix)).unwrap(), authored);
+                        for (_, other_suffix) in cases {
+                            assert_eq!(source_path(other_suffix).exists(), suffix == other_suffix);
+                        }
+                        let after = session.get_api_read(info.root_instance_id).unwrap();
+                        assert_eq!(
+                            after
+                                .instances
+                                .keys()
+                                .copied()
+                                .collect::<std::collections::HashSet<_>>(),
+                            original_ids
+                        );
+                        let script = &after.instances[&id];
+                        assert_eq!(script.name, "Visible");
+                        assert_eq!(script.class_name, "Script");
+                        assert_eq!(
+                            script
+                                .properties
+                                .get(&ustr("RunContext"))
+                                .map(|value| value.as_ref())
+                                .unwrap_or(&Variant::Enum(Enum::from_u32(contexts["Legacy"]))),
+                            &Variant::Enum(Enum::from_u32(contexts[target]))
+                        );
+                        assert_eq!(
+                            script.properties[&ustr("Disabled")].as_ref(),
+                            &Variant::Bool(true)
+                        );
+                        let Some(Variant::Attributes(attributes)) = script
+                            .properties
+                            .get(&ustr("Attributes"))
+                            .map(|value| value.as_ref())
+                        else {
+                            panic!("Script metadata attributes were lost");
+                        };
+                        assert_eq!(
+                            attributes.get("TestLabel"),
+                            Some(&Variant::String("retained".into()))
+                        );
+                        let metadata = session.path().join(if directory {
+                            "src/Physical/init.meta.jsonc"
+                        } else {
+                            "src/Physical.meta.jsonc"
+                        });
+                        assert!(metadata.exists());
+                        assert!(!metadata.with_extension("json").exists());
+                        for child in &original_children {
+                            assert_eq!(after.instances[child].parent, id);
+                        }
+                    }
+                }
+            }
+            for message in settled_messages(&session, initial.message_cursor) {
+                assert!(message.added.is_empty(), "{:?}", message.added.keys());
+                assert!(message.removed.is_empty(), "{:?}", message.removed);
+            }
+            let final_read = session.get_api_read(info.root_instance_id).unwrap();
+            assert_eq!(
+                final_read
+                    .instances
+                    .keys()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>(),
+                original_ids
+            );
+            if directory {
+                assert_eq!(
+                    fs::read(session.path().join("src/Physical/Helper.luau")).unwrap(),
+                    b"return 17\n"
+                );
+                assert_eq!(
+                    fs::read(session.path().join("src/Physical/Nested/Child.luau")).unwrap(),
+                    b"return 23\n"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn studio_run_context_migration_keeps_effective_source_from_metadata() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use rbx_dom_weak::types::Enum;
+
+    let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+    let effective = "print('effective metadata source')\n";
+    for directory in [false, true] {
+        for metadata_extension in ["json", "jsonc"] {
+            let mut session = TestServeSession::with_setup("add_folder", |root| {
+                fs::write(
+                    root.join("default.project.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "ContextMetadataSource",
+                        "tree": {"$className": "Folder", "$path": "src"}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let (source, metadata) = if directory {
+                    fs::create_dir_all(root.join("src/Physical")).unwrap();
+                    fs::write(root.join("src/Physical/Child.luau"), "return 42\n").unwrap();
+                    (
+                        "src/Physical/init.server.luau",
+                        format!("src/Physical/init.meta.{metadata_extension}"),
+                    )
+                } else {
+                    (
+                        "src/Physical.server.luau",
+                        format!("src/Physical.meta.{metadata_extension}"),
+                    )
+                };
+                fs::write(root.join(source), "print('physical source')\r\n").unwrap();
+                fs::write(
+                    root.join(metadata),
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "Visible", "properties": {"Source": effective},
+                        "attributes": {"TestLabel": "retained"}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            });
+            let info = session.wait_to_come_online();
+            let initial = session.get_api_read(info.root_instance_id).unwrap();
+            let id = initial
+                .instances
+                .values()
+                .find(|instance| instance.name == "Visible")
+                .unwrap()
+                .id;
+            let expected_source = Variant::String(effective.into());
+            assert_eq!(
+                initial.instances[&id].properties[&ustr("Source")].as_ref(),
+                &expected_source
+            );
+            let response = session.post_api_write(&WriteRequest {
+                session_id: info.session_id,
+                operation_id: None,
+                predecessor: None,
+                source_baselines: Default::default(),
+                message_cursor: Some(initial.message_cursor),
+                authority: WriteAuthority::Filesystem,
+                removed: Vec::new(),
+                added: Default::default(),
+                updated: vec![InstanceUpdate {
+                    changed_properties: UstrMap::from_iter([(
+                        ustr("RunContext"),
+                        Some(Variant::Enum(Enum::from_u32(contexts["Client"]))),
+                    )]),
+                    ..shared_update(id)
+                }],
+            });
+            assert!(
+                response.errors.is_empty(),
+                "Directory {directory}, metadata {metadata_extension}. {:?}",
+                response.errors
+            );
+            assert!(
+                response.conflicts.updated_instances.is_empty(),
+                "{:?}",
+                response.conflicts
+            );
+            let (previous, destination) = if directory {
+                (
+                    "src/Physical/init.server.luau",
+                    "src/Physical/init.client.luau",
+                )
+            } else {
+                ("src/Physical.server.luau", "src/Physical.client.luau")
+            };
+            assert!(!session.path().join(previous).exists());
+            assert_eq!(
+                fs::read(session.path().join(destination)).unwrap(),
+                effective.as_bytes()
+            );
+            for message in settled_messages(&session, initial.message_cursor) {
+                assert!(message.added.is_empty());
+                assert!(message.removed.is_empty());
+            }
+            let after = session.get_api_read(info.root_instance_id).unwrap();
+            assert_eq!(
+                after.instances[&id].properties[&ustr("Source")].as_ref(),
+                &expected_source
+            );
+            assert_eq!(
+                after
+                    .instances
+                    .keys()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>(),
+                initial.instances.keys().copied().collect()
+            );
+            if directory {
+                assert_eq!(
+                    fs::read(session.path().join("src/Physical/Child.luau")).unwrap(),
+                    b"return 42\n"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn studio_run_context_migration_preserves_unseen_filesystem_structural_changes() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use rbx_dom_weak::types::Enum;
+
+    let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::write(root.join("src/Original.server.luau"), "print('original')\n").unwrap();
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "ContextConflict",
+                "tree": {"$className": "Folder", "$path": "src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let initial = session.get_api_read(info.root_instance_id).unwrap();
+    let id = initial
+        .instances
+        .values()
+        .find(|instance| instance.name == "Original")
+        .unwrap()
+        .id;
+    let metadata = serde_json::to_vec(&serde_json::json!({
+        "name": "DiskRenamed",
+        "properties": {"RunContext": {"Enum": contexts["Legacy"]}}
+    }))
+    .unwrap();
+    fs::write(session.path().join("src/Original.meta.json"), &metadata).unwrap();
+    let disk_context = Variant::Enum(Enum::from_u32(contexts["Legacy"]));
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            read.message_cursor > initial.message_cursor
+                && read.instances[&id].name == "DiskRenamed"
+                && read.instances[&id]
+                    .properties
+                    .get(&ustr("RunContext"))
+                    .map(|value| value.as_ref())
+                    .unwrap_or(&disk_context)
+                    == &disk_context
+        }),
+        "The filesystem rename and context were not observed"
+    );
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
+        message_cursor: Some(initial.message_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: Vec::new(),
+        added: Default::default(),
+        updated: vec![InstanceUpdate {
+            changed_properties: UstrMap::from_iter([(
+                ustr("RunContext"),
+                Some(Variant::Enum(Enum::from_u32(contexts["Client"]))),
+            )]),
+            ..shared_update(id)
+        }],
+    });
+    assert!(
+        response.accepted.updated_instances.is_empty(),
+        "{:?}",
+        response.accepted
+    );
+    assert!(
+        !response.conflicts.updated_instances.is_empty(),
+        "An unseen filesystem structural change was not protected"
+    );
+    assert_eq!(
+        fs::read(session.path().join("src/Original.server.luau")).unwrap(),
+        b"print('original')\n"
+    );
+    assert_eq!(
+        fs::read(session.path().join("src/Original.meta.json")).unwrap(),
+        metadata
+    );
+    assert!(!session.path().join("src/Original.client.luau").exists());
+    let after = session.get_api_read(info.root_instance_id).unwrap();
+    assert_eq!(after.instances[&id].name, "DiskRenamed");
+    assert_eq!(
+        after
+            .instances
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        initial.instances.keys().copied().collect()
+    );
+    assert_eq!(
+        after.instances[&id]
+            .properties
+            .get(&ustr("RunContext"))
+            .map(|value| value.as_ref())
+            .unwrap_or(&disk_context),
+        &disk_context
+    );
+}
+
+#[test]
+fn studio_run_context_migration_rejects_a_changed_nested_project_owner() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use rbx_dom_weak::types::Enum;
+
+    let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        for (directory, source) in [
+            ("code", "print('original')\n"),
+            ("other", "print('other')\n"),
+        ] {
+            let path = root.join("src/Nested").join(directory);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("Original.server.luau"), source).unwrap();
+        }
+        fs::write(
+            root.join("src/Nested/default.project.json"),
+            r#"{"name":"Nested","tree":{"$path":"code"}}"#,
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let initial = session.get_api_read(info.root_instance_id).unwrap();
+    let id = initial
+        .instances
+        .values()
+        .find(|instance| instance.name == "Original")
+        .unwrap()
+        .id;
+    let changed = r#"{"name":"Nested","tree":{"$path":"other"}}"#;
+    fs::write(
+        session.path().join("src/Nested/default.project.json"),
+        changed,
+    )
+    .unwrap();
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
+        message_cursor: Some(initial.message_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: Vec::new(),
+        added: Default::default(),
+        updated: vec![InstanceUpdate {
+            changed_properties: UstrMap::from_iter([(
+                ustr("RunContext"),
+                Some(Variant::Enum(Enum::from_u32(contexts["Client"]))),
+            )]),
+            ..shared_update(id)
+        }],
+    });
+    assert!(
+        response.accepted.updated_instances.is_empty(),
+        "{response:?}"
+    );
+    assert!(
+        !response.errors.is_empty() || !response.conflicts.updated_instances.is_empty(),
+        "A changed project owner must not report the migration Saved. {response:?}"
+    );
+    for (directory, source) in [
+        ("code", "print('original')\n"),
+        ("other", "print('other')\n"),
+    ] {
+        let path = session.path().join("src/Nested").join(directory);
+        assert_eq!(
+            fs::read(path.join("Original.server.luau")).unwrap(),
+            source.as_bytes()
+        );
+        assert!(!path.join("Original.client.luau").exists());
+    }
+    assert_eq!(
+        fs::read_to_string(session.path().join("src/Nested/default.project.json")).unwrap(),
+        changed
+    );
+}
+
+#[test]
+fn studio_run_context_migration_refuses_collisions_fixed_paths_and_exclusions() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use rbx_dom_weak::types::Enum;
+
+    let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+    for case in [
+        "collision",
+        "fixed",
+        "excluded",
+        "optional",
+        "nested-optional",
+        "referenced-optional",
+    ] {
+        let directory = if case == "nested-optional" {
+            "src/Nested/code"
+        } else {
+            "src"
+        };
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fs::create_dir_all(root.join(directory)).unwrap();
+            fs::write(
+                root.join(directory).join("Original.server.luau"),
+                "print('original')\n",
+            )
+            .unwrap();
+            let mut config = serde_json::json!({
+                "name": "ContextSafety",
+                "tree": {"$className": "Folder", "$path": "src"}
+            });
+            match case {
+                "collision" => {
+                    fs::write(root.join("src/Original.client.luau"), "print('occupied')\n").unwrap()
+                }
+                "fixed" => {
+                    config["tree"] = serde_json::json!({
+                        "$className": "Folder", "Original": {"$path": "src/Original.server.luau"}
+                    })
+                }
+                "excluded" => {
+                    config["syncbackRules"] = serde_json::json!({
+                        "ignorePaths": ["src/Original.client.luau"]
+                    })
+                }
+                "optional" => {
+                    config["tree"]["Pinned"] = serde_json::json!({
+                        "$path": {"optional": "src/Original.client.luau"}
+                    });
+                }
+                "nested-optional" => {
+                    fs::write(
+                        root.join("src/Nested/default.project.json"),
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": "Nested",
+                            "tree": {
+                                "$path": "code",
+                                "Pinned": {"$path": {"optional": "code/Original.client.luau"}}
+                            }
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                "referenced-optional" => {
+                    config["tree"]["Reserved"] = serde_json::json!({
+                        "$path": {"optional": "reserved.project.json"}
+                    });
+                    fs::write(
+                        root.join("reserved.project.json"),
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": "Reserved",
+                            "tree": {"$path": {"optional": "src/Original.client.luau"}}
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            fs::write(
+                root.join("default.project.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+        });
+        let info = session.wait_to_come_online();
+        let initial = session.get_api_read(info.root_instance_id).unwrap();
+        let id = initial
+            .instances
+            .values()
+            .find(|instance| {
+                instance
+                    .properties
+                    .get(&ustr("Source"))
+                    .is_some_and(|value| {
+                        value.as_ref() == &Variant::String("print('original')\n".into())
+                    })
+            })
+            .unwrap()
+            .id;
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
+            message_cursor: Some(initial.message_cursor),
+            authority: WriteAuthority::Filesystem,
+            removed: Vec::new(),
+            added: Default::default(),
+            updated: vec![InstanceUpdate {
+                changed_properties: UstrMap::from_iter([(
+                    ustr("RunContext"),
+                    Some(Variant::Enum(Enum::from_u32(contexts["Client"]))),
+                )]),
+                ..shared_update(id)
+            }],
+        });
+        assert!(
+            !response.errors.is_empty() || !response.conflicts.updated_instances.is_empty(),
+            "Unsafe migration {case} was reported Saved."
+        );
+        assert!(
+            response.accepted.updated_instances.is_empty(),
+            "{:?}",
+            response.accepted
+        );
+        assert_eq!(
+            fs::read(session.path().join(directory).join("Original.server.luau")).unwrap(),
+            b"print('original')\n"
+        );
+        if case == "collision" {
+            assert_eq!(
+                fs::read(session.path().join("src/Original.client.luau")).unwrap(),
+                b"print('occupied')\n"
+            );
+        } else {
+            assert!(!session
+                .path()
+                .join(directory)
+                .join("Original.client.luau")
+                .exists());
+        }
+        for message in settled_messages(&session, initial.message_cursor) {
+            assert!(message.added.is_empty(), "{case}. {message:?}");
+            assert!(message.removed.is_empty(), "{case}. {message:?}");
+        }
+        let after = session.get_api_read(info.root_instance_id).unwrap();
+        assert_eq!(
+            after.instances[&id].properties[&ustr("RunContext")].as_ref(),
+            &Variant::Enum(Enum::from_u32(contexts["Server"]))
+        );
+        assert_eq!(
+            after
+                .instances
+                .keys()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            initial.instances.keys().copied().collect()
+        );
+    }
+}
+
+#[test]
+fn studio_run_context_change_composes_with_move_rename_source_and_metadata() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    use rbx_dom_weak::types::Enum;
+
+    let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+    for directory in [false, true] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fs::create_dir_all(root.join("src/Destination")).unwrap();
+            fs::write(
+                root.join("default.project.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "ContextComposition",
+                    "tree": {"$className": "Folder", "$path": "src"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            if directory {
+                fs::create_dir_all(root.join("src/Original")).unwrap();
+                fs::write(root.join("src/Original/init.server.luau"), "print('old')\n").unwrap();
+                fs::write(root.join("src/Original/Child.luau"), "return 42\n").unwrap();
+            } else {
+                fs::write(root.join("src/Original.server.luau"), "print('old')\n").unwrap();
+            }
+        });
+        let info = session.wait_to_come_online();
+        let initial = session.get_api_read(info.root_instance_id).unwrap();
+        let id = initial
+            .instances
+            .values()
+            .find(|instance| instance.name == "Original")
+            .unwrap()
+            .id;
+        let parent = initial
+            .instances
+            .values()
+            .find(|instance| instance.name == "Destination")
+            .unwrap()
+            .id;
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
+            message_cursor: Some(initial.message_cursor),
+            authority: WriteAuthority::Filesystem,
+            removed: Vec::new(),
+            added: Default::default(),
+            updated: vec![InstanceUpdate {
+                changed_parent: Some(parent),
+                changed_name: Some("Renamed".into()),
+                changed_properties: UstrMap::from_iter([
+                    (
+                        ustr("RunContext"),
+                        Some(Variant::Enum(Enum::from_u32(contexts["Client"]))),
+                    ),
+                    (
+                        ustr("Source"),
+                        Some(Variant::String("print('new')\n".into())),
+                    ),
+                    (ustr("Disabled"), Some(Variant::Bool(true))),
+                ]),
+                ..shared_update(id)
+            }],
+        });
+        assert!(
+            response.errors.is_empty(),
+            "Directory {directory}. {:?}",
+            response.errors
+        );
+        assert!(
+            response.conflicts.updated_instances.is_empty(),
+            "{:?}",
+            response.conflicts
+        );
+        assert!(response.accepted.added_instances.is_empty());
+        assert!(response.accepted.removed_instances.is_empty());
+        let destination = session.path().join(if directory {
+            "src/Destination/Renamed/init.client.luau"
+        } else {
+            "src/Destination/Renamed.client.luau"
+        });
+        assert_eq!(fs::read(destination).unwrap(), b"print('new')\n");
+        assert!(!session.path().join("src/Original.server.luau").exists());
+        assert!(!session.path().join("src/Original").exists());
+        for message in settled_messages(&session, initial.message_cursor) {
+            assert!(message.added.is_empty(), "{:?}", message.added.keys());
+            assert!(message.removed.is_empty(), "{:?}", message.removed);
+        }
+        let after = session.get_api_read(info.root_instance_id).unwrap();
+        assert_eq!(
+            after
+                .instances
+                .keys()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            initial.instances.keys().copied().collect()
+        );
+        assert_eq!(after.instances[&id].parent, parent);
+        assert_eq!(after.instances[&id].name, "Renamed");
+        assert_eq!(
+            after.instances[&id].properties[&ustr("Disabled")].as_ref(),
+            &Variant::Bool(true)
+        );
+    }
+}
+
+#[test]
 fn studio_repeated_actor_moves_resolve_authored_relative_mount_destinations() {
     use crate::rojo_test::serve_util::TestServeSession;
     for mapping in ["src", "./src", "directory/../src"] {
@@ -101,6 +926,673 @@ fn studio_repeated_actor_moves_resolve_authored_relative_mount_destinations() {
             );
         }
     }
+}
+
+/// A move must not lose to filesystem authority just because an unrelated file changed
+/// on disk after Studio last read the tree. Only effects that touch the moved subtree or
+/// its destination are real conflicts.
+#[test]
+fn studio_move_after_unrelated_disk_change_is_not_a_conflict() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir_all(root.join("src/Actor")).unwrap();
+        fs::create_dir_all(root.join("src/Destination")).unwrap();
+        fs::write(root.join("src/Actor/Handler.luau"), "return 1\n").unwrap();
+        fs::write(root.join("src/Unrelated.luau"), "return 0\n").unwrap();
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "UnrelatedRace",
+                "tree": {"$className":"Folder", "$path":"src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let actor = wait_for_instance(&session, "Actor");
+    let handler = wait_for_instance(&session, "Handler");
+    let destination = wait_for_instance(&session, "Destination");
+    let unrelated = wait_for_instance(&session, "Unrelated");
+    let stale_cursor = session
+        .get_api_read(info.root_instance_id)
+        .unwrap()
+        .message_cursor;
+    fs::write(session.path().join("src/Unrelated.luau"), "return 2\n").unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(unrelated).unwrap();
+            read.message_cursor > stale_cursor
+        }),
+        "The unrelated disk change was never published"
+    );
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
+        message_cursor: Some(stale_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: Vec::new(),
+        added: Default::default(),
+        updated: vec![InstanceUpdate {
+            id: actor,
+            changed_parent: Some(destination),
+            changed_name: None,
+            changed_class_name: None,
+            changed_metadata: None,
+            changed_properties: UstrMap::default(),
+        }],
+    });
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(
+        response.conflicts.updated_instances.is_empty(),
+        "{:?}",
+        response.conflicts
+    );
+    let after = session.get_api_read(info.root_instance_id).unwrap();
+    assert_eq!(after.instances[&actor].parent, destination);
+    assert_eq!(after.instances[&handler].parent, actor);
+    assert_eq!(
+        fs::read_to_string(session.path().join("src/Destination/Actor/Handler.luau")).unwrap(),
+        "return 1\n"
+    );
+}
+
+/// Renames, and a rename combined with a move, take the same relocation path, so an
+/// unrelated disk change must not turn either into a filesystem-wins conflict. A
+/// Studio edit inside the subtree that the predecessor proves is not a conflict either.
+#[test]
+fn studio_rename_and_move_survive_unrelated_and_proven_changes() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir_all(root.join("src/Actor")).unwrap();
+        fs::create_dir_all(root.join("src/Destination")).unwrap();
+        fs::write(root.join("src/Actor/Handler.luau"), "return 1\n").unwrap();
+        fs::write(root.join("src/Unrelated.luau"), "return 0\n").unwrap();
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "RenameRace",
+                "tree": {"$className":"Folder", "$path":"src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let actor = wait_for_instance(&session, "Actor");
+    let handler = wait_for_instance(&session, "Handler");
+    let destination = wait_for_instance(&session, "Destination");
+    let unrelated = wait_for_instance(&session, "Unrelated");
+    let write = |cursor: u32, predecessor: Option<String>, update: InstanceUpdate| {
+        session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            operation_id: None,
+            predecessor,
+            source_baselines: Default::default(),
+            message_cursor: Some(cursor),
+            authority: WriteAuthority::Filesystem,
+            removed: Vec::new(),
+            added: Default::default(),
+            updated: vec![update],
+        })
+    };
+    let update = |id, parent: Option<Ref>, name: Option<&str>| InstanceUpdate {
+        id,
+        changed_parent: parent,
+        changed_name: name.map(str::to_owned),
+        changed_class_name: None,
+        changed_metadata: None,
+        changed_properties: UstrMap::default(),
+    };
+    let publish_unrelated = |contents: &str, after: u32| {
+        fs::write(session.path().join("src/Unrelated.luau"), contents).unwrap();
+        assert!(
+            eventually(|| session.get_api_read(unrelated).unwrap().message_cursor > after),
+            "The unrelated disk change was never published"
+        );
+    };
+
+    // A rename alone, racing an unrelated disk change.
+    let cursor = session.get_api_read(actor).unwrap().message_cursor;
+    publish_unrelated("return 2\n", cursor);
+    let response = write(cursor, None, update(actor, None, Some("Renamed")));
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(
+        response.conflicts.updated_instances.is_empty(),
+        "{:?}",
+        response.conflicts
+    );
+    assert!(session.path().join("src/Renamed/Handler.luau").exists());
+
+    // A rename and a move together, racing another unrelated disk change.
+    let cursor = session.get_api_read(actor).unwrap().message_cursor;
+    publish_unrelated("return 3\n", cursor);
+    let response = write(cursor, None, update(actor, Some(destination), Some("Both")));
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(
+        response.conflicts.updated_instances.is_empty(),
+        "{:?}",
+        response.conflicts
+    );
+    assert!(session
+        .path()
+        .join("src/Destination/Both/Handler.luau")
+        .exists());
+
+    // A Studio edit inside the subtree, then a move from the cursor before that edit.
+    // The edit's acknowledgement proves Studio already knows about it.
+    let cursor = session.get_api_read(actor).unwrap().message_cursor;
+    let mut edit = update(handler, None, None);
+    edit.changed_properties =
+        UstrMap::from_iter([(ustr("Source"), Some(Variant::String("return 4\n".into())))]);
+    let edited = write(cursor, None, edit);
+    assert!(edited.errors.is_empty(), "{:?}", edited.errors);
+    assert!(edited.acknowledgement.is_some());
+    let response = write(
+        cursor,
+        edited.acknowledgement,
+        update(actor, Some(info.root_instance_id), None),
+    );
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(
+        response.conflicts.updated_instances.is_empty(),
+        "{:?}",
+        response.conflicts
+    );
+    let after = session.get_api_read(info.root_instance_id).unwrap();
+    assert_eq!(after.instances[&actor].parent, info.root_instance_id);
+    assert_eq!(after.instances[&handler].parent, actor);
+    assert_eq!(
+        fs::read_to_string(session.path().join("src/Both/Handler.luau")).unwrap(),
+        "return 4\n"
+    );
+}
+
+/// A disk change inside the moved subtree that Studio has not seen is a genuine
+/// conflict, so filesystem authority must still win.
+#[test]
+fn studio_move_after_disk_change_inside_subtree_still_conflicts() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir_all(root.join("src/Actor")).unwrap();
+        fs::create_dir_all(root.join("src/Destination")).unwrap();
+        fs::write(root.join("src/Actor/Handler.luau"), "return 1\n").unwrap();
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "SubtreeRace",
+                "tree": {"$className":"Folder", "$path":"src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let actor = wait_for_instance(&session, "Actor");
+    let handler = wait_for_instance(&session, "Handler");
+    let destination = wait_for_instance(&session, "Destination");
+    let stale_cursor = session
+        .get_api_read(info.root_instance_id)
+        .unwrap()
+        .message_cursor;
+    fs::write(session.path().join("src/Actor/Handler.luau"), "return 2\n").unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(handler).unwrap();
+            read.message_cursor > stale_cursor
+        }),
+        "The subtree disk change was never published"
+    );
+    let response = session.post_api_write(&WriteRequest {
+        session_id: info.session_id,
+        operation_id: None,
+        predecessor: None,
+        source_baselines: Default::default(),
+        message_cursor: Some(stale_cursor),
+        authority: WriteAuthority::Filesystem,
+        removed: Vec::new(),
+        added: Default::default(),
+        updated: vec![InstanceUpdate {
+            id: actor,
+            changed_parent: Some(destination),
+            changed_name: None,
+            changed_class_name: None,
+            changed_metadata: None,
+            changed_properties: UstrMap::default(),
+        }],
+    });
+    assert!(
+        !response.conflicts.updated_instances.is_empty(),
+        "A genuine subtree change must still conflict"
+    );
+    assert!(session.path().join("src/Actor/Handler.luau").exists());
+}
+
+/// Watchers report a rename on disk as a removal and a creation. When the created path
+/// holds exactly the removed subtree, it is a move, so the instances must keep their
+/// ids instead of Studio deleting them and building fresh copies.
+#[test]
+fn filesystem_renames_and_moves_keep_instance_ids() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir_all(root.join("src/Folder/Nested")).unwrap();
+        fs::create_dir_all(root.join("src/Destination")).unwrap();
+        fs::write(root.join("src/Module.luau"), "return 1\n").unwrap();
+        fs::write(root.join("src/Folder/Child.luau"), "return 2\n").unwrap();
+        fs::write(root.join("src/Folder/Nested/init.luau"), "return 3\n").unwrap();
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "DiskRenames",
+                "tree": {"$className":"Folder", "$path":"src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let module = wait_for_instance(&session, "Module");
+    let folder = wait_for_instance(&session, "Folder");
+    let child = wait_for_instance(&session, "Child");
+    let nested = wait_for_instance(&session, "Nested");
+    let destination = wait_for_instance(&session, "Destination");
+    let root = info.root_instance_id;
+    let converge = |id: Ref, name: &str, parent: Ref, label: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let read = session.get_api_read(root).unwrap();
+            if let Some(instance) = read.instances.get(&id) {
+                if instance.name == name && instance.parent == parent {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label} did not keep its id. {:?}",
+                read.instances
+                    .values()
+                    .map(|instance| (instance.name.to_string(), instance.id))
+                    .collect::<Vec<_>>()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let path = |relative: &str| session.path().join(relative);
+
+    fs::rename(path("src/Module.luau"), path("src/Renamed.luau")).unwrap();
+    converge(module, "Renamed", root, "A file rename");
+
+    fs::rename(
+        path("src/Renamed.luau"),
+        path("src/Destination/Renamed.luau"),
+    )
+    .unwrap();
+    converge(module, "Renamed", destination, "A file move");
+
+    fs::rename(path("src/Folder"), path("src/Moved")).unwrap();
+    converge(folder, "Moved", root, "A folder rename");
+    converge(child, "Child", folder, "A folder rename's child");
+    converge(
+        nested,
+        "Nested",
+        folder,
+        "A folder rename's init script folder",
+    );
+
+    fs::rename(path("src/Moved"), path("src/Destination/Moved")).unwrap();
+    converge(folder, "Moved", destination, "A folder move");
+    converge(child, "Child", folder, "A folder move's child");
+
+    // Edits after a paired rename land on the same instance at its new path.
+    fs::write(path("src/Destination/Moved/Child.luau"), "return 4\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = session.get_api_read(child).unwrap();
+        if read.instances[&child].properties[&ustr("Source")].as_ref()
+            == &Variant::String("return 4\n".into())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "The moved child stopped syncing");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // A rename that also rewrites the file is not provably the same instance, so it
+    // may take a new id, but it must still converge.
+    fs::remove_file(path("src/Destination/Renamed.luau")).unwrap();
+    fs::write(path("src/Destination/Different.luau"), "return 99\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = session.get_api_read(root).unwrap();
+        let names: Vec<_> = read
+            .instances
+            .values()
+            .map(|i| i.name.to_string())
+            .collect();
+        if names.iter().any(|name| name == "Different")
+            && !names.iter().any(|name| name == "Renamed")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "The rewritten file did not converge"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn filesystem_child_folder_move_after_parent_rename_keeps_subtree_identity() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir_all(root.join("src/Parent/Tree")).unwrap();
+        for index in 0..120 {
+            fs::write(
+                root.join(format!("src/Parent/Tree/Child{index:03}.luau")),
+                format!("return {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "DescendantMove",
+                "tree": {"$className":"Folder", "$path":"src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let parent = wait_for_instance(&session, "Parent");
+    let tree = wait_for_instance(&session, "Tree");
+    let child = wait_for_instance(&session, "Child002");
+    fs::rename(
+        session.path().join("src/Parent"),
+        session.path().join("src/Renamed"),
+    )
+    .unwrap();
+    assert!(eventually(|| {
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        read.instances.get(&parent).is_some_and(|instance| {
+            instance.name == "Renamed" && instance.parent == info.root_instance_id
+        }) && read
+            .instances
+            .get(&tree)
+            .is_some_and(|instance| instance.parent == parent)
+    }));
+
+    let destination = session.path().join("src/New/Deep/Tree");
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::rename(session.path().join("src/Renamed/Tree"), &destination).unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            let Some(moved) = read.instances.get(&tree) else {
+                return false;
+            };
+            read.instances
+                .get(&moved.parent)
+                .is_some_and(|instance| instance.name == "Deep")
+                && read
+                    .instances
+                    .get(&child)
+                    .is_some_and(|instance| instance.parent == tree)
+        }),
+        "Moving a child folder after renaming its parent recreated the subtree"
+    );
+    fs::write(destination.join("Child002.luau"), "return 999\n").unwrap();
+    assert!(eventually(|| {
+        session
+            .get_api_read(child)
+            .unwrap()
+            .instances
+            .get(&child)
+            .and_then(|instance| instance.properties.get(&ustr("Source")))
+            .is_some_and(|source| source.as_ref() == &Variant::String("return 999\n".into()))
+    }));
+}
+
+#[test]
+fn filesystem_move_into_new_parent_ancestry_keeps_identity_and_siblings() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/Module.luau"), "return 1\n").unwrap();
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "NewParentMove",
+                "tree": {"$className":"Folder", "$path":"src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let module = wait_for_instance(&session, "Module");
+    let destination = session.path().join("src/NewParent/Nested");
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("Sibling.luau"), "return 2\n").unwrap();
+    fs::rename(
+        session.path().join("src/Module.luau"),
+        destination.join("Module.luau"),
+    )
+    .unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            let Some(moved) = read.instances.get(&module) else {
+                return false;
+            };
+            let Some(parent) = read.instances.get(&moved.parent) else {
+                return false;
+            };
+            let Some(grandparent) = read.instances.get(&parent.parent) else {
+                return false;
+            };
+            parent.name == "Nested"
+                && grandparent.name == "NewParent"
+                && read
+                    .instances
+                    .values()
+                    .any(|instance| instance.name == "Sibling" && instance.parent == moved.parent)
+        }),
+        "A same-burst move into new parent ancestry lost identity or sibling content"
+    );
+    fs::write(destination.join("Module.luau"), "return 3\n").unwrap();
+    assert!(
+        eventually(|| {
+            session
+                .get_api_read(module)
+                .unwrap()
+                .instances
+                .get(&module)
+                .is_some_and(|instance| {
+                    instance
+                        .properties
+                        .get(&ustr("Source"))
+                        .is_some_and(|source| {
+                            source.as_ref() == &Variant::String("return 3\n".into())
+                        })
+                })
+        }),
+        "The moved module stopped syncing after its new parents were added"
+    );
+}
+
+#[test]
+fn filesystem_rename_identity_distinguishes_identical_entries_and_case_changes() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir_all(root.join("src/EmptyA")).unwrap();
+        fs::create_dir_all(root.join("src/EmptyB")).unwrap();
+        for name in ["SameA", "SameB", "Replaced"] {
+            fs::write(root.join(format!("src/{name}.luau")), "return 1\n").unwrap();
+        }
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "RenameIdentity",
+                "tree": {"$className":"Folder", "$path":"src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let same_a = wait_for_instance(&session, "SameA");
+    let same_b = wait_for_instance(&session, "SameB");
+    let empty_a = wait_for_instance(&session, "EmptyA");
+    let empty_b = wait_for_instance(&session, "EmptyB");
+    let replaced = wait_for_instance(&session, "Replaced");
+    let path = |relative: &str| session.path().join(relative);
+
+    // Equal contents are not enough to associate two simultaneous renames.
+    fs::rename(path("src/SameA.luau"), path("src/RenamedB.luau")).unwrap();
+    fs::rename(path("src/SameB.luau"), path("src/RenamedA.luau")).unwrap();
+    fs::rename(path("src/EmptyA"), path("src/MovedB")).unwrap();
+    fs::rename(path("src/EmptyB"), path("src/MovedA")).unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            [
+                (same_a, "RenamedB"),
+                (same_b, "RenamedA"),
+                (empty_a, "MovedB"),
+                (empty_b, "MovedA"),
+            ]
+            .into_iter()
+            .all(|(id, name)| {
+                read.instances
+                    .get(&id)
+                    .is_some_and(|instance| instance.name == name)
+            })
+        }),
+        "Identical entries exchanged or lost their identities"
+    );
+
+    fs::rename(path("src/RenamedB.luau"), path("src/renamedb.luau")).unwrap();
+    fs::rename(path("src/MovedB"), path("src/movedb")).unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            [(same_a, "renamedb"), (empty_a, "movedb")]
+                .into_iter()
+                .all(|(id, name)| {
+                    read.instances
+                        .get(&id)
+                        .is_some_and(|instance| instance.name == name)
+                })
+        }),
+        "Case-only renames lost their identities"
+    );
+    fs::write(path("src/renamedb.luau"), "return 2\n").unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(same_a).unwrap();
+            read.instances.get(&same_a).is_some_and(|instance| {
+                instance
+                    .properties
+                    .get(&ustr("Source"))
+                    .is_some_and(|source| source.as_ref() == &Variant::String("return 2\n".into()))
+            })
+        }),
+        "A case-renamed script stopped syncing"
+    );
+
+    // An unrelated deletion and equal creation must not inherit the deleted id.
+    fs::remove_file(path("src/Replaced.luau")).unwrap();
+    fs::write(path("src/Independent.luau"), "return 1\n").unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(info.root_instance_id).unwrap();
+            !read.instances.contains_key(&replaced)
+                && read
+                    .instances
+                    .values()
+                    .any(|instance| instance.name == "Independent")
+        }),
+        "Independent identical content inherited a deleted identity"
+    );
+}
+
+#[test]
+fn studio_moves_through_long_paths_keep_identity_and_source_sync() {
+    use crate::rojo_test::serve_util::TestServeSession;
+    let deep = (0..18).fold(std::path::PathBuf::from("src"), |path, index| {
+        path.join(format!("NestedDirectory{index:02}"))
+    });
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::create_dir_all(root.join(&deep)).unwrap();
+        fs::write(root.join("src/Module.luau"), "return 1\n").unwrap();
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "LongMoves",
+                "tree": {"$className":"Folder", "$path":"src"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    let info = session.wait_to_come_online();
+    let module = wait_for_instance(&session, "Module");
+    let destination = wait_for_instance(&session, "NestedDirectory17");
+    let long_path = session.path().join(&deep).join("Module.luau");
+    assert!(long_path.as_os_str().len() > 260);
+    for parent in [destination, info.root_instance_id, destination] {
+        let read = session.get_api_read(info.root_instance_id).unwrap();
+        // Let long-path watcher echoes race the request's already captured cursor.
+        #[cfg(windows)]
+        std::thread::sleep(Duration::from_millis(100));
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
+            message_cursor: Some(read.message_cursor),
+            authority: WriteAuthority::Filesystem,
+            removed: Vec::new(),
+            added: Default::default(),
+            updated: vec![InstanceUpdate {
+                id: module,
+                changed_parent: Some(parent),
+                changed_name: None,
+                changed_class_name: None,
+                changed_metadata: None,
+                changed_properties: UstrMap::default(),
+            }],
+        });
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(
+            response.conflicts.updated_instances.is_empty(),
+            "Moving to {parent:?} conflicted. {:?}",
+            response.conflicts
+        );
+        assert_eq!(
+            session.get_api_read(module).unwrap().instances[&module].parent,
+            parent
+        );
+    }
+    assert!(long_path.exists());
+    assert!(!session.path().join("src/Module.luau").exists());
+    fs::write(&long_path, "return 2\n").unwrap();
+    assert!(
+        eventually(|| {
+            let read = session.get_api_read(module).unwrap();
+            read.instances.get(&module).is_some_and(|instance| {
+                instance
+                    .properties
+                    .get(&ustr("Source"))
+                    .is_some_and(|source| source.as_ref() == &Variant::String("return 2\n".into()))
+            })
+        }),
+        "The long-path module stopped syncing"
+    );
 }
 
 #[test]
@@ -1386,12 +2878,8 @@ fn assert_numeric_api_writes_converge(cases: &[(f64, f64)]) {
                 for update in &response.accepted.updated_instances {
                     assert_eq!(
                         update.changed_properties.get(&ustr("Value")),
-                        Some(&if expected == 0.0 {
-                            None
-                        } else {
-                            Some(Variant::Float64(expected))
-                        }),
-                        "Acknowledgment and disk disagree for {input}."
+                        Some(&Some(Variant::Float64(expected))),
+                        "Acknowledgment must contain the canonical wire value for {input}."
                     );
                 }
                 let read = session.get_api_read(root_id).unwrap();
@@ -1708,7 +3196,7 @@ fn model_tree_rules_reach_instances_stored_in_metadata() {
         )
         .unwrap();
     });
-    session.wait_to_come_online();
+    let info = session.wait_to_come_online();
     let mover_dir = session.path().join("src/ReplicatedStorage/Mover");
     let mover = wait_for_instance(&session, "Mover");
     let spark = wait_for_instance(&session, "Spark");
@@ -1724,12 +3212,11 @@ fn model_tree_rules_reach_instances_stored_in_metadata() {
         eventually(|| mover_dir.join("Outer/FX.rbxm").is_file()),
         "FX never became a model"
     );
-    // The model is written before the metadata that held it.
-    assert!(eventually(|| !fs::read_to_string(
-        mover_dir.join("init.meta.json")
-    )
-    .unwrap()
-    .contains("Outer")));
+    // Destination visibility precedes durability work and source cleanup. A read
+    // takes the tree lock, so it waits for the whole relayout before checking disk.
+    session.get_api_read(info.root_instance_id).unwrap();
+    let metadata = fs::read_to_string(mover_dir.join("init.meta.json")).unwrap();
+    assert!(!metadata.contains("Outer"), "{metadata}");
     let model =
         rbx_binary::from_reader(fs::File::open(mover_dir.join("Outer/FX.rbxm")).unwrap()).unwrap();
     let root = model.root();
@@ -3657,6 +5144,7 @@ mod serve_lifetime {
 
 mod serve_live_edit_place {
     use std::{
+        fs::File,
         io::Read,
         path::Path,
         process::{Command, Stdio},
@@ -3691,6 +5179,10 @@ mod serve_live_edit_place {
     }
 
     fn marker(place: &Path) -> Option<String> {
+        attribute(place, "__RojoPlus_LiveEditUrl")
+    }
+
+    fn attribute(place: &Path, key: &str) -> Option<String> {
         let dom = rbx_binary::from_reader(std::fs::read(place).unwrap().as_slice()).unwrap();
         let workspace = dom
             .descendants()
@@ -3700,7 +5192,7 @@ mod serve_live_edit_place {
         else {
             return None;
         };
-        match attributes.get("__RojoPlus_LiveEditUrl")? {
+        match attributes.get(key)? {
             Variant::String(value) => Some(value.clone()),
             Variant::BinaryString(value) => {
                 std::str::from_utf8(value.as_ref()).ok().map(str::to_owned)
@@ -3743,6 +5235,83 @@ mod serve_live_edit_place {
             .read_to_string(&mut stderr)
             .unwrap();
         stderr
+    }
+
+    #[test]
+    fn directional_live_edit_place_matches_negotiated_identity_and_policy() {
+        for mode in ["fs-to-studio", "studio-to-fs", "bidirectional"] {
+            let directory = tempfile::tempdir().unwrap();
+            let project = directory.path().join("default.project.json");
+            std::fs::write(&project, PLACE_PROJECT).unwrap();
+            let template = directory.path().join("Live.{port}.rbxl");
+            let mut process = KillOnDrop(
+                command(&project, &template)
+                    .args(["--sync-direction", mode, "--shutdown-on-stdin-eof"])
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let port = read_server_port(process.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
+            let client = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let info_bytes = client
+                .get(format!("http://127.0.0.1:{port}/api/rojo"))
+                .header("Accept", "application/json")
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .unwrap();
+            let info: serde_json::Value = serde_json::from_slice(&info_bytes).unwrap();
+            assert_eq!(info["syncDirection"], mode);
+            assert_eq!(
+                info["supportedSyncDirections"],
+                serde_json::json!(["fs-to-studio", "studio-to-fs", "bidirectional"])
+            );
+            let place = directory.path().join(format!("Live.{port}.rbxl"));
+            wait_for_place(&place);
+            assert_eq!(marker(&place), Some(format!("127.0.0.1:{port}")));
+            assert_eq!(
+                attribute(&place, "__RojoPlus_LiveEditSessionId").as_deref(),
+                info["sessionId"].as_str()
+            );
+            assert_eq!(
+                attribute(&place, "__RojoPlus_LiveEditDirection").as_deref(),
+                Some(mode)
+            );
+            let bytes = client
+                .get(format!(
+                    "http://127.0.0.1:{port}/api/read/{}",
+                    info["rootInstanceId"].as_str().unwrap()
+                ))
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .unwrap();
+            let served: librojo::web_api::ReadResponse<'_> =
+                crate::rojo_test::serve_util::deserialize_msgpack(&bytes).unwrap();
+            let json = serde_json::to_string(&served).unwrap();
+            for name in [
+                "__RojoPlus_LiveEditSessionId",
+                "__RojoPlus_LiveEditDirection",
+                "__RojoPlus_LiveEditUrl",
+                "__RojoPlus_LiveEditBootstrapped",
+            ] {
+                assert!(
+                    !json.contains(name),
+                    "A generated-place marker leaked into the served tree."
+                );
+            }
+            assert_eq!(std::fs::read_to_string(project).unwrap(), PLACE_PROJECT);
+            drop(process.0.stdin.take().unwrap());
+            assert!(wait_for_exit(&mut process).success());
+        }
     }
 
     #[test]
@@ -3794,8 +5363,18 @@ mod serve_live_edit_place {
             let port = read_server_port(owner.0.stdout.take().unwrap(), SERVE_PORT_PREFIX);
             let port = port.to_string();
             let place = directory.path().join(format!("Live.{port}.rbxl"));
-            let lock_path = directory.path().join(format!("Live.{port}.rbxl.lock"));
+            let lock_path = directory
+                .path()
+                .join(format!("Live.{port}.rbxl.rojo-live-edit.lock"));
             wait_for_place(&place);
+            let studio_path = directory.path().join(format!("Live.{port}.rbxl.lock"));
+            let studio = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&studio_path)
+                .unwrap();
+            studio.try_lock().unwrap();
             let original = std::fs::read(&place).unwrap();
             // The writer is done, but the server still owns the output. IPv4 and
             // IPv6 loopback can listen on the same port without sharing a socket.

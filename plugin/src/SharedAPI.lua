@@ -107,6 +107,29 @@ function SharedAPI.isWriteAuthority(authority)
 	return authority == "Filesystem" or authority == "Studio"
 end
 
+function SharedAPI.canSyncbackFromStudio(app)
+	assert(app == nil or type(app) == "table", "Syncback policy requires an App or nil.")
+	return app == nil or app.serveSession == nil or app.serveSession:getSyncDirection() ~= "fs-to-studio"
+end
+
+function SharedAPI.describeStatus(app)
+	assert(app == nil or type(app) == "table", "Status requires an App or nil.")
+	if app == nil then
+		return { status = "Unloaded" }
+	end
+	const result = {
+		status = app.state.appStatus,
+		syncDirection = if app.serveSession then app.serveSession:getSyncDirection() else nil,
+	}
+	if result.status == "Connected" then
+		result.projectName = app.state.projectName
+		result.address = app.state.address
+	elseif result.status == "Error" then
+		result.error = app.state.errorMessage
+	end
+	return result
+end
+
 function SharedAPI.register(app)
 	if not RunService:IsEdit() then
 		return
@@ -198,24 +221,7 @@ function SharedAPI.register(app)
 	end
 
 	function api.getStatus()
-		if registeredApp == nil then
-			return {
-				status = "Unloaded",
-			}
-		end
-
-		const result = {
-			status = registeredApp.state.appStatus,
-		}
-
-		if registeredApp.state.appStatus == "Connected" then
-			result.projectName = registeredApp.state.projectName
-			result.address = registeredApp.state.address
-		elseif registeredApp.state.appStatus == "Error" then
-			result.error = registeredApp.state.errorMessage
-		end
-
-		return result
+		return SharedAPI.describeStatus(registeredApp)
 	end
 
 	function api.getAddress()
@@ -422,6 +428,9 @@ function SharedAPI.register(app)
 				success = false,
 				error = "Rojo+ plugin is not loaded",
 			}
+		end
+		if not SharedAPI.canSyncbackFromStudio(registeredApp) then
+			return { success = false, error = "The filesystem-only session prohibits Studio syncback writes." }
 		end
 
 		const address = api.getAddress()

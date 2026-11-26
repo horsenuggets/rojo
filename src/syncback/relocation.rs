@@ -435,6 +435,26 @@ pub(crate) fn execute_replacements(
     })
 }
 
+pub(crate) fn execute_script_replacements(
+    vfs: &memofs::Vfs,
+    journal: &Path,
+    project: &crate::Project,
+    entries: Vec<super::relocation_transaction::Replacement>,
+    expected: &HashMap<PathBuf, Option<Vec<u8>>>,
+    ownership: &super::ScriptMigrationOwnership,
+) -> std::io::Result<()> {
+    execute_transaction(vfs, journal, || {
+        super::relocation_transaction::execute_script_replacements_guarded(
+            vfs,
+            journal,
+            project,
+            entries,
+            expected,
+            Some(ownership),
+        )
+    })
+}
+
 fn execute_transaction(
     vfs: &memofs::Vfs,
     journal: &Path,
@@ -452,7 +472,11 @@ fn execute_transaction(
     vfs.sync_path(cache.parent().unwrap())?;
     vfs.sync_path(cache)?;
     let result = execute();
-    if super::relocation_transaction::recover(vfs, journal).is_ok() {
+    // A successful execute has already flushed its commit marker. Recovery reparses
+    // the whole journal, which holds every moved file's bytes, so only failures and
+    // journals without a visible commit need it.
+    let committed = result.is_ok() && vfs.metadata(journal.join("commit")).is_ok();
+    if committed || super::relocation_transaction::recover(vfs, journal).is_ok() {
         if let Err(error) = retire_journal(vfs, journal) {
             log::warn!(
                 "Could not retire relocation journal \"{}\" ({error}).",
@@ -553,6 +577,12 @@ fn recover_journals(vfs: &memofs::Vfs, cache: &Path) -> std::io::Result<()> {
             vfs.remove_dir_all(entry.path())?;
             vfs.sync_path(&cache)?;
         } else {
+            if super::relocation_transaction::rolls_back_outside_project(vfs, entry.path())? {
+                return Err(std::io::Error::other(format!(
+                    "Refused to recover the script rename journal at \"{}\" because it would write outside its project folder. Check the listed files, then delete the journal folder to continue.",
+                    entry.path().display()
+                )));
+            }
             super::relocation_transaction::recover(vfs, entry.path())?;
             retire_journal(vfs, entry.path())?;
         }
@@ -1085,20 +1115,13 @@ mod tests {
         assert!(!temp.path().join(".rojo").exists());
         let cache = cache_directory(&project);
         std::fs::create_dir_all(&cache).unwrap();
-        let mut permissions = std::fs::metadata(&cache).unwrap().permissions();
+        let original_permissions = std::fs::metadata(&cache).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
         std::fs::set_permissions(&cache, permissions).unwrap();
         let result = recover_relocations(&vfs, &project);
         // Restore before the temporary directory is cleaned up, also on Windows.
-        let mut permissions = std::fs::metadata(&cache).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            permissions.set_mode(0o700);
-        }
-        #[cfg(not(unix))]
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&cache, permissions).unwrap();
+        std::fs::set_permissions(&cache, original_permissions).unwrap();
         result.unwrap();
         assert!(!relocation_lock_path(&cache).unwrap().exists());
     }

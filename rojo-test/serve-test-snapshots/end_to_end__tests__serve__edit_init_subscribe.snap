@@ -6,6 +6,7 @@ body:
   messageCursor: 1
   messages:
     - added: {}
+      origin: filesystem
       removed: []
       updated:
         - changedClassName: ~

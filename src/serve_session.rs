@@ -23,6 +23,30 @@ use crate::{
     snapshot_middleware::snapshot_from_vfs,
 };
 
+/// Immutable live-sync policy, separate from per-write conflict authority.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum SyncDirection {
+    FsToStudio,
+    StudioToFs,
+    Bidirectional,
+}
+
+impl SyncDirection {
+    pub const ALL: [Self; 3] = [Self::FsToStudio, Self::StudioToFs, Self::Bidirectional];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FsToStudio => "fs-to-studio",
+            Self::StudioToFs => "studio-to-fs",
+            Self::Bidirectional => "bidirectional",
+        }
+    }
+}
+
 /// Contains all of the state for a Rojo serve session. A serve session is used
 /// when we need to build a Rojo tree and possibly rebuild it when input files
 /// change.
@@ -61,10 +85,17 @@ pub struct ServeSession {
     // Retain identity while the project exists. Recovery must survive its deletion or rename.
     checkpoint_identity: PathBuf,
 
+    // Serialize request-local Stores without weakening the independent-process OS lock.
+    checkpoint_gate: Mutex<()>,
+
     /// A randomly generated ID for this serve session. It's used to ensure that
     /// a client doesn't begin connecting to a different server part way through
     /// an operation that needs to be atomic.
     session_id: SessionId,
+
+    /// Fixed at construction. Filesystem reconciliation still runs in every mode
+    /// to retain current ownership and conflict baselines.
+    sync_direction: Option<SyncDirection>,
 
     /// The tree of Roblox instances associated with this session that will be
     /// updated in real-time. This is derived from the session's VFS and will
@@ -193,26 +224,38 @@ fn preflight_startup_recovery(
 }
 
 impl ServeSession {
-    /// Start a new serve session from the given in-memory filesystem and start
-    /// path.
-    ///
-    /// The project file is expected to be loaded out-of-band since it's
-    /// currently loaded from the filesystem directly instead of through the
-    /// in-memory filesystem layer.
-    /// Start a new serve session from the given in-memory filesystem and
-    /// start path.
-    ///
-    /// The project file is expected to be loaded out-of-band since it's
-    /// currently loaded from the filesystem directly instead of through
-    /// the in-memory filesystem layer.
+    /// Start a serve session with the legacy, client-selected live-sync behavior.
     pub fn new<P: AsRef<Path>>(vfs: Vfs, start_path: P) -> Result<Self, ServeSessionError> {
         Self::new_with_pool(vfs, start_path, None)
+    }
+
+    /// Start a serve session with a fixed live-sync policy. `None` preserves the
+    /// behavior of ordinary manual sessions that do not specify a policy.
+    pub fn new_with_sync_direction<P: AsRef<Path>>(
+        vfs: Vfs,
+        start_path: P,
+        sync_direction: Option<SyncDirection>,
+    ) -> Result<Self, ServeSessionError> {
+        Self::new_with_pool_and_sync_direction(vfs, start_path, None, sync_direction)
+    }
+
+    pub fn sync_direction(&self) -> Option<SyncDirection> {
+        self.sync_direction
     }
 
     pub(crate) fn new_with_pool<P: AsRef<Path>>(
         vfs: Vfs,
         start_path: P,
         pool: Option<Arc<rayon::ThreadPool>>,
+    ) -> Result<Self, ServeSessionError> {
+        Self::new_with_pool_and_sync_direction(vfs, start_path, pool, None)
+    }
+
+    fn new_with_pool_and_sync_direction<P: AsRef<Path>>(
+        vfs: Vfs,
+        start_path: P,
+        pool: Option<Arc<rayon::ThreadPool>>,
+        sync_direction: Option<SyncDirection>,
     ) -> Result<Self, ServeSessionError> {
         let start_time = Instant::now();
         let start_path = vfs.canonicalize(start_path.as_ref())?;
@@ -240,6 +283,7 @@ impl ServeSession {
 
         // Journals are private server state, never source instances.
         instance_context.set_reserved_cache_path(root_project.folder_location().join(".rojo"));
+        instance_context.omit_import_witness = sync_direction == Some(SyncDirection::FsToStudio);
 
         // Ordinary application recovery can restore manifests. Use the final
         // filesystem state rather than keeping a pre-recovery ownership snapshot.
@@ -267,7 +311,11 @@ impl ServeSession {
         apply_patch_set(&mut tree, patch_set);
 
         let session_id = SessionId::new();
-        let message_queue = MessageQueue::new();
+        let message_queue = if sync_direction == Some(SyncDirection::FsToStudio) {
+            MessageQueue::filesystem_to_studio()
+        } else {
+            MessageQueue::new()
+        };
 
         let tree = Arc::new(Mutex::new(tree));
         let message_queue = Arc::new(message_queue);
@@ -283,14 +331,17 @@ impl ServeSession {
             tree_mutation_receiver,
             pool,
             Arc::clone(&root_project),
+            sync_direction,
         );
 
         Ok(Self {
             change_processor,
             start_time,
             session_id,
+            sync_direction,
             root_project,
             checkpoint_identity,
+            checkpoint_gate: Mutex::new(()),
             tree,
             message_queue,
             tree_mutation_sender,
@@ -375,6 +426,12 @@ impl ServeSession {
         &self.checkpoint_identity
     }
 
+    /// Hold only around synchronous checkpoint I/O, after body reads and tree capture.
+    /// Declare before opening a Store so that the Store drops before this guard.
+    pub(crate) fn checkpoint_gate(&self) -> MutexGuard<'_, ()> {
+        self.checkpoint_gate.lock().unwrap()
+    }
+
     pub fn root_project(&self) -> &Project {
         &self.root_project
     }
@@ -410,11 +467,11 @@ pub(crate) fn build_require_context(
     snapshot: &InstanceSnapshot,
     root: &Path,
 ) -> anyhow::Result<Arc<RequireContext>> {
-    Ok(Arc::new(RequireContext {
-        project_root: root.to_path_buf(),
-        path_mappings: extract_path_mappings(snapshot, root)?,
-        datamodel: snapshot.class_name == "DataModel",
-    }))
+    Ok(Arc::new(RequireContext::new(
+        root.to_path_buf(),
+        extract_path_mappings(snapshot, root)?,
+        snapshot.class_name == "DataModel",
+    )))
 }
 
 #[profiling::function]
@@ -422,15 +479,36 @@ pub(crate) fn build_require_context_from_tree(
     tree: &RojoTree,
     root: &Path,
 ) -> anyhow::Result<Arc<RequireContext>> {
+    // Every move rebuilds these mappings from the whole tree, so the shallow levels
+    // walk their children in parallel. Results are concatenated in child order,
+    // which keeps exactly the sequential depth-first order the normalization relies
+    // on for mappings that share a path.
+    const PARALLEL_DEPTH: usize = 4;
     fn walk(
         tree: &RojoTree,
         id: rbx_dom_weak::types::Ref,
         dm: &mut Vec<String>,
         mappings: &mut Vec<(PathBuf, Vec<String>)>,
     ) {
+        use rayon::prelude::*;
         let instance = tree.get_instance(id).unwrap();
         for path in instance.metadata().watch_paths() {
             mappings.push((path.to_path_buf(), dm.clone()));
+        }
+        if dm.len() < PARALLEL_DEPTH && instance.children().len() > 1 {
+            let nested: Vec<_> = instance
+                .children()
+                .par_iter()
+                .map(|child| {
+                    let mut dm = dm.clone();
+                    dm.push(tree.get_instance(*child).unwrap().name().to_owned());
+                    let mut nested = Vec::new();
+                    walk(tree, *child, &mut dm, &mut nested);
+                    nested
+                })
+                .collect();
+            mappings.extend(nested.into_iter().flatten());
+            return;
         }
         for child in instance.children() {
             dm.push(tree.get_instance(*child).unwrap().name().to_owned());
@@ -443,11 +521,11 @@ pub(crate) fn build_require_context_from_tree(
         profiling::scope!("Rojo require mappings tree traversal");
         walk(tree, tree.get_root_id(), &mut Vec::new(), &mut mappings);
     }
-    Ok(Arc::new(RequireContext {
-        project_root: root.to_path_buf(),
-        path_mappings: normalize_path_mappings(mappings, root, &tree.root().metadata().context)?,
-        datamodel: tree.root().class_name() == "DataModel",
-    }))
+    Ok(Arc::new(RequireContext::new(
+        root.to_path_buf(),
+        normalize_path_mappings(mappings, root, &tree.root().metadata().context)?,
+        tree.root().class_name() == "DataModel",
+    )))
 }
 
 /// Recursively extracts `$path` mappings from the project tree.
@@ -494,6 +572,7 @@ fn normalize_path_mappings(
     context: &InstanceContext,
 ) -> anyhow::Result<Vec<(PathBuf, Vec<String>)>> {
     profiling::scope!("Rojo require mappings normalization");
+    use rayon::prelude::*;
     let mut decorated: Vec<_> = mappings
         .into_iter()
         .map(|(path, target)| {
@@ -501,8 +580,9 @@ fn normalize_path_mappings(
             (path.components().count(), (path, target))
         })
         .collect();
+    // Stable, like `sort_by`, so mappings sharing a path keep their tree order.
     decorated
-        .sort_by(|(a_depth, a), (b_depth, b)| b_depth.cmp(a_depth).then_with(|| a.0.cmp(&b.0)));
+        .par_sort_by(|(a_depth, a), (b_depth, b)| b_depth.cmp(a_depth).then_with(|| a.0.cmp(&b.0)));
     let mut mappings: Vec<_> = decorated.into_iter().map(|(_, mapping)| mapping).collect();
     mappings.dedup();
     if let Some(packages) = &context.package_sources {
@@ -520,6 +600,184 @@ mod test {
     use super::*;
 
     use memofs::StdBackend;
+
+    #[test]
+    fn sync_direction_is_fixed_while_independent_filesystem_changes_reconcile() {
+        use memofs::{VfsEvent, VfsSnapshot};
+        for direction in [None].into_iter().chain(SyncDirection::ALL.map(Some)) {
+            let mut imfs = root_mapping_with_reserved_cache();
+            let session = ServeSession::new_with_sync_direction(
+                Vfs::new(imfs.clone()),
+                "/root/serve.project.json",
+                direction,
+            )
+            .unwrap();
+            let id = *session
+                .tree()
+                .get_ids_at_path(Path::new("/root/Code.luau"))
+                .iter()
+                .next()
+                .unwrap();
+            assert_eq!(
+                session
+                    .tree()
+                    .get_metadata(id)
+                    .unwrap()
+                    .import_inputs
+                    .is_some(),
+                direction != Some(SyncDirection::FsToStudio)
+            );
+            let cursor = session.message_queue().cursor();
+            imfs.load_snapshot("/root/Code.luau", VfsSnapshot::file("return 42"))
+                .unwrap();
+            imfs.raise_event(VfsEvent::Write("/root/Code.luau".into()));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        session.message_queue().subscribe(cursor),
+                    )
+                    .await
+                    .expect("Independent filesystem change did not reconcile")
+                    .unwrap();
+                });
+            let tree = session.tree();
+            assert_eq!(
+                tree.get_instance(id)
+                    .unwrap()
+                    .properties()
+                    .get(&rbx_dom_weak::ustr("Source")),
+                Some(&rbx_dom_weak::types::Variant::String("return 42".into()))
+            );
+            assert_eq!(session.sync_direction(), direction);
+            assert_eq!(
+                tree.get_metadata(id).unwrap().import_inputs.is_some(),
+                direction != Some(SyncDirection::FsToStudio)
+            );
+            assert!(tree
+                .get_metadata(id)
+                .unwrap()
+                .context
+                .import_input_scope
+                .0
+                .is_none());
+            assert_eq!(
+                session.message_queue().tracks_writes(),
+                direction != Some(SyncDirection::FsToStudio)
+            );
+        }
+    }
+
+    #[test]
+    fn worker_retained_source_uses_constructed_session_policy() {
+        use crate::{snapshot::PatchUpdate, web::interface::WriteAuthority};
+        use memofs::VfsSnapshot;
+        use rbx_dom_weak::{types::Variant, ustr};
+        for direction in [
+            None,
+            Some(SyncDirection::Bidirectional),
+            Some(SyncDirection::StudioToFs),
+        ] {
+            let mut imfs = root_mapping_with_reserved_cache();
+            let vfs = Vfs::new(imfs.clone());
+            vfs.set_watch_enabled(false);
+            let session =
+                ServeSession::new_with_sync_direction(vfs, "/root/serve.project.json", direction)
+                    .unwrap();
+            let (id, captured) = {
+                let tree = session.tree();
+                let id = *tree
+                    .get_ids_at_path(Path::new("/root/Code.luau"))
+                    .iter()
+                    .next()
+                    .unwrap();
+                session
+                    .message_queue()
+                    .capture_source_baselines_for(&tree, [id]);
+                let Variant::String(source) =
+                    &tree.get_instance(id).unwrap().properties()[&ustr("Source")]
+                else {
+                    panic!("Expected Source");
+                };
+                (id, source.clone())
+            };
+            assert_eq!(session.message_queue().cursor(), 0);
+            imfs.load_snapshot(
+                "/root/Code.luau",
+                VfsSnapshot::file("return 'diskSource'\n"),
+            )
+            .unwrap();
+            let (result_sender, result_receiver) = crossbeam_channel::bounded(1);
+            session
+                .tree_mutation_sender()
+                .send(TreeMutation {
+                    operation_id: Some("retained-source-save".into()),
+                    predecessor: None,
+                    source_baselines: [(id, 0)].into_iter().collect(),
+                    message_cursor: Some(0),
+                    authority: WriteAuthority::Studio,
+                    patch_set: crate::snapshot::PatchSet {
+                        updated_instances: vec![PatchUpdate {
+                            id,
+                            changed_name: None,
+                            changed_class_name: None,
+                            changed_parent: None,
+                            changed_properties: [(
+                                ustr("Source"),
+                                Some(Variant::String(format!("{captured}\n-- native save\n"))),
+                            )]
+                            .into_iter()
+                            .collect(),
+                            changed_metadata: None,
+                        }],
+                        ..crate::snapshot::PatchSet::new()
+                    },
+                    additions: Default::default(),
+                    result_sender,
+                })
+                .unwrap();
+            let (result, _, ack) = result_receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let studio_only = direction == Some(SyncDirection::StudioToFs);
+            assert_eq!(ack.is_some(), studio_only, "{direction:?} {result:?}");
+            assert_eq!(result.2.is_empty(), studio_only, "{direction:?} {result:?}");
+            assert_eq!(
+                std::str::from_utf8(&session.vfs().read("/root/Code.luau").unwrap()).unwrap(),
+                if studio_only {
+                    format!("{captured}\n-- native save\n")
+                } else {
+                    "return 'diskSource'\n".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_session_constructors_leave_sync_direction_unspecified() {
+        let session = ServeSession::new(
+            Vfs::new(root_mapping_with_reserved_cache()),
+            "/root/serve.project.json",
+        )
+        .unwrap();
+        assert_eq!(session.sync_direction(), None);
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let pooled = ServeSession::new_with_pool(
+            Vfs::new(root_mapping_with_reserved_cache()),
+            "/root/serve.project.json",
+            Some(pool),
+        )
+        .unwrap();
+        assert_eq!(pooled.sync_direction(), None);
+    }
 
     #[test]
     fn path_mapping_normalization_preserves_eager_ordering_for_all_small_permutations() {
@@ -582,7 +840,7 @@ mod test {
             vec!["ReplicatedStorage".into(), "Packages".into()],
         )];
         let context = build_require_context(&snapshot, root).unwrap();
-        assert_eq!(context.path_mappings, expected);
+        assert_eq!(context.path_mappings(), expected.as_slice());
         let tree = RojoTree::new(snapshot);
         assert_eq!(
             build_require_context_from_tree(&tree, root).unwrap(),
@@ -636,7 +894,7 @@ mod test {
             assert_eq!(actual.datamodel, class_name == "DataModel");
             assert_eq!(actual.project_root, root);
             assert_eq!(
-                actual.path_mappings,
+                actual.path_mappings(),
                 vec![
                     (
                         root.join("Source/Shared/Util.luau"),

@@ -1,6 +1,39 @@
 return function()
 	local SharedAPI = require(script.Parent.SharedAPI)
 
+	it("reports the effective session direction rather than persistent settings", function()
+		for _, direction in { "fs-to-studio", "studio-to-fs", "bidirectional" } do
+			local status = SharedAPI.describeStatus({
+				state = { appStatus = "Connected", projectName = "Project", address = "localhost" },
+				serveSession = {
+					getSyncDirection = function()
+						return direction
+					end,
+				},
+			})
+			expect(status.syncDirection).to.equal(direction)
+			expect(status.projectName).to.equal("Project")
+			expect(status.address).to.equal("localhost")
+		end
+		expect(SharedAPI.describeStatus(nil).status).to.equal("Unloaded")
+		local failed = SharedAPI.describeStatus({ state = { appStatus = "Error", errorMessage = "Retained drafts." } })
+		expect(failed.error).to.equal("Retained drafts.")
+		expect(failed.syncDirection).to.equal(nil)
+	end)
+
+	it("does not let standalone shared syncback bypass a filesystem-only session", function()
+		for _, direction in { "fs-to-studio", "studio-to-fs", "bidirectional" } do
+			expect(SharedAPI.canSyncbackFromStudio({
+				serveSession = {
+					getSyncDirection = function()
+						return direction
+					end,
+				},
+			})).to.equal(direction ~= "fs-to-studio")
+		end
+		expect(SharedAPI.canSyncbackFromStudio({})).to.equal(true)
+	end)
+
 	it("should only configure two-way sync without an active session", function()
 		local expected = {
 			Confirming = false,

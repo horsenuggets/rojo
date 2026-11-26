@@ -52,55 +52,83 @@ pub fn validate_patch_set(tree: &RojoTree, patch_set: &PatchSet) -> anyhow::Resu
         return Ok(());
     }
     let root = tree.get_root_id();
-    let mut parents: HashMap<_, _> = tree
-        .descendants(root)
-        .map(|instance| (instance.id(), instance.parent()))
-        .collect();
+    let exists = |id: Ref| tree.get_instance(id).is_some();
     let removed: HashSet<_> = patch_set.removed_instances.iter().copied().collect();
     for id in &removed {
         anyhow::ensure!(*id != root, "Cannot remove the tree root");
-        anyhow::ensure!(parents.contains_key(id), "Removed instance does not exist");
+        anyhow::ensure!(exists(*id), "Removed instance does not exist");
     }
-    let mut moved = HashSet::new();
+    // Only reparented instances differ from the current tree, which is acyclic.
+    // Resolving just the ancestry the checks below need keeps a single move from
+    // indexing every instance in the project.
+    let mut parents: HashMap<Ref, Ref> = HashMap::new();
     for update in &patch_set.updated_instances {
-        anyhow::ensure!(
-            parents.contains_key(&update.id),
-            "Updated instance does not exist"
-        );
+        anyhow::ensure!(exists(update.id), "Updated instance does not exist");
         if let Some(parent) = update.changed_parent {
             anyhow::ensure!(update.id != root, "Cannot reparent the tree root");
-            anyhow::ensure!(parents.contains_key(&parent), "Parent does not exist");
-            anyhow::ensure!(moved.insert(update.id), "Duplicate reparent update");
-            parents.insert(update.id, parent);
+            anyhow::ensure!(exists(parent), "Parent does not exist");
+            anyhow::ensure!(
+                parents.insert(update.id, parent).is_none(),
+                "Duplicate reparent update"
+            );
         }
     }
+    let final_parent = |id: Ref| -> Ref {
+        parents
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| tree.get_instance(id).unwrap().parent())
+    };
 
-    // Resolve against the final graph, not update order or the old ancestry.
-    let mut survives = HashMap::from([(root, true)]);
-    for id in parents.keys().copied() {
+    // Any cycle in the final graph runs through a reparented instance, so walking
+    // up from each of them finds every cycle. Instances already proven to reach the
+    // root end later walks, so a batch visits each ancestor at most once.
+    let mut reaches_root: HashSet<Ref> = HashSet::new();
+    for &start in parents.keys() {
         let mut path = Vec::new();
         let mut visiting = HashSet::new();
-        let mut current = id;
-        while !survives.contains_key(&current) {
+        let mut current = start;
+        while current != root && !reaches_root.contains(&current) {
             anyhow::ensure!(visiting.insert(current), "Patch would create a cycle");
             path.push(current);
-            current = parents[&current];
+            current = final_parent(current);
         }
-        let mut alive = survives[&current];
-        for node in path.into_iter().rev() {
-            alive &= !removed.contains(&node);
-            survives.insert(node, alive);
-        }
+        reaches_root.extend(path);
     }
+
+    // Resolve against the final graph, not update order or the old ancestry. Each
+    // ancestor's answer is cached, so siblings share one walk instead of repeating it.
+    let mut survival: HashMap<Ref, bool> = HashMap::new();
+    let mut survives = |id: Ref| -> bool {
+        let mut path = Vec::new();
+        let mut current = id;
+        let result = loop {
+            if let Some(&known) = survival.get(&current) {
+                break known;
+            }
+            if removed.contains(&current) {
+                break false;
+            }
+            if current == root {
+                break true;
+            }
+            path.push(current);
+            current = final_parent(current);
+        };
+        for visited in path {
+            survival.insert(visited, result);
+        }
+        result
+    };
     for update in &patch_set.updated_instances {
         anyhow::ensure!(
-            survives[&update.id],
+            survives(update.id),
             "Updated instance is removed by the patch"
         );
     }
     for addition in &patch_set.added_instances {
         anyhow::ensure!(
-            survives.get(&addition.parent_id) == Some(&true),
+            exists(addition.parent_id) && survives(addition.parent_id),
             "Addition parent does not survive the patch"
         );
     }
@@ -504,6 +532,179 @@ mod test {
         assert_eq!(child_instance.class_name(), snapshot.class_name);
         assert_eq!(child_instance.properties(), &snapshot.properties);
         assert!(child_instance.children().is_empty());
+    }
+
+    /// The previous validation, which resolved the final parent of every instance.
+    /// It is the oracle for the ancestry-scoped validation.
+    fn validate_against_whole_tree(tree: &RojoTree, patch_set: &PatchSet) -> bool {
+        let root = tree.get_root_id();
+        let mut parents: HashMap<_, _> = tree
+            .descendants(root)
+            .map(|instance| (instance.id(), instance.parent()))
+            .collect();
+        let removed: HashSet<_> = patch_set.removed_instances.iter().copied().collect();
+        if removed
+            .iter()
+            .any(|id| *id == root || !parents.contains_key(id))
+        {
+            return false;
+        }
+        let mut moved = HashSet::new();
+        for update in &patch_set.updated_instances {
+            if !parents.contains_key(&update.id) {
+                return false;
+            }
+            if let Some(parent) = update.changed_parent {
+                if update.id == root || !parents.contains_key(&parent) || !moved.insert(update.id) {
+                    return false;
+                }
+                parents.insert(update.id, parent);
+            }
+        }
+        let mut survives = HashMap::from([(root, true)]);
+        for id in parents.keys().copied() {
+            let mut path = Vec::new();
+            let mut visiting = HashSet::new();
+            let mut current = id;
+            while !survives.contains_key(&current) {
+                if !visiting.insert(current) {
+                    return false;
+                }
+                path.push(current);
+                current = parents[&current];
+            }
+            let mut alive = survives[&current];
+            for node in path.into_iter().rev() {
+                alive &= !removed.contains(&node);
+                survives.insert(node, alive);
+            }
+        }
+        patch_set
+            .updated_instances
+            .iter()
+            .all(|update| survives[&update.id])
+            && patch_set
+                .added_instances
+                .iter()
+                .all(|addition| survives.get(&addition.parent_id) == Some(&true))
+    }
+
+    #[test]
+    fn scoped_structural_validation_matches_whole_tree_validation() {
+        // A small linear congruential generator keeps the cases reproducible.
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound
+        };
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for _ in 0..20_000 {
+            let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root"));
+            let mut ids = vec![tree.get_root_id()];
+            for index in 0..6 {
+                let parent = ids[next(ids.len())];
+                ids.push(
+                    tree.insert_instance(
+                        parent,
+                        InstanceSnapshot::new().name(format!("Node{index}")),
+                    ),
+                );
+            }
+            let pick = |roll: usize| {
+                if roll < ids.len() {
+                    ids[roll]
+                } else {
+                    Ref::none()
+                }
+            };
+            let mut patch = PatchSet::new();
+            for _ in 0..next(4) {
+                patch.updated_instances.push(PatchUpdate {
+                    id: pick(next(ids.len() + 1)),
+                    changed_name: None,
+                    changed_class_name: None,
+                    changed_parent: (next(4) != 0).then(|| pick(next(ids.len() + 1))),
+                    changed_properties: UstrMap::default(),
+                    changed_metadata: None,
+                });
+            }
+            for _ in 0..next(3) {
+                patch.removed_instances.push(pick(next(ids.len() + 1)));
+            }
+            for _ in 0..next(3) {
+                patch.added_instances.push(PatchAdd {
+                    parent_id: pick(next(ids.len() + 1)),
+                    instance: InstanceSnapshot::new().name("Added"),
+                });
+            }
+            let structural = !patch.removed_instances.is_empty()
+                || patch
+                    .updated_instances
+                    .iter()
+                    .any(|update| update.changed_parent.is_some());
+            if !structural {
+                continue;
+            }
+            let expected = validate_against_whole_tree(&tree, &patch);
+            assert_eq!(
+                validate_patch_set(&tree, &patch).is_ok(),
+                expected,
+                "{patch:?}"
+            );
+            if expected {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+        // Both outcomes must be exercised for the comparison to mean anything.
+        assert!(
+            accepted > 1_000 && rejected > 1_000,
+            "{accepted} {rejected}"
+        );
+    }
+
+    #[test]
+    fn deep_batches_validate_siblings_and_removed_subtrees_correctly() {
+        // Many updates under one deep chain share ancestry. Caching must neither
+        // repeat those walks nor carry a removed ancestor's answer to survivors.
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root"));
+        let mut parent = tree.get_root_id();
+        let mut chain = Vec::new();
+        for depth in 0..400 {
+            parent =
+                tree.insert_instance(parent, InstanceSnapshot::new().name(format!("D{depth}")));
+            chain.push(parent);
+        }
+        let leaves: Vec<_> = (0..400)
+            .map(|index| {
+                tree.insert_instance(parent, InstanceSnapshot::new().name(format!("L{index}")))
+            })
+            .collect();
+        let update = |id| PatchUpdate {
+            id,
+            changed_name: None,
+            changed_class_name: None,
+            changed_parent: None,
+            changed_properties: UstrMap::default(),
+            changed_metadata: None,
+        };
+        let mut patch = PatchSet::new();
+        patch.removed_instances.push(leaves[0]);
+        patch.updated_instances = leaves[1..].iter().map(|&id| update(id)).collect();
+        assert!(validate_patch_set(&tree, &patch).is_ok());
+        assert_eq!(
+            validate_patch_set(&tree, &patch).is_ok(),
+            validate_against_whole_tree(&tree, &patch)
+        );
+
+        // Removing a middle ancestor removes every leaf, including the cached siblings.
+        patch.removed_instances = vec![chain[200]];
+        assert!(validate_patch_set(&tree, &patch).is_err());
+        assert!(!validate_against_whole_tree(&tree, &patch));
     }
 
     #[test]

@@ -65,6 +65,7 @@ pub struct TestServeSession {
     rojo_process: KillOnDrop,
     _dir: TempDir,
 
+    client: reqwest::blocking::Client,
     port: usize,
     project_path: PathBuf,
 }
@@ -127,6 +128,7 @@ impl TestServeSession {
         TestServeSession {
             rojo_process,
             _dir: dir,
+            client: loopback_client(),
             port,
             project_path,
         }
@@ -186,14 +188,14 @@ impl TestServeSession {
 
     pub fn get_api_rojo(&self) -> Result<ServerInfoResponse, reqwest::Error> {
         let url = format!("http://localhost:{}/api/rojo", self.port);
-        let body = reqwest::blocking::get(url)?.bytes()?;
+        let body = self.client.get(url).send()?.error_for_status()?.bytes()?;
 
         Ok(deserialize_msgpack(&body).expect("Server returned malformed response"))
     }
 
     pub fn get_api_read(&self, id: Ref) -> Result<ReadResponse<'_>, reqwest::Error> {
         let url = format!("http://localhost:{}/api/read/{}", self.port, id);
-        let body = reqwest::blocking::get(url)?.bytes()?;
+        let body = self.client.get(url).send()?.error_for_status()?.bytes()?;
 
         Ok(deserialize_msgpack(&body).expect("Server returned malformed response"))
     }
@@ -251,7 +253,8 @@ impl TestServeSession {
     pub fn post_api_write(&self, request: &WriteRequest) -> WriteResponse {
         let url = format!("http://localhost:{}/api/write", self.port);
         let body = serialize_msgpack(request).unwrap();
-        let response = reqwest::blocking::Client::new()
+        let response = self
+            .client
             .post(url)
             .body(body)
             .send()
@@ -266,7 +269,7 @@ impl TestServeSession {
         ids: &[Ref],
         session_id: SessionId,
     ) -> Result<reqwest::blocking::Response, reqwest::Error> {
-        let client = reqwest::blocking::Client::new();
+        let client = &self.client;
         let url = format!("http://localhost:{}/api/serialize", self.port);
         let body = serialize_msgpack(&SerializeRequest {
             session_id,
@@ -285,7 +288,7 @@ impl TestServeSession {
         &self,
         headers: &[(&str, &str)],
     ) -> reqwest::blocking::Response {
-        let client = reqwest::blocking::Client::new();
+        let client = &self.client;
         let url = format!("http://localhost:{}/api/rojo", self.port);
 
         let mut request = client.get(url);
@@ -300,7 +303,7 @@ impl TestServeSession {
     /// Used to verify that the local-only gate on `/api/open` admits loopback
     /// peers (the test harness always connects over loopback).
     pub fn api_open_status(&self, id: &str) -> reqwest::StatusCode {
-        let client = reqwest::blocking::Client::new();
+        let client = &self.client;
         let url = format!("http://localhost:{}/api/open/{}", self.port, id);
 
         client
@@ -309,6 +312,14 @@ impl TestServeSession {
             .expect("Failed to send request")
             .status()
     }
+}
+
+fn loopback_client() -> reqwest::blocking::Client {
+    // These requests target the child server, never a machine's configured proxy.
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("Couldn't create loopback HTTP client")
 }
 
 pub fn serialize_msgpack<T: Serialize>(value: T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
@@ -373,6 +384,61 @@ fn startup_ports_are_read_from_actual_listening_messages() {
         ),
         23456
     );
+}
+
+#[test]
+fn loopback_client_ignores_proxy_environment() {
+    const CHILD_FLAG: &str = "ROJO_LOOPBACK_PROXY_TEST_CHILD";
+    if std::env::var_os(CHILD_FLAG).is_some() {
+        use std::{io::Write, net::TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            {
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+                )
+                .unwrap();
+        });
+        let response = loopback_client()
+            .get(format!("http://{address}/"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .unwrap();
+        assert_eq!(response.text().unwrap(), "direct");
+        server.join().unwrap();
+        return;
+    }
+
+    // Isolate proxy variables from the other tests running in this process.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "rojo_test::serve_util::loopback_client_ignores_proxy_environment",
+        ])
+        .env(CHILD_FLAG, "1")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env("all_proxy", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
 }
 
 /// Takes a SerializeResponse and creates an XML model out of the response.

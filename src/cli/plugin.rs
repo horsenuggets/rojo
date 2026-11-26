@@ -209,6 +209,55 @@ mod test {
     }
 
     #[test]
+    fn the_embedded_plugin_contains_exactly_one_copy_of_each_owned_dependency_module() {
+        use rbx_dom_weak::{types::Variant, ustr};
+
+        let session = initialize_plugin().unwrap();
+        let tree = session.tree();
+        let dom = tree.inner();
+        let modules: &[(&[&str], &str)] = &[
+            (
+                &["Packages", "msgpack"],
+                include_str!("../../plugin/msgpack.lua"),
+            ),
+            (
+                &["Packages", "Roact", "Binding"],
+                include_str!("../../plugin/roact-binding.lua"),
+            ),
+            (
+                &["Packages", "Roact", "Component"],
+                include_str!("../../plugin/roact-component.lua"),
+            ),
+            (
+                &["Packages", "Roact", "createReconciler"],
+                include_str!("../../plugin/roact-reconciler.lua"),
+            ),
+            (
+                &["Packages", "Roact", "RobloxRenderer"],
+                include_str!("../../plugin/roact-renderer.lua"),
+            ),
+        ];
+        for (path, source) in modules {
+            let mut instance = dom.get_by_ref(tree.get_root_id()).unwrap();
+            for &name in *path {
+                let matches: Vec<_> = instance
+                    .children()
+                    .iter()
+                    .map(|id| dom.get_by_ref(*id).unwrap())
+                    .filter(|instance| instance.name == name)
+                    .collect();
+                assert_eq!(matches.len(), 1, "Expected one module at {path:?}");
+                instance = matches[0];
+            }
+            assert_eq!(instance.class, "ModuleScript");
+            assert_eq!(
+                instance.properties.get(&ustr("Source")),
+                Some(&Variant::String(source.replace("\r\n", "\n")))
+            );
+        }
+    }
+
+    #[test]
     fn the_plugin_never_overwrites_upstream_rojo() {
         assert_eq!(PLUGIN_FILE_NAME, "Rojo+.rbxm");
         for upstream in ["Rojo.rbxm", "RojoManagedPlugin.rbxm"] {

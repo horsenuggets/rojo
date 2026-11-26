@@ -187,7 +187,7 @@ fn compute_property_patches(
     if let Some(specified_id) = attribute_specified_id(snapshot) {
         snapshot.metadata.specified_id = Some(specified_id);
     }
-    let changed_metadata = if &snapshot.metadata == instance.metadata() {
+    let changed_metadata = if snapshot.metadata.eq_snapshot(instance.metadata()) {
         None
     } else {
         Some(take(&mut snapshot.metadata))
@@ -443,6 +443,62 @@ mod test {
     use rbx_dom_weak::types::Attributes;
 
     use crate::snapshot::apply_patch_set;
+
+    #[cfg(windows)]
+    #[test]
+    fn namespace_only_metadata_changes_do_not_publish_filesystem_edits() {
+        use crate::snapshot::InstanceMetadata;
+        use std::path::PathBuf;
+        for (plain, extended) in [
+            (r"C:\project\Module.luau", r"\\?\C:\project\Module.luau"),
+            (
+                r"\\server\share\Module.luau",
+                r"\\?\UNC\server\share\Module.luau",
+            ),
+        ] {
+            for reverse in [false, true] {
+                let (old, new) = if reverse {
+                    (extended, plain)
+                } else {
+                    (plain, extended)
+                };
+                let snapshot = |path: &str| {
+                    InstanceSnapshot::new().name("Module").metadata(
+                        InstanceMetadata::new()
+                            .instigating_source(PathBuf::from(path))
+                            .relevant_paths(vec![
+                                PathBuf::from(path),
+                                PathBuf::from(path).with_extension("meta.json"),
+                            ]),
+                    )
+                };
+                let tree = RojoTree::new(snapshot(old));
+                let id = tree.get_root_id();
+                assert_eq!(
+                    compute_patch_set(Some(snapshot(new)), &tree, id),
+                    PatchSet::new()
+                );
+                let mut changed = snapshot(new);
+                changed.metadata.ignore_unknown_instances = true;
+                assert!(!compute_patch_set(Some(changed), &tree, id)
+                    .updated_instances
+                    .is_empty());
+                let mut changed = snapshot(new);
+                changed
+                    .metadata
+                    .relevant_paths
+                    .push(PathBuf::from(r"C:\project\Other.luau"));
+                assert!(!compute_patch_set(Some(changed), &tree, id)
+                    .updated_instances
+                    .is_empty());
+                assert!(
+                    !compute_patch_set(Some(snapshot(r"C:\different\Module.luau")), &tree, id)
+                        .updated_instances
+                        .is_empty()
+                );
+            }
+        }
+    }
 
     /// An unchanged instance whose ID comes from its `Rojo_Id` attribute must not
     /// look changed, or two-way sync would treat every write to it as a conflict.

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use rbx_dom_weak::{
@@ -19,7 +20,7 @@ fn attribute_string(value: &Variant) -> Option<String> {
     }
 }
 
-use super::{InstanceMetadata, InstanceSnapshot};
+use super::{InstanceMetadata, InstanceSnapshot, RequireContext};
 
 /// The referents to give a snapshot's instances, shaped like the snapshot. See
 /// [`RojoTree::insert_instance_with_referents`].
@@ -376,6 +377,16 @@ impl RojoTree {
         Ok(())
     }
 
+    /// Moves an attached child to the end of its current sibling order without
+    /// changing its identity, parent, metadata, or path indexes.
+    pub(crate) fn move_child_to_end(&mut self, id: Ref) {
+        if let Some(parent) = self.get_instance(id).map(|instance| instance.parent()) {
+            if parent.is_some() {
+                self.inner.transfer_within(id, parent);
+            }
+        }
+    }
+
     pub fn remove(&mut self, id: Ref) {
         // Capture the entire retiring subtree before removing ANY ancestor metadata.
         // Traversal is proportional to the structural removal, never a property edit.
@@ -409,6 +420,26 @@ impl RojoTree {
         }
 
         self.inner.destroy(id);
+    }
+
+    /// Points every filesystem-context instance at one shared import context.
+    ///
+    /// An import refresh only rewrites instances with Luau sources. Leaving the rest on
+    /// an older context made metadata comparisons walk two full mapping lists per
+    /// instance, and contexts with equal mappings still compared element by element.
+    /// Sharing one `Arc` lets those comparisons stop at pointer equality.
+    pub fn share_require_context(&mut self, context: &Arc<RequireContext>) {
+        for metadata in self.metadata_map.values_mut() {
+            let context_slot = &mut metadata.context;
+            if context_slot.reserved_cache_path().is_none() {
+                continue;
+            }
+            if let Some(current) = &context_slot.require_context {
+                if !Arc::ptr_eq(current, context) {
+                    context_slot.require_context = Some(context.clone());
+                }
+            }
+        }
     }
 
     /// Replaces the metadata associated with the given instance ID.
