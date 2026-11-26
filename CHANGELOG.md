@@ -31,6 +31,15 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.14`
+
+* Fixed filesystem Source writes being echoed back as Studio edits when several writes
+  to one script returned before their change notifications arrived.
+* Released the import cache lock before rewriting script Source, so sibling scripts are
+  transformed in parallel again.
+* The startup refusal for an unfinished rename journal that would write outside its
+  project now lists those files and says to keep the journal until they are restored.
+
 ## `7.7.1-horse.2.13`
 
 * Added `rojo serve --sync-direction` with `fs-to-studio`, `studio-to-fs`, and
