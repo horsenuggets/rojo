@@ -22,6 +22,8 @@ mod noop_backend;
 mod relocation;
 mod snapshot;
 mod std_backend;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod watch_batch;
 
 use std::path::{Path, PathBuf};
@@ -72,6 +74,14 @@ impl<T> IoResultExt<T> for io::Result<T> {
 #[must_use = "Dropping the guard immediately releases the filesystem lock"]
 pub struct VfsLockGuard {
     pub(crate) _file: Option<std::fs::File>,
+}
+
+/// An opaque native filesystem identity that can be compared across observations.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct FileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) created: std::time::SystemTime,
 }
 
 /// Backend that can be used to create a `Vfs`.
@@ -148,6 +158,13 @@ pub trait VfsBackend: sealed::Sealed + Send + Sync + 'static {
     fn create_dir(&mut self, path: &Path) -> io::Result<()>;
     fn create_dir_all(&mut self, path: &Path) -> io::Result<()>;
     fn metadata(&self, path: &Path) -> io::Result<Metadata>;
+
+    /// Observe a path's native identity without scanning its descendants or adding watches.
+    /// `None` means the backend cannot establish an unambiguous identity.
+    fn file_identity(&self, _path: &Path) -> io::Result<Option<FileIdentity>> {
+        Ok(None)
+    }
+
     fn remove_file(&mut self, path: &Path) -> io::Result<()>;
     fn remove_dir_all(&mut self, path: &Path) -> io::Result<()>;
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
@@ -216,6 +233,17 @@ pub enum VfsEvent {
     Create(PathBuf),
     Write(PathBuf),
     Remove(PathBuf),
+    /// A rename linked by the native watcher, not inferred from matching contents.
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        /// The destination identity when the native burst settled. Consumers must
+        /// revalidate it before trusting linkage. Synthetic renames may omit it.
+        identity: Option<FileIdentity>,
+    },
+    /// One settled watcher burst, delivered as a single channel message so consumers
+    /// cannot split related events or combine them with another burst.
+    Batch(Vec<VfsEvent>),
 }
 
 /// Contains implementation details of the Vfs, wrapped by `Vfs` and `VfsLock`,
@@ -307,8 +335,16 @@ impl VfsInner {
     }
 
     fn commit_event(&mut self, event: &VfsEvent) -> io::Result<()> {
-        if let VfsEvent::Remove(path) = event {
-            let _ = self.backend.unwatch(path);
+        match event {
+            VfsEvent::Remove(path) | VfsEvent::Rename { from: path, .. } => {
+                let _ = self.backend.unwatch(path);
+            }
+            VfsEvent::Batch(events) => {
+                for event in events {
+                    self.commit_event(event)?;
+                }
+            }
+            _ => {}
         }
 
         Ok(())
@@ -558,6 +594,16 @@ impl Vfs {
     pub fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
         let path = path.as_ref();
         self.inner.read().unwrap().metadata(path)
+    }
+
+    /// Observe a path's current native identity without scanning or registering watches.
+    #[inline]
+    pub fn file_identity<P: AsRef<Path>>(&self, path: P) -> io::Result<Option<FileIdentity>> {
+        self.inner
+            .read()
+            .unwrap()
+            .backend
+            .file_identity(path.as_ref())
     }
 
     /// Normalize a path via the underlying backend.
@@ -1056,6 +1102,39 @@ mod test {
         assert!(vfs.exists("file").unwrap());
         vfs.remove_file("file").unwrap();
         assert!(!vfs.exists("file").unwrap());
+    }
+
+    #[test]
+    fn committing_a_batch_unwatches_every_removed_path() {
+        let backend = ReadProbe::new();
+        let calls = Arc::clone(&backend.calls);
+        let vfs = Vfs::new(backend);
+        vfs.commit_event(&VfsEvent::Batch(vec![
+            VfsEvent::Create(PathBuf::from("created")),
+            VfsEvent::Remove(PathBuf::from("first")),
+            VfsEvent::Batch(vec![
+                VfsEvent::Write(PathBuf::from("written")),
+                VfsEvent::Remove(PathBuf::from("second")),
+            ]),
+        ]))
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["unwatch", "unwatch"]);
+    }
+
+    #[test]
+    fn virtual_backends_have_no_native_file_identity() {
+        let mut backend = InMemoryFs::new();
+        backend
+            .load_snapshot("file", VfsSnapshot::file("hello"))
+            .unwrap();
+        assert_eq!(backend.file_identity(Path::new("file")).unwrap(), None);
+        let vfs = Vfs::new(backend);
+        assert_eq!(vfs.file_identity("file").unwrap(), None);
+        assert_eq!(vfs.file_identity("missing").unwrap(), None);
+        assert_eq!(
+            Vfs::new(NoopBackend::new()).file_identity("file").unwrap(),
+            None
+        );
     }
 
     #[test]
