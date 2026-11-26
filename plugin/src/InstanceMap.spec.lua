@@ -2,8 +2,8 @@
 
 InstanceMap.spec
 
-Tests which parent changes the instance map reports. Only an instance whose own Parent
-changed should be reported, never the descendants of an instance that moved.
+Tests structural change reporting and attribute ownership. Only an instance whose own
+Parent changed should be reported, never the descendants of an instance that moved.
 
 --]]
 
@@ -117,6 +117,51 @@ return function()
 	-- Signals can be deferred, so give them a frame to arrive before checking.
 	const function settle()
 		task.wait()
+	end
+
+	for _, className in CLASS_NAMES do
+		it(`does not report unmanaged attribute changes on {className}`, function()
+			const reports = {}
+			const map = InstanceMap.new(function(_, property)
+				if property == "Attributes" then
+					table.insert(reports, property)
+				end
+			end)
+			map.__isGameRunning = function()
+				return false
+			end
+			const instance = Instance.new(className)
+			map:insert("ATTRIBUTES", instance)
+			const ok, failure = pcall(function()
+				for _, name in
+					{
+						"Rojo_Id",
+						"Rojo_Target_Link",
+						"__RojoPlus_ConnectionUrl",
+						"__RojoPlus_LiveEditBootstrapped",
+					}
+				do
+					instance:SetAttribute(name, "owned")
+					settle()
+					expect(instance:GetAttribute(name)).to.equal("owned")
+					expect(#reports).to.equal(0)
+					instance:SetAttribute(name, nil)
+					settle()
+					expect(#reports).to.equal(0)
+				end
+				instance:SetAttribute("Authored", "kept")
+				settle()
+				expect(#reports).to.equal(1)
+				table.clear(reports)
+				instance:SetAttribute("__RojoPlus_ConnectionUrl", "localhost:34872")
+				instance:SetAttribute("Authored", "changed")
+				settle()
+				expect(#reports).to.equal(1)
+			end)
+			map:stop()
+			instance:Destroy()
+			assert(ok, failure)
+		end)
 	end
 
 	it("should capture undelivered structural changes once without advancing authority", function()

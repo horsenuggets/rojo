@@ -135,6 +135,36 @@ return function()
 		root:Destroy()
 	end)
 
+	-- Studio creates services like ControllerService on demand. Their Clone returns
+	-- nil, so they must be skipped quietly instead of warning on every flush.
+	it("should skip instances whose Clone returns nil, like services", function()
+		local root, instanceMap, serialized, run = harness()
+		local cloneable = folder("Cloneable", root)
+		-- Stands in for a service, the only reachable case, by returning nil from Clone.
+		local uncloneable = folder("Uncloneable", root)
+		local stand = setmetatable({
+			Clone = function()
+				return nil
+			end,
+		}, {
+			__index = function(_, key)
+				return uncloneable[key]
+			end,
+		})
+
+		local additions = run({ stand, cloneable })
+
+		local names = {}
+		for _, addition in additions do
+			table.insert(names, addition.ids.name)
+		end
+		expect(table.concat(names, ",")).to.equal("Cloneable")
+		expect(table.concat(serialized, ",")).to.equal("(Cloneable)")
+		expect(instanceMap.fromInstances[stand]).to.equal(nil)
+		instanceMap:stop()
+		root:Destroy()
+	end)
+
 	it("should not track or send anything that fails to serialize", function()
 		local root = Instance.new("Folder")
 		local instanceMap = InstanceMap.new()

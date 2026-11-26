@@ -21,12 +21,17 @@ return strict("Config", {
 	codename = "Epiphany",
 	version = realVersion,
 	expectedServerVersionString = ("%d.%d or newer"):format(realVersion[1], realVersion[2]),
-	-- Must match the server's PROTOCOL_VERSION.
+	-- Must match the server's ordinary and explicit-direction protocol constants.
 	protocolVersion = 12,
+	directionalProtocolVersion = 13,
 	defaultHost = "localhost",
 	defaultPort = "34872",
 	syncRemindersEnabled = false,
 	-- Set by a build tool before Studio opens the place, formatted as
 	-- `host:port`, so a throwaway live edit place reconnects without any UI.
 	liveEditAttribute = "__RojoPlus_LiveEditUrl",
+	liveEditSessionAttribute = "__RojoPlus_LiveEditSessionId",
+	liveEditDirectionAttribute = "__RojoPlus_LiveEditDirection",
+	-- Saved with the place so a new plugin lifetime cannot silently rehydrate by name.
+	liveEditBootstrapAttribute = "__RojoPlus_LiveEditBootstrapped",
 })

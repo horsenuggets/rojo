@@ -25,7 +25,7 @@ local defaultSettings = {
 	autoConnectPlaytestServer = false,
 	confirmationBehavior = "Initial" :: "Never" | "Initial" | "Large Changes" | "Unlisted PlaceId",
 	largeChangesConfirmationThreshold = 5,
-	playSounds = true,
+	playSounds = false,
 	typecheckingEnabled = false,
 	logLevel = "Info",
 	timingLogsEnabled = false,
@@ -34,7 +34,8 @@ local defaultSettings = {
 
 local Settings = {}
 
-Settings._values = table.clone(defaultSettings)
+Settings._defaults = table.freeze(defaultSettings)
+Settings._values = table.clone(Settings._defaults)
 Settings._updateListeners = {}
 Settings._bindings = {}
 

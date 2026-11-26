@@ -35,10 +35,13 @@ local ApiSubscribeMessage = t.interface({
 	added = t.map(RbxId, ApiInstance),
 	updated = t.array(ApiInstanceUpdate),
 	sourceOperations = t.optional(t.map(RbxId, t.string)),
+	origin = t.optional(t.union(t.literal("filesystem"), t.literal("studio"))),
 })
 
 local ApiInfoResponse = t.interface({
 	sessionId = t.string,
+	syncDirection = t.optional(t.string),
+	supportedSyncDirections = t.optional(t.array(t.string)),
 	serverVersion = t.string,
 	protocolVersion = t.number,
 	expectedPlaceIds = t.optional(t.array(t.number)),

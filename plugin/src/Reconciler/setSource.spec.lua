@@ -102,7 +102,9 @@ return function()
 						instance.Source = operation.Proposal
 						instance.Text = operation.Proposal
 						instance.Version += 1
-						notify(instance)
+						if not instance.DelayNotification then
+							notify(instance)
+						end
 						if instance.DelayReturn then
 							operation.Committed = true
 							coroutine.yield()
@@ -150,6 +152,7 @@ return function()
 			test.Set = createSourceSetter(editor)
 		end
 		test.Text = editor.GetEditorSource
+		test.Notify = notify
 
 		function test.Start()
 			while #ready > 0 do
@@ -265,7 +268,9 @@ return function()
 						end
 						instance.Text, instance.Source = proposed, proposed
 						instance.Version += 1
-						notify(instance)
+						if not instance.DelayNotification then
+							notify(instance)
+						end
 						if instance.DelayReturn then
 							operation.Committed = true
 							coroutine.yield()
@@ -311,6 +316,120 @@ return function()
 
 		return test
 	end
+
+	it("observes a commit once when its notification is delivered after return", function()
+		for _, serviceBoundary in { false, true } do
+			for _, open in { false, true } do
+				for _, delayed in { false, true } do
+					local test = fixture(false, serviceBoundary)
+					local instance = test.Script("initial", open)
+					instance.DelayNotification = delayed
+					local map, reports, outcomes = test.Map(instance)
+					local request = map:setSource(instance, "remote")
+					test.Start()
+					test.Step(instance, "attempt")
+					test.Step(instance, "commit")
+					expect(request.Status).to.equal("committed")
+					expect(#reports).to.equal(1)
+					expect(reports[1].Observation.Operation).to.equal(request)
+					expect(request.CommittedRevision).to.equal(reports[1].Observation.Revision)
+					if delayed then
+						test.Notify(instance)
+					end
+					expect(#reports).to.equal(1)
+					expect(map:getSourceRevision(instance)).to.equal(request.CommittedRevision)
+					-- Only the owed delivery is absorbed. Later identical activity is typing.
+					test.Notify(instance)
+					expect(#reports).to.equal(2)
+					expect(reports[2].Observation.Operation).to.equal(nil)
+					expect(reports[2].Observation.Value).to.equal("remote")
+					expect(#outcomes).to.equal(1)
+					map:stop()
+				end
+			end
+		end
+	end)
+
+	it("keeps a queued patch valid when the preceding commit notification is late", function()
+		for _, open in { false, true } do
+			local test = fixture(false, true)
+			local instance = test.Script("initial", open)
+			instance.DelayNotification = true
+			local map, reports = test.Map(instance)
+			local first = map:setSource(instance, "first")
+			test.Drain()
+			local second = map:setSource(instance, "second")
+			test.Notify(instance)
+			test.Drain()
+			test.Notify(instance)
+			expect(first.Status).to.equal("committed")
+			expect(second.Status).to.equal("committed")
+			expect(test.Text(instance)).to.equal("second")
+			expect(#reports).to.equal(2)
+			expect(reports[1].Observation.Operation).to.equal(first)
+			expect(reports[2].Observation.Operation).to.equal(second)
+			map:stop()
+		end
+	end)
+
+	it("retains typing and exact reversions after a commit with delayed notification", function()
+		for _, open in { false, true } do
+			local test = fixture(false, true)
+			local instance = test.Script("initial", open)
+			instance.DelayNotification = true
+			local map, reports = test.Map(instance)
+			local request = map:setSource(instance, "remote")
+			test.Drain()
+			expect(#reports).to.equal(1)
+			instance:Edit("genuine draft")
+			instance:Edit("remote")
+			test.Notify(instance)
+			expect(request.Status).to.equal("committed")
+			-- Intervening typing revokes the owed delivery, so the late callback is kept.
+			expect(#reports).to.equal(4)
+			for index, value in { "genuine draft", "remote", "remote" } do
+				expect(reports[index + 1].Observation.Operation).to.equal(nil)
+				expect(reports[index + 1].Observation.Value).to.equal(value)
+			end
+			map:stop()
+		end
+	end)
+
+	it("does not retain successful notification ownership across observer leases", function()
+		local test = fixture(false, true)
+		local instance = test.Script("initial")
+		instance.DelayNotification = true
+		local oldMap = test.Map(instance)
+		local request = oldMap:setSource(instance, "remote")
+		test.Drain()
+		oldMap:stop()
+		local freshMap, reports = test.Map(instance)
+		test.Notify(instance)
+		expect(request.Status).to.equal("committed")
+		expect(#reports).to.equal(1)
+		expect(reports[1].Observation.Operation).to.equal(nil)
+		freshMap:stop()
+	end)
+
+	it("does not normalize a failed invocation into a successful observed commit", function()
+		for _, open in { false, true } do
+			local test = fixture(false, true)
+			local instance = test.Script("initial", open)
+			instance.DelayNotification, instance.DelayReturn = true, true
+			local map, reports = test.Map(instance)
+			local request = map:setSource(instance, "remote")
+			test.Start()
+			test.Step(instance, "attempt")
+			test.Step(instance, "fail", "Uncertain editor failure.")
+			expect(request.Status).to.equal("failed")
+			expect(request.CommittedRevision).to.equal(nil)
+			expect(#reports).to.equal(0)
+			instance:Edit("remote")
+			expect(#reports).to.equal(1)
+			expect(reports[1].Observation.Operation).to.equal(nil)
+			map:stop()
+		end
+	end)
 
 	it("revalidates a rejected range after newer local text instead of reusing its offsets", function()
 		local test = fixture(false, true)

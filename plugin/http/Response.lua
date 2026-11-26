@@ -33,8 +33,8 @@ function Response:json()
 	return HttpService:JSONDecode(self.body)
 end
 
-function Response:msgpack()
-	return msgpack.decode(self.body)
+function Response:msgpack(checkpoint)
+	return msgpack.decode(self.body, checkpoint)
 end
 
 return Response

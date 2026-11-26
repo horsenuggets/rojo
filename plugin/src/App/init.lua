@@ -17,6 +17,7 @@ local Config = require(Plugin.Config)
 local Settings = require(Plugin.Settings)
 local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
+local DirectionPolicy = require(Plugin.DirectionPolicy)
 local ServeSession = require(Plugin.ServeSession)
 local SharedAPI = require(Plugin.SharedAPI)
 local ApiContext = require(Plugin.ApiContext)
@@ -161,7 +162,9 @@ function App:init()
 			end
 		end)
 
-		if self.liveEditConnection then
+		if self.liveEditMarkerError then
+			self:setState({ appStatus = AppStatus.Error, errorMessage = self.liveEditMarkerError })
+		elseif self.liveEditConnection then
 			-- A live edit place already names its server, so a prior manual
 			-- session would only be a guess.
 			Log.trace(
@@ -204,6 +207,10 @@ function App:willUnmount()
 	SharedAPI.unregister()
 
 	self:endSession()
+	for _, session in self.resumableSessions or {} do
+		session:destroy()
+	end
+	self.resumableSessions = nil
 
 	self.waypointConnection:Disconnect()
 	self.confirmationBindable:Destroy()
@@ -598,26 +605,14 @@ end
 	reported rather than silently treated as a normal place.
 ]]
 function App:readLiveEditMarker()
-	local value = workspace:GetAttribute(Config.liveEditAttribute)
-	if value == nil then
-		return nil
-	end
-
-	if type(value) ~= "string" then
-		Log.warn("Ignoring live edit marker that is a {} instead of a string", type(value))
-		return nil
-	end
-
-	local host, port = string.match(value, "^(.-):(%d+)$")
-	if host == nil or #host == 0 then
-		Log.warn("Ignoring malformed live edit marker '{}'", value)
-		return nil
-	end
-
-	return {
-		host = host,
-		port = port,
-	}
+	local valid, marker = pcall(
+		DirectionPolicy.marker,
+		workspace:GetAttribute(Config.liveEditAttribute),
+		workspace:GetAttribute(Config.liveEditSessionAttribute),
+		workspace:GetAttribute(Config.liveEditDirectionAttribute)
+	)
+	self.liveEditMarkerError = if valid then nil else tostring(marker)
+	return if valid then marker else nil
 end
 
 --[[
@@ -679,9 +674,115 @@ function App:useRunningConnectionInfo()
 	self.setPort(port)
 end
 
+-- Roact may evaluate an updater later, and building a patch tree may yield. Check
+-- ownership on both sides so neither queued work nor a resumed diff can outlive it.
+local function setSessionState(self, isCurrent, update)
+	if not isCurrent() then
+		return
+	end
+	self:setState(function(prevState)
+		if not isCurrent() then
+			return nil
+		end
+		local changes = if type(update) == "function" then update(prevState) else update
+		return if isCurrent() then changes else nil
+	end)
+end
+
+-- Status and confirmation updates can supersede each other within one session too.
+local function beginSessionTransition(lifetime, isCurrent)
+	local transition = {}
+	lifetime.transition = transition
+	return function()
+		return isCurrent() and lifetime.transition == transition
+	end
+end
+
+local function finishSession(self, lifetime, details, stop)
+	if self.sessionLifetime ~= lifetime or not lifetime.active then
+		return
+	end
+
+	-- Detach shared ownership before any external callback can start a replacement.
+	-- Cleanup handles are captured, never read back from a potentially newer session.
+	lifetime.active = false
+	local serveSession = self.serveSession
+	local cleanupPrecommit, cleanupPostcommit = self.cleanupPrecommit, self.cleanupPostcommit
+	self.serveSession = nil
+	self.cleanupPrecommit, self.cleanupPostcommit = nil, nil
+	local function isCurrent()
+		return self.sessionLifetime == lifetime
+	end
+
+	self:releaseSyncLock()
+	if isCurrent() then
+		self:clearRunningConnectionInfo()
+	end
+	if cleanupPrecommit then
+		cleanupPrecommit()
+	end
+	if cleanupPostcommit then
+		cleanupPostcommit()
+	end
+	if stop and serveSession then
+		serveSession:stop()
+	end
+	if serveSession and serveSession.getResumeKey then
+		local key = serveSession:getResumeKey()
+		if key ~= nil then
+			self.resumableSessions = self.resumableSessions or {}
+			self.resumableSessions[key] = serveSession
+		end
+	end
+
+	if not isCurrent() then
+		return
+	end
+	setSessionState(self, isCurrent, {
+		appStatus = if details ~= nil then AppStatus.Error else AppStatus.NotConnected,
+		errorMessage = if details ~= nil then tostring(details) else nil,
+		toolbarIcon = if details ~= nil then Assets.Images.PluginButtonWarning else Assets.Images.PluginButton,
+		patchData = {
+			patch = PatchSet.newEmpty(),
+			unapplied = PatchSet.newEmpty(),
+			timestamp = os.time(),
+		},
+	})
+	if not isCurrent() then
+		return
+	end
+	if details ~= nil then
+		Log.warn("Disconnected from an error: {}", details)
+	end
+	self:addNotification({
+		text = if details ~= nil then tostring(details) else "Disconnected from session.",
+		timeout = 10,
+	})
+end
+
 function App:startSession()
+	if self.serveSession ~= nil or (self.sessionLifetime and self.sessionLifetime.active) then
+		return
+	end
+	self.liveEditConnection = self:readLiveEditMarker()
+	if self.liveEditMarkerError ~= nil then
+		self:setState({ appStatus = AppStatus.Error, errorMessage = self.liveEditMarkerError })
+		self:addNotification({ text = self.liveEditMarkerError, timeout = 10 })
+		return
+	end
+
+	-- Reserve even the construction phase, before a session can be published.
+	local lifetime = { active = true }
+	self.sessionLifetime = lifetime
+	local function isCurrent()
+		return self.sessionLifetime == lifetime and lifetime.active
+	end
 	local claimedLock, priorOwner = self:claimSyncLock()
+	if not isCurrent() then
+		return
+	end
 	if not claimedLock then
+		lifetime.active = false
 		local msg = string.format("Could not sync because user '%s' is already syncing", tostring(priorOwner))
 
 		Log.warn(msg)
@@ -689,7 +790,9 @@ function App:startSession()
 			text = msg,
 			timeout = 10,
 		})
-		self:setState({
+		setSessionState(self, function()
+			return self.sessionLifetime == lifetime
+		end, {
 			appStatus = AppStatus.Error,
 			errorMessage = msg,
 			toolbarIcon = Assets.Images.PluginButtonWarning,
@@ -702,20 +805,50 @@ function App:startSession()
 
 	local baseUrl = toBaseUrl(host, port)
 	local apiContext = ApiContext.new(baseUrl)
+	if not isCurrent() then
+		return
+	end
 
-	-- A live edit place is a throwaway copy of the filesystem, so it always
-	-- writes Studio edits back and lets the filesystem win conflicts, without
-	-- changing the settings a normal place uses.
+	-- Legacy live edit places enable two-way sync. Explicit server direction is
+	-- negotiated before hydration; filesystem conflict authority remains independent.
 	local liveEdit = self:isLiveEditEndpoint(host, port)
 	local twoWaySync = if liveEdit then true else Settings:get("twoWaySync")
 
-	local serveSession = ServeSession.new({
-		apiContext = apiContext,
-		twoWaySync = twoWaySync,
-		twoWaySyncAuthority = if liveEdit then "Filesystem" else nil,
-	})
+	local marker = if liveEdit then self.liveEditConnection else nil
+	local key = if marker and marker.sessionId
+		then DirectionPolicy.resumeKey(baseUrl, marker.sessionId, marker.direction)
+		else nil
+	local serveSession = key and self.resumableSessions and self.resumableSessions[key]
+	if serveSession then
+		serveSession:resume(apiContext, marker)
+	else
+		if next(self.resumableSessions or {}) ~= nil then
+			apiContext:disconnect()
+			finishSession(
+				self,
+				lifetime,
+				"This place retains a directional session for a different endpoint, session identity or direction. Preserve/export its drafts before opening a freshly generated place; automatic takeover was refused.",
+				false
+			)
+			return
+		end
+		serveSession = ServeSession.new({
+			apiContext = apiContext,
+			twoWaySync = twoWaySync,
+			twoWaySyncAuthority = if liveEdit then "Filesystem" else nil,
+			liveEditMarker = marker,
+		})
+	end
+	if not isCurrent() then
+		serveSession:stop()
+		return
+	end
+	self.serveSession = serveSession
 
 	serveSession:setSyncResultCallback(function(status, result)
+		if not isCurrent() then
+			return
+		end
 		if status == "Failed" then
 			local messages = {}
 			for _, err in result.errors do
@@ -725,29 +858,42 @@ function App:startSession()
 				text = "Could not save Studio changes:\n" .. table.concat(messages, "\n"),
 				timeout = 8,
 			})
+		elseif status == "Saved" and result.notices ~= nil then
+			for _, notice in result.notices do
+				self:addNotification({ text = notice.message, timeout = 8 })
+			end
 		elseif status == "Conflicted" then
 			self:addNotification({
-				text = "Filesystem values won a conflict and were restored in Studio.",
+				text = if serveSession:getSyncDirection() == "studio-to-fs"
+					then "Studio changes conflicted with filesystem ownership. Editor drafts were retained."
+					else "Filesystem values won a conflict and were restored in Studio.",
 				timeout = 8,
 			})
 		end
 	end)
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
-		self:setState({
+		setSessionState(self, isCurrent, {
 			connectingText = text,
 		})
 	end)
 
-	self.cleanupPrecommit = serveSession:hookPrecommit(function(patch, instanceMap)
-		-- Build new tree for patch
-		self:setState({
-			patchTree = PatchTree.build(patch, instanceMap, { "Property", "Old", "New" }),
-		})
+	local cleanupPrecommit = serveSession:hookPrecommit(function(patch, instanceMap)
+		if not isCurrent() then
+			return
+		end
+		-- Capture current values before the patch is applied, not in a queued updater.
+		local patchTree = PatchTree.build(patch, instanceMap, { "Property", "Old", "New" }, isCurrent)
+		setSessionState(self, isCurrent, { patchTree = patchTree })
 	end)
-	self.cleanupPostcommit = serveSession:hookPostcommit(function(patch, instanceMap, unappliedPatch)
+	if not isCurrent() then
+		cleanupPrecommit()
+		return
+	end
+	self.cleanupPrecommit = cleanupPrecommit
+	local cleanupPostcommit = serveSession:hookPostcommit(function(patch, instanceMap, unappliedPatch)
 		local now = DateTime.now().UnixTimestamp
-		self:setState(function(prevState)
+		setSessionState(self, isCurrent, function(prevState)
 			local oldPatchData = prevState.patchData
 			local newPatchData = {
 				patch = patch,
@@ -772,75 +918,70 @@ function App:startSession()
 		end)
 	end)
 
+	if not isCurrent() then
+		cleanupPostcommit()
+		return
+	end
+	self.cleanupPostcommit = cleanupPostcommit
+
 	serveSession:onStatusChanged(function(status, details)
+		if not isCurrent() then
+			return
+		end
+		local isStatusCurrent = beginSessionTransition(lifetime, isCurrent)
 		if status == ServeSession.Status.Connecting then
-			if self.dismissSyncReminder then
-				self.dismissSyncReminder()
-				self.dismissSyncReminder = nil
+			local dismissSyncReminder = self.dismissSyncReminder
+			self.dismissSyncReminder = nil
+			if dismissSyncReminder then
+				dismissSyncReminder()
+			end
+			if not isStatusCurrent() then
+				return
 			end
 
-			self:setState({
+			setSessionState(self, isStatusCurrent, {
 				appStatus = AppStatus.Connecting,
 				toolbarIcon = Assets.Images.PluginButton,
 			})
+			if not isStatusCurrent() then
+				return
+			end
 			self:addNotification({
 				text = "Connecting to session...",
 			})
 		elseif status == ServeSession.Status.Connected then
 			self.knownProjects[details] = true
 			self:setPriorSyncInfo(host, port, details)
+			if not isStatusCurrent() then
+				return
+			end
 			self:setRunningConnectionInfo(baseUrl)
+			if not isStatusCurrent() then
+				return
+			end
 
 			local address = ("%s:%s"):format(host, port)
-			self:setState({
+			setSessionState(self, isStatusCurrent, {
 				appStatus = AppStatus.Connected,
 				projectName = details,
 				address = address,
 				toolbarIcon = Assets.Images.PluginButtonConnected,
 			})
+			if not isStatusCurrent() then
+				return
+			end
 			self:addNotification({
 				text = string.format("Connected to session '%s' at %s.", details, address),
 			})
 		elseif status == ServeSession.Status.Disconnected then
-			self.serveSession = nil
-			self:releaseSyncLock()
-			self:clearRunningConnectionInfo()
-			self:setState({
-				patchData = {
-					patch = PatchSet.newEmpty(),
-					unapplied = PatchSet.newEmpty(),
-					timestamp = os.time(),
-				},
-			})
-
-			-- Details being present indicates that this
-			-- disconnection was from an error.
-			if details ~= nil then
-				Log.warn("Disconnected from an error: {}", details)
-
-				self:setState({
-					appStatus = AppStatus.Error,
-					errorMessage = tostring(details),
-					toolbarIcon = Assets.Images.PluginButtonWarning,
-				})
-				self:addNotification({
-					text = tostring(details),
-					timeout = 10,
-				})
-			else
-				self:setState({
-					appStatus = AppStatus.NotConnected,
-					toolbarIcon = Assets.Images.PluginButton,
-				})
-				self:addNotification({
-					text = "Disconnected from session.",
-					timeout = 10,
-				})
-			end
+			finishSession(self, lifetime, details, false)
 		end
 	end)
 
 	serveSession:setConfirmCallback(function(instanceMap, patch, serverInfo)
+		if not isCurrent() then
+			return "Abort"
+		end
 		if PatchSet.isEmpty(patch) then
 			Log.trace("Accepting patch without confirmation because it is empty")
 			return "Accept"
@@ -910,12 +1051,18 @@ function App:startSession()
 			end
 		end
 
-		self:setState({
+		local isConfirmationCurrent = beginSessionTransition(lifetime, isCurrent)
+		setSessionState(self, isConfirmationCurrent, {
 			connectingText = "Computing diff view...",
 		})
-		self:setState({
+		if not isConfirmationCurrent() then
+			return "Abort"
+		end
+		local patchTree =
+			PatchTree.build(patch, instanceMap, { "Property", "Current", "Incoming" }, isConfirmationCurrent)
+		setSessionState(self, isConfirmationCurrent, {
 			appStatus = AppStatus.Confirming,
-			patchTree = PatchTree.build(patch, instanceMap, { "Property", "Current", "Incoming" }),
+			patchTree = patchTree,
 			confirmData = {
 				serverInfo = serverInfo,
 				patch = patch,
@@ -923,6 +1070,9 @@ function App:startSession()
 			},
 			toolbarIcon = Assets.Images.PluginButton,
 		})
+		if not isConfirmationCurrent() then
+			return "Abort"
+		end
 
 		self:addNotification({
 			text = string.format(
@@ -932,34 +1082,26 @@ function App:startSession()
 			timeout = 7,
 		})
 
-		return self.confirmationEvent:Wait()
+		if not isConfirmationCurrent() then
+			return "Abort"
+		end
+		local response = self.confirmationEvent:Wait()
+		return if isConfirmationCurrent() then response else "Abort"
 	end)
 
-	serveSession:start()
-
-	self.serveSession = serveSession
+	if isCurrent() then
+		serveSession:start()
+	end
 end
 
 function App:endSession()
-	if self.serveSession == nil then
+	local lifetime = self.sessionLifetime
+	if lifetime == nil or not lifetime.active then
 		return
 	end
 
 	Log.trace("Disconnecting session")
-
-	self.serveSession:stop()
-	self.serveSession = nil
-	self:setState({
-		appStatus = AppStatus.NotConnected,
-	})
-
-	if self.cleanupPrecommit ~= nil then
-		self.cleanupPrecommit()
-	end
-	if self.cleanupPostcommit ~= nil then
-		self.cleanupPostcommit()
-	end
-
+	finishSession(self, lifetime, nil, true)
 	Log.trace("Session terminated by user")
 end
 

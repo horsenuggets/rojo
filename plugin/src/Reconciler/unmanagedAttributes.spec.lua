@@ -17,6 +17,9 @@ return function()
 			{ "Rojo_Target_PrimaryPart", true },
 			{ "Rojo_Other", false },
 			{ "__RojoPlus_LiveEditUrl", true },
+			{ "__RojoPlus_LiveEditSessionId", true },
+			{ "__RojoPlus_LiveEditDirection", true },
+			{ "__RojoPlus_LiveEditBootstrapped", true },
 			{ "__RojoPlus_ConnectionUrl", true },
 			{ "__Rojo_Other", false },
 		}
@@ -59,6 +62,17 @@ return function()
 			expect(merged.RBX_ReimportId ~= nil).to.equal(bit32.btest(bits, 8))
 			-- The marker always comes from Studio, never from the filesystem.
 			expect(merged["__RojoPlus_LiveEditUrl"]).to.equal(if bit32.btest(bits, 16) then "localhost:34901" else nil)
+		end
+	end)
+
+	it("preserves directional session and bootstrap markers through attribute normalization", function()
+		for _, name in
+			{ "__RojoPlus_LiveEditSessionId", "__RojoPlus_LiveEditDirection", "__RojoPlus_LiveEditBootstrapped" }
+		do
+			for _, incoming in { {}, { [name] = "replace" } } do
+				expect(unmanagedAttributes.merge(incoming, { [name] = "preserve" })[name]).to.equal("preserve")
+				expect(unmanagedAttributes.merge(incoming, {})[name]).to.equal(nil)
+			end
 		end
 	end)
 

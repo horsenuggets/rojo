@@ -5,6 +5,10 @@
 	not proof of a remote commit. Only a successful editor invocation after a non-nil final
 	proposal confirms that operation. A retry discards the preceding proposal's evidence.
 
+	If a successful call returns before its change notification, its visible commit is
+	observed at return. The first later delivery in the same lease is absorbed only when
+	no other observation intervened and the text still equals that commit.
+
 	Cancel revokes the observer lease immediately and marks CancellationRequested. Invoked
 	operations stay pending until the engine returns, then deliver one actual terminal
 	outcome to their retained completion listeners. Observe adopts that pending operation
@@ -87,7 +91,7 @@ local function createSourceSetter(boundary)
 		local request, active = state.Request, state.Active
 		-- Revoke the session lease before notifying anyone. Keep the instance's runner,
 		-- revision stream, and active proposal alive until the engine invocation returns.
-		state.Generation, state.Request = nil, nil
+		state.Generation, state.Request, state.OwedDelivery = nil, nil, nil
 		table.clear(state.Observers)
 		if request and request ~= active then
 			request.CancellationRequested = true
@@ -105,6 +109,49 @@ local function createSourceSetter(boundary)
 		complete(if request ~= active then request else nil, "locally-cancelled")
 	end
 
+	local function observe(instance, state, owesDelivery)
+		if states[instance] ~= state then
+			return
+		end
+		local readSuccess, value = pcall(boundary.GetEditorSource, instance)
+		local owed = state.OwedDelivery
+		state.OwedDelivery = nil
+		if
+			readSuccess
+			and owed
+			and owed.Generation == state.Generation
+			and owed.Revision == state.Revision
+			and owed.Value == value
+		then
+			-- Deferred engine delivery arrives after its successful call returned. That
+			-- call already produced this transition's one observation, so absorb exactly
+			-- one first matching delivery. Any intervening observation revokes the debt.
+			return
+		end
+		state.Revision += 1
+		local active = state.Active
+		local candidate
+		if readSuccess and active and active.ProposedRevision == state.Revision - 1 and active.Value == value then
+			candidate = active
+			active.ObservedRevision = state.Revision
+			if owesDelivery then
+				state.OwedDelivery = { Generation = state.Generation, Revision = state.Revision, Value = value }
+			end
+		end
+		local observation = {
+			Error = if readSuccess then nil else tostring(value),
+			Generation = state.Generation,
+			Operation = candidate,
+			Revision = state.Revision,
+			Value = if readSuccess then value else nil,
+		}
+		-- Apart from one owed delivery, never suppress typing by content, open-document
+		-- status, or heartbeat pause.
+		for _, observer in table.clone(state.Observers) do
+			notify(candidate, "change", observer.Changed, observation)
+		end
+	end
+
 	local function getState(instance)
 		local state = states[instance]
 		if state then
@@ -118,28 +165,7 @@ local function createSourceSetter(boundary)
 		state = { Generation = generation, Revision = 0, Observers = {} }
 		states[instance] = state
 		state.Changes = boundary.ConnectChanged(instance, function()
-			if states[instance] ~= state then
-				return
-			end
-			state.Revision += 1
-			local readSuccess, value = pcall(boundary.GetEditorSource, instance)
-			local active = state.Active
-			local candidate
-			if readSuccess and active and active.ProposedRevision == state.Revision - 1 and active.Value == value then
-				candidate = active
-				active.ObservedRevision = state.Revision
-			end
-			local observation = {
-				Error = if readSuccess then nil else tostring(value),
-				Generation = state.Generation,
-				Operation = candidate,
-				Revision = state.Revision,
-				Value = if readSuccess then value else nil,
-			}
-			-- Never suppress typing by content, open-document status, or heartbeat pause.
-			for _, observer in table.clone(state.Observers) do
-				notify(candidate, "change", observer.Changed, observation)
-			end
+			observe(instance, state)
 		end)
 		state.Connection = instance.Destroying:Connect(function()
 			if states[instance] == state then
@@ -229,6 +255,20 @@ local function createSourceSetter(boundary)
 			end)
 
 			request.CommitUncertain = not success and request.ProposedRevision ~= nil
+			if
+				success
+				and appliedFrom ~= nil
+				and appliedFrom ~= request.Value
+				and request.ObservedRevision == nil
+				and state.Revision == appliedRevision
+			then
+				local readSuccess, visible = pcall(boundary.GetEditorSource, instance)
+				if readSuccess and visible == request.Value then
+					-- Deferred signals can deliver after the call returns. Observe the visible
+					-- commit while this operation is still active, then owe one delivery.
+					observe(instance, state, true)
+				end
+			end
 			state.Active = nil
 			if state.Request == request then
 				state.Request = nil
