@@ -141,7 +141,9 @@ local function createSourceSetter(boundary)
 		end
 		if candidate and owesDelivery then
 			-- Consecutive owed commits accumulate. Anything else revokes every debt.
-			local count = if owed and owed.Generation == state.Generation and owed.Revision == state.Revision - 1
+			local count = if owed
+					and owed.Generation == state.Generation
+					and owed.Revision == state.Revision - 1
 				then owed.Count
 				else 0
 			state.OwedDelivery =
