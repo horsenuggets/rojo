@@ -80,6 +80,17 @@ pub fn snapshot_project(
             .or_else(emit_legacy_scripts_default)
             .unwrap(),
     );
+    // Reloading a boundary replaces its served revision and any deeper ancestry.
+    // Active traversal ancestry is deliberately cleared in retained metadata, but
+    // this ownership witness must survive shallow reads and later migrations.
+    let served = Arc::make_mut(&mut context.served_projects.0);
+    if let Some(index) = served
+        .iter()
+        .position(|old| old.file_location == project.file_location)
+    {
+        served.truncate(index);
+    }
+    served.push(Arc::new(project.clone()));
 
     match snapshot_project_node(&context, path, project_name, &project.tree, vfs, None)? {
         Some(found_snapshot) => {
@@ -117,6 +128,21 @@ pub fn snapshot_project_node(
     parent_class: Option<&str>,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
     let project_folder = project_path.parent().unwrap();
+    // A referring project node can retain metadata from the referenced root.
+    // Its own authored children still belong to the referring declaration's
+    // ancestry, not the deeper boundary that supplied its filesystem payload.
+    let mut context = Cow::Borrowed(context);
+    if let Some(index) = context
+        .served_projects
+        .0
+        .iter()
+        .position(|project| project.file_location == project_path)
+    {
+        if index + 1 < context.served_projects.0.len() {
+            Arc::make_mut(&mut context.to_mut().served_projects.0).truncate(index + 1);
+        }
+    }
+    let context = context.as_ref();
 
     let mut class_name_from_path = None;
 

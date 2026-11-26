@@ -1,17 +1,29 @@
 use std::{
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, TcpListener},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
 };
 
 use clap::Parser;
+use futures::{
+    future::{pending, select},
+    StreamExt,
+};
 use memofs::Vfs;
-use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
+use termcolor::{Buffer, BufferWriter, ColorChoice, WriteColor};
 
-use crate::{serve_session::ServeSession, web::LiveServer};
+use crate::{
+    serve_session::{ServeSession, SyncDirection},
+    web::LiveServer,
+};
 
-use super::{resolve_path, GlobalOptions};
+use super::{
+    display,
+    live_edit_place::{self, LiveEditPlace, OutputOwnership},
+    resolve_path, GlobalOptions,
+};
 
 const DEFAULT_BIND_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const DEFAULT_PORT: u16 = 34872;
@@ -41,18 +53,42 @@ pub struct ServeCommand {
     #[clap(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
 
+    /// Fix the live-sync direction for this session. Omit to let the client choose.
+    #[clap(long, value_enum)]
+    pub sync_direction: Option<SyncDirection>,
+
     /// Stop the server when standard input closes or encounters a read error.
     #[clap(long)]
     pub shutdown_on_stdin_eof: bool,
+
+    /// Write the served project to this .rbxl or .rbxlx place once listening, with
+    /// `{port}` in the filename replaced by the bound port. Parent directory names
+    /// are literal. The place's Workspace
+    /// carries the `__RojoPlus_LiveEditUrl` attribute, so the Rojo+ plugin
+    /// connects to this server as soon as Studio opens it. Any old file at the path
+    /// is removed before the start message, and the new one appears all at once,
+    /// so a caller can wait for it to exist. The served tree never gets the
+    /// attribute. A failed write stops the server with an error.
+    #[clap(long, value_name = "TEMPLATE")]
+    pub live_edit_place: Option<PathBuf>,
 }
 
 impl ServeCommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
+        let live_edit_place = self
+            .live_edit_place
+            .as_deref()
+            .map(LiveEditPlace::parse)
+            .transpose()?;
         let project_path = resolve_path(&self.project)?;
 
         let vfs = Vfs::new_default()?;
 
-        let session = Arc::new(ServeSession::new(vfs, project_path)?);
+        let session = Arc::new(ServeSession::new_with_sync_direction(
+            vfs,
+            project_path,
+            self.sync_direction,
+        )?);
 
         let (ip, port) = resolve_bind_address(&session, self.address, self.port)?;
 
@@ -64,29 +100,108 @@ impl ServeCommand {
             self.allowed_hosts
         };
 
-        let server = LiveServer::new(session);
+        let server = LiveServer::new(Arc::clone(&session));
 
-        let on_listening = |address: std::net::SocketAddr| {
-            let _ = show_start_message(address.ip(), address.port(), global.color.into());
+        // The place writer reports here, which also stops the server, since a live
+        // edit without its place can never connect.
+        let failure: Arc<Mutex<Option<anyhow::Error>>> = Arc::default();
+        let (failed, mut on_failure) = futures::channel::mpsc::unbounded::<()>();
+        let writer: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::default();
+        let mut output_ownership = None;
+
+        let on_listening = {
+            // Borrow the run-scope guard, rather than moving it into the callback
+            // or writer, so finishing the place never releases a live server's output.
+            let output_ownership = &mut output_ownership;
+            let failure = Arc::clone(&failure);
+            let writer = Arc::clone(&writer);
+            move |address: SocketAddr| {
+                let report = move |error: anyhow::Error| {
+                    *failure.lock().unwrap() = Some(error);
+                    let _ = failed.unbounded_send(());
+                };
+                let path = live_edit_place
+                    .as_ref()
+                    .map(|place| place.resolve(address.port()));
+                if let Some(path) = &path {
+                    match OutputOwnership::acquire(path) {
+                        Ok(ownership) => *output_ownership = Some(ownership),
+                        Err(error) => {
+                            report(error);
+                            return;
+                        }
+                    }
+                    if let Err(error) = live_edit_place::remove_stale(path) {
+                        report(error);
+                        return;
+                    }
+                }
+
+                let _ = show_start_message(address.ip(), address.port(), global.color.into());
+
+                if let (Some(place), Some(path)) = (live_edit_place, path) {
+                    let marker = live_edit_place::connection_address(address);
+                    *writer.lock().unwrap() = Some(thread::spawn(move || {
+                        let policy = session
+                            .sync_direction()
+                            .map(|direction| (session.session_id(), direction));
+                        let mut tree = session.tree();
+                        if let Err(error) =
+                            live_edit_place::write(&mut tree, &path, place.kind(), &marker, policy)
+                        {
+                            report(error);
+                        }
+                    }));
+                }
+            }
         };
 
-        if self.shutdown_on_stdin_eof {
+        let stdin_eof = self.shutdown_on_stdin_eof.then(|| {
             let (sender, receiver) = futures::channel::oneshot::channel();
             // Keep blocking stdin reads outside Tokio so runtime teardown never waits for input.
-            std::thread::Builder::new()
+            thread::Builder::new()
                 .name("rojo-stdin-shutdown".into())
                 .spawn(move || {
                     wait_for_stdin_eof(io::stdin().lock());
                     let _ = sender.send(());
-                })?;
-            server.start_with_shutdown((ip, port).into(), allowed_hosts, on_listening, async {
-                let _ = receiver.await;
-            })?;
-        } else {
-            server.start((ip, port).into(), allowed_hosts, on_listening)?;
-        }
+                })
+                .map(|_| receiver)
+        });
+        let stdin_eof = stdin_eof.transpose()?;
 
-        Ok(())
+        let shutdown = async move {
+            let stdin_eof = async move {
+                match stdin_eof {
+                    Some(receiver) => {
+                        let _ = receiver.await;
+                    }
+                    None => pending::<()>().await,
+                }
+            };
+            // The channel closes without a message once the place is written.
+            let failed = async move {
+                if on_failure.next().await.is_none() {
+                    pending::<()>().await;
+                }
+            };
+            futures::pin_mut!(stdin_eof, failed);
+            select(stdin_eof, failed).await;
+        };
+
+        let served =
+            server.start_with_shutdown((ip, port).into(), allowed_hosts, on_listening, shutdown);
+
+        // Finish a write in progress, so shutting down never leaves a staging file.
+        if let Some(writer) = writer.lock().unwrap().take() {
+            let _ = writer.join();
+        }
+        drop(output_ownership);
+        served?;
+        let failure = failure.lock().unwrap().take();
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -141,60 +256,35 @@ fn find_available_port(ip: IpAddr, starting_port: u16) -> anyhow::Result<u16> {
 }
 
 fn show_start_message(bind_address: IpAddr, port: u16, color: ColorChoice) -> io::Result<()> {
-    let mut green = ColorSpec::new();
-    green.set_fg(Some(Color::Green)).set_bold(true);
-
     let writer = BufferWriter::stdout(color);
     let mut buffer = writer.buffer();
+    write_start_message(&mut buffer, bind_address, port)?;
+    writer.print(&buffer)
+}
 
-    let address_string = if bind_address.is_loopback() {
-        "localhost".to_owned()
-    } else {
-        bind_address.to_string()
-    };
+fn write_start_message(buffer: &mut Buffer, bind_address: IpAddr, port: u16) -> io::Result<()> {
+    let host = display::display_host(bind_address);
 
-    writeln!(&mut buffer, "Rojo+ server listening:")?;
+    write!(buffer, "Rojo+ server listening on ")?;
+    display::write_muted(buffer, &format!("{host}:{port}"))?;
+    writeln!(buffer, ".")?;
 
-    write!(&mut buffer, "  Address: ")?;
-    buffer.set_color(&green)?;
-    writeln!(&mut buffer, "{}", address_string)?;
-
-    buffer.set_color(&ColorSpec::new())?;
-    write!(&mut buffer, "  Port:    ")?;
-    buffer.set_color(&green)?;
-    writeln!(&mut buffer, "{}", port)?;
-
-    writeln!(&mut buffer)?;
+    write!(buffer, "Visit ")?;
+    display::write_muted(buffer, &format!("http://{host}:{port}/"))?;
+    writeln!(buffer, " in your browser for more information.")?;
 
     if !bind_address.is_loopback() {
-        let mut warning = ColorSpec::new();
-        warning.set_fg(Some(Color::Yellow)).set_bold(true);
-
-        buffer.set_color(&warning)?;
-        writeln!(
-            &mut buffer,
-            "WARNING: This server is bound to {address_string}, which is reachable from the \
-             network.\n\
-             The serve API is unauthenticated, so anyone who can reach {address_string}:{port} \
-             can read\n\
-             and modify your project's source. Prefer binding to localhost and tunneling (e.g. \
-             SSH,\n\
-             Tailscale, or WireGuard) when you need remote access."
+        buffer.set_color(&display::warning())?;
+        write!(
+            buffer,
+            "This server is bound to {host}, which is reachable from the network. The serve \
+             API is unauthenticated, so anyone who can reach {host}:{port} can read and modify \
+             your project's source. Prefer binding to localhost and tunneling (for example \
+             over SSH, Tailscale, or WireGuard) when you need remote access."
         )?;
-        buffer.set_color(&ColorSpec::new())?;
-        writeln!(&mut buffer)?;
+        buffer.reset()?;
+        writeln!(buffer)?;
     }
-
-    buffer.set_color(&ColorSpec::new())?;
-    write!(&mut buffer, "Visit ")?;
-
-    buffer.set_color(&green)?;
-    write!(&mut buffer, "http://{}:{}/", address_string, port)?;
-
-    buffer.set_color(&ColorSpec::new())?;
-    writeln!(&mut buffer, " in your browser for more information.")?;
-
-    writer.print(&buffer)?;
 
     Ok(())
 }
@@ -202,6 +292,83 @@ fn show_start_message(bind_address: IpAddr, port: u16, color: ColorChoice) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn start_message(bind_address: IpAddr, port: u16, buffer: Buffer) -> String {
+        let mut buffer = buffer;
+        write_start_message(&mut buffer, bind_address, port).unwrap();
+        String::from_utf8(buffer.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn start_message_is_two_sentences_on_loopback() {
+        assert_eq!(
+            start_message(DEFAULT_BIND_ADDRESS.into(), 52876, Buffer::no_color()),
+            "Rojo+ server listening on localhost:52876.\n\
+             Visit http://localhost:52876/ in your browser for more information.\n"
+        );
+    }
+
+    #[test]
+    fn start_message_keeps_the_url_contiguous_inside_its_style() {
+        let text = start_message(DEFAULT_BIND_ADDRESS.into(), 52876, Buffer::ansi());
+        // Tools that relay this output find the address with a pattern like
+        // `http://host:port/`, so styling must surround the URL, never split it.
+        assert!(text.contains("http://localhost:52876/\x1b[0m in your browser"));
+        assert!(text.contains("localhost:52876\x1b[0m.\n"));
+        assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn start_message_warns_in_sentences_when_reachable_from_the_network() {
+        let text = start_message(Ipv4Addr::UNSPECIFIED.into(), 34872, Buffer::no_color());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Rojo+ server listening on 0.0.0.0:34872.");
+        assert!(lines[2].starts_with("This server is bound to 0.0.0.0, which is reachable"));
+        assert!(lines[2].ends_with("when you need remote access."));
+        assert!(!text.contains("WARNING"));
+    }
+
+    #[test]
+    fn sync_direction_is_optional_and_accepts_only_exact_policy_names() {
+        assert_eq!(
+            ServeCommand::try_parse_from(["serve"])
+                .unwrap()
+                .sync_direction,
+            None
+        );
+        for (value, expected) in [
+            ("fs-to-studio", SyncDirection::FsToStudio),
+            ("studio-to-fs", SyncDirection::StudioToFs),
+            ("bidirectional", SyncDirection::Bidirectional),
+        ] {
+            assert_eq!(
+                ServeCommand::try_parse_from(["serve", "--sync-direction", value])
+                    .unwrap()
+                    .sync_direction,
+                Some(expected)
+            );
+        }
+        for value in [
+            "",
+            "filesystem",
+            "Filesystem",
+            "FsToStudio",
+            "FS-TO-STUDIO",
+            "two-way",
+            "none",
+        ] {
+            assert!(ServeCommand::try_parse_from(["serve", "--sync-direction", value]).is_err());
+        }
+        assert!(ServeCommand::try_parse_from(["serve", "--sync-direction"]).is_err());
+        assert!(ServeCommand::try_parse_from([
+            "serve",
+            "--sync-direction",
+            "fs-to-studio",
+            "--sync-direction",
+            "bidirectional"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn stdin_shutdown_is_opt_in() {

@@ -186,6 +186,65 @@ impl FsSnapshot {
         Ok(true)
     }
 
+    /// A suffix migration is the sole scoped write allowed to remove a source.
+    /// Its source and sidecar output are staged and recovered as one transaction.
+    pub(crate) fn write_script_migration_to_vfs(
+        &self,
+        project: &crate::Project,
+        vfs: &Vfs,
+        expected: &HashMap<PathBuf, Option<Vec<u8>>>,
+        ownership: &super::ScriptMigrationOwnership,
+    ) -> io::Result<()> {
+        use super::relocation_transaction::Replacement;
+        use memofs::VfsSnapshot;
+        self.check_packages(vfs)?;
+        if self.added_dirs.iter().any(|path| {
+            !vfs.metadata(project.folder_location().join(path))
+                .is_ok_and(|metadata| metadata.is_dir())
+        }) || !self.removed_dirs.is_empty()
+            || !self.shared_edits.is_empty()
+            || self.shared_error.is_some()
+        {
+            return Err(io::Error::other(
+                "Script suffix migrations may only replace files",
+            ));
+        }
+        let mut changes = std::collections::BTreeMap::new();
+        for (path, contents) in self.file_changes() {
+            let path = project.folder_location().join(path);
+            let before = expected.get(&path).ok_or_else(|| {
+                io::Error::other(format!(
+                    "Missing script migration baseline at {}",
+                    path.display()
+                ))
+            })?;
+            if before.as_deref() != contents {
+                changes.insert(path, (before, contents));
+            }
+        }
+        let entries = changes
+            .into_iter()
+            .map(|(path, (before, after))| Replacement {
+                path,
+                expected: before
+                    .as_ref()
+                    .map(|bytes| VfsSnapshot::file(bytes.clone())),
+                desired: after.map(|bytes| VfsSnapshot::file(bytes.to_vec())),
+            })
+            .collect();
+        let cache = super::relocation::cache_directory(project);
+        vfs.create_dir_all(&cache)?;
+        vfs.sync_path(project.folder_location())?;
+        super::relocation::execute_script_replacements(
+            vfs,
+            &cache.join(uuid::Uuid::new_v4().to_string()),
+            project,
+            entries,
+            expected,
+            ownership,
+        )
+    }
+
     /// Creates a new `FsSnapshot`.
     pub fn new() -> Self {
         Self {

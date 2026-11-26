@@ -3,7 +3,7 @@ use std::path::Path;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use tempfile::{tempdir, TempDir};
 
-use librojo::cli::BuildCommand;
+use librojo::cli::{BuildCommand, ColorChoice};
 
 pub fn benchmark_small_place(c: &mut Criterion) {
     bench_build_place(c, "Small Place", "test-projects/benchmark_small_place")
@@ -20,7 +20,7 @@ fn bench_build_place(c: &mut Criterion, name: &str, path: &str) {
     group.bench_function("build", |b| {
         b.iter_batched(
             || place_setup(path),
-            |(_dir, options)| options.run().unwrap(),
+            |(_dir, options)| options.run(ColorChoice::Never).unwrap(),
             BatchSize::SmallInput,
         )
     });

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use rbx_dom_weak::{
@@ -19,7 +20,7 @@ fn attribute_string(value: &Variant) -> Option<String> {
     }
 }
 
-use super::{InstanceMetadata, InstanceSnapshot};
+use super::{InstanceMetadata, InstanceSnapshot, RequireContext};
 
 /// The referents to give a snapshot's instances, shaped like the snapshot. See
 /// [`RojoTree::insert_instance_with_referents`].
@@ -156,6 +157,26 @@ impl RojoTree {
         } else {
             None
         }
+    }
+
+    /// Lets `read` see the tree with one property replaced, then restores the
+    /// original value. Changes nothing else, so metadata and source tracking stay
+    /// as they were, and holding `&mut self` keeps anyone else from observing it.
+    pub fn with_property_override<R>(
+        &mut self,
+        id: Ref,
+        key: Ustr,
+        value: Variant,
+        read: impl FnOnce(&RojoTree) -> R,
+    ) -> Option<R> {
+        let original = self.inner.get_by_ref_mut(id)?.properties.insert(key, value);
+        let result = read(self);
+        let properties = &mut self.inner.get_by_ref_mut(id).unwrap().properties;
+        match original {
+            Some(original) => properties.insert(key, original),
+            None => properties.remove(&key),
+        };
+        Some(result)
     }
 
     pub fn get_instance_mut(&mut self, id: Ref) -> Option<InstanceWithMetaMut<'_>> {
@@ -356,6 +377,16 @@ impl RojoTree {
         Ok(())
     }
 
+    /// Moves an attached child to the end of its current sibling order without
+    /// changing its identity, parent, metadata, or path indexes.
+    pub(crate) fn move_child_to_end(&mut self, id: Ref) {
+        if let Some(parent) = self.get_instance(id).map(|instance| instance.parent()) {
+            if parent.is_some() {
+                self.inner.transfer_within(id, parent);
+            }
+        }
+    }
+
     pub fn remove(&mut self, id: Ref) {
         // Capture the entire retiring subtree before removing ANY ancestor metadata.
         // Traversal is proportional to the structural removal, never a property edit.
@@ -389,6 +420,26 @@ impl RojoTree {
         }
 
         self.inner.destroy(id);
+    }
+
+    /// Points every filesystem-context instance at one shared import context.
+    ///
+    /// An import refresh only rewrites instances with Luau sources. Leaving the rest on
+    /// an older context made metadata comparisons walk two full mapping lists per
+    /// instance, and contexts with equal mappings still compared element by element.
+    /// Sharing one `Arc` lets those comparisons stop at pointer equality.
+    pub fn share_require_context(&mut self, context: &Arc<RequireContext>) {
+        for metadata in self.metadata_map.values_mut() {
+            let context_slot = &mut metadata.context;
+            if context_slot.reserved_cache_path().is_none() {
+                continue;
+            }
+            if let Some(current) = &context_slot.require_context {
+                if !Arc::ptr_eq(current, context) {
+                    context_slot.require_context = Some(context.clone());
+                }
+            }
+        }
     }
 
     /// Replaces the metadata associated with the given instance ID.
@@ -666,6 +717,40 @@ mod test {
 
     use super::{RojoTree, SnapshotReferents};
     use std::path::PathBuf;
+
+    #[test]
+    fn property_overrides_are_visible_only_while_reading() {
+        let mut tree = RojoTree::new(InstanceSnapshot::new().name("Root").children(vec![
+            InstanceSnapshot::new()
+                .name("Kept")
+                .properties(UstrMap::from_iter([(ustr("Value"), Variant::Int32(1))])),
+            InstanceSnapshot::new().name("Absent"),
+        ]));
+        let [kept, absent] = [tree.root().children()[0], tree.root().children()[1]];
+
+        for (id, original) in [(kept, Some(Variant::Int32(1))), (absent, None)] {
+            let seen = tree
+                .with_property_override(id, ustr("Value"), Variant::Int32(2), |tree| {
+                    tree.get_instance(id)
+                        .unwrap()
+                        .properties()
+                        .get(&ustr("Value"))
+                        .cloned()
+                })
+                .unwrap();
+            assert_eq!(seen, Some(Variant::Int32(2)));
+            assert_eq!(
+                tree.get_instance(id)
+                    .unwrap()
+                    .properties()
+                    .get(&ustr("Value")),
+                original.as_ref()
+            );
+        }
+        assert!(tree
+            .with_property_override(Ref::new(), ustr("Value"), Variant::Int32(2), |_| ())
+            .is_none());
+    }
 
     #[test]
     fn ordinary_edits_do_not_retain_sources_and_serialization_disables_retirement() {

@@ -203,12 +203,19 @@ impl Drop for PendingCapture {
 
 impl ExportJobs {
     fn reader(&self) -> Option<ExportReader<'_>> {
-        self.1
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_READERS).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| ExportReader(&self.1))
+        let mut active = self.1.load(Ordering::Acquire);
+        while active < MAX_READERS {
+            match self.1.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(ExportReader(&self.1)),
+                Err(observed) => active = observed,
+            }
+        }
+        None
     }
 
     pub fn connect(
@@ -616,6 +623,7 @@ mod tests {
             assert!(matches!(socket.read().unwrap(), Message::Pong(_)));
             ready.send(()).unwrap();
             let client = reqwest::blocking::Client::builder()
+                .no_proxy()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap();

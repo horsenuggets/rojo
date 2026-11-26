@@ -10,4 +10,8 @@ protocolVersion: 12
 rootInstanceId: id-2
 serverVersion: "[server-version]"
 sessionId: id-1
+supportedSyncDirections:
+  - fs-to-studio
+  - studio-to-fs
+  - bidirectional
 unexpectedPlaceIds: ~

@@ -77,7 +77,570 @@ pub fn syncback_instance(
     id: Ref,
     new_tree: WeakDom,
 ) -> anyhow::Result<FsSnapshot> {
-    syncback_scoped(vfs, old_tree, project, id, new_tree, false)
+    syncback_scoped(vfs, old_tree, project, id, new_tree, false, None)
+}
+
+type ProjectDeclarationBytes = HashMap<PathBuf, Option<Vec<u8>>>;
+
+/// A live Script's suffix change, planned from the accepted property overlay.
+/// The caller must install its output in one recoverable replacement transaction.
+#[derive(Debug)]
+pub(crate) struct ScriptSuffixMigration {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub middleware: Middleware,
+    pub ownership: ScriptMigrationOwnership,
+}
+
+/// Resolve missing tails using the backend's namespace. A listed but unresolved
+/// entry, uncertain case/Unicode equivalence, or an I/O error cannot prove absence.
+/// Watcher dependency proofs and migration ownership must use the same identity.
+pub(crate) fn canonical_dependency_path(
+    fs: &mut memofs::VfsLock<'_>,
+    path: &Path,
+) -> Option<PathBuf> {
+    if !fs.is_absolute_path(path) {
+        return None;
+    }
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs.normalize(ancestor) {
+            Ok(mut resolved) => {
+                for name in missing.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor
+                    .file_name()?
+                    .to_str()
+                    .filter(|name| name.is_ascii())?;
+                let parent = ancestor.parent()?;
+                if let Some(entries) = fs.read_dir(parent).with_not_found().ok()? {
+                    for entry in entries {
+                        let entry = entry.ok()?;
+                        let candidate = entry.path().file_name()?.to_str()?;
+                        if candidate.eq_ignore_ascii_case(name) {
+                            return None;
+                        }
+                        // The backend already reported the ASCII target missing. Only
+                        // a resolved Unicode sibling proves a distinct namespace entry.
+                        if !candidate.is_ascii() && fs.normalize(entry.path()).is_err() {
+                            return None;
+                        }
+                    }
+                }
+                missing.push(name);
+                ancestor = parent;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Read-only identity evidence survives commit and crash recovery, including
+/// aliases used by declarations whose optional destinations do not exist yet.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct ScriptMigrationOwnership {
+    pub declarations: ProjectDeclarationBytes,
+    paths: HashMap<PathBuf, PathBuf>,
+    directories: HashMap<PathBuf, Vec<PathBuf>>,
+    files: HashSet<PathBuf>,
+    absent: HashSet<PathBuf>,
+    // Declaration traversal sees siblings too. Only the scoped serializer's exact
+    // output may grant write authority beyond the project directory after restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_authority: Option<ScriptMigrationWriteAuthority>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScriptMigrationWriteAuthority {
+    source: PathBuf,
+    destination: PathBuf,
+    paths: HashSet<PathBuf>,
+}
+
+impl ScriptMigrationOwnership {
+    pub(crate) fn validate(
+        &self,
+        fs: &mut memofs::VfsLock<'_>,
+        writes: &[PathBuf],
+    ) -> std::io::Result<()> {
+        // This indexes frozen authority, never observations. Older journals without
+        // every lexical parent keep the exhaustive loop; validation cannot invent
+        // recovery authority by normalizing a parent that was not captured.
+        let write_parents = (|| {
+            let mut index: HashMap<&Path, Vec<&PathBuf>> = HashMap::new();
+            for write in writes {
+                let canonical = self.paths.get(write.parent()?)?;
+                index.entry(canonical.as_path()).or_default().push(write);
+            }
+            Some(index)
+        })();
+        if write_parents.is_some() {
+            self.validate_write_parents(fs, writes)?;
+        }
+        for (path, expected) in &self.declarations {
+            if fs
+                .read(path)
+                .with_not_found()?
+                .as_deref()
+                .map(Vec::as_slice)
+                != expected.as_deref()
+            {
+                return Err(std::io::Error::other(format!(
+                    "Project declaration changed at {}",
+                    path.display()
+                )));
+            }
+        }
+        for (path, expected) in &self.paths {
+            if canonical_dependency_path(fs, path).as_ref() != Some(expected) {
+                return Err(std::io::Error::other(format!(
+                    "Project mapping identity changed at {}",
+                    path.display()
+                )));
+            }
+        }
+        for path in &self.files {
+            if !writes.contains(path) && !fs.metadata(path)?.is_file() {
+                return Err(std::io::Error::other(format!(
+                    "Project dependency is no longer a file at {}",
+                    path.display()
+                )));
+            }
+        }
+        for path in &self.absent {
+            if fs.metadata(path).with_not_found()?.is_some() {
+                return Err(std::io::Error::other(format!(
+                    "Project mapping appeared at {}",
+                    path.display()
+                )));
+            }
+        }
+        for (directory, expected) in &self.directories {
+            let canonical = fs.normalize(directory)?;
+            let mut allowed = HashSet::new();
+            let mut allow_write = |write: &Path| {
+                if write.parent().is_some_and(|parent| {
+                    fs.normalize(parent).is_ok_and(|parent| parent == canonical)
+                }) {
+                    if let Some(name) = write.file_name() {
+                        allowed.insert(PathBuf::from(name));
+                    }
+                }
+            };
+            if let Some(index) = &write_parents {
+                // Keep each relevant observation in writes order, including repeated
+                // parents. A transient retarget after normalize(directory) must not
+                // be hidden by before/after guards or a reused successful result.
+                if let Some(candidates) = index.get(canonical.as_path()) {
+                    for write in candidates {
+                        allow_write(write);
+                    }
+                }
+            } else {
+                for write in writes {
+                    allow_write(write);
+                }
+            }
+            let mut actual = fs
+                .read_dir(directory)?
+                .map(|entry| entry.map(|entry| PathBuf::from(entry.path().file_name().unwrap())))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            actual.retain(|name| !allowed.contains(name));
+            actual.sort();
+            let expected: Vec<_> = expected
+                .iter()
+                .filter(|name| !allowed.contains(*name))
+                .cloned()
+                .collect();
+            if actual != expected {
+                return Err(std::io::Error::other(format!(
+                    "Project declaration directory changed at {}",
+                    directory.display()
+                )));
+            }
+        }
+        if write_parents.is_some() {
+            self.validate_write_parents(fs, writes)?;
+        }
+        Ok(())
+    }
+
+    fn validate_write_parents(
+        &self,
+        fs: &mut memofs::VfsLock<'_>,
+        writes: &[PathBuf],
+    ) -> std::io::Result<()> {
+        for write in writes {
+            // Called only after all lexical parents have frozen path evidence.
+            let parent = write.parent().unwrap();
+            if fs.normalize(parent)?.as_path() != self.paths[parent].as_path() {
+                return Err(std::io::Error::other(format!(
+                    "Script write parent identity changed at {}",
+                    parent.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn identity(&mut self, vfs: &Vfs, path: &Path) -> anyhow::Result<PathBuf> {
+        let canonical = canonical_dependency_path(&mut vfs.lock(), path).with_context(|| {
+            format!(
+                "Cannot prove project mapping identity at {}",
+                path.display()
+            )
+        })?;
+        if let Some(previous) = self.paths.insert(path.to_path_buf(), canonical.clone()) {
+            anyhow::ensure!(previous == canonical, "Project mapping identity changed");
+        }
+        Ok(canonical)
+    }
+
+    fn capture(&mut self, vfs: &Vfs, path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+        self.identity(vfs, path)?;
+        if !self.declarations.contains_key(path) {
+            self.declarations.insert(
+                path.to_path_buf(),
+                vfs.read(path).with_not_found()?.map(|bytes| bytes.to_vec()),
+            );
+        }
+        Ok(self.declarations[path].clone())
+    }
+
+    fn project(&mut self, vfs: &Vfs, path: &Path, name: Option<&str>) -> anyhow::Result<Project> {
+        let bytes = self
+            .capture(vfs, path)?
+            .context("A project declaration disappeared while planning a script migration")?;
+        let frozen = Vfs::new(memofs::InMemoryFs::new());
+        frozen.create_dir_all(path.parent().context("Project path has no parent")?)?;
+        frozen.write(path, bytes)?;
+        Ok(Project::load_exact(&frozen, path, name)?)
+    }
+}
+
+/// Walk declaration references even when their optional roots produce no instance.
+/// Filesystem traversal reads directory entries and declarations only, never payloads.
+struct MigrationDeclarations<'a> {
+    vfs: &'a Vfs,
+    targets: Vec<PathBuf>,
+    ownership: ScriptMigrationOwnership,
+    active_projects: HashSet<PathBuf>,
+    active_directories: HashSet<PathBuf>,
+    served_ancestry: Option<HashSet<PathBuf>>,
+    source_views: usize,
+}
+
+impl MigrationDeclarations<'_> {
+    fn project(
+        &mut self,
+        context: &crate::snapshot::InstanceContext,
+        project: &Project,
+    ) -> anyhow::Result<()> {
+        let canonical = self.ownership.identity(self.vfs, &project.file_location)?;
+        anyhow::ensure!(
+            self.active_projects.insert(canonical.clone()),
+            "Project dependency cycle prevents script migration"
+        );
+        let mut context = context.clone();
+        context.clear_sync_rules();
+        context.add_sync_rules(
+            project
+                .sync_rules
+                .iter()
+                .map(|rule| crate::snapshot::SyncRule {
+                    base_path: project.folder_location().to_path_buf(),
+                    ..rule.clone()
+                }),
+        );
+        context.add_path_ignore_rules(project.glob_ignore_paths.iter().map(|glob| {
+            crate::snapshot::PathIgnoreRule {
+                glob: glob.clone(),
+                base_path: project.folder_location().to_path_buf(),
+            }
+        }));
+        // Match project middleware's branch-local reset without weakening project cycles.
+        let directories = std::mem::take(&mut self.active_directories);
+        self.node(&context, project, &project.tree)?;
+        self.active_directories = directories;
+        self.active_projects.remove(&canonical);
+        Ok(())
+    }
+
+    fn node(
+        &mut self,
+        context: &crate::snapshot::InstanceContext,
+        project: &Project,
+        node: &crate::project::ProjectNode,
+    ) -> anyhow::Result<()> {
+        if let Some(mapping) = &node.path {
+            let path = project.folder_location().join(mapping.path());
+            let canonical = self.ownership.identity(self.vfs, &path)?;
+            self.filesystem(context, &canonical, true)?;
+        }
+        for child in node.children.values() {
+            self.node(context, project, child)?;
+        }
+        Ok(())
+    }
+
+    fn filesystem(
+        &mut self,
+        context: &crate::snapshot::InstanceContext,
+        path: &Path,
+        reservation: bool,
+    ) -> anyhow::Result<()> {
+        let mut context = context.clone();
+        let mut path = path.to_path_buf();
+        if let Some((root, _)) = &context.package_mount {
+            crate::package_sources::contained(self.vfs, root, &path)?;
+        }
+        if let Some(packages) = &context.package_sources {
+            if path == packages.root.join("wally.install.json") {
+                return Ok(());
+            }
+            if let Some(package) = packages.local_mount(&path) {
+                packages.check_generation(self.vfs)?;
+                context.package_mount = Some((
+                    packages.root.join(package.source_path.as_ref().unwrap()),
+                    packages.root.join(&package.install_path),
+                ));
+                path = packages.original_path(&crate::package_sources::normalize(&path));
+                return self.filesystem(&context, &path, reservation);
+            }
+        }
+        if context.is_reserved_path(&path) {
+            return Ok(());
+        }
+        if reservation {
+            let canonical = self.ownership.identity(self.vfs, &path)?;
+            anyhow::ensure!(
+                !self.targets.contains(&canonical),
+                "A project mapping pins this script source"
+            );
+        }
+        let Some(metadata) = self.vfs.metadata(&path).with_not_found()? else {
+            self.ownership.absent.insert(path.clone());
+            // Missing custom Project-rule files are probes too, not only *.project.json.
+            if crate::change_processor::dependency_file_middleware(&context, &path)
+                == Some(Middleware::Project)
+            {
+                self.ownership.capture(self.vfs, &path)?;
+            }
+            return Ok(());
+        };
+        if metadata.is_file() {
+            self.ownership.files.insert(path.clone());
+            let canonical = self.ownership.identity(self.vfs, &path)?;
+            if self.targets.first() == Some(&canonical) {
+                self.source_views += 1;
+                anyhow::ensure!(
+                    self.source_views == 1,
+                    "A project mapping introduces another owner for this script source"
+                );
+                if let Some(served) = &self.served_ancestry {
+                    anyhow::ensure!(
+                        served == &self.active_projects,
+                        "The script's served project ancestry changed before migration"
+                    );
+                }
+            }
+        }
+        if metadata.is_dir() {
+            let canonical = self.ownership.identity(self.vfs, &path)?;
+            anyhow::ensure!(
+                self.active_directories.insert(canonical.clone()),
+                "Directory dependency cycle prevents script migration"
+            );
+            let mut selected = None;
+            for name in DEFAULT_PROJECT_NAMES {
+                let probe = path.join(name);
+                if self.ownership.capture(self.vfs, &probe)?.is_some() && selected.is_none() {
+                    selected = Some(probe);
+                }
+            }
+            if let Some(project_path) = selected {
+                let project = self
+                    .ownership
+                    .project(self.vfs, &project_path, Some("Migration"))?;
+                self.project(&context, &project)?;
+            } else {
+                let entries = self
+                    .vfs
+                    .read_dir(&path)?
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                let mut names: Vec<_> = entries
+                    .iter()
+                    .map(|entry| PathBuf::from(entry.path().file_name().unwrap()))
+                    .collect();
+                names.sort();
+                if let Some(previous) = self
+                    .ownership
+                    .directories
+                    .insert(path.clone(), names.clone())
+                {
+                    anyhow::ensure!(previous == names, "Project declaration directory changed");
+                }
+                for entry in entries {
+                    if !crate::snapshot::is_path_ignored(&context.path_ignore_rules, entry.path()) {
+                        self.filesystem(&context, entry.path(), false)?;
+                    }
+                }
+            }
+            self.active_directories.remove(&canonical);
+        } else if !dir_init_files()
+            .iter()
+            .any(|(_, name)| path.file_name().is_some_and(|file| file == *name))
+            && crate::change_processor::dependency_file_middleware(&context, &path)
+                == Some(Middleware::Project)
+        {
+            let project = self.ownership.project(self.vfs, &path, Some("Migration"))?;
+            self.project(&context, &project)?;
+        }
+        Ok(())
+    }
+}
+
+fn script_migration_projects(
+    vfs: &Vfs,
+    context: &crate::snapshot::InstanceContext,
+    project: &Project,
+    targets: &[&Path],
+) -> anyhow::Result<ScriptMigrationOwnership> {
+    let mut graph = MigrationDeclarations {
+        vfs,
+        targets: Vec::new(),
+        ownership: ScriptMigrationOwnership::default(),
+        active_projects: HashSet::new(),
+        active_directories: HashSet::new(),
+        served_ancestry: (!context.served_projects.0.is_empty()).then(HashSet::new),
+        source_views: 0,
+    };
+    for path in targets {
+        graph.targets.push(graph.ownership.identity(vfs, path)?);
+    }
+    for served in context.served_projects.0.iter() {
+        let canonical = graph.ownership.identity(vfs, &served.file_location)?;
+        graph.served_ancestry.as_mut().unwrap().insert(canonical);
+    }
+    // Frozen current bytes are not proof that they served the live instance.
+    for served in context
+        .served_projects
+        .0
+        .iter()
+        .map(AsRef::as_ref)
+        .chain([project])
+    {
+        let current =
+            graph
+                .ownership
+                .project(vfs, &served.file_location, served.name.as_deref())?;
+        anyhow::ensure!(
+            current == *served,
+            "The served project changed while planning a script migration"
+        );
+    }
+    let mut root_context = crate::snapshot::InstanceContext::new();
+    root_context.package_sources = context.package_sources.clone();
+    if let Some(cache) = context.reserved_cache_path() {
+        root_context.set_reserved_cache_path(cache.to_path_buf());
+    }
+    graph.project(&root_context, project)?;
+    anyhow::ensure!(
+        graph.served_ancestry.is_none() || graph.source_views == 1,
+        "The served script source is no longer owned by its project declaration graph"
+    );
+    graph.ownership.validate(&mut vfs.lock(), &[])?;
+    Ok(graph.ownership)
+}
+
+pub(crate) fn syncback_script_migration(
+    vfs: &Vfs,
+    old_tree: &RojoTree,
+    project: &Project,
+    id: Ref,
+    new_tree: WeakDom,
+) -> anyhow::Result<(FsSnapshot, Option<ScriptSuffixMigration>)> {
+    let old = old_tree
+        .get_instance(id)
+        .context("Unknown script instance")?;
+    let mut migration = (|| {
+        if old.class_name() != "Script" || new_tree.root().class != "Script" {
+            return None;
+        }
+        let script = script_middleware_for_syncback(new_tree.root(), Some(old), project)?;
+        let source = source_file(&old)?;
+        let canonical = file_names::canonical_script_source_name(
+            script,
+            &source,
+            &old.metadata().context.sync_rules,
+        )?;
+        let destination = source.with_file_name(canonical.as_ref());
+        (source != destination).then(|| ScriptSuffixMigration {
+            source,
+            destination,
+            middleware: if old
+                .metadata()
+                .middleware
+                .is_some_and(|value| value.is_dir())
+            {
+                file_names::directory_variant(script)
+            } else {
+                script
+            },
+            ownership: ScriptMigrationOwnership::default(),
+        })
+    })();
+    if let Some(migration) = &mut migration {
+        let path = old.metadata().instigating_source.as_ref().unwrap().path();
+        migration.ownership = script_migration_projects(
+            vfs,
+            &old.metadata().context,
+            project,
+            &[&migration.source, &migration.destination, path],
+        )?;
+    }
+    let output = syncback_scoped(
+        vfs,
+        old_tree,
+        project,
+        id,
+        new_tree,
+        false,
+        migration.as_ref(),
+    )?;
+    if let Some(migration) = &mut migration {
+        for path in [&migration.source, &migration.destination] {
+            migration.ownership.identity(
+                vfs,
+                path.parent()
+                    .context("Script migration path has no parent")?,
+            )?;
+        }
+        let mut paths = HashSet::new();
+        for (path, _) in output.file_changes() {
+            let path = project.folder_location().join(path);
+            migration.ownership.identity(vfs, &path)?;
+            // Capture the lexical parent separately. Its canonical prefix spelling
+            // need not match the prefix selected when canonicalizing the file.
+            migration.ownership.identity(
+                vfs,
+                path.parent()
+                    .context("Script migration output has no parent")?,
+            )?;
+            paths.insert(path);
+        }
+        migration.ownership.write_authority = Some(ScriptMigrationWriteAuthority {
+            source: migration.source.clone(),
+            destination: migration.destination.clone(),
+            paths,
+        });
+    }
+    Ok((output, migration))
 }
 
 /// Serializes a model file from `new_tree`, which must hold the model's whole
@@ -89,7 +652,7 @@ pub fn syncback_model_file(
     id: Ref,
     new_tree: WeakDom,
 ) -> anyhow::Result<FsSnapshot> {
-    syncback_scoped(vfs, old_tree, project, id, new_tree, true)
+    syncback_scoped(vfs, old_tree, project, id, new_tree, true, None)
 }
 
 /// Links the references between instances in `dom` through `Rojo_Id` and
@@ -157,6 +720,7 @@ fn syncback_scoped(
     id: Ref,
     mut new_tree: WeakDom,
     whole_model: bool,
+    migration: Option<&ScriptSuffixMigration>,
 ) -> anyhow::Result<FsSnapshot> {
     let old_inst = old_tree
         .get_instance(id)
@@ -191,12 +755,13 @@ fn syncback_scoped(
         source_file(&old_inst),
     ) {
         if let Some(name) = source.file_name().and_then(|name| name.to_str()) {
-            if file_names::canonical_script_source_name(
-                script,
-                &source,
-                &old_inst.metadata().context.sync_rules,
-            )
-            .is_some_and(|canonical| canonical != name)
+            if migration.is_none()
+                && file_names::canonical_script_source_name(
+                    script,
+                    &source,
+                    &old_inst.metadata().context.sync_rules,
+                )
+                .is_some_and(|canonical| canonical != name)
             {
                 anyhow::bail!(
                     "This script's class or RunContext requires a different source filename. \
@@ -220,9 +785,49 @@ fn syncback_scoped(
         },
         old: Some(id),
         new: new_tree.root_ref(),
-        path: path.clone(),
-        middleware: Some(middleware),
+        path: migration
+            .filter(|_| !middleware.is_dir())
+            .map_or_else(|| path.clone(), |migration| migration.destination.clone()),
+        middleware: migration.is_none().then_some(middleware),
     };
+    if let Some(migration) = migration {
+        anyhow::ensure!(
+            !is_project_owned(old_inst.metadata()),
+            "Fixed project mappings cannot migrate script suffixes"
+        );
+        for target in [&migration.source, &migration.destination] {
+            anyhow::ensure!(
+                !crate::snapshot::is_path_ignored(
+                    &old_inst.metadata().context.path_ignore_rules,
+                    target
+                ),
+                "The script migration source or destination is ignored"
+            );
+            anyhow::ensure!(
+                old_tree
+                    .get_ids_at_path(target)
+                    .iter()
+                    .all(|owner| *owner == id),
+                "An aliased script source cannot migrate"
+            );
+        }
+        snapshot.validate_script_migration(&migration.source, &migration.destination)?;
+        snapshot.validate_script_destination(&migration.destination)?;
+        snapshot.validate_script_rule_for_middleware(
+            &migration.destination,
+            file_names::script_middleware_for_instance(new_tree.root()).unwrap(),
+        )?;
+        if middleware.is_dir() {
+            for (_, initializer) in dir_init_files() {
+                let candidate = path.join(initializer);
+                anyhow::ensure!(
+                    candidate == migration.source
+                        || vfs.metadata(&candidate).with_not_found()?.is_none(),
+                    "A competing initializer prevents script suffix migration"
+                );
+            }
+        }
+    }
     if let Some(rules) = &project.syncback_rules {
         let globs = rules.compile_globs()?;
         if !is_valid_path(&Some(globs), project.folder_location(), &path) {
@@ -237,12 +842,15 @@ fn syncback_scoped(
             anyhow::bail!("This instance is excluded by the project's syncback rules");
         }
     }
-    let mut output = middleware.syncback(&snapshot)?.fs_snapshot;
+    let mut output = get_best_middleware(&snapshot)
+        .syncback(&snapshot)?
+        .fs_snapshot;
 
     // Directory scripts are serialized to the default initializer name, but
     // the directory may use another one, like `init.lua`. Writing both would
     // be a multi-file change and leave two competing initializers.
     if let Some(tracked) = source_file(&old_inst).filter(|tracked| *tracked != path) {
+        let tracked = migration.map_or(tracked, |migration| migration.destination.clone());
         for (_, name) in dir_init_files() {
             let staged = path.join(name);
             if staged != tracked {
@@ -282,6 +890,9 @@ fn syncback_scoped(
             );
         }
         output.retarget_added_file(&json_path, &jsonc_path);
+    }
+    if let Some(migration) = migration {
+        output.remove_file(&migration.source);
     }
     output.guard_packages(vfs, old_inst.metadata().context.package_sources.as_deref());
     Ok(output)
@@ -1222,6 +1833,650 @@ mod test {
     use super::*;
     use crate::snapshot::{InstanceMetadata, InstanceSnapshot};
     use rbx_dom_weak::{types::Attributes, UstrMap};
+
+    #[test]
+    fn write_scope_validation_output_captures_lexical_write_parent_evidence() {
+        let vfs = Vfs::new(memofs::InMemoryFs::new());
+        vfs.set_watch_enabled(false);
+        vfs.create_dir_all("/project/src").unwrap();
+        let source = PathBuf::from("/project/src/Code.server.luau");
+        vfs.write(&source, "return 1").unwrap();
+        vfs.write(
+            "/project/default.project.json",
+            r#"{"name":"Test","tree":{"$className":"Folder"}}"#,
+        )
+        .unwrap();
+        let project =
+            Project::load_exact(&vfs, Path::new("/project/default.project.json"), None).unwrap();
+        let tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Code")
+                .class_name("Script")
+                .metadata(
+                    InstanceMetadata::new()
+                        .instigating_source(source.clone())
+                        .middleware(Middleware::RunContextServerScript),
+                ),
+        );
+        let contexts = &rbx_reflection_database::get().unwrap().enums["RunContext"].items;
+        let edited = WeakDom::new(
+            rbx_dom_weak::InstanceBuilder::new("Script")
+                .with_name("Code")
+                .with_property("Source", "return 2")
+                .with_property(
+                    "RunContext",
+                    rbx_dom_weak::types::Enum::from_u32(contexts["Client"]),
+                ),
+        );
+        let (_, migration) =
+            syncback_script_migration(&vfs, &tree, &project, tree.get_root_id(), edited).unwrap();
+        let migration = migration.unwrap();
+        let ownership = migration.ownership;
+        for path in ownership
+            .write_authority
+            .as_ref()
+            .unwrap()
+            .paths
+            .iter()
+            .chain([&migration.source, &migration.destination])
+        {
+            let parent = path.parent().unwrap();
+            assert_eq!(
+                ownership.paths.get(parent),
+                Some(&vfs.lock().normalize(parent).unwrap()),
+                "Missing frozen lexical parent for {path:?}"
+            );
+        }
+    }
+
+    fn write_scope_validation_fixture() -> (Vfs, ScriptMigrationOwnership, Vec<PathBuf>) {
+        let vfs = Vfs::new(memofs::InMemoryFs::new());
+        vfs.set_watch_enabled(false);
+        vfs.create_dir_all("/project/P").unwrap();
+        vfs.create_dir_all("/project/Peer").unwrap();
+        let writes = ["Code.server.luau", "Code.luau"]
+            .map(|name| Path::new("/project/P").join(name))
+            .to_vec();
+        vfs.write(&writes[0], "source").unwrap();
+        vfs.write("/project/Peer/Untouched.luau", "peer").unwrap();
+        vfs.write("/project/main.project.json", "declaration")
+            .unwrap();
+        let mut ownership = ScriptMigrationOwnership::default();
+        ownership
+            .capture(&vfs, Path::new("/project/main.project.json"))
+            .unwrap();
+        ownership
+            .capture(&vfs, Path::new("/project/optional.project.json"))
+            .unwrap();
+        ownership.absent.insert(PathBuf::from("/project/optional"));
+        ownership
+            .files
+            .insert(PathBuf::from("/project/Peer/Untouched.luau"));
+        for parent in [Path::new("/project/P"), Path::new("/project/Peer")] {
+            ownership.identity(&vfs, parent).unwrap();
+            let mut names = vfs
+                .read_dir(parent)
+                .unwrap()
+                .map(|entry| PathBuf::from(entry.unwrap().path().file_name().unwrap()))
+                .collect::<Vec<_>>();
+            names.sort();
+            ownership.directories.insert(parent.to_owned(), names);
+        }
+        ownership.write_authority = Some(ScriptMigrationWriteAuthority {
+            source: writes[0].clone(),
+            destination: writes[1].clone(),
+            paths: writes
+                .iter()
+                .cloned()
+                .chain([PathBuf::from("/project/Peer/Untouched.luau")])
+                .collect(),
+        });
+        (vfs, ownership, writes)
+    }
+
+    #[test]
+    fn write_scope_validation_keeps_declarations_absence_inventory_and_actual_write_scope() {
+        for change in [
+            "new_declaration",
+            "deleted_declaration",
+            "changed_declaration",
+            "absence",
+            "unexpected_entry",
+            "authority_superset",
+            "file_kind",
+        ] {
+            for complete in [false, true] {
+                let (vfs, mut ownership, writes) = write_scope_validation_fixture();
+                if change == "authority_superset" {
+                    ownership
+                        .files
+                        .remove(Path::new("/project/Peer/Untouched.luau"));
+                }
+                if !complete {
+                    ownership.paths.remove(Path::new("/project/P"));
+                }
+                ownership.validate(&mut vfs.lock(), &writes).unwrap();
+                match change {
+                    "new_declaration" => {
+                        vfs.write("/project/optional.project.json", "new").unwrap()
+                    }
+                    "deleted_declaration" => vfs.remove_file("/project/main.project.json").unwrap(),
+                    "changed_declaration" => {
+                        vfs.write("/project/main.project.json", "changed").unwrap()
+                    }
+                    "absence" => vfs.create_dir_all("/project/optional").unwrap(),
+                    "unexpected_entry" => vfs.write("/project/P/Foreign.luau", "foreign").unwrap(),
+                    "authority_superset" => {
+                        vfs.remove_file("/project/Peer/Untouched.luau").unwrap()
+                    }
+                    "file_kind" => {
+                        vfs.remove_file("/project/Peer/Untouched.luau").unwrap();
+                        vfs.create_dir_all("/project/Peer/Untouched.luau").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    ownership.validate(&mut vfs.lock(), &writes).is_err(),
+                    "Accepted {change}, complete={complete}"
+                );
+            }
+        }
+        let (vfs, ownership, writes) = write_scope_validation_fixture();
+        // A staged source is exempt only when it is an actual write, not merely allowed.
+        vfs.remove_file(&writes[0]).unwrap();
+        assert!(ownership.validate(&mut vfs.lock(), &[]).is_err());
+        assert!(ownership.validate(&mut vfs.lock(), &writes[1..]).is_err());
+        ownership.validate(&mut vfs.lock(), &writes).unwrap();
+        let restored: ScriptMigrationOwnership =
+            serde_json::from_slice(&serde_json::to_vec(&ownership).unwrap()).unwrap();
+        restored.validate(&mut vfs.lock(), &writes).unwrap();
+    }
+
+    #[test]
+    fn write_scope_validation_one_missing_parent_keeps_the_entire_exhaustive_loop() {
+        use memofs::{test_support::RecordingBackend, InMemoryFs};
+        let (vfs, mut ownership, mut writes) = write_scope_validation_fixture();
+        writes.push(PathBuf::from("/project/Peer/Untouched.luau"));
+        ownership.paths.remove(Path::new("/project/Peer"));
+        let mut memory = InMemoryFs::new();
+        memory
+            .load_snapshot(
+                "/project",
+                vfs.snapshot_tree(Path::new("/project")).unwrap(),
+            )
+            .unwrap();
+        let (backend, handle) = RecordingBackend::new(memory);
+        let recorded = Vfs::new(backend);
+        recorded.set_watch_enabled(false);
+        handle.start();
+        ownership.validate(&mut recorded.lock(), &writes).unwrap();
+        let counts = handle.stop();
+        for (parent, expected) in [("/project/P", 6), ("/project/Peer", 3)] {
+            assert_eq!(
+                counts
+                    .iter()
+                    .filter(|(call, _)| call.operation == "canonicalize"
+                        && call.paths == [Path::new(parent).as_os_str()])
+                    .map(|(_, count)| count)
+                    .sum::<u64>(),
+                expected
+            );
+        }
+        recorded
+            .write("/project/Peer/Foreign.luau", "foreign")
+            .unwrap();
+        assert!(ownership.validate(&mut recorded.lock(), &writes).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_scope_validation_native_aliases_keep_original_write_order_and_persistent_identity() {
+        use memofs::{test_support::RecordingBackend, StdBackend};
+        use std::sync::{Arc, Mutex};
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let parent = root.join("P");
+        std::fs::create_dir(&parent).unwrap();
+        let a = root.join("A");
+        let b = root.join("B");
+        let directory = root.join("D");
+        for alias in [&a, &b, &directory] {
+            std::os::unix::fs::symlink(&parent, alias).unwrap();
+        }
+        let plain = Vfs::new(StdBackend::new().unwrap());
+        plain.set_watch_enabled(false);
+        let mut ownership = ScriptMigrationOwnership::default();
+        for alias in [&a, &b] {
+            ownership.identity(&plain, alias).unwrap();
+        }
+        ownership.directories.insert(directory.clone(), vec![]);
+        let writes = vec![
+            b.join("Code.luau"),
+            a.join("Code.meta.json"),
+            b.join("Code.server.luau"),
+        ];
+        let state = Arc::new(Mutex::new((false, Vec::new())));
+        let hook_state = state.clone();
+        let hook_directory = directory.clone();
+        let (backend, _) = RecordingBackend::new(StdBackend::new().unwrap());
+        let backend = backend.with_after_observation(move |operation, path| {
+            let mut state = hook_state.lock().unwrap();
+            if path == hook_directory {
+                state.0 = operation == "canonicalize";
+            } else if state.0 && operation == "canonicalize" {
+                state.1.push(path.to_owned());
+            }
+        });
+        let vfs = Vfs::new(backend);
+        vfs.set_watch_enabled(false);
+        ownership.validate(&mut vfs.lock(), &writes).unwrap();
+        assert_eq!(
+            state.lock().unwrap().1,
+            vec![b.clone(), a.clone(), b.clone()]
+        );
+        // Durable evidence is lexical-parent evidence, not the parent of a
+        // canonical file spelling. A persistent retarget must fail after restart.
+        let mut ownership: ScriptMigrationOwnership =
+            serde_json::from_slice(&serde_json::to_vec(&ownership).unwrap()).unwrap();
+        let hidden = root.join("H");
+        std::fs::rename(&parent, &hidden).unwrap();
+        std::os::unix::fs::symlink(&hidden, &parent).unwrap();
+        for complete in [true, false] {
+            if !complete {
+                ownership.paths.remove(&a);
+            }
+            assert!(ownership.validate(&mut vfs.lock(), &writes).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_scope_validation_native_transient_parent_observations_and_after_guard() {
+        use memofs::{test_support::RecordingBackend, StdBackend};
+        use std::sync::{Arc, Mutex};
+        // D is a lexical inventory alias, so its canonicalization unambiguously
+        // identifies the directory predicate, not an earlier path-evidence check.
+        for change in ["after_directory", "between_writes", "after_inventory"] {
+            for complete in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = dunce::canonicalize(temp.path()).unwrap();
+                let parent = root.join("P");
+                let hidden = root.join("H");
+                let directory = root.join("D");
+                std::fs::create_dir(&parent).unwrap();
+                std::os::unix::fs::symlink(&parent, &directory).unwrap();
+                let source = parent.join("Code.server.luau");
+                let destination = parent.join("Code.luau");
+                let plain = Vfs::new(StdBackend::new().unwrap());
+                plain.set_watch_enabled(false);
+                let mut ownership = ScriptMigrationOwnership::default();
+                ownership.identity(&plain, &parent).unwrap();
+                // The source has already been staged. Its frozen inventory still
+                // includes it, making inappropriate write exemptions observable.
+                ownership
+                    .directories
+                    .insert(directory.clone(), vec![PathBuf::from("Code.server.luau")]);
+                let writes = vec![destination, source];
+                if !complete {
+                    ownership.paths.remove(&parent);
+                }
+                let state = Arc::new(Mutex::new((false, 0usize, false, false)));
+                let hook_state = state.clone();
+                let hook_parent = parent.clone();
+                let hook_hidden = hidden.clone();
+                let hook_directory = directory.clone();
+                let (backend, _) = RecordingBackend::new(StdBackend::new().unwrap());
+                let backend = backend.with_after_observation(move |operation, path| {
+                    let mut state = hook_state.lock().unwrap();
+                    if operation == "canonicalize" && path == hook_directory {
+                        state.0 = true;
+                    } else if operation == "canonicalize" && path == hook_parent && state.0 {
+                        state.1 += 1;
+                    }
+                    let trigger = !state.2
+                        && match change {
+                            "after_directory" => {
+                                operation == "canonicalize" && path == hook_directory
+                            }
+                            "between_writes" => {
+                                operation == "canonicalize"
+                                    && path == hook_parent
+                                    && state.0
+                                    && state.1 == 1
+                            }
+                            "after_inventory" => operation == "read_dir" && path == hook_directory,
+                            _ => unreachable!(),
+                        };
+                    if trigger {
+                        std::fs::rename(&hook_parent, &hook_hidden).unwrap();
+                        std::os::unix::fs::symlink(&hook_hidden, &hook_parent).unwrap();
+                        state.2 = true;
+                    }
+                    if operation == "read_dir"
+                        && path == hook_directory
+                        && state.2
+                        && matches!(change, "after_directory" | "between_writes")
+                    {
+                        std::fs::remove_file(&hook_parent).unwrap();
+                        std::fs::rename(&hook_hidden, &hook_parent).unwrap();
+                        state.3 = true;
+                    }
+                });
+                let vfs = Vfs::new(backend);
+                vfs.set_watch_enabled(false);
+                let result = ownership.validate(&mut vfs.lock(), &writes);
+                let state = *state.lock().unwrap();
+                assert!(state.2, "Race did not fire for {change}");
+                if hidden.exists() {
+                    std::fs::remove_file(&parent).unwrap();
+                    std::fs::rename(&hidden, &parent).unwrap();
+                }
+                // Incomplete journals keep the historical loop, including its lack
+                // of an after guard. They still reject the reviewed transient race.
+                let refuses = complete || matches!(change, "after_directory" | "between_writes");
+                assert_eq!(
+                    result.is_err(),
+                    refuses,
+                    "Race {change}, complete={complete}, {result:?}"
+                );
+                if change == "between_writes" {
+                    assert_eq!(state.1, 2);
+                }
+                if !complete && change == "after_directory" {
+                    assert!(state.3);
+                }
+                assert!(!parent.join("Code.server.luau").exists());
+                assert!(!parent.join("Code.luau").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_dependency_allows_resolved_unicode_siblings_in_memory() {
+        let vfs = Vfs::new(memofs::InMemoryFs::new());
+        vfs.set_watch_enabled(false);
+        vfs.create_dir_all("/project/Other/Piña colada").unwrap();
+        vfs.write("/project/Other/Σ.luau", "return 1").unwrap();
+        let mut fs = vfs.lock();
+        for tail in [
+            "default.project.json",
+            "default.project.jsonc",
+            "New/Child.luau",
+        ] {
+            let path = Path::new("/project/Other").join(tail);
+            assert_eq!(canonical_dependency_path(&mut fs, &path), Some(path));
+        }
+        assert_eq!(
+            canonical_dependency_path(&mut fs, Path::new("/project/Other/Absentü.luau")),
+            None
+        );
+        assert_eq!(
+            canonical_dependency_path(&mut fs, Path::new("Other/New")),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_dependency_allows_resolved_unicode_siblings_on_disk() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temporary.path()).unwrap();
+        std::fs::create_dir(root.join("Piña colada")).unwrap();
+        std::fs::write(root.join("Σ.luau"), "return 1").unwrap();
+        let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+        vfs.set_watch_enabled(false);
+        let mut fs = vfs.lock();
+        for tail in [
+            "default.project.json",
+            "default.project.jsonc",
+            "New/Child.luau",
+        ] {
+            let path = root.join(tail);
+            assert_eq!(canonical_dependency_path(&mut fs, &path), Some(path));
+        }
+    }
+
+    #[test]
+    fn canonical_dependency_rejects_missing_ascii_case_alias() {
+        let vfs = Vfs::new(memofs::InMemoryFs::new());
+        vfs.set_watch_enabled(false);
+        vfs.create_dir_all("/project/Other").unwrap();
+        vfs.write("/project/Other/DEFAULT.project.json", "{}")
+            .unwrap();
+        assert_eq!(
+            canonical_dependency_path(
+                &mut vfs.lock(),
+                Path::new("/project/Other/default.project.json"),
+            ),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_dependency_rejects_unresolved_unicode_siblings() {
+        for target in ["missing", "Piña colada"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(temporary.path()).unwrap();
+            let candidate = root.join("Piña colada");
+            std::os::unix::fs::symlink(target, &candidate).unwrap();
+            let vfs = Vfs::new(memofs::StdBackend::new().unwrap());
+            vfs.set_watch_enabled(false);
+            let mut fs = vfs.lock();
+            let error = fs.normalize(&candidate).unwrap_err();
+            if target == "missing" {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            } else {
+                assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+            }
+            assert_eq!(
+                canonical_dependency_path(&mut fs, &root.join("default.project.json")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn migration_ownership_with_unicode_siblings_revalidates_commit_evidence() {
+        for change in ["absence", "identity", "directory", "bytes"] {
+            let vfs = Vfs::new(memofs::InMemoryFs::new());
+            vfs.set_watch_enabled(false);
+            vfs.create_dir_all("/project/Fixture").unwrap();
+            vfs.create_dir_all("/project/Other/Piña colada").unwrap();
+            vfs.write("/project/Fixture/Code.server.luau", "print(0)")
+                .unwrap();
+            vfs.write("/project/default.project.json", r#"{"name":"Test","tree":{"$className":"Folder","Fixture":{"$path":"Fixture"},"Other":{"$path":"Other"},"Absent":{"$path":{"optional":"extras"}}}}"#).unwrap();
+            let project =
+                Project::load_exact(&vfs, Path::new("/project/default.project.json"), None)
+                    .unwrap();
+            let writes = [
+                PathBuf::from("/project/Fixture/Code.server.luau"),
+                PathBuf::from("/project/Fixture/Code.client.luau"),
+            ];
+            let ownership = script_migration_projects(
+                &vfs,
+                &Default::default(),
+                &project,
+                &[&writes[0], &writes[1]],
+            )
+            .unwrap();
+            ownership.validate(&mut vfs.lock(), &writes).unwrap();
+            match change {
+                "absence" => vfs.create_dir_all("/project/extras").unwrap(),
+                "identity" => vfs
+                    .write("/project/Other/DEFAULT.project.json", "{}")
+                    .unwrap(),
+                "directory" => vfs.create_dir_all("/project/Other/New").unwrap(),
+                "bytes" => vfs
+                    .write("/project/default.project.json", "foreign declaration")
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                ownership.validate(&mut vfs.lock(), &writes).is_err(),
+                "Accepted {change}"
+            );
+            assert_eq!(
+                vfs.read("/project/Fixture/Code.server.luau")
+                    .unwrap()
+                    .as_slice(),
+                b"print(0)"
+            );
+            assert!(!vfs.exists("/project/Fixture/Code.client.luau").unwrap());
+        }
+    }
+
+    #[test]
+    fn migration_ownership_resolves_installed_package_reservations() {
+        let vfs = Vfs::new(memofs::InMemoryFs::new());
+        vfs.set_watch_enabled(false);
+        for path in [
+            "/project/Local/Library",
+            "/project/Packages/_Index/Library/library",
+        ] {
+            vfs.create_dir_all(path).unwrap();
+        }
+        let manifest = "[package]\nname = \"scope/app\"\nversion = \"1.0.0\"\nrealm = \"shared\"\n[dependencies]\nLibrary = \"^Local/Library\"\n";
+        let local = "[package]\nname = \"scope/library\"\nrealm = \"shared\"\n";
+        vfs.write("/project/wally.toml", manifest).unwrap();
+        vfs.write("/project/Local/Library/wally.toml", local)
+            .unwrap();
+        vfs.write("/project/wally.install.json", serde_json::to_vec(&serde_json::json!({
+            "version":1,
+            "manifest_hash":crate::package_sources::sha256(manifest.as_bytes()),
+            "local_manifests":{"Local/Library/wally.toml":crate::package_sources::sha256(local.as_bytes())},
+            "package_roots":[{"name":"scope/library", "kind":"local", "realm":"shared", "install_path":"Packages/_Index/Library/library", "source_path":"Local/Library"}],
+            "generated_paths":[]
+        })).unwrap()).unwrap();
+        vfs.write("/project/Local/Library/Code.legacy.luau", "print(0)")
+            .unwrap();
+        let mut context = crate::snapshot::InstanceContext::default();
+        context.package_sources =
+            crate::package_sources::PackageSources::load(&vfs, Path::new("/project"))
+                .unwrap()
+                .map(std::sync::Arc::new);
+        assert!(context.package_sources.as_ref().unwrap().problem.is_none());
+        for name in ["Code", "Spare"] {
+            vfs.write("/project/default.project.json", format!(r#"{{"name":"Test","tree":{{"$className":"Folder","$path":"Local/Library","Reserved":{{"$path":{{"optional":"Packages/_Index/Library/library/{name}.client.luau"}}}}}}}}"#)).unwrap();
+            let project =
+                Project::load_exact(&vfs, Path::new("/project/default.project.json"), None)
+                    .unwrap();
+            let result = script_migration_projects(
+                &vfs,
+                &context,
+                &project,
+                &[
+                    Path::new("/project/Local/Library/Code.legacy.luau"),
+                    Path::new("/project/Local/Library/Code.client.luau"),
+                ],
+            );
+            if name == "Code" {
+                assert!(result.unwrap_err().to_string().contains("project mapping"));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn migration_ownership_survives_restart_and_guards_declaration_graph() {
+        use super::relocation_transaction::{
+            execute_script_replacements_guarded, recover, Recovery, Replacement,
+        };
+        use memofs::{InMemoryFs, VfsSnapshot};
+
+        for change in [
+            "unchanged",
+            "custom",
+            "probe",
+            "directory",
+            "absent",
+            "file_kind",
+        ] {
+            let mut backend = InMemoryFs::new();
+            backend.load_snapshot("/project", VfsSnapshot::dir([
+                ("default.project.json", VfsSnapshot::file(r#"{"name":"Test","syncRules":[{"pattern":"*.ref","use":"project"}],"tree":{"$className":"Folder","$path":"src","Reserved":{"$path":{"optional":"reserved.ref"}},"Absent":{"$path":{"optional":"extras"}}}}"#)),
+                ("reserved.ref", VfsSnapshot::file(r#"{"name":"Reserved","tree":{"$path":{"optional":"src/Spare.luau"}}}"#)),
+                ("src", VfsSnapshot::dir([
+                    ("Code.legacy.luau", VfsSnapshot::file("old source")),
+                    ("Other.luau", VfsSnapshot::file("unrelated payload")),
+                ])),
+            ])).unwrap();
+            let vfs = Vfs::new(backend);
+            vfs.set_watch_enabled(false);
+            let project =
+                Project::load_exact(&vfs, Path::new("/project/default.project.json"), None)
+                    .unwrap();
+            let source = PathBuf::from("/project/src/Code.legacy.luau");
+            let destination = PathBuf::from("/project/src/Code.client.luau");
+            let ownership = script_migration_projects(
+                &vfs,
+                &Default::default(),
+                &project,
+                &[&source, &destination],
+            )
+            .unwrap();
+            let mut expected = ownership.declarations.clone();
+            expected.insert(source.clone(), Some(b"old source".to_vec()));
+            expected.insert(destination.clone(), None);
+            let entries = vec![
+                Replacement {
+                    path: source,
+                    expected: Some(VfsSnapshot::file("old source")),
+                    desired: None,
+                },
+                Replacement {
+                    path: destination,
+                    expected: None,
+                    desired: Some(VfsSnapshot::file("new source")),
+                },
+            ];
+            let journal = Path::new("/project/.rojo/relocations/script");
+            vfs.create_dir_all(journal.parent().unwrap()).unwrap();
+            execute_script_replacements_guarded(
+                &vfs,
+                journal,
+                &project,
+                entries,
+                &expected,
+                Some(&ownership),
+            )
+            .unwrap();
+            let mut backend = InMemoryFs::new();
+            backend
+                .load_snapshot(
+                    "/project",
+                    vfs.snapshot_tree(Path::new("/project")).unwrap(),
+                )
+                .unwrap();
+            let restarted = Vfs::new(backend);
+            restarted.set_watch_enabled(false);
+            match change {
+                "custom" => restarted
+                    .write("/project/reserved.ref", "foreign declaration")
+                    .unwrap(),
+                "probe" => restarted
+                    .write("/project/src/default.project.json", "foreign declaration")
+                    .unwrap(),
+                "directory" => restarted.create_dir_all("/project/src/New").unwrap(),
+                "absent" => restarted.create_dir_all("/project/extras").unwrap(),
+                "file_kind" => {
+                    restarted.remove_file("/project/src/Other.luau").unwrap();
+                    restarted.create_dir_all("/project/src/Other.luau").unwrap();
+                }
+                _ => {}
+            }
+            let before = restarted.snapshot_tree(Path::new("/project")).unwrap();
+            if change == "unchanged" {
+                assert_eq!(recover(&restarted, journal).unwrap(), Recovery::Committed);
+            } else {
+                assert!(recover(&restarted, journal).is_err(), "Accepted {change}");
+                assert_eq!(
+                    restarted.snapshot_tree(Path::new("/project")).unwrap(),
+                    before
+                );
+            }
+        }
+    }
 
     #[test]
     fn sound_alias_project_syncback_cleans_keys_even_without_value_changes() {

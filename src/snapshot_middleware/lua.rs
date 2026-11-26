@@ -88,11 +88,19 @@ fn snapshot_lua_source(
 
     // Emit native anchored imports in DataModels and relative imports in models.
     // Keep the authored source separate so syncback can reverse this lowering.
+    let mut import_inputs = None;
+    let mut shared = context
+        .import_input_scope
+        .0
+        .as_ref()
+        .map(|cache| cache.lock().unwrap());
+    let mut local = luaurc::ImportInputCache::new(context.captures_import_inputs());
+    let inputs = shared.as_deref_mut().unwrap_or(&mut local);
     let source = if let Some(ref req_ctx) = context.require_context {
         let info = ResolveInfo {
             file_path: path,
             vfs,
-            path_mappings: &req_ctx.path_mappings,
+            path_mappings: req_ctx.path_mappings(),
             project_root: &req_ctx.project_root,
         };
 
@@ -100,21 +108,40 @@ fn snapshot_lua_source(
             .package_mount
             .as_ref()
             .and_then(|(_, installed)| installed.parent());
-        match luaurc::resolve_requires_with_package_dependencies(
+        match luaurc::resolve_requires_with_inputs(
             &contents,
             &info,
             req_ctx.datamodel,
             package_dependencies,
+            Some(&luaurc::PathMappingIndex::for_context(req_ctx)),
+            inputs,
         ) {
-            Ok(resolved) => resolved,
+            Ok((resolved, inputs)) => {
+                import_inputs = inputs;
+                resolved
+            }
             Err(err) => {
+                // Syntax errors belong to the payload, not the import context. A
+                // successful configuration read remains evidence even if lowering
+                // failed. Read/configuration errors never populate this witness.
+                import_inputs = inputs.witness_for(path);
                 log::warn!("Failed to resolve requires in {}: {}", path.display(), err);
                 contents.as_str().to_string()
             }
         }
     } else {
+        if context.captures_import_inputs() {
+            match inputs.capture_for(vfs, path) {
+                Ok(witness) => import_inputs = witness,
+                Err(error) => log::warn!(
+                    "Cannot capture import inputs in {}. {error:#}",
+                    path.display()
+                ),
+            }
+        }
         contents.as_str().to_string()
     };
+    drop(shared);
 
     let mut properties = UstrMap::with_capacity(2);
     properties.insert(ustr("Source"), source.as_str().into());
@@ -141,6 +168,7 @@ fn snapshot_lua_source(
                 .context(context),
         );
     snapshot.metadata.source_transform = transform;
+    snapshot.metadata.import_inputs = import_inputs;
     Ok(snapshot)
 }
 
@@ -191,8 +219,10 @@ pub fn snapshot_lua_init(
         })
         .collect();
     let source_transform = init_snapshot.metadata.source_transform.take();
+    let import_inputs = init_snapshot.metadata.import_inputs.take();
     init_snapshot.metadata = dir_snapshot.metadata;
     init_snapshot.metadata.source_transform = source_transform;
+    init_snapshot.metadata.import_inputs = import_inputs;
     track_init_file(&mut init_snapshot, init_path);
 
     DirectoryMetadata::read_and_apply_all(vfs, folder_path, &mut init_snapshot)?;

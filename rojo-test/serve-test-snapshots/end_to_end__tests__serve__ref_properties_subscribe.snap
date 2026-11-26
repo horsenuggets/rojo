@@ -21,6 +21,7 @@ body:
               Bool: false
             PrimaryPart:
               Ref: id-9
+      origin: filesystem
       removed: []
       updated:
         - changedClassName: ~

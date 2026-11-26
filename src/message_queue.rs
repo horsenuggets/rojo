@@ -6,7 +6,7 @@ use std::{
 use futures::channel::oneshot;
 use rbx_dom_weak::{types::Ref, Ustr};
 
-use crate::snapshot::{AppliedPatchSet, RojoTree, SourceTransform};
+use crate::snapshot::{AppliedPatchSet, PublicationOrigin, RojoTree, SourceTransform};
 
 const CAUSAL_EFFECT_LIMIT: usize = 1024;
 const CAUSAL_EFFECT_KEY_LIMIT: usize = 65_536;
@@ -132,10 +132,20 @@ pub(crate) fn attribute_source_operations(
 }
 
 /// A patch queue with persistent history that can be subscribed to.
-#[derive(Default)]
 pub struct MessageQueue {
     history: RwLock<History>,
     message_listeners: Mutex<Vec<Listener>>,
+    track_writes: bool,
+}
+
+impl Default for MessageQueue {
+    fn default() -> Self {
+        Self {
+            history: RwLock::default(),
+            message_listeners: Mutex::default(),
+            track_writes: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -262,6 +272,17 @@ impl MessageQueue {
         Self::default()
     }
 
+    pub(crate) fn filesystem_to_studio() -> Self {
+        Self {
+            track_writes: false,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn tracks_writes(&self) -> bool {
+        self.track_writes
+    }
+
     pub fn push_messages(&self, new_messages: &[AppliedPatchSet]) {
         self.push_messages_with_origins(
             new_messages
@@ -314,7 +335,7 @@ impl MessageQueue {
     ) -> Option<String> {
         let mut message_listeners = self.message_listeners.lock().unwrap();
         let mut history = self.history.write().unwrap();
-        let mut coverage = match acknowledged {
+        let mut coverage = match acknowledged.filter(|_| self.track_writes) {
             Some(Some(token)) => history
                 .acknowledgements
                 .iter()
@@ -326,7 +347,7 @@ impl MessageQueue {
         let previous_cursor = history.messages.len();
         for (patch, origin) in new_messages {
             let revision = history.messages.len() as u32 + 1;
-            if !matches!(origin, MessageOrigin::Correction) {
+            if self.track_writes && !matches!(origin, MessageOrigin::Correction) {
                 for update in &patch.updated {
                     if update
                         .changed_properties
@@ -384,6 +405,12 @@ impl MessageQueue {
                 }
             }
             let mut published = patch.clone();
+            published.origin = Some(match origin {
+                MessageOrigin::Studio => PublicationOrigin::Studio,
+                MessageOrigin::Filesystem | MessageOrigin::Correction => {
+                    PublicationOrigin::Filesystem
+                }
+            });
             if !matches!(origin, MessageOrigin::Studio) {
                 published.source_operations.clear();
             }
@@ -394,22 +421,27 @@ impl MessageQueue {
         if (!filesystem_properties.is_empty() || !structural_changes.is_empty())
             && history.messages.len() == previous_cursor
         {
-            history.messages.push(AppliedPatchSet::new());
+            history.messages.push(AppliedPatchSet {
+                origin: Some(PublicationOrigin::Filesystem),
+                ..AppliedPatchSet::new()
+            });
         }
-        let revision = history.messages.len() as u32;
-        if !filesystem_properties.is_empty() || !structural_changes.is_empty() {
-            history.record_effect(
-                revision,
-                MessageOrigin::Filesystem,
-                structural_changes.iter().copied().collect(),
-                filesystem_properties.iter().copied().collect(),
-            );
-        }
-        for key in filesystem_properties {
-            history.filesystem_property_revisions.insert(*key, revision);
-        }
-        for id in structural_changes {
-            history.structural_revisions.insert(*id, revision);
+        if self.track_writes {
+            let revision = history.messages.len() as u32;
+            if !filesystem_properties.is_empty() || !structural_changes.is_empty() {
+                history.record_effect(
+                    revision,
+                    MessageOrigin::Filesystem,
+                    structural_changes.iter().copied().collect(),
+                    filesystem_properties.iter().copied().collect(),
+                );
+            }
+            for key in filesystem_properties {
+                history.filesystem_property_revisions.insert(*key, revision);
+            }
+            for id in structural_changes {
+                history.structural_revisions.insert(*id, revision);
+            }
         }
 
         let mut remaining_listeners = Vec::new();
@@ -457,6 +489,17 @@ impl MessageQueue {
         properties: impl IntoIterator<Item = (Ref, Ustr)>,
         predecessor: Option<&str>,
     ) -> bool {
+        self.has_unproven_changes_since_filtered(cursor, targets, properties, predecessor, None)
+    }
+
+    fn has_unproven_changes_since_filtered(
+        &self,
+        cursor: u32,
+        targets: impl IntoIterator<Item = Ref>,
+        properties: impl IntoIterator<Item = (Ref, Ustr)>,
+        predecessor: Option<&str>,
+        ignored_filesystem_source: Option<Ref>,
+    ) -> bool {
         let history = self.history.read().unwrap();
         if cursor > history.messages.len() as u32 || cursor < history.effects_floor {
             return true;
@@ -475,7 +518,67 @@ impl MessageQueue {
         history.effects.iter().any(|effect| {
             effect.cursor > cursor
                 && (!effect.structural.is_disjoint(&targets)
-                    || !effect.properties.is_disjoint(&properties))
+                    || match ignored_filesystem_source
+                        .filter(|_| matches!(effect.origin, MessageOrigin::Filesystem))
+                    {
+                        Some(id) => properties.iter().any(|key| {
+                            *key != (id, rbx_dom_weak::ustr("Source"))
+                                && effect.properties.contains(key)
+                        }),
+                        None => !effect.properties.is_disjoint(&properties),
+                    })
+                && !effect.covered_by(coverage)
+        })
+    }
+
+    /// Check retained Source history under a trusted Studio-only session policy.
+    /// Only this ID's filesystem Source payload is ignored. Structural effects,
+    /// foreign Studio effects, and unknown or expired coverage still fail closed.
+    pub(crate) fn has_unproven_source_changes_except_filesystem_payload(
+        &self,
+        cursor: u32,
+        targets: impl IntoIterator<Item = Ref>,
+        id: Ref,
+        predecessor: Option<&str>,
+    ) -> bool {
+        self.has_unproven_changes_since_filtered(
+            cursor,
+            targets,
+            [(id, rbx_dom_weak::ustr("Source"))],
+            predecessor,
+            Some(id),
+        )
+    }
+
+    /// Like `has_unproven_changes_since`, but any property of `owners` counts, which
+    /// suits checks that cover a whole subtree rather than named properties.
+    pub(crate) fn has_unproven_changes_touching(
+        &self,
+        cursor: u32,
+        targets: &HashSet<Ref>,
+        owners: &HashSet<Ref>,
+        predecessor: Option<&str>,
+    ) -> bool {
+        let history = self.history.read().unwrap();
+        if cursor > history.messages.len() as u32 || cursor < history.effects_floor {
+            return true;
+        }
+        let coverage = predecessor.and_then(|token| {
+            history
+                .acknowledgements
+                .iter()
+                .find(|ack| ack.token == token)
+        });
+        if predecessor.is_some() && coverage.is_none() {
+            return true;
+        }
+        history.effects.iter().any(|effect| {
+            effect.cursor > cursor
+                && (!effect.structural.is_disjoint(targets)
+                    || effect
+                        .properties
+                        .iter()
+                        .any(|(owner, _)| owners.contains(owner)))
                 && !effect.covered_by(coverage)
         })
     }
@@ -526,6 +629,9 @@ impl MessageQueue {
         tree: &RojoTree,
         ids: impl IntoIterator<Item = Ref>,
     ) {
+        if !self.track_writes {
+            return;
+        }
         self.capture_source_baselines_at(tree, ids, false);
         let needs_barrier = {
             let history = self.history.read().unwrap();
@@ -548,6 +654,9 @@ impl MessageQueue {
         tree: &RojoTree,
         ids: impl IntoIterator<Item = Ref>,
     ) {
+        if !self.track_writes {
+            return;
+        }
         self.capture_source_baselines_at(tree, ids, true);
     }
 
@@ -846,6 +955,105 @@ mod tests {
     use crate::snapshot::{AppliedPatchSet, AppliedPatchUpdate, InstanceMetadata};
 
     use super::*;
+
+    #[test]
+    fn filesystem_only_publications_skip_write_history_and_source_capture() {
+        use crate::snapshot::{InstanceSnapshot, RojoTree};
+        let queue = MessageQueue::filesystem_to_studio();
+        assert!(!queue.tracks_writes());
+        let tree = RojoTree::new(InstanceSnapshot::new());
+        queue.capture_source_baselines_for(
+            &tree,
+            std::iter::from_fn(|| -> Option<Ref> {
+                panic!("Filesystem-only publication traversed Source baselines.")
+            }),
+        );
+        queue.capture_source_baselines_before_for(
+            &tree,
+            std::iter::from_fn(|| -> Option<Ref> {
+                panic!("Filesystem-only publication traversed Source before-images.")
+            }),
+        );
+        let id = Ref::new();
+        let patch = AppliedPatchSet {
+            updated: vec![AppliedPatchUpdate {
+                changed_name: Some("Changed".into()),
+                changed_properties: [(ustr("Source"), Some(Variant::String("new source".into())))]
+                    .into_iter()
+                    .collect(),
+                ..AppliedPatchUpdate::new(id)
+            }],
+            ..AppliedPatchSet::new()
+        };
+        queue.push_messages(std::slice::from_ref(&patch));
+        let acknowledgement = queue.publish_write(
+            [(&patch, MessageOrigin::Studio)],
+            &[(id, ustr("Source"))],
+            &[id],
+            None,
+            true,
+        );
+        assert!(acknowledgement.is_none());
+        let (cursor, messages) = futures::executor::block_on(queue.subscribe(0)).unwrap();
+        assert_eq!(cursor, 2);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].updated[0].changed_name.as_deref(),
+            Some("Changed")
+        );
+        assert_eq!(messages[0].origin, Some(PublicationOrigin::Filesystem));
+        let history = queue.history.read().unwrap();
+        assert!(history.sources.is_empty());
+        assert!(history.effects.is_empty());
+        assert!(history.acknowledgements.is_empty());
+        assert!(history.filesystem_property_revisions.is_empty());
+        assert!(history.structural_revisions.is_empty());
+    }
+
+    #[test]
+    fn publication_direction_uses_trusted_queue_origin_and_retains_cursor_order() {
+        let queue = MessageQueue::new();
+        let forged = AppliedPatchSet {
+            origin: Some(PublicationOrigin::Studio),
+            ..AppliedPatchSet::new()
+        };
+        queue.push_messages(std::slice::from_ref(&forged));
+        queue.push_messages_with_origins(
+            [
+                (&forged, MessageOrigin::Studio),
+                (&forged, MessageOrigin::Correction),
+            ],
+            &[],
+            &[],
+        );
+        queue.push_messages_with_origins([], &[(Ref::new(), ustr("Source"))], &[]);
+        let (cursor, messages) = futures::executor::block_on(queue.subscribe(0)).unwrap();
+        assert_eq!(cursor, 4);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|patch| patch.origin)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(PublicationOrigin::Filesystem),
+                Some(PublicationOrigin::Studio),
+                Some(PublicationOrigin::Filesystem),
+                Some(PublicationOrigin::Filesystem),
+            ]
+        );
+        for (patch, expected) in
+            messages
+                .iter()
+                .zip(["filesystem", "studio", "filesystem", "filesystem"])
+        {
+            assert_eq!(serde_json::to_value(patch).unwrap()["origin"], expected);
+        }
+        let (replayed_cursor, replayed) = futures::executor::block_on(queue.subscribe(1)).unwrap();
+        assert_eq!(replayed_cursor, cursor);
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].origin, Some(PublicationOrigin::Studio));
+    }
 
     #[test]
     fn source_provenance_requires_accepted_canonical_studio_origin() {
@@ -1247,6 +1455,131 @@ mod tests {
         let (_, wire) = queue.subscribe(0).try_recv().unwrap().unwrap();
         assert_eq!(wire.len(), 1);
         assert!(wire[0].is_empty());
+    }
+
+    #[test]
+    fn studio_only_source_history_exempts_only_exact_filesystem_payload() {
+        for hidden in [false, true] {
+            let queue = MessageQueue::new();
+            let code = Ref::new();
+            let other = Ref::new();
+            let source = ustr("Source");
+            let patch = AppliedPatchSet {
+                updated: vec![AppliedPatchUpdate {
+                    changed_properties: [(source, Some(Variant::String("disk".into())))]
+                        .into_iter()
+                        .collect(),
+                    ..AppliedPatchUpdate::new(code)
+                }],
+                ..AppliedPatchSet::new()
+            };
+            if hidden {
+                queue.push_messages_with_origins([], &[(code, source)], &[]);
+            } else {
+                queue.push_messages(&[patch]);
+            }
+            let proof = queue.publish_write([], &[], &[], None, true).unwrap();
+            for predecessor in [None, Some(proof.as_str())] {
+                assert!(
+                    !queue.has_unproven_source_changes_except_filesystem_payload(
+                        0,
+                        [code],
+                        code,
+                        predecessor,
+                    )
+                );
+                assert!(queue.has_unproven_changes_since(0, [code], [(code, source)], predecessor));
+                assert!(queue.has_unproven_changes_since(
+                    0,
+                    [code],
+                    [(code, source), (other, source)],
+                    predecessor,
+                ));
+            }
+            assert!(queue.has_unproven_source_changes_except_filesystem_payload(
+                0,
+                [code],
+                code,
+                Some("unknown"),
+            ));
+            assert!(queue.has_unproven_source_changes_except_filesystem_payload(
+                queue.cursor() + 1,
+                [code],
+                code,
+                None,
+            ));
+            queue.push_messages_with_origins([], &[(other, source), (code, ustr("Disabled"))], &[]);
+            // The shared filter can exempt only this ID's Source, never another
+            // script's payload or another relevant property on the same instance.
+            for relevant in [(other, source), (code, ustr("Disabled"))] {
+                assert!(queue.has_unproven_changes_since_filtered(
+                    0,
+                    [code],
+                    [(code, source), relevant],
+                    Some(&proof),
+                    Some(code),
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn studio_only_source_history_preserves_structure_foreign_effects_and_expiry() {
+        for kind in [
+            "structure",
+            "metadata",
+            "foreign",
+            "expired-proof",
+            "expired-history",
+        ] {
+            let queue = MessageQueue::new();
+            let code = Ref::new();
+            let ancestor = Ref::new();
+            let source = ustr("Source");
+            let proof = queue.publish_write([], &[], &[], None, true).unwrap();
+            queue.push_messages_with_origins([], &[(code, source)], &[]);
+            match kind {
+                "structure" => queue.push_messages_with_origins([], &[], &[ancestor]),
+                "metadata" => queue.push_messages(&[AppliedPatchSet {
+                    updated: vec![AppliedPatchUpdate {
+                        changed_metadata: Some(Default::default()),
+                        ..AppliedPatchUpdate::new(ancestor)
+                    }],
+                    ..AppliedPatchSet::new()
+                }]),
+                "foreign" => {
+                    let patch = AppliedPatchSet {
+                        updated: vec![AppliedPatchUpdate {
+                            changed_properties: [(source, Some(Variant::String("foreign".into())))]
+                                .into_iter()
+                                .collect(),
+                            ..AppliedPatchUpdate::new(code)
+                        }],
+                        ..AppliedPatchSet::new()
+                    };
+                    queue.publish_write([(&patch, MessageOrigin::Studio)], &[], &[], None, true);
+                }
+                "expired-proof" => {
+                    for _ in 0..CAUSAL_ACK_LIMIT {
+                        queue.publish_write([], &[], &[], None, true);
+                    }
+                }
+                _ => {
+                    for _ in 0..CAUSAL_EFFECT_LIMIT {
+                        queue.push_messages_with_origins([], &[(code, source)], &[]);
+                    }
+                }
+            }
+            assert!(
+                queue.has_unproven_source_changes_except_filesystem_payload(
+                    0,
+                    [code, ancestor],
+                    code,
+                    Some(&proof),
+                ),
+                "{kind}"
+            );
+        }
     }
 
     #[test]

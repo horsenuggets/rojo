@@ -121,7 +121,9 @@ impl ExportCommand {
     }
 }
 
-fn write_output(output: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+/// Replaces `output` atomically with `bytes`, so readers see either the old file
+/// or the complete new one, and no staging file is left behind.
+pub(super) fn write_output(output: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let directory = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())

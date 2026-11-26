@@ -698,7 +698,10 @@ fn xml_property_payload(
                 let data = reader.take(keypoints * width)?;
                 if tag == 0x16 {
                     ensure!(
-                        data.chunks_exact(20).all(|point| point[16..20] == [0; 4]),
+                        data.as_chunks::<20>()
+                            .0
+                            .iter()
+                            .all(|point| point[16..20] == [0; 4]),
                         "Typed conversion discards native ColorSequence envelopes."
                     );
                 }

@@ -20,7 +20,7 @@ mod txt;
 mod util;
 mod yaml;
 
-pub(crate) use luaurc::SourceSerializationDeferred;
+pub(crate) use luaurc::{ImportInputScope, SourceSerializationDeferred};
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -66,8 +66,10 @@ pub(crate) fn prepare_requires(
     require_context: &std::sync::Arc<crate::snapshot::RequireContext>,
 ) -> anyhow::Result<()> {
     profiling::scope!("Rojo.PrepareProjectImports");
-    let mappings = luaurc::PathMappingIndex::new(&require_context.path_mappings);
-    prepare_requires_with_index(snapshot, vfs, require_context, &mappings)
+    let mappings = luaurc::PathMappingIndex::for_context(require_context);
+    let capture = snapshot.metadata.context.captures_import_inputs();
+    let mut inputs = luaurc::ImportInputCache::new(capture);
+    prepare_requires_with_index(snapshot, vfs, require_context, &mappings, &mut inputs)
 }
 
 fn prepare_requires_with_index(
@@ -75,6 +77,7 @@ fn prepare_requires_with_index(
     vfs: &Vfs,
     require_context: &std::sync::Arc<crate::snapshot::RequireContext>,
     mappings: &luaurc::PathMappingIndex,
+    inputs: &mut luaurc::ImportInputCache,
 ) -> anyhow::Result<()> {
     use rbx_dom_weak::{types::Variant, ustr};
     let mut resolved = true;
@@ -95,7 +98,7 @@ fn prepare_requires_with_index(
             let info = luaurc::ResolveInfo {
                 file_path: path,
                 vfs,
-                path_mappings: &require_context.path_mappings,
+                path_mappings: require_context.path_mappings(),
                 project_root: &require_context.project_root,
             };
             let package_dependencies = snapshot
@@ -104,14 +107,16 @@ fn prepare_requires_with_index(
                 .package_mount
                 .as_ref()
                 .and_then(|(_, installed)| installed.parent());
-            match luaurc::resolve_requires_with_mapping_index(
+            match luaurc::resolve_requires_with_inputs(
                 &original,
                 &info,
                 require_context.datamodel,
                 package_dependencies,
                 Some(mappings),
+                inputs,
             ) {
-                Ok(emitted) => {
+                Ok((emitted, witness)) => {
+                    snapshot.metadata.import_inputs = witness;
                     *source = emitted.clone();
                     snapshot.metadata.source_transform = (emitted != original)
                         .then_some(crate::snapshot::SourceTransform { original, emitted });
@@ -123,14 +128,17 @@ fn prepare_requires_with_index(
             }
         }
     }
-    // Keep the source, transform, and its resolution context together on failure.
-    // Preserve middleware boundaries. Model-file descendants intentionally have
-    // no inherited filesystem context; adding one would produce false disk conflicts.
-    if resolved && snapshot.metadata.context.reserved_cache_path().is_some() {
+    // Keep an existing source, transform, and resolution context together on failure.
+    // An initial failure has no old transform. Retain the project mappings so a later
+    // config repair can resolve it, while the missing witness keeps writes closed.
+    // Model-file descendants intentionally have no inherited filesystem context.
+    if (resolved || snapshot.metadata.context.require_context.is_none())
+        && snapshot.metadata.context.reserved_cache_path().is_some()
+    {
         snapshot.metadata.context.require_context = Some(require_context.clone());
     }
     for child in &mut snapshot.children {
-        prepare_requires_with_index(child, vfs, require_context, mappings)?;
+        prepare_requires_with_index(child, vfs, require_context, mappings, inputs)?;
     }
     Ok(())
 }
@@ -172,6 +180,15 @@ pub fn snapshot_from_vfs(
     vfs: &Vfs,
     path: &Path,
 ) -> anyhow::Result<Option<InstanceSnapshot>> {
+    if context.captures_import_inputs() && context.import_input_scope.0.is_none() {
+        // Only this traversal shares reads. Retained metadata clears the scope,
+        // so a subsequent watcher read cannot reuse an earlier disk observation.
+        let mut scoped = context.clone();
+        scoped.import_input_scope.0 = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            luaurc::ImportInputCache::new(true),
+        )));
+        return snapshot_from_vfs(&scoped, vfs, path);
+    }
     if let Some((source, _)) = &context.package_mount {
         crate::package_sources::contained(vfs, source, path)?;
     }
@@ -754,9 +771,9 @@ mod test {
             ]),
         )
         .unwrap();
-        let require_context = std::sync::Arc::new(crate::snapshot::RequireContext {
-            project_root: PathBuf::from("/project"),
-            path_mappings: vec![
+        let require_context = std::sync::Arc::new(crate::snapshot::RequireContext::new(
+            PathBuf::from("/project"),
+            vec![
                 (
                     PathBuf::from("Source/Foo"),
                     vec![
@@ -777,8 +794,8 @@ mod test {
                     ],
                 ),
             ],
-            datamodel: true,
-        });
+            true,
+        ));
         let mut context = InstanceContext::new();
         context.set_reserved_cache_path(PathBuf::from("/project/.rojo"));
         context.require_context = Some(require_context.clone());
@@ -793,6 +810,67 @@ mod test {
         snapshot_from_vfs(context, vfs, Path::new("/project/Source/Foo"))
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn import_witness_tracks_plain_source_init_and_effective_overrides() {
+        use rbx_dom_weak::{types::Variant, ustr};
+        for plain in [false, true] {
+            let (vfs, context, require_context) = require_fixture();
+            let path = Path::new("/project/Source/Foo");
+            let mut snapshot = require_snapshot(&context, &vfs);
+            let initial = snapshot.metadata.import_inputs.clone().unwrap();
+            assert_eq!(initial[Path::new("/project/Source/Foo/.luaurc")], None);
+            assert_eq!(initial[Path::new("/project/Source/.luaurc")], None);
+            assert!(initial[Path::new("/project/.luaurc")].is_some());
+            assert_eq!(initial[Path::new("/.luaurc")], None);
+            if plain {
+                snapshot
+                    .properties
+                    .insert(ustr("Source"), Variant::String("return 42".into()));
+            }
+            prepare_requires(&mut snapshot, &vfs, &require_context).unwrap();
+            assert_eq!(snapshot.metadata.import_inputs.as_ref().unwrap(), &initial);
+            vfs.write(path.join(".luaurc"), r#"{"aliases":{"packages":".."}}"#)
+                .unwrap();
+            prepare_requires(&mut snapshot, &vfs, &require_context).unwrap();
+            assert_ne!(snapshot.metadata.import_inputs.as_ref().unwrap(), &initial);
+            assert_eq!(initial[Path::new("/project/Source/Foo/.luaurc")], None);
+        }
+    }
+
+    #[test]
+    fn import_witness_is_shared_per_preparation_and_omitted_for_filesystem_only() {
+        use std::sync::Arc;
+        for filesystem_only in [false, true] {
+            let (vfs, mut context, require_context) = require_fixture();
+            context.omit_import_witness = filesystem_only;
+            for name in ["A", "B"] {
+                vfs.write(format!("/project/Source/Foo/{name}.luau"), "return 42")
+                    .unwrap();
+            }
+            let mut snapshot = require_snapshot(&context, &vfs);
+            // Snapshot traversal and explicit re-preparation must both share bytes,
+            // without retaining a cache that could outlive this filesystem read.
+            for pass in 0..2 {
+                if pass == 1 {
+                    prepare_requires(&mut snapshot, &vfs, &require_context).unwrap();
+                }
+                assert!(snapshot.metadata.context.import_input_scope.0.is_none());
+                for child in &snapshot.children {
+                    assert_eq!(child.metadata.import_inputs.is_none(), filesystem_only);
+                    assert!(child.metadata.context.import_input_scope.0.is_none());
+                    if !filesystem_only {
+                        assert!(Arc::ptr_eq(
+                            snapshot.metadata.import_inputs.as_ref().unwrap(),
+                            child.metadata.import_inputs.as_ref().unwrap()
+                        ));
+                    }
+                }
+            }
+            assert_eq!(snapshot.metadata.import_inputs.is_none(), filesystem_only);
+            assert_eq!(snapshot.children.len(), 2);
+        }
     }
 
     #[test]

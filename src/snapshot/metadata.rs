@@ -82,7 +82,14 @@ pub struct InstanceMetadata {
     /// Server-only expected bytes protect model files and metadata as well as Source.
     #[serde(skip)]
     pub(crate) package_file_contents: std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+
+    /// Exact server-read import inputs, including absent configuration probes. These
+    /// describe interpretation, not Source payload, and can never come from a client.
+    #[serde(skip)]
+    pub(crate) import_inputs: Option<Arc<ImportInputs>>,
 }
+
+pub(crate) type ImportInputs = std::collections::BTreeMap<PathBuf, Option<Arc<Vec<u8>>>>;
 
 impl InstanceMetadata {
     pub fn new() -> Self {
@@ -97,7 +104,77 @@ impl InstanceMetadata {
             source_transform: None,
             installed_paths: Vec::new(),
             package_file_contents: std::collections::BTreeMap::new(),
+            import_inputs: None,
         }
+    }
+
+    /// Snapshot traversal can reach the same Windows source through an ordinary
+    /// path or a verbatim long path. That spelling alone is not a filesystem edit.
+    pub(crate) fn eq_snapshot(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            use crate::syncback::relocation_transaction::same_canonical_spelling;
+            // Ordinary source/configuration edits need no comparison clone.
+            if self.relevant_paths == other.relevant_paths
+                && self.instigating_source == other.instigating_source
+                && self.import_inputs == other.import_inputs
+            {
+                return false;
+            }
+            if !self.eq_import_inputs(other)
+                || self.relevant_paths.len() != other.relevant_paths.len()
+                || !self
+                    .relevant_paths
+                    .iter()
+                    .zip(&other.relevant_paths)
+                    .all(|(a, b)| same_canonical_spelling(a, b))
+            {
+                return false;
+            }
+            let mut equivalent = other.clone();
+            equivalent.import_inputs.clone_from(&self.import_inputs);
+            equivalent.relevant_paths.clone_from(&self.relevant_paths);
+            if let (Some(InstigatingSource::Path(a)), Some(InstigatingSource::Path(b))) =
+                (&self.instigating_source, &mut equivalent.instigating_source)
+            {
+                if same_canonical_spelling(a, b) {
+                    b.clone_from(a);
+                }
+            }
+            self == &equivalent
+        }
+        #[cfg(not(windows))]
+        false
+    }
+
+    fn eq_import_inputs(&self, other: &Self) -> bool {
+        if self.import_inputs == other.import_inputs {
+            return true;
+        }
+        #[cfg(windows)]
+        if let (Some(left), Some(right)) = (&self.import_inputs, &other.import_inputs) {
+            use crate::syncback::relocation_transaction::same_canonical_spelling;
+
+            if left.len() != right.len() {
+                return false;
+            }
+            // Mixed namespace spellings can reorder the map. Match every probe once,
+            // retaining exact bytes, absence, and even duplicate namespace evidence.
+            let mut unmatched: Vec<_> = right.iter().collect();
+            for (path, bytes) in left.iter() {
+                let Some(index) = unmatched.iter().position(|(other_path, other_bytes)| {
+                    bytes == *other_bytes && same_canonical_spelling(path, other_path)
+                }) else {
+                    return false;
+                };
+                unmatched.swap_remove(index);
+            }
+            return true;
+        }
+        false
     }
 
     pub(crate) fn has_same_structure(&self, other: &Self) -> bool {
@@ -111,6 +188,18 @@ impl InstanceMetadata {
             && self.middleware == other.middleware
             && self.schema == other.schema
             && self.installed_paths == other.installed_paths
+            && self.eq_import_inputs(other)
+    }
+
+    /// Served revisions are server-only proof, not a Source identity change or
+    /// a client metadata edit. Still install their refreshed immutable witnesses.
+    pub(crate) fn eq_without_served_projects(&self, other: &Self) -> bool {
+        let mut context = self.context.clone();
+        context.served_projects = other.context.served_projects.clone();
+        self.has_same_structure(other)
+            && self.source_transform == other.source_transform
+            && self.package_file_contents == other.package_file_contents
+            && context == other.context
     }
 
     pub(crate) fn watch_paths(&self) -> impl Iterator<Item = &PathBuf> {
@@ -156,6 +245,7 @@ impl InstanceMetadata {
         // Active traversal ancestry must not survive into a later watch reload.
         context.active_projects = None;
         context.active_directories = None;
+        context.import_input_scope = Default::default();
         Self { context, ..self }
     }
 
@@ -193,7 +283,8 @@ pub struct SourceTransform {
 /// Holds context for `.luaurc` alias resolution. When present on an
 /// `InstanceContext`, alias-based requires will be transformed into
 /// runtime require-by-string paths, anchored for DataModel projects.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// `Eq` lets `Arc<RequireContext>` comparisons return early on pointer equality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequireContext {
     /// The absolute path of the project root directory (where the
     /// .project.json file lives).
@@ -210,8 +301,102 @@ pub struct RequireContext {
     /// { "Plugin": { "$path": "Source/Plugin" } }
     /// ```
     /// produces: `("Source/Plugin", ["Plugin"])`
-    pub path_mappings: Vec<(PathBuf, Vec<String>)>,
+    path_mappings: Vec<(PathBuf, Vec<String>)>,
     pub datamodel: bool,
+    /// Lookup of `path_mappings` by path. Mappings cover every watched project
+    /// path, so a linear scan per import made snapshotting quadratic.
+    #[serde(skip)]
+    mapping_prefixes: MappingPrefixCache,
+}
+
+impl RequireContext {
+    pub fn new(
+        project_root: PathBuf,
+        path_mappings: Vec<(PathBuf, Vec<String>)>,
+        datamodel: bool,
+    ) -> Self {
+        Self {
+            project_root,
+            path_mappings,
+            datamodel,
+            mapping_prefixes: MappingPrefixCache::default(),
+        }
+    }
+
+    pub fn path_mappings(&self) -> &[(PathBuf, Vec<String>)] {
+        &self.path_mappings
+    }
+
+    pub fn replace_path_mappings(&mut self, path_mappings: Vec<(PathBuf, Vec<String>)>) {
+        self.path_mappings = path_mappings;
+        self.mapping_prefixes = MappingPrefixCache::default();
+    }
+
+    pub(crate) fn mapping_prefixes(&self) -> MappingPrefixes {
+        let mut cached = self.mapping_prefixes.0.lock().unwrap();
+        cached
+            .get_or_insert_with(|| Arc::new(build_mapping_prefixes(&self.path_mappings)))
+            .clone()
+    }
+}
+
+/// Maps a mapping path, or its extensionless script alias, to its first ordinal.
+pub(crate) type MappingPrefixes = Arc<std::collections::HashMap<PathBuf, usize>>;
+
+/// Derived state belongs to one controlled mapping list. Replacing that list or
+/// cloning its context starts an empty cache, regardless of allocation or length.
+#[derive(Default)]
+struct MappingPrefixCache(std::sync::Mutex<Option<MappingPrefixes>>);
+
+pub(crate) fn build_mapping_prefixes(
+    mappings: &[(PathBuf, Vec<String>)],
+) -> std::collections::HashMap<PathBuf, usize> {
+    let mut prefixes = std::collections::HashMap::with_capacity(mappings.len());
+    for (ordinal, (path, _)) in mappings.iter().enumerate() {
+        prefixes.entry(path.clone()).or_insert(ordinal);
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "lua" || extension == "luau")
+        {
+            prefixes.entry(path.with_extension("")).or_insert(ordinal);
+        }
+    }
+    prefixes
+}
+
+impl Clone for MappingPrefixCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for MappingPrefixCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for MappingPrefixCache {}
+
+impl fmt::Debug for MappingPrefixCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MappingPrefixCache")
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ServedProjects(pub Arc<Vec<Arc<crate::Project>>>);
+
+impl PartialEq for ServedProjects {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+            || (self.0.len() == other.0.len()
+                && self
+                    .0
+                    .iter()
+                    .zip(other.0.iter())
+                    .all(|(left, right)| Arc::ptr_eq(left, right) || left == right))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,12 +424,24 @@ pub struct InstanceContext {
     #[serde(skip)]
     pub(crate) active_directories: Option<Arc<Vec<PathBuf>>>,
 
+    /// Immutable declarations that actually served this instance, not traversal state.
+    /// Sharing both the ancestry and declarations keeps descendant contexts inexpensive.
+    #[serde(skip)]
+    pub(crate) served_projects: ServedProjects,
+
     /// Set only while reading one instance's own file for a two-way sync write.
     /// Directories then skip children stored in their own files, so checking an
     /// edit doesn't re-read a folder's entire subtree. Always cleared before the
     /// snapshot is compared or applied.
     #[serde(skip)]
     pub(crate) shallow: bool,
+
+    /// Explicit filesystem-only sessions cannot accept writes and omit their proof.
+    #[serde(skip)]
+    pub(crate) omit_import_witness: bool,
+
+    #[serde(skip)]
+    pub(crate) import_input_scope: crate::snapshot_middleware::ImportInputScope,
 
     #[serde(skip)]
     pub(crate) package_sources: Option<Arc<crate::package_sources::PackageSources>>,
@@ -262,7 +459,10 @@ impl InstanceContext {
             require_context: None,
             active_projects: None,
             active_directories: None,
+            served_projects: ServedProjects::default(),
             shallow: false,
+            omit_import_witness: false,
+            import_input_scope: Default::default(),
             package_sources: None,
             package_mount: None,
         }
@@ -277,7 +477,10 @@ impl InstanceContext {
             require_context,
             active_projects,
             active_directories,
+            served_projects: _,
             shallow,
+            omit_import_witness,
+            import_input_scope: _,
             package_sources,
             package_mount,
         } = self;
@@ -297,6 +500,7 @@ impl InstanceContext {
             && active_projects == &other.active_projects
             && active_directories == &other.active_directories
             && shallow == &other.shallow
+            && omit_import_witness == &other.omit_import_witness
             && package_sources == &other.package_sources
             && package_mount == &other.package_mount
     }
@@ -316,6 +520,10 @@ impl InstanceContext {
 
     pub fn reserved_cache_path(&self) -> Option<&Path> {
         self.reserved_cache_path.as_deref()
+    }
+
+    pub(crate) fn captures_import_inputs(&self) -> bool {
+        self.reserved_cache_path.is_some() && !self.omit_import_witness
     }
 
     /// Returns whether the path lexically names the reserved cache or a descendant.
@@ -628,13 +836,334 @@ mod test {
     }
 
     #[test]
+    fn import_witness_is_server_only_and_changes_interpretation_not_payload() {
+        let original = InstanceMetadata::new();
+        let mut changed = original.clone();
+        changed.import_inputs = Some(Arc::new(
+            [
+                (
+                    PathBuf::from("/project/.luaurc"),
+                    Some(Arc::new(b"{}".to_vec())),
+                ),
+                (PathBuf::from("/project/Source/.luaurc"), None),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        assert!(!original.has_same_structure(&changed));
+        assert!(!changed.eq_without_served_projects(&original));
+        let mut forged = serde_json::to_value(&original).unwrap();
+        forged["import_inputs"] = serde_json::json!({"/project/.luaurc": [1, 2, 3]});
+        for encoded in [serde_json::to_value(&changed).unwrap(), forged] {
+            assert_eq!(
+                serde_json::from_value::<InstanceMetadata>(encoded).unwrap(),
+                original
+            );
+        }
+        let encoded = rmp_serde::to_vec_named(&changed).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<InstanceMetadata>(&encoded).unwrap(),
+            original
+        );
+        assert_eq!(changed.watch_paths().count(), 0);
+    }
+
+    #[test]
+    fn import_witness_preserves_bytes_absence_paths_and_capture_state() {
+        let mut original = InstanceMetadata::new();
+        original.import_inputs = Some(Arc::new(
+            [
+                (
+                    PathBuf::from("/project/.luaurc"),
+                    Some(Arc::new(b"{}".to_vec())),
+                ),
+                (PathBuf::from("/project/Source/.luaurc"), None),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        for change in 0..7 {
+            let mut changed = original.clone();
+            let inputs = Arc::make_mut(changed.import_inputs.as_mut().unwrap());
+            match change {
+                0 => {
+                    *inputs.get_mut(Path::new("/project/.luaurc")).unwrap() =
+                        Some(Arc::new(b"{\"aliases\":{}}".to_vec()))
+                }
+                1 => *inputs.get_mut(Path::new("/project/.luaurc")).unwrap() = None,
+                2 => {
+                    *inputs
+                        .get_mut(Path::new("/project/Source/.luaurc"))
+                        .unwrap() = Some(Arc::new(Vec::new()))
+                }
+                3 => {
+                    inputs.remove(Path::new("/project/Source/.luaurc"));
+                }
+                4 => {
+                    inputs.remove(Path::new("/project/Source/.luaurc"));
+                    inputs.insert("/project/Other/.luaurc".into(), None);
+                }
+                5 => inputs.clear(),
+                6 => changed.import_inputs = None,
+                _ => unreachable!(),
+            }
+            for (left, right) in [(&original, &changed), (&changed, &original)] {
+                assert!(!left.eq_snapshot(right), "change {change}");
+                assert!(!left.has_same_structure(right), "change {change}");
+                assert!(!left.eq_without_served_projects(right), "change {change}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_import_witness_namespace_only_keys_are_equivalent() {
+        for (ordinary, verbatim) in [
+            (
+                r"C:\project\Source\.luaurc",
+                r"\\?\C:\project\Source\.luaurc",
+            ),
+            (
+                r"\\server\share\project\.luaurc",
+                r"\\?\UNC\server\share\project\.luaurc",
+            ),
+        ] {
+            for bytes in [None, Some(Arc::new(b"{}".to_vec()))] {
+                let mut original = InstanceMetadata::new();
+                original.import_inputs = Some(Arc::new(
+                    [(PathBuf::from(ordinary), bytes.clone())]
+                        .into_iter()
+                        .collect(),
+                ));
+                let mut changed = original.clone();
+                changed.import_inputs = Some(Arc::new(
+                    [(PathBuf::from(verbatim), bytes.clone())]
+                        .into_iter()
+                        .collect(),
+                ));
+                assert_ne!(original, changed);
+                for (left, right) in [(&original, &changed), (&changed, &original)] {
+                    assert!(left.eq_snapshot(right), "{ordinary}");
+                    assert!(left.has_same_structure(right), "{ordinary}");
+                    assert!(left.eq_without_served_projects(right), "{ordinary}");
+                }
+                for replacement in [None, Some(Arc::new(b"{\"aliases\":{}}".to_vec()))] {
+                    if replacement == bytes {
+                        continue;
+                    }
+                    let mut edited = changed.clone();
+                    Arc::make_mut(edited.import_inputs.as_mut().unwrap())
+                        .insert(PathBuf::from(verbatim), replacement);
+                    for (left, right) in [(&original, &edited), (&edited, &original)] {
+                        assert!(!left.eq_snapshot(right), "{ordinary}");
+                        assert!(!left.has_same_structure(right), "{ordinary}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_import_witness_mixed_namespace_order_preserves_every_probe() {
+        let mut original = InstanceMetadata::new();
+        original.import_inputs = Some(Arc::new(
+            [
+                (
+                    PathBuf::from(r"C:\project\A\.luaurc"),
+                    Some(Arc::new(b"{}".to_vec())),
+                ),
+                (PathBuf::from(r"\\?\C:\project\B\.luaurc"), None),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let mut changed = original.clone();
+        changed.import_inputs = Some(Arc::new(
+            [
+                (
+                    PathBuf::from(r"\\?\C:\project\A\.luaurc"),
+                    Some(Arc::new(b"{}".to_vec())),
+                ),
+                (PathBuf::from(r"C:\project\B\.luaurc"), None),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        for (left, right) in [(&original, &changed), (&changed, &original)] {
+            assert!(left.eq_snapshot(right));
+            assert!(left.has_same_structure(right));
+        }
+        let inputs = Arc::make_mut(changed.import_inputs.as_mut().unwrap());
+        inputs.remove(Path::new(r"C:\project\B\.luaurc"));
+        inputs.insert(PathBuf::from(r"C:\project\A\.luaurc"), None);
+        assert!(!original.eq_snapshot(&changed));
+        assert!(!original.has_same_structure(&changed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_import_witness_namespace_equivalence_keeps_strict_path_distinctions() {
+        for (left, right) in [
+            (
+                r"C:\project\Source\.luaurc",
+                r"\\?\C:\project\Other\.luaurc",
+            ),
+            (
+                r"C:\project\Source\.luaurc",
+                r"\\?\C:\project\source\.luaurc",
+            ),
+            (
+                r"C:\project\Source\.luaurc",
+                r"\\?\D:\project\Source\.luaurc",
+            ),
+            (r"C:\project\Source\.luaurc", r"\\?\C:\project\Link\.luaurc"),
+            (
+                r"C:\project\Source\.luaurc",
+                r"\\?\C:\project\Other\..\Source\.luaurc",
+            ),
+            (r"C:\project\NUL\.luaurc", r"\\?\C:\project\NUL\.luaurc"),
+            (
+                r"C:\project\CON.txt\.luaurc",
+                r"\\?\C:\project\CON.txt\.luaurc",
+            ),
+            (
+                r"C:\project\Source.\.luaurc",
+                r"\\?\C:\project\Source.\.luaurc",
+            ),
+            (
+                r"C:\project\Source \.luaurc",
+                r"\\?\C:\project\Source \.luaurc",
+            ),
+            (
+                r"\\server\share\project\.luaurc",
+                r"\\?\UNC\server\other\project\.luaurc",
+            ),
+        ] {
+            let mut original = InstanceMetadata::new();
+            original.import_inputs = Some(Arc::new(
+                [(PathBuf::from(left), None)].into_iter().collect(),
+            ));
+            let mut changed = original.clone();
+            changed.import_inputs = Some(Arc::new(
+                [(PathBuf::from(right), None)].into_iter().collect(),
+            ));
+            for (left, right) in [(&original, &changed), (&changed, &original)] {
+                assert!(!left.eq_snapshot(right));
+                assert!(!left.has_same_structure(right));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_long_path_plain_module_import_witness_snapshot_namespace_equivalence() {
+        use crate::snapshot_middleware::snapshot_from_vfs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let verbatim = root
+            .join("long-source-directory".repeat(12))
+            .join("nested")
+            .join("Module.lua");
+        let ordinary = PathBuf::from(verbatim.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        assert!(ordinary.as_os_str().len() > 260);
+        assert_ne!(ordinary, verbatim);
+        std::fs::create_dir_all(verbatim.parent().unwrap()).unwrap();
+        std::fs::write(&verbatim, "return 1").unwrap();
+        std::fs::write(root.join(".luaurc"), "{}").unwrap();
+        let mut context = InstanceContext::new();
+        context.set_reserved_cache_path(root.join(".rojo"));
+        assert!(context.require_context.is_none());
+        assert!(context.captures_import_inputs());
+        let vfs = memofs::Vfs::new(memofs::StdBackend::new().unwrap());
+        vfs.set_watch_enabled(false);
+        let original = snapshot_from_vfs(&context, &vfs, &ordinary)
+            .unwrap()
+            .unwrap();
+        let changed = snapshot_from_vfs(&context, &vfs, &verbatim)
+            .unwrap()
+            .unwrap();
+        for (snapshot, path) in [(&original, &ordinary), (&changed, &verbatim)] {
+            assert_eq!(snapshot.class_name, "ModuleScript");
+            assert_eq!(
+                snapshot.properties[&rbx_dom_weak::ustr("Source")],
+                rbx_dom_weak::types::Variant::String("return 1".into())
+            );
+            assert!(snapshot.metadata.context.require_context.is_none());
+            let inputs = snapshot.metadata.import_inputs.as_ref().unwrap();
+            assert_eq!(
+                inputs.get(&path.parent().unwrap().join(".luaurc")),
+                Some(&None)
+            );
+            assert!(inputs
+                .values()
+                .any(|bytes| bytes.as_deref().is_some_and(|bytes| bytes == b"{}")));
+        }
+        assert_ne!(
+            original.metadata.import_inputs,
+            changed.metadata.import_inputs
+        );
+        for (before, after) in [(&original, &changed), (&changed, &original)] {
+            let tree = crate::snapshot::RojoTree::new(before.clone());
+            let patch =
+                crate::snapshot::compute_patch_set(Some(after.clone()), &tree, tree.get_root_id());
+            assert_eq!(patch, crate::snapshot::PatchSet::new());
+        }
+        for (left, right) in [
+            (&original.metadata, &changed.metadata),
+            (&changed.metadata, &original.metadata),
+        ] {
+            assert!(left.eq_snapshot(right));
+            // Hold the source spelling fixed to isolate witness-only structural changes.
+            let mut same_source = right.clone();
+            same_source
+                .instigating_source
+                .clone_from(&left.instigating_source);
+            same_source.relevant_paths.clone_from(&left.relevant_paths);
+            assert!(left.has_same_structure(&same_source));
+            assert!(left.eq_without_served_projects(&same_source));
+        }
+    }
+
+    #[test]
+    fn plain_module_import_witness_config_edits_remain_structural() {
+        use crate::snapshot_middleware::snapshot_from_vfs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let path = root.join("Module.lua");
+        let config = root.join(".luaurc");
+        std::fs::write(&path, "return 1").unwrap();
+        std::fs::write(&config, "{}").unwrap();
+        let mut context = InstanceContext::new();
+        context.set_reserved_cache_path(root.join(".rojo"));
+        let snapshot = || {
+            let vfs = memofs::Vfs::new(memofs::StdBackend::new().unwrap());
+            vfs.set_watch_enabled(false);
+            snapshot_from_vfs(&context, &vfs, &path).unwrap().unwrap()
+        };
+        let original = snapshot();
+        std::fs::write(&config, "{\"aliases\":{}}").unwrap();
+        let bytes_changed = snapshot();
+        std::fs::remove_file(&config).unwrap();
+        let absent = snapshot();
+        for changed in [&bytes_changed, &absent] {
+            assert_eq!(original.properties, changed.properties);
+            assert!(!original.metadata.eq_snapshot(&changed.metadata));
+            assert!(!original.metadata.has_same_structure(&changed.metadata));
+        }
+        assert!(!bytes_changed.metadata.has_same_structure(&absent.metadata));
+    }
+
+    #[test]
     fn structural_metadata_ignores_derived_require_mapping_changes() {
         let mut original = InstanceMetadata::new();
-        original.context.require_context = Some(Arc::new(RequireContext {
-            project_root: "/project".into(),
-            path_mappings: vec![("Source/Actor".into(), vec!["Actor".into()])],
-            datamodel: true,
-        }));
+        original.context.require_context = Some(Arc::new(RequireContext::new(
+            "/project".into(),
+            vec![("Source/Actor".into(), vec!["Actor".into()])],
+            true,
+        )));
         let mut equal = original.clone();
         equal.context.require_context = Some(Arc::new(
             original.context.require_context.as_deref().unwrap().clone(),
@@ -648,8 +1177,12 @@ mod test {
         assert!(equal.has_same_structure(&original));
 
         let mut changed = equal;
-        Arc::make_mut(changed.context.require_context.as_mut().unwrap()).path_mappings[0].1 =
-            vec!["Destination".into(), "Actor".into()];
+        Arc::make_mut(changed.context.require_context.as_mut().unwrap()).replace_path_mappings(
+            vec![(
+                "Source/Actor".into(),
+                vec!["Destination".into(), "Actor".into()],
+            )],
+        );
         assert_ne!(original.context, changed.context);
         assert_ne!(original, changed);
         for _ in 0..2 {
@@ -661,11 +1194,11 @@ mod test {
     #[test]
     fn structural_metadata_preserves_every_local_context_field() {
         let mut original = InstanceMetadata::new();
-        original.context.require_context = Some(Arc::new(RequireContext {
-            project_root: "/project".into(),
-            path_mappings: vec![("Source/Actor".into(), vec!["Actor".into()])],
-            datamodel: true,
-        }));
+        original.context.require_context = Some(Arc::new(RequireContext::new(
+            "/project".into(),
+            vec![("Source/Actor".into(), vec!["Actor".into()])],
+            true,
+        )));
         let package_sources: crate::package_sources::PackageSources =
             serde_json::from_value(serde_json::json!({
                 "root": "/project",
@@ -676,10 +1209,10 @@ mod test {
             }))
             .unwrap();
         let package_sources = Arc::new(package_sources);
-        for flags in 0..4096 {
+        for flags in 0..8192 {
             let mut changed = original.clone();
             let require_context = Arc::make_mut(changed.context.require_context.as_mut().unwrap());
-            require_context.path_mappings.clear();
+            require_context.replace_path_mappings(Vec::new());
             if flags & 1 != 0 {
                 changed.context.path_ignore_rules = Arc::new(vec![PathIgnoreRule {
                     base_path: "/project".into(),
@@ -720,6 +1253,9 @@ mod test {
             if flags & 2048 != 0 {
                 changed.context.package_mount =
                     Some(("/project/Packages/Local".into(), "/project/Source".into()));
+            }
+            if flags & 4096 != 0 {
+                changed.context.omit_import_witness = true;
             }
             for _ in 0..2 {
                 assert_eq!(

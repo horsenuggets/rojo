@@ -314,6 +314,14 @@ impl<'sync> SyncbackSnapshot<'sync> {
         if middleware.is_dir() || self.middleware.is_some() {
             return Ok(());
         }
+        self.validate_script_rule_for_middleware(path, middleware)
+    }
+
+    pub(super) fn validate_script_rule_for_middleware(
+        &self,
+        path: &Path,
+        middleware: Middleware,
+    ) -> anyhow::Result<()> {
         let context = self.context();
         let rules = context
             .map(|context| context.sync_rules.as_slice())

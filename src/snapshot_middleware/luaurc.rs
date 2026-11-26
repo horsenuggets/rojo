@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::{HashMap, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
@@ -25,37 +24,113 @@ struct LuauRc {
     aliases: HashMap<String, String>,
 }
 
-/// Find the nearest `.luaurc` file by walking up from the given
-/// directory. Returns the parsed aliases and the directory containing
-/// the `.luaurc`.
-fn find_luaurc(
-    vfs: &Vfs,
-    start_dir: &Path,
-) -> anyhow::Result<Option<(HashMap<String, String>, PathBuf)>> {
-    let mut current = start_dir.to_path_buf();
+/// Traversal-only sharing is discarded when metadata retains its context. It is
+/// not interpretation state and cannot make an otherwise equal snapshot differ.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ImportInputScope(pub Option<Arc<Mutex<ImportInputCache>>>);
 
-    loop {
-        let luaurc_path = current.join(".luaurc");
+impl PartialEq for ImportInputScope {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
 
-        match vfs.read_to_string(&luaurc_path) {
-            Ok(contents) => {
-                let rc: LuauRc = serde_json::from_str(&contents)
-                    .with_context(|| format!("failed to parse {}", luaurc_path.display()))?;
-                return Ok(Some((rc.aliases, current)));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to read {}", luaurc_path.display()));
-            }
-        }
+/// One preparation owns these reads. Siblings share both configuration bytes and
+/// probe lists, but the next snapshot always starts a fresh cache.
+#[derive(Debug)]
+pub(crate) struct ImportInputCache {
+    capture: bool,
+    files: crate::snapshot::ImportInputs,
+    directories: HashMap<PathBuf, Arc<LuauRcInputs>>,
+    parsed: HashMap<PathBuf, Arc<LuauRc>>,
+}
 
-        if !current.pop() {
-            break;
+#[derive(Debug)]
+struct LuauRcInputs {
+    nearest: Option<(Arc<LuauRc>, PathBuf)>,
+    witness: Option<Arc<crate::snapshot::ImportInputs>>,
+}
+
+impl ImportInputCache {
+    pub(super) fn new(capture: bool) -> Self {
+        Self {
+            capture,
+            files: Default::default(),
+            directories: Default::default(),
+            parsed: Default::default(),
         }
     }
 
-    Ok(None)
+    pub(super) fn capture_for(
+        &mut self,
+        vfs: &Vfs,
+        file: &Path,
+    ) -> anyhow::Result<Option<Arc<crate::snapshot::ImportInputs>>> {
+        let directory = file
+            .parent()
+            .context("script file has no parent directory")?;
+        Ok(self.find(vfs, directory)?.witness.clone())
+    }
+
+    pub(super) fn witness_for(&self, file: &Path) -> Option<Arc<crate::snapshot::ImportInputs>> {
+        self.directories
+            .get(file.parent()?)
+            .and_then(|inputs| inputs.witness.clone())
+    }
+
+    fn find(&mut self, vfs: &Vfs, start_dir: &Path) -> anyhow::Result<Arc<LuauRcInputs>> {
+        if let Some(inputs) = self.directories.get(start_dir) {
+            return Ok(inputs.clone());
+        }
+        let mut nearest = None;
+        let mut witness = crate::snapshot::ImportInputs::new();
+        for current in start_dir.ancestors() {
+            let path = current.join(".luaurc");
+            let contents = if let Some(bytes) = self.files.get(&path) {
+                bytes.clone()
+            } else {
+                let bytes = match vfs.read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("failed to read {}", path.display()))
+                    }
+                };
+                self.files.insert(path.clone(), bytes.clone());
+                bytes
+            };
+            if nearest.is_none() {
+                if let Some(bytes) = &contents {
+                    // Parse the very bytes retained in the witness, never a later read.
+                    let rc = if let Some(rc) = self.parsed.get(&path) {
+                        rc.clone()
+                    } else {
+                        let rc: LuauRc = serde_json::from_slice(bytes)
+                            .with_context(|| format!("failed to parse {}", path.display()))?;
+                        let rc = Arc::new(rc);
+                        self.parsed.insert(path.clone(), rc.clone());
+                        rc
+                    };
+                    nearest = Some((rc, current.to_path_buf()));
+                }
+            }
+            if self.capture {
+                // Guard outer probes too. Removing the nearest configuration must
+                // not expose an independently edited outer alias during commit.
+                witness.insert(path, contents);
+            } else if nearest.is_some() {
+                break;
+            }
+        }
+        let inputs = Arc::new(LuauRcInputs {
+            nearest,
+            witness: self.capture.then(|| Arc::new(witness)),
+        });
+        self.directories
+            .insert(start_dir.to_path_buf(), inputs.clone());
+        Ok(inputs)
+    }
 }
 
 /// Information needed to resolve requires for a single script file.
@@ -77,7 +152,7 @@ pub struct ResolveInfo<'a> {
 /// unsorted mappings or a script's extensionless alias colliding with another mount.
 pub(super) struct PathMappingIndex<'a> {
     mappings: &'a [(PathBuf, Vec<String>)],
-    prefixes: HashMap<Cow<'a, Path>, usize>,
+    prefixes: Arc<HashMap<PathBuf, usize>>,
 }
 
 impl<'a> PathMappingIndex<'a> {
@@ -86,21 +161,18 @@ impl<'a> PathMappingIndex<'a> {
             "Rojo.BuildImportMappingIndex",
             format!("Mappings {}", mappings.len()).as_str()
         );
-        let mut prefixes = HashMap::with_capacity(mappings.len());
-        for (ordinal, (path, _)) in mappings.iter().enumerate() {
-            prefixes
-                .entry(Cow::Borrowed(path.as_path()))
-                .or_insert(ordinal);
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "lua" || extension == "luau")
-            {
-                prefixes
-                    .entry(Cow::Owned(path.with_extension("")))
-                    .or_insert(ordinal);
-            }
+        Self {
+            mappings,
+            prefixes: Arc::new(crate::snapshot::build_mapping_prefixes(mappings)),
         }
-        Self { mappings, prefixes }
+    }
+
+    /// Reuses the context's index, which survives across individual scripts.
+    pub(super) fn for_context(context: &'a crate::snapshot::RequireContext) -> Self {
+        Self {
+            mappings: context.path_mappings(),
+            prefixes: context.mapping_prefixes(),
+        }
     }
 
     fn matching_prefix<'p>(&self, relative: &'p Path) -> (Option<(usize, &'p Path)>, usize) {
@@ -189,6 +261,49 @@ pub(super) fn resolve_requires_with_mapping_index(
     package_dependencies: Option<&Path>,
     index: Option<&PathMappingIndex>,
 ) -> anyhow::Result<String> {
+    resolve_requires_with_inputs(
+        source,
+        info,
+        datamodel,
+        package_dependencies,
+        index,
+        &mut ImportInputCache::new(false),
+    )
+    .map(|(source, _)| source)
+}
+
+pub(super) fn resolve_requires_with_inputs(
+    source: &str,
+    info: &ResolveInfo,
+    datamodel: bool,
+    package_dependencies: Option<&Path>,
+    index: Option<&PathMappingIndex>,
+    inputs: &mut ImportInputCache,
+) -> anyhow::Result<(String, Option<Arc<crate::snapshot::ImportInputs>>)> {
+    let directory = info
+        .file_path
+        .parent()
+        .context("script file has no parent directory")?;
+    let inputs = inputs.find(info.vfs, directory)?;
+    let source = resolve_requires_from_inputs(
+        source,
+        info,
+        datamodel,
+        package_dependencies,
+        index,
+        &inputs.nearest,
+    )?;
+    Ok((source, inputs.witness.clone()))
+}
+
+fn resolve_requires_from_inputs(
+    source: &str,
+    info: &ResolveInfo,
+    datamodel: bool,
+    package_dependencies: Option<&Path>,
+    index: Option<&PathMappingIndex>,
+    luaurc: &Option<(Arc<LuauRc>, PathBuf)>,
+) -> anyhow::Result<String> {
     profiling::scope!(
         "Rojo.ResolveSourceImports",
         format!(
@@ -209,11 +324,9 @@ pub(super) fn resolve_requires_with_mapping_index(
         .parent()
         .context("script file has no parent directory")?;
 
-    let luaurc = find_luaurc(info.vfs, file_dir)?;
-
     let mut aliases = luaurc
         .as_ref()
-        .map(|(aliases, _)| aliases.clone())
+        .map(|(rc, _)| rc.aliases.clone())
         .unwrap_or_default();
     if let Some(directory) = package_dependencies {
         // Package ownership changes only this namespace. Other authored aliases
@@ -268,7 +381,7 @@ pub(super) fn resolve_requires_with_mapping_index(
     // Apply replacements in reverse order to preserve byte offsets
     let mut result = source.to_string();
     let mut sorted = replacements;
-    sorted.sort_by(|a, b| b.start.cmp(&a.start));
+    sorted.sort_by_key(|replacement| std::cmp::Reverse(replacement.start));
 
     for mut replacement in sorted {
         if datamodel {
@@ -1007,6 +1120,66 @@ mod test {
     use super::*;
 
     #[test]
+    fn import_witness_uses_frozen_reads_and_shares_outer_bytes_across_directories() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+        let mut fs = InMemoryFs::new();
+        fs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([(
+                ".luaurc",
+                VfsSnapshot::file(r#"{"aliases":{"near":"First"}}"#),
+            )]),
+        )
+        .unwrap();
+        let vfs = Vfs::new(fs);
+        let source = "return require('@near/Helper')";
+        let mut info = ResolveInfo {
+            file_path: Path::new("/project/A/Code.luau"),
+            vfs: &vfs,
+            path_mappings: &[],
+            project_root: Path::new("/project"),
+        };
+        let mut inputs = ImportInputCache::new(true);
+        let (first, witness) =
+            resolve_requires_with_inputs(source, &info, true, None, None, &mut inputs).unwrap();
+        let witness = witness.unwrap();
+        assert!(first.contains("@game/First/Helper"));
+        let rc = Path::new("/project/.luaurc");
+        vfs.write(rc, r#"{"aliases":{"near":"Second"}}"#).unwrap();
+        info.file_path = Path::new("/project/B/Code.luau");
+        let (second, sibling) =
+            resolve_requires_with_inputs(source, &info, true, None, None, &mut inputs).unwrap();
+        assert_eq!(first, second);
+        let sibling = sibling.unwrap();
+        assert!(Arc::ptr_eq(
+            witness[rc].as_ref().unwrap(),
+            sibling[rc].as_ref().unwrap()
+        ));
+        let (fresh, next) = resolve_requires_with_inputs(
+            source,
+            &info,
+            true,
+            None,
+            None,
+            &mut ImportInputCache::new(true),
+        )
+        .unwrap();
+        assert!(fresh.contains("@game/Second/Helper"));
+        assert_ne!(next.as_ref().unwrap()[rc], witness[rc]);
+    }
+
+    #[test]
+    fn import_witness_never_turns_read_errors_into_absence() {
+        let vfs = Vfs::new(memofs::NoopBackend::new());
+        let mut inputs = ImportInputCache::new(true);
+        for _ in 0..2 {
+            assert!(inputs.find(&vfs, Path::new("/project/Source")).is_err());
+            assert!(inputs.files.is_empty());
+            assert!(inputs.directories.is_empty());
+        }
+    }
+
+    #[test]
     fn unchanged_require_syntax_reuses_extraction_without_reusing_resolution() {
         let source = "-- Syntax reuse regression.\nreturn require('@shared/Value')";
         let first = parse_require_calls(source).unwrap();
@@ -1124,6 +1297,101 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn context_index_is_reused_and_tracks_replaced_mappings() {
+        let root = Path::new("/root");
+        let query = Path::new("/root/Source/Shared/Thing");
+        let mut context = crate::snapshot::RequireContext::new(
+            root.into(),
+            vec![("Source/Shared".into(), vec!["Shared".into()])],
+            true,
+        );
+        let first = PathMappingIndex::for_context(&context);
+        let second = PathMappingIndex::for_context(&context);
+        assert!(Arc::ptr_eq(&first.prefixes, &second.prefixes));
+        assert_eq!(first.resolve(query, root), ["Shared", "Thing"]);
+        drop((first, second));
+
+        // Replacing or resizing the list must rebuild rather than reuse stale ordinals.
+        context.replace_path_mappings(vec![
+            ("Source/Shared/Thing".into(), vec!["Moved".into()]),
+            ("Source/Shared".into(), vec!["Shared".into()]),
+        ]);
+        let replaced = PathMappingIndex::for_context(&context);
+        assert_eq!(replaced.resolve(query, root), ["Moved"]);
+        assert_eq!(
+            replaced.resolve(query, root),
+            to_datamodel_path(query, context.path_mappings(), root)
+        );
+        drop(replaced);
+        context.replace_path_mappings(context.path_mappings()[..1].to_vec());
+        assert_eq!(
+            PathMappingIndex::for_context(&context).resolve(query, root),
+            ["Moved"]
+        );
+        context.replace_path_mappings(Vec::new());
+        assert_eq!(
+            PathMappingIndex::for_context(&context).resolve(query, root),
+            ["Source", "Shared", "Thing"]
+        );
+
+        // A clone may be mutated independently, so it never inherits the index.
+        let clone = context.clone();
+        let cached = PathMappingIndex::for_context(&context).prefixes;
+        assert!(!Arc::ptr_eq(
+            &cached,
+            &PathMappingIndex::for_context(&clone).prefixes
+        ));
+    }
+
+    #[test]
+    fn context_index_rebuilds_for_same_length_reorders_and_path_changes() {
+        let root = Path::new("/root");
+        let query = Path::new("/root/Source/Shared/Thing");
+        let mut mappings = vec![
+            ("Source/Shared/Thing".into(), vec!["Specific".into()]),
+            ("Source/Shared".into(), vec!["Shared".into()]),
+        ];
+        let mut context = crate::snapshot::RequireContext::new(root.into(), mappings.clone(), true);
+        let original = PathMappingIndex::for_context(&context).prefixes;
+        assert_eq!(
+            PathMappingIndex::for_context(&context).resolve(query, root),
+            ["Specific"]
+        );
+
+        mappings.swap(0, 1);
+        context.replace_path_mappings(mappings.clone());
+        let reordered = PathMappingIndex::for_context(&context);
+        assert!(!Arc::ptr_eq(&original, &reordered.prefixes));
+        assert_eq!(reordered.resolve(query, root), ["Shared", "Thing"]);
+        assert_eq!(
+            reordered.resolve(query, root),
+            to_datamodel_path(query, context.path_mappings(), root)
+        );
+        let reordered_prefixes = reordered.prefixes.clone();
+        drop(reordered);
+
+        mappings[0].0 = "Source/Other".into();
+        context.replace_path_mappings(mappings);
+        let replaced = PathMappingIndex::for_context(&context);
+        assert!(!Arc::ptr_eq(&reordered_prefixes, &replaced.prefixes));
+        for query in [
+            query,
+            Path::new("/root/Source/Shared/Child"),
+            Path::new("/root/Source/Other/Child"),
+        ] {
+            assert_eq!(
+                replaced.resolve(query, root),
+                to_datamodel_path(query, context.path_mappings(), root)
+            );
+        }
+        assert_eq!(replaced.resolve(query, root), ["Specific"]);
+        assert_eq!(
+            replaced.resolve(Path::new("/root/Source/Other/Child"), root),
+            ["Shared", "Child"]
+        );
     }
 
     #[test]
@@ -2442,7 +2710,7 @@ return {}"#,
             false,
         )
         .unwrap();
-        replacements.sort_by(|a, b| b.start.cmp(&a.start));
+        replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.start));
         let mut result = source.to_string();
         for replacement in replacements {
             result.replace_range(replacement.start..replacement.end, &replacement.new_text);

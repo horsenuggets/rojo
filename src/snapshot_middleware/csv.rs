@@ -219,7 +219,7 @@ fn convert_localization_csv(contents: &[u8]) -> anyhow::Result<String> {
     for record in &records {
         let mut entry = LocalizationEntry::default();
 
-        for (header, value) in headers.iter().zip(record.into_iter()) {
+        for (header, value) in headers.iter().zip(record) {
             if header.is_empty() || value.is_empty() {
                 continue;
             }

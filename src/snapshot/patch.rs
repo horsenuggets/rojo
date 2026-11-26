@@ -1,12 +1,14 @@
 //! Defines the data structures used for describing instance patches.
 
+use std::{collections::HashMap, sync::Arc};
+
 use rbx_dom_weak::{
     types::{Ref, Variant},
     HashMapExt as _, Ustr, UstrMap,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{InstanceMetadata, InstanceSnapshot};
+use super::{InstanceMetadata, InstanceSnapshot, InstanceWithMeta, RojoTree};
 
 /// A set of different kinds of patches that can be applied to an WeakDom.
 ///
@@ -69,10 +71,51 @@ pub struct PatchUpdate {
 ///
 // TODO: Introduce machinery to detect conflicts, like keeping previous +
 // current values in all fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PublicationOrigin {
+    Filesystem,
+    Studio,
+}
+
+/// An owned instance at a Studio addition's capture boundary. This is domain data,
+/// not a wire instance; transport filtering still belongs to the web interface.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedAdditionInstance {
+    pub id: Ref,
+    pub parent: Ref,
+    pub name: String,
+    pub class_name: Ustr,
+    pub properties: UstrMap<Variant>,
+    pub children: Vec<Ref>,
+    pub metadata: InstanceMetadata,
+}
+
+impl CapturedAdditionInstance {
+    fn capture(instance: InstanceWithMeta<'_>) -> Self {
+        Self {
+            id: instance.id(),
+            parent: instance.parent(),
+            name: instance.name().to_owned(),
+            class_name: instance.class_name(),
+            properties: instance.properties().clone(),
+            children: instance.children().to_vec(),
+            metadata: instance.metadata().clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppliedPatchSet {
+    /// Assigned by the publication queue, never inferred from a client's proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<PublicationOrigin>,
     pub removed: Vec<Ref>,
     pub added: Vec<Ref>,
+    /// Studio additions cannot borrow a later tree revision. Queue history and
+    /// subscriber replays share this immutable evidence without cloning subtrees.
+    #[serde(skip)]
+    pub(crate) captured_additions: Option<Arc<HashMap<Ref, CapturedAdditionInstance>>>,
     pub updated: Vec<AppliedPatchUpdate>,
     /// Server-only publication provenance. Never supplied by a proposed patch.
     #[serde(
@@ -86,8 +129,10 @@ pub struct AppliedPatchSet {
 impl AppliedPatchSet {
     pub fn new() -> Self {
         AppliedPatchSet {
+            origin: None,
             removed: Vec::new(),
             added: Vec::new(),
+            captured_additions: None,
             updated: Vec::new(),
             source_operations: Default::default(),
         }
@@ -97,11 +142,40 @@ impl AppliedPatchSet {
         self.removed.is_empty() && self.added.is_empty() && self.updated.is_empty()
     }
 
+    /// Freeze only Studio-origin additions, immediately after the mutation that
+    /// produced them. Filesystem publications intentionally keep lazy serialization.
+    pub(crate) fn capture_additions(&mut self, tree: &RojoTree) {
+        if self.added.is_empty() || self.captured_additions.is_some() {
+            return;
+        }
+        let mut captured = HashMap::new();
+        let mut pending = self.added.clone();
+        while let Some(id) = pending.pop() {
+            // Applied patches can list both roots and descendants. Capture each
+            // instance once, rather than copying every overlapping subtree.
+            if captured.contains_key(&id) {
+                continue;
+            }
+            let Some(instance) = tree.get_instance(id) else {
+                continue;
+            };
+            pending.extend_from_slice(instance.children());
+            captured.insert(id, CapturedAdditionInstance::capture(instance));
+        }
+        self.captured_additions = Some(Arc::new(captured));
+    }
+
+    /// Coalesce filesystem reconciliation before capturing any Studio publication.
+    /// Frozen messages describe ordered capture boundaries and must stay separate.
     pub(crate) fn combine(patches: impl IntoIterator<Item = Self>) -> Self {
         use std::collections::{HashMap, HashSet};
         let mut combined = Self::new();
         let mut updates = HashMap::new();
         for patch in patches {
+            assert!(
+                patch.captured_additions.is_none(),
+                "Combine patches before capturing Studio additions"
+            );
             combined.removed.extend(patch.removed);
             combined.added.extend(patch.added);
             for update in patch.updated {
@@ -179,6 +253,57 @@ impl AppliedPatchUpdate {
 mod test {
     use super::*;
     use rbx_dom_weak::ustr;
+
+    #[test]
+    fn addition_capture_is_immutable_shared_and_never_serialized_or_deserialized() {
+        let mut tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Original")
+                .property("Source", "return 1")
+                .children(vec![InstanceSnapshot::new().name("Child")]),
+        );
+        let root = tree.get_root_id();
+        let mut patch = AppliedPatchSet {
+            added: vec![root, tree.root().children()[0], root],
+            ..AppliedPatchSet::new()
+        };
+        patch.capture_additions(&tree);
+        let cloned = patch.clone();
+        assert!(Arc::ptr_eq(
+            patch.captured_additions.as_ref().unwrap(),
+            cloned.captured_additions.as_ref().unwrap()
+        ));
+        tree.get_instance_mut(root).unwrap().inner_mut().name = "Later".into();
+        patch.capture_additions(&tree);
+        let captured = patch.captured_additions.as_ref().unwrap();
+        assert_eq!(captured[&root].name, "Original");
+        assert_eq!(captured.len(), 2);
+        assert!(Arc::ptr_eq(
+            patch.captured_additions.as_ref().unwrap(),
+            cloned.captured_additions.as_ref().unwrap()
+        ));
+
+        let mut json = serde_json::to_value(&patch).unwrap();
+        assert!(json.get("captured_additions").is_none());
+        json["captured_additions"] = serde_json::json!({root.to_string(): "untrusted"});
+        let decoded: AppliedPatchSet = serde_json::from_value(json).unwrap();
+        assert!(decoded.captured_additions.is_none());
+        let bytes = rmp_serde::to_vec_named(&patch).unwrap();
+        let decoded: AppliedPatchSet = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(decoded.captured_additions.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "Combine patches before capturing Studio additions")]
+    fn combining_captured_publications_cannot_discard_their_capture_boundary() {
+        let tree = RojoTree::new(InstanceSnapshot::new());
+        let mut patch = AppliedPatchSet {
+            added: vec![tree.get_root_id()],
+            ..AppliedPatchSet::new()
+        };
+        patch.capture_additions(&tree);
+        AppliedPatchSet::combine([patch]);
+    }
 
     #[test]
     fn combined_patches_replace_stale_sources_in_one_structural_edit() {
