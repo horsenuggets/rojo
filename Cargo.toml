@@ -139,6 +139,7 @@ maplit = "1.0.2"
 semver = "1.0.22"
 
 [dev-dependencies]
+memofs = { version = "0.4.0", path = "crates/memofs", features = ["test-support"] }
 rojo-insta-ext = { path = "crates/rojo-insta-ext" }
 
 criterion = "0.3.6"

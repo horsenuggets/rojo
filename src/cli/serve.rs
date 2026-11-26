@@ -14,7 +14,10 @@ use futures::{
 use memofs::Vfs;
 use termcolor::{Buffer, BufferWriter, ColorChoice, WriteColor};
 
-use crate::{serve_session::ServeSession, web::LiveServer};
+use crate::{
+    serve_session::{ServeSession, SyncDirection},
+    web::LiveServer,
+};
 
 use super::{
     display,
@@ -50,6 +53,10 @@ pub struct ServeCommand {
     #[clap(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
 
+    /// Fix the live-sync direction for this session. Omit to let the client choose.
+    #[clap(long, value_enum)]
+    pub sync_direction: Option<SyncDirection>,
+
     /// Stop the server when standard input closes or encounters a read error.
     #[clap(long)]
     pub shutdown_on_stdin_eof: bool,
@@ -77,7 +84,11 @@ impl ServeCommand {
 
         let vfs = Vfs::new_default()?;
 
-        let session = Arc::new(ServeSession::new(vfs, project_path)?);
+        let session = Arc::new(ServeSession::new_with_sync_direction(
+            vfs,
+            project_path,
+            self.sync_direction,
+        )?);
 
         let (ip, port) = resolve_bind_address(&session, self.address, self.port)?;
 
@@ -131,9 +142,12 @@ impl ServeCommand {
                 if let (Some(place), Some(path)) = (live_edit_place, path) {
                     let marker = live_edit_place::connection_address(address);
                     *writer.lock().unwrap() = Some(thread::spawn(move || {
+                        let policy = session
+                            .sync_direction()
+                            .map(|direction| (session.session_id(), direction));
                         let mut tree = session.tree();
                         if let Err(error) =
-                            live_edit_place::write(&mut tree, &path, place.kind(), &marker)
+                            live_edit_place::write(&mut tree, &path, place.kind(), &marker, policy)
                         {
                             report(error);
                         }
@@ -279,20 +293,6 @@ fn write_start_message(buffer: &mut Buffer, bind_address: IpAddr, port: u16) -> 
 mod tests {
     use super::*;
 
-    #[test]
-    fn stdin_shutdown_is_opt_in() {
-        assert!(
-            !ServeCommand::try_parse_from(["serve"])
-                .unwrap()
-                .shutdown_on_stdin_eof
-        );
-        assert!(
-            ServeCommand::try_parse_from(["serve", "--shutdown-on-stdin-eof"])
-                .unwrap()
-                .shutdown_on_stdin_eof
-        );
-    }
-
     fn start_message(bind_address: IpAddr, port: u16, buffer: Buffer) -> String {
         let mut buffer = buffer;
         write_start_message(&mut buffer, bind_address, port).unwrap();
@@ -326,6 +326,62 @@ mod tests {
         assert!(lines[2].starts_with("This server is bound to 0.0.0.0, which is reachable"));
         assert!(lines[2].ends_with("when you need remote access."));
         assert!(!text.contains("WARNING"));
+    }
+
+    #[test]
+    fn sync_direction_is_optional_and_accepts_only_exact_policy_names() {
+        assert_eq!(
+            ServeCommand::try_parse_from(["serve"])
+                .unwrap()
+                .sync_direction,
+            None
+        );
+        for (value, expected) in [
+            ("fs-to-studio", SyncDirection::FsToStudio),
+            ("studio-to-fs", SyncDirection::StudioToFs),
+            ("bidirectional", SyncDirection::Bidirectional),
+        ] {
+            assert_eq!(
+                ServeCommand::try_parse_from(["serve", "--sync-direction", value])
+                    .unwrap()
+                    .sync_direction,
+                Some(expected)
+            );
+        }
+        for value in [
+            "",
+            "filesystem",
+            "Filesystem",
+            "FsToStudio",
+            "FS-TO-STUDIO",
+            "two-way",
+            "none",
+        ] {
+            assert!(ServeCommand::try_parse_from(["serve", "--sync-direction", value]).is_err());
+        }
+        assert!(ServeCommand::try_parse_from(["serve", "--sync-direction"]).is_err());
+        assert!(ServeCommand::try_parse_from([
+            "serve",
+            "--sync-direction",
+            "fs-to-studio",
+            "--sync-direction",
+            "bidirectional"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn stdin_shutdown_is_opt_in() {
+        assert!(
+            !ServeCommand::try_parse_from(["serve"])
+                .unwrap()
+                .shutdown_on_stdin_eof
+        );
+        assert!(
+            ServeCommand::try_parse_from(["serve", "--shutdown-on-stdin-eof"])
+                .unwrap()
+                .shutdown_on_stdin_eof
+        );
     }
 
     #[test]

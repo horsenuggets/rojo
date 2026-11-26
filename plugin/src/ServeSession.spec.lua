@@ -31,6 +31,206 @@ return function()
 		return setmetatable(fields, class)
 	end
 
+	local function startupSession()
+		local control = { info = {}, sync = {}, connected = 0, sockets = 0, appliedIds = 0 }
+		local function pending(list)
+			return Promise.new(function(resolve, reject)
+				table.insert(list, { resolve = resolve, reject = reject })
+			end)
+		end
+		local session = sessionState({
+			__twoWaySync = true,
+			__status = ServeSession.Status.NotStarted,
+			__connections = {},
+			__instanceMap = { stop = function() end },
+			__changeBatcher = { stop = function() end },
+			__apiContext = {
+				connect = function()
+					return pending(control.info)
+				end,
+				disconnect = function() end,
+				connectWebSocket = function()
+					control.sockets += 1
+					return Promise.resolve()
+				end,
+			},
+			__initialSync = function()
+				return pending(control.sync)
+			end,
+			__applyGameAndPlaceId = function()
+				control.appliedIds += 1
+			end,
+			__updateLoadingText = function() end,
+			__statusChangedCallback = function(status)
+				if status == ServeSession.Status.Connected then
+					control.connected += 1
+				end
+			end,
+		}, ServeSession)
+		control.answerInfo = function(index)
+			control.info[index].resolve({ projectName = "StartupTest", rootInstanceId = "ROOT" })
+		end
+		return session, control
+	end
+
+	it("should preserve healthy startup through initial sync and the socket", function()
+		local session, control = startupSession()
+		session:start()
+		expect(session:getStatus()).to.equal(ServeSession.Status.Connecting)
+		control.answerInfo(1)
+		expect(#control.sync).to.equal(1)
+		expect(control.connected).to.equal(0)
+		control.sync[1].resolve()
+		expect(control.connected).to.equal(1)
+		expect(control.appliedIds).to.equal(1)
+		expect(control.sockets).to.equal(1)
+		session:stop()
+	end)
+
+	for _, phase in { "info", "sync" } do
+		it(`should ignore late startup {phase} success or failure after stopping`, function()
+			for _, failed in { false, true } do
+				local session, control = startupSession()
+				session:start()
+				if phase == "sync" then
+					control.answerInfo(1)
+				end
+				session:stop()
+				local boundary = if phase == "info" then control.info[1] else control.sync[1]
+				if failed then
+					boundary.reject("Late transport failure")
+				elseif phase == "info" then
+					control.answerInfo(1)
+				else
+					boundary.resolve()
+				end
+				expect(#control.sync).to.equal(if phase == "info" then 0 else 1)
+				expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+				expect(control.connected).to.equal(0)
+				expect(control.appliedIds).to.equal(0)
+				expect(control.sockets).to.equal(0)
+			end
+		end)
+
+		it(`should ignore superseded startup {phase} success or failure`, function()
+			for _, failed in { false, true } do
+				local session, control = startupSession()
+				session:start()
+				if phase == "sync" then
+					control.answerInfo(1)
+				end
+				session:start()
+				local boundary = if phase == "info" then control.info[1] else control.sync[1]
+				if failed then
+					boundary.reject("Superseded transport failure")
+				elseif phase == "info" then
+					control.answerInfo(1)
+				else
+					boundary.resolve()
+				end
+				expect(session:getStatus()).to.equal(ServeSession.Status.Connecting)
+				expect(#control.sync).to.equal(if phase == "info" then 0 else 1)
+				expect(control.connected).to.equal(0)
+				control.answerInfo(2)
+				control.sync[#control.sync].resolve()
+				expect(control.connected).to.equal(1)
+				expect(control.sockets).to.equal(1)
+				session:stop()
+			end
+		end)
+	end
+
+	it("should stop startup before hydration when the initial read answers after disconnect", function()
+		local ApiContext = require(script.Parent.ApiContext)
+		local Http = require(script.Parent.Parent.Packages.Http)
+		local Config = require(script.Parent.Config)
+		local originalGet = Http.get
+		local session, control = startupSession()
+		local api = ApiContext.new("http://localhost")
+		session.__apiContext = api
+		local answer, httpCancelled, hydrated = nil, false, false
+		local success, problem = pcall(function()
+			Http.get = function(url)
+				if url:find("/api/rojo", 1, true) then
+					return Promise.resolve({
+						code = 200,
+						body = Http.msgpackEncode({
+							sessionId = "session",
+							serverVersion = "7.7.1",
+							protocolVersion = Config.protocolVersion,
+							projectName = "StartupTest",
+							rootInstanceId = "ROOT",
+						}),
+					})
+				end
+				return Promise.new(function(resolve, _, onCancel)
+					answer = resolve
+					onCancel(function()
+						httpCancelled = true
+					end)
+				end)
+			end
+			session.__initialSync = ServeSession.__initialSync
+			session.__syncStep = function()
+				return function() end
+			end
+			session.__reconciler = {
+				hydrate = function()
+					hydrated = true
+				end,
+			}
+			api.connectWebSocket = function()
+				control.sockets += 1
+				return Promise.resolve()
+			end
+			session:start()
+			session:stop()
+			answer({
+				code = 200,
+				body = Http.msgpackEncode({ sessionId = "session", messageCursor = 4, instances = {} }),
+			})
+			expect(httpCancelled).to.equal(true)
+			expect(hydrated).to.equal(false)
+			expect(control.connected).to.equal(0)
+			expect(control.sockets).to.equal(0)
+			expect(api.__sessionId).to.equal("session")
+		end)
+		session:stop()
+		Http.get = originalGet
+		assert(success, problem)
+	end)
+
+	it("should honor reentrant startup stops from loading and status callbacks", function()
+		for _, boundary in { "Connecting", "Loading initial data from server...", "Starting sync loop...", "Connected" } do
+			local session, control = startupSession()
+			session.__updateLoadingText = function(text)
+				if text == boundary then
+					session:stop()
+				end
+			end
+			session.__statusChangedCallback = function(status)
+				if status == boundary then
+					session:stop()
+				end
+			end
+			session:start()
+			if #control.info > 0 then
+				control.answerInfo(1)
+			end
+			if #control.sync > 0 then
+				control.sync[1].resolve()
+			end
+			expect(session:getStatus()).to.equal(ServeSession.Status.Disconnected)
+			expect(control.sockets).to.equal(0)
+			expect(control.appliedIds).to.equal(0)
+			if boundary == "Connecting" then
+				expect(#control.info).to.equal(0)
+			elseif boundary == "Loading initial data from server..." then
+				expect(#control.sync).to.equal(0)
+			end
+		end
+	end)
+
 	local function writeResult(errors, conflicts)
 		return {
 			messageCursor = 0,
@@ -68,6 +268,9 @@ return function()
 			},
 		})
 		session.__changeBatcher.__renderSteppedConnection:Disconnect()
+		-- These schedules exercise write ordering, so deletions are sent as soon as
+		-- they are flushed. Detachment holding has its own tests below.
+		session.__changeBatcher.__detachGrace = 0
 		session.__instanceMap.onInstanceChanged = nil
 		session.__deferredChanges = nil
 		local instance = Instance.new(className)
@@ -1065,6 +1268,83 @@ return function()
 		assert(success, problem)
 	end)
 
+	it("should not batch a filesystem Source commit whose notification arrives after return", function()
+		local createSourceSetter = require(script.Parent.Reconciler.setSource)
+		local applyPatch = require(script.Parent.Reconciler.applyPatch)
+		for _, delayed in { false, true } do
+			local session, instance, control = sourceRecoverySession()
+			local map = session.__instanceMap
+			map:removeId("EDITED")
+			instance.Source = control.text
+			local changed
+			local ready = {}
+			map.sourceSetter = createSourceSetter({
+				ConnectChanged = function(_, callback)
+					changed = callback
+					return {
+						Disconnect = function()
+							changed = nil
+						end,
+					}
+				end,
+				GetEditorSource = function()
+					return control.text
+				end,
+				Spawn = function(callback)
+					table.insert(ready, callback)
+				end,
+				UpdateSourceAsync = function(_, propose)
+					local value = propose()
+					if value ~= nil then
+						control.text, instance.Source = value, value
+						if not delayed then
+							changed()
+						end
+					end
+				end,
+			})
+			map.__isGameRunning = function()
+				return false
+			end
+			map.onInstanceChanged = function(target, property, observation)
+				session:__onInstanceChanged(target, property, observation)
+			end
+			map:insert("EDITED", instance)
+			session.__reconciler.applyPatch = function(_, patch)
+				return applyPatch(map, patch)
+			end
+			local success, problem = pcall(function()
+				local applying = session:__applyPatchNow(sourcePublication("return 'filesystem'"), 1)
+				expect(#ready).to.equal(1)
+				table.remove(ready, 1)()
+				assert(applying:await())
+				if delayed then
+					changed()
+				end
+				control.cursor = 1
+				session:flushChanges()
+				expect(control.text).to.equal("return 'filesystem'")
+				expect(session.__changeBatcher:isEmpty()).to.equal(true)
+				expect(session.__localPropertyEdits.EDITED).to.equal(nil)
+				expect(session.__sourceDrafts.EDITED).to.equal(nil)
+				expect(#control.requests).to.equal(0)
+				expect(#session:getSyncResults()).to.equal(0)
+				expect(session.__sourceBaselines[instance].Cursor).to.equal(1)
+
+				control.text, instance.Source = "return 'typed'", "return 'typed'"
+				changed()
+				local writing = session:flushChanges()
+				expect(#control.requests).to.equal(1)
+				expect(control.requests[1].updated[1].changedProperties.Source.String).to.equal("return 'typed'")
+				control.settle[1](writeResult())
+				assert(writing:await())
+			end)
+			session:stop()
+			instance:Destroy()
+			assert(success, problem)
+		end
+	end)
+
 	it("should defer a candidate remote notification until its actual commit is confirmed", function()
 		local session, instance, control = sourceRecoverySession()
 		local _, generation = session.__instanceMap:getSourceRevision(instance)
@@ -1407,7 +1687,7 @@ return function()
 			local function publish(text, operation, cursor)
 				local applying = session:__applyPatch(sourcePublication(text, operation), cursor)
 				while #control.jobs > 0 do
-					table.remove(control.jobs, 1)()
+					assert(table.remove(control.jobs, 1))()
 				end
 				if applying ~= nil then
 					assert(applying:await(), `Source publication failed at seed {seed}.`)
@@ -3446,6 +3726,563 @@ return function()
 			assert(success, problem)
 		end
 	end)
+
+	it("should not capture held context or observe Source for filesystem-only notifications", function()
+		local cursorReads = 0
+		local session = ServeSession.new({
+			twoWaySync = false,
+			apiContext = {
+				getMessageCursor = function()
+					cursorReads += 1
+					return 1
+				end,
+				disconnect = function() end,
+			},
+		})
+		local instance = Instance.new("ModuleScript")
+		local success, problem = pcall(function()
+			session:__onInstanceChanged(instance, "Parent")
+			session:__onInstanceChanged(instance, "Source")
+			session:__onChildAdded(instance)
+			expect(session:flushChanges()).to.equal(nil)
+			expect(cursorReads).to.equal(0)
+			expect(next(session.__instanceMap.sourceConnections)).to.equal(nil)
+			expect(next(session.__changeBatcher.__detached)).to.equal(nil)
+			expect(session.__changeBatcher.__pendingContext).to.equal(nil)
+			expect(session.__pendingWriteCursor).to.equal(nil)
+		end)
+		session:stop()
+		instance:Destroy()
+		assert(success, problem)
+	end)
+
+	local function heldSession()
+		local session, instance, control = structuralSession("Parent")
+		local batcher = session.__changeBatcher
+		control.now, control.contexts = 0, {}
+		batcher.__detachGrace = 3
+		batcher.__clock = function()
+			return control.now
+		end
+		local write = session.__apiContext.write
+		session.__apiContext.write = function(api, patch, cursor, authority, operation, predecessor)
+			table.insert(control.contexts, { cursor = cursor, predecessor = predecessor })
+			return write(api, patch, cursor, authority, operation, predecessor)
+		end
+		control.detach = function(target)
+			target.Parent = nil
+			session:__queueChange(target, "Parent")
+		end
+		return session, instance, control
+	end
+
+	it(
+		"should merge held context with reattachment and later held properties without rebasing unrelated batches",
+		function()
+			local session, instance, control = heldSession()
+			local success, problem = pcall(function()
+				control.cursor = 2
+				control.detach(instance)
+				instance.Name = "HeldName"
+				session:__queueChange(instance, "Name")
+				expect(session:flushChanges()).to.equal(nil)
+				expect(session.__writeHead).to.equal(nil)
+				expect(next(session.__writeTickets)).to.equal(nil)
+				control.cursor = 5
+				instance.Name = "NewerHeldName"
+				session:__queueChange(instance, "Name")
+				-- A later property notification still belongs to the held instance.
+				expect(session:flushChanges()).to.equal(nil)
+				control.cursor = 8
+				control.edit("DESTINATION")
+				local reattached = session:flushChanges()
+				expect(control.contexts[1].cursor).to.equal(2)
+				expect(control.requests[1].updated[1].changedName).to.equal("NewerHeldName")
+				expect(control.requests[1].updated[1].changedParent).to.equal("DESTINATION")
+				control.answer(1, 8)
+				reattached:await()
+				expect(next(session.__changeBatcher.__detached)).to.equal(nil)
+				control.cursor = 9
+				instance.Name = "Independent"
+				session:__queueChange(instance, "Name")
+				local independent = session:flushChanges()
+				expect(control.contexts[2].cursor).to.equal(9)
+				control.answer(2, 9)
+				independent:await()
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end
+	)
+
+	it("should retain held context and a later Source edit until the script reattaches", function()
+		local session, instance, control = propertySession("ModuleScript")
+		local root = Instance.new("Folder")
+		local success, problem = pcall(function()
+			local map, batcher = session.__instanceMap, session.__changeBatcher
+			map.onChildAdded = nil
+			map:insert("ROOT", root)
+			instance.Parent = root
+			map.knownParents[instance], map.observedParents[instance] = root, root
+			local now, sentCursor = 0, nil
+			batcher.__detachGrace = 3
+			batcher.__clock = function()
+				return now
+			end
+			local write = session.__apiContext.write
+			session.__apiContext.write = function(api, patch, cursor)
+				sentCursor = cursor
+				return write(api, patch)
+			end
+			control.cursor = 1
+			instance.Parent = nil
+			session:__queueChange(instance, "Parent")
+			expect(session:flushChanges()).to.equal(nil)
+			control.cursor = 3
+			instance.Source = "return 'held edit'"
+			session:__queueChange(instance, "Source")
+			expect(session:flushChanges()).to.equal(nil)
+			expect(#control.requests).to.equal(0)
+			expect(session.__sourceDrafts.EDITED.Source).to.equal("return 'held edit'")
+			control.cursor, now = 5, 1
+			instance.Parent = root
+			session:__queueChange(instance, "Parent")
+			local reattached = session:flushChanges()
+			expect(sentCursor).to.equal(1)
+			expect(control.requests[1].updated[1].changedProperties.Source.String).to.equal("return 'held edit'")
+			local result = writeResult()
+			result.messageCursor = 5
+			control.settle[1](result)
+			reattached:await()
+			expect(session.__sourceDrafts.EDITED).to.equal(nil)
+		end)
+		session:stop()
+		instance:Destroy()
+		root:Destroy()
+		assert(success, problem)
+	end)
+
+	for _, mixed in { false, true } do
+		it(`should preserve held context dependencies through expiry with mixed changes {mixed}`, function()
+			local session, instance, control = heldSession()
+			local success, problem = pcall(function()
+				local peer = session.__instanceMap.fromIds.PROBE
+				peer.Name = "First"
+				session:__queueChange(peer, "Name")
+				local first = session:flushChanges()
+				control.cursor = 1
+				control.detach(instance)
+				expect(session:flushChanges()).to.equal(nil)
+				expect(#control.requests).to.equal(1)
+				local result = writeResult()
+				result.messageCursor, result.acknowledgement = 1, "first-proof"
+				control.settle[1](result)
+				first:await()
+				-- An independent later write is not a predecessor of the held deletion.
+				peer.Name = "Second"
+				session:__queueChange(peer, "Name")
+				local second = session:flushChanges()
+				result = writeResult()
+				result.messageCursor, result.acknowledgement = 2, "second-proof"
+				control.settle[2](result)
+				second:await()
+				control.cursor = 4
+				if mixed then
+					peer.Name = "Mixed"
+					session:__queueChange(peer, "Name")
+				end
+				control.now = 3
+				local deletion = session:flushChanges()
+				expect(control.contexts[3].cursor).to.equal(1)
+				expect(control.contexts[3].predecessor).to.equal("first-proof")
+				expect(control.requests[3].removed[1]).to.equal("EDITED")
+				expect(#control.requests[3].updated).to.equal(if mixed then 1 else 0)
+				control.answer(3, 4)
+				deletion:await()
+			end)
+			control.cleanup()
+			assert(success, problem)
+		end)
+	end
+
+	it("should intersect held context with an unrelated intent that predates every write ticket", function()
+		local session, instance, control = heldSession()
+		local success, problem = pcall(function()
+			control.detach(instance)
+			expect(session:flushChanges()).to.equal(nil)
+			local peer = session.__instanceMap.fromIds.PROBE
+			peer.Name = "Independent"
+			session:__queueChange(peer, "Name")
+			local first = session:flushChanges()
+			local result = writeResult()
+			result.acknowledgement = "unrelated-proof"
+			control.settle[1](result)
+			first:await()
+			control.cursor, control.now = 5, 3
+			peer.Name = "Mixed"
+			session:__queueChange(peer, "Name")
+			local deletion = session:flushChanges()
+			expect(control.contexts[2].cursor).to.equal(0)
+			expect(control.contexts[2].predecessor).to.equal(nil)
+			control.answer(2, 5)
+			deletion:await()
+		end)
+		control.cleanup()
+		assert(success, problem)
+	end)
+
+	it(
+		"should retain separate held contexts for staggered detachments and discard removed or replaced targets",
+		function()
+			for _, retire in { "none", "removed", "replaced" } do
+				local session, instance, control = heldSession()
+				local success, problem = pcall(function()
+					local map = session.__instanceMap
+					local peer = map.fromIds.DISK
+					control.cursor = 1
+					control.detach(instance)
+					session:flushChanges()
+					control.cursor, control.now = 2, 1
+					control.detach(peer)
+					session:flushChanges()
+					if retire ~= "none" then
+						map:removeId("EDITED")
+						if retire == "replaced" then
+							map:insert("EDITED", Instance.new("Folder"))
+						end
+					end
+					control.cursor, control.now = 10, 3
+					local first = session:flushChanges()
+					if retire == "none" then
+						expect(control.contexts[1].cursor).to.equal(1)
+						expect(control.requests[1].removed[1]).to.equal("EDITED")
+						control.answer(1, 10)
+						first:await()
+					else
+						expect(first).to.equal(nil)
+					end
+					control.now = 4
+					local second = session:flushChanges()
+					local index = if retire == "none" then 2 else 1
+					expect(control.contexts[index].cursor).to.equal(2)
+					expect(control.requests[index].removed[1]).to.equal("DISK")
+					control.answer(index, 10)
+					second:await()
+					expect(next(session.__changeBatcher.__detached)).to.equal(nil)
+				end)
+				local replacement = session.__instanceMap.fromIds.EDITED
+				control.cleanup()
+				if replacement ~= nil and replacement ~= instance then
+					replacement:Destroy()
+				end
+				assert(success, problem)
+			end
+		end
+	)
+
+	for _, release in { "expiry", "callback", "reattach" } do
+		it(
+			`should accept a newly held deletion after an observed disk edit at the {release} release boundary`,
+			function()
+				local session, instance, control = heldSession()
+				local second = session.__instanceMap.fromIds.DISK
+				local success, problem = pcall(function()
+					local map, batcher = session.__instanceMap, session.__changeBatcher
+					session.__twoWaySyncAuthority = "Filesystem"
+					if release == "callback" then
+						batcher.__onDetachmentExpired = function(target, properties)
+							for name in properties do
+								batcher:add(target, name)
+							end
+						end
+					end
+					control.cursor = 1
+					control.detach(instance)
+					expect(session:flushChanges()).to.equal(nil)
+					local applied = Promise.resolve(session:__applyPatch({
+						added = {},
+						removed = {},
+						updated = { { id = "DISK", changedName = "ObservedDiskEdit", changedProperties = {} } },
+					}, 5)):await()
+					expect(applied).to.equal(true)
+					control.cursor = 5
+					expect(second.Name).to.equal("ObservedDiskEdit")
+					expect(map.fromIds.DISK).to.equal(second)
+					control.cursor, control.now = 10, 3
+					expect(batcher.__detached[second]).to.equal(nil)
+					control.detach(second)
+					if release == "reattach" then
+						instance.Parent = map.fromIds.PROBE
+					end
+					local first = session:flushChanges()
+					expect(#control.requests).to.equal(1)
+					expect(control.contexts[1].cursor).to.equal(1)
+					control.answer(1, 10)
+					expect(first:await()).to.equal(true)
+					local diskExists = true
+					-- Model the Filesystem conflict contract only at the API boundary. The
+					-- observed edit predates this deletion, so the server must accept it.
+					session.__apiContext.write = function(_, patch, cursor, authority)
+						table.insert(control.requests, patch)
+						table.insert(control.contexts, { cursor = cursor })
+						expect(patch.removed[1]).to.equal("DISK")
+						expect(authority).to.equal("Filesystem")
+						local result = writeResult()
+						result.messageCursor = 15
+						if cursor < 5 then
+							result.conflicts.removed_instances = { "DISK" }
+						else
+							diskExists = false
+							result.accepted.removed_instances = { "DISK" }
+						end
+						return Promise.resolve(result)
+					end
+					control.cursor, control.now = 15, 6
+					expect(session:flushChanges():await()).to.equal(true)
+					expect(session:getSyncResults()[2].status).to.equal("Saved")
+					expect(diskExists).to.equal(false)
+					expect(control.contexts[2].cursor).to.equal(10)
+					expect(map.fromIds.DISK).to.equal(nil)
+					expect(next(batcher.__detached)).to.equal(nil)
+				end)
+				control.cleanup()
+				second:Destroy()
+				assert(success, problem)
+			end
+		)
+
+		for _, invariant in { "released lineage", "new held lineage" } do
+			it(`should preserve {invariant} when all fresh intent is held at the {release} release boundary`, function()
+				local session, instance, control = heldSession()
+				local second = session.__instanceMap.fromIds.DISK
+				local success, problem = pcall(function()
+					local map, batcher = session.__instanceMap, session.__changeBatcher
+					if release == "callback" then
+						batcher.__onDetachmentExpired = function(target, properties)
+							for name in properties do
+								batcher:add(target, name)
+							end
+						end
+					end
+					-- Use real ticket resolution with disjoint valid histories. Neither
+					-- intent can borrow the other's proof merely by sharing a flush.
+					local firstProof = session:__newWriteTicket({ false })
+					session:__resolveWriteTicket(firstProof, "held-proof")
+					session:__completeWriteTicket(firstProof)
+					control.cursor = 1
+					control.detach(instance)
+					expect(session:flushChanges()).to.equal(nil)
+					expect(session.__writeHead).to.equal(firstProof)
+					local freshProof = session:__newWriteTicket({ false })
+					session:__resolveWriteTicket(freshProof, "fresh-proof")
+					session:__completeWriteTicket(freshProof)
+					control.cursor, control.now = 10, 3
+					expect(batcher.__detached[second]).to.equal(nil)
+					control.detach(second)
+					if release == "reattach" then
+						-- No fresh Parent notification is queued for the first instance.
+						-- Only its original held Parent is emitted by the release.
+						instance.Parent = map.fromIds.PROBE
+					end
+					local first = session:flushChanges()
+					expect(#control.requests).to.equal(1)
+					expect(#control.requests[1].removed).to.equal(if release == "reattach" then 0 else 1)
+					expect(#control.requests[1].updated).to.equal(if release == "reattach" then 1 else 0)
+					if invariant == "released lineage" then
+						expect(control.contexts[1].predecessor).to.equal("held-proof")
+					end
+					control.answer(1, 10)
+					expect(first:await()).to.equal(true)
+					control.cursor, control.now = 15, 6
+					local deletion = session:flushChanges()
+					expect(control.requests[2].removed[1]).to.equal("DISK")
+					if invariant == "new held lineage" then
+						expect(control.contexts[2].predecessor).to.equal("fresh-proof")
+					end
+					control.answer(2, 15)
+					expect(deletion:await()).to.equal(true)
+					expect(next(batcher.__detached)).to.equal(nil)
+					expect(next(session.__writeTickets)).to.equal(nil)
+				end)
+				control.cleanup()
+				second:Destroy()
+				assert(success, problem)
+			end)
+		end
+	end
+
+	it("should retain held context across suspension and release it on permanent disconnect", function()
+		for _, resume in { false, true } do
+			local session, instance, control = heldSession()
+			local success, problem = pcall(function()
+				control.cursor = 2
+				control.detach(instance)
+				session:flushChanges()
+				session.__resumeKey = "retained-session"
+				session:stop()
+				control.cursor, control.now = 8, 10
+				expect(session:flushChanges()).to.equal(nil)
+				expect(session.__changeBatcher.__detached[instance] ~= nil).to.equal(true)
+				if resume then
+					session:resume(session.__apiContext, nil)
+					session.__status = ServeSession.Status.Connected
+					session.__suspended, session.__changeBatcher.__suspended = nil, nil
+					local deletion = session:flushChanges()
+					expect(control.contexts[1].cursor).to.equal(2)
+					control.answer(1, 8)
+					deletion:await()
+				end
+				session:destroy()
+				expect(next(session.__changeBatcher.__detached)).to.equal(nil)
+				expect(session.__changeBatcher.__pendingContext).to.equal(nil)
+			end)
+			session:destroy()
+			control.cleanup()
+			assert(success, problem)
+		end
+	end)
+
+	-- A detachment that ends before the grace period is a move through the real
+	-- session path: one Parent write, the instance stays tracked, and no deletion.
+	it("should send a held detachment that is reattached as a single move", function()
+		for _, sameParent in { false, true } do
+			local session, instance, control = structuralSession("Parent")
+			local success, problem = pcall(function()
+				local batcher = session.__changeBatcher
+				local now = 0
+				batcher.__detachGrace = 3
+				batcher.__clock = function()
+					return now
+				end
+				instance.Parent = nil
+				session:__queueChange(instance, "Parent")
+				expect(session:flushChanges()).to.equal(nil)
+				expect(#control.requests).to.equal(0)
+				now = 1
+				control.edit(if sameParent then "PROBE" else "DESTINATION")
+				local write = session:flushChanges()
+				-- Returning to the original parent still sends the Parent, which the
+				-- server treats as already satisfied.
+				expect(#control.requests).to.equal(1)
+				local request = control.requests[1]
+				expect(#request.removed).to.equal(0)
+				expect(request.updated[1].changedParent).to.equal(if sameParent then "PROBE" else "DESTINATION")
+				control.answer(1, 1)
+				write:await()
+				expect(session.__instanceMap.fromIds.EDITED).to.equal(instance)
+				expect(next(batcher.__detached)).to.equal(nil)
+			end)
+			control.cleanup()
+			assert(success, `Same parent {sameParent} failed. {tostring(problem)}`)
+		end
+	end)
+
+	it("should send a held detachment as a deletion once the grace period ends", function()
+		local session, instance, control = structuralSession("Parent")
+		local success, problem = pcall(function()
+			local batcher = session.__changeBatcher
+			local now = 0
+			batcher.__detachGrace = 3
+			batcher.__clock = function()
+				return now
+			end
+			instance.Parent = nil
+			session:__queueChange(instance, "Parent")
+			expect(session:flushChanges()).to.equal(nil)
+			now = 2.9
+			expect(session:flushChanges()).to.equal(nil)
+			expect(#control.requests).to.equal(0)
+			now = 3
+			local write = session:flushChanges()
+			expect(#control.requests).to.equal(1)
+			expect(control.requests[1].removed[1]).to.equal("EDITED")
+			local result = writeResult()
+			result.accepted.removed_instances = { "EDITED" }
+			control.settle[1](result)
+			write:await()
+			expect(session.__instanceMap.fromIds.EDITED).to.equal(nil)
+		end)
+		control.cleanup()
+		assert(success, problem)
+	end)
+
+	for _, invariant in { "original cursor", "protected filesystem edit" } do
+		it(`should retain the held deletion's {invariant} across a processed Source publication`, function()
+			local session, instance, control = sourceRecoverySession()
+			local root = Instance.new("Folder")
+			local success, problem = pcall(function()
+				local map, batcher = session.__instanceMap, session.__changeBatcher
+				map.onChildAdded = nil
+				map:insert("ROOT", root)
+				instance.Parent = root
+				map.knownParents[instance], map.observedParents[instance] = root, root
+				session.__twoWaySyncAuthority = "Filesystem"
+				local now, messages = 0, nil
+				batcher.__detachGrace = 3
+				batcher.__clock = function()
+					return now
+				end
+				session.__apiContext.connect = function()
+					return Promise.resolve({ projectName = "HeldDeletionTest" })
+				end
+				session.__apiContext.connectWebSocket = function(_, handlers)
+					messages = handlers.messages
+					return Promise.resolve()
+				end
+				session.__apiContext.setMessageCursor = function(_, cursor)
+					control.cursor = cursor
+				end
+				session.__initialSync = function()
+					return Promise.resolve()
+				end
+				-- Model the server's Filesystem removal conflict at the transport boundary.
+				-- A cursor covering the disk edit would incorrectly authorize this deletion.
+				local diskSource = "return 'disk edit'"
+				local sentCursor, sentAuthority
+				session.__apiContext.write = function(_, patch, cursor, authority)
+					table.insert(control.requests, patch)
+					sentCursor, sentAuthority = cursor, authority
+					local result = writeResult()
+					result.messageCursor = 1
+					if authority == "Filesystem" and cursor < 1 then
+						result.conflicts.removed_instances = { "EDITED" }
+					else
+						diskSource = nil
+						result.accepted.removed_instances = { "EDITED" }
+					end
+					return Promise.resolve(result)
+				end
+				session:start()
+				expect(messages ~= nil).to.equal(true)
+				instance.Parent = nil
+				session:__queueChange(instance, "Parent")
+				expect(session:flushChanges()).to.equal(nil)
+				expect(#control.requests).to.equal(0)
+				messages({ messageCursor = 1, messages = { sourcePublication(diskSource) } })
+				local applied = session.__lastPublication:await()
+				expect(applied).to.equal(true)
+				expect(control.cursor).to.equal(1)
+				expect(control.text).to.equal(diskSource)
+				now = 3
+				local completed = session:flushChanges():await()
+				expect(completed).to.equal(true)
+				expect(#control.requests).to.equal(1)
+				expect(control.requests[1].removed[1]).to.equal("EDITED")
+				expect(sentAuthority).to.equal("Filesystem")
+				if invariant == "original cursor" then
+					expect(sentCursor).to.equal(0)
+				else
+					expect(diskSource).to.equal("return 'disk edit'")
+					expect(session:getSyncResults()[1].status).to.equal("Conflicted")
+					expect(map.fromIds.EDITED).to.equal(instance)
+				end
+			end)
+			session:stop()
+			instance:Destroy()
+			root:Destroy()
+			assert(success, problem)
+		end)
+	end
 
 	it("should transfer a nil Parent intent to deletion without replaying its buffered old parent", function()
 		local session, instance, control = structuralSession("Parent")

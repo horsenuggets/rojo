@@ -1,5 +1,13 @@
 {
   "name": "Rojo",
+  "globIgnorePaths": [
+    "plugin/Packages/msgpack-luau",
+    "plugin/Packages/Roact",
+    "plugin/Packages/Roact/src/Binding.lua",
+    "plugin/Packages/Roact/src/Component.lua",
+    "plugin/Packages/Roact/src/RobloxRenderer.lua",
+    "plugin/Packages/Roact/src/createReconciler.lua"
+  ],
   "tree": {
     "$className": "Folder",
     "Plugin": {
@@ -18,6 +26,24 @@
       },
       "RbxDom": {
         "$path": "plugin/rbx_dom_lua"
+      },
+      "msgpack": {
+        "$path": "plugin/msgpack.lua"
+      },
+      "Roact": {
+        "$path": "plugin/Packages/Roact/src",
+        "Binding": {
+          "$path": "plugin/roact-binding.lua"
+        },
+        "Component": {
+          "$path": "plugin/roact-component.lua"
+        },
+        "RobloxRenderer": {
+          "$path": "plugin/roact-renderer.lua"
+        },
+        "createReconciler": {
+          "$path": "plugin/roact-reconciler.lua"
+        }
       }
     },
     "Version": {

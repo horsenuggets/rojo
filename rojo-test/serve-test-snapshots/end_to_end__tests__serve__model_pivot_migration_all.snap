@@ -17,6 +17,7 @@ body:
           Properties:
             NeedsPivotMigration:
               Bool: false
+      origin: filesystem
       removed: []
       updated:
         - changedClassName: ~

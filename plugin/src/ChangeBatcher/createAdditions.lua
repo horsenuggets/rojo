@@ -126,9 +126,16 @@ return function(instanceMap, candidates, serialize, makeId)
 		-- made while serializing are queued like any other.
 		local copied, copy = pcall(function()
 			local clone = instance:Clone()
-			prune(instance, clone)
+			if clone ~= nil then
+				prune(instance, clone)
+			end
 			return clone
 		end)
+		-- Services Studio creates on demand, like TextBoxService, can't be cloned
+		-- and never belong on disk, so they are not additions at all.
+		if copied and copy == nil then
+			continue
+		end
 		if not copied then
 			Log.warn("Could not send {} to the file system. {}", instance:GetFullName(), copy)
 			continue

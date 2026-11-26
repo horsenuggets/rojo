@@ -171,13 +171,16 @@ end
 
 -- Given a list of ancestor ids in descending order, builds the nodes for them
 -- using the patch and instanceMap info
-function Tree:buildAncestryNodes(previousId: string?, ancestryIds: { string }, patch, instanceMap)
+function Tree:buildAncestryNodes(previousId: string?, ancestryIds: { string }, patch, instanceMap, isCurrent)
 	local clock = os.clock()
 	-- Build nodes for ancestry by going up the tree
 	previousId = previousId or "ROOT"
 
 	for _, ancestorId in ancestryIds do
 		clock = yieldIfNeeded(clock)
+		if isCurrent and not isCurrent() then
+			return
+		end
 
 		local value = instanceMap.fromIds[ancestorId] or patch.added[ancestorId]
 		if not value then
@@ -198,17 +201,34 @@ local PatchTree = {}
 
 -- Builds a new tree from a patch and instanceMap
 -- uses changeListHeaders in node.changeList
-function PatchTree.build(patch, instanceMap, changeListHeaders)
-	Timer.start("PatchTree.build")
+function PatchTree.build(patch, instanceMap, changeListHeaders, isCurrent)
+	if isCurrent and not isCurrent() then
+		return nil
+	end
+	Timer.start("PatchTree.build", "wall")
 	local clock = os.clock()
+
+	-- Every checkpoint below is inside one patch section and the enclosing build.
+	-- Retiring either scope must not leave a timer behind on the suspended coroutine.
+	local function cancelled()
+		if isCurrent and not isCurrent() then
+			Timer.stop()
+			Timer.stop()
+			return true
+		end
+		return false
+	end
 
 	local tree = Tree.new()
 
 	local knownAncestors = {}
 
-	Timer.start("patch.updated")
+	Timer.start("patch.updated", "wall")
 	for _, change in patch.updated do
 		clock = yieldIfNeeded(clock)
+		if cancelled() then
+			return nil
+		end
 
 		local instance = instanceMap.fromIds[change.id]
 		if not instance then
@@ -233,7 +253,10 @@ function PatchTree.build(patch, instanceMap, changeListHeaders)
 			parentId = instanceMap.fromInstances[parentObject]
 		end
 
-		tree:buildAncestryNodes(previousId, ancestryIds, patch, instanceMap)
+		tree:buildAncestryNodes(previousId, ancestryIds, patch, instanceMap, isCurrent)
+		if cancelled() then
+			return nil
+		end
 
 		-- Gather detail text
 		local changeList, changeInfo = nil, nil
@@ -287,9 +310,12 @@ function PatchTree.build(patch, instanceMap, changeListHeaders)
 	end
 	Timer.stop()
 
-	Timer.start("patch.removed")
+	Timer.start("patch.removed", "wall")
 	for _, idOrInstance in patch.removed do
 		clock = yieldIfNeeded(clock)
+		if cancelled() then
+			return nil
+		end
 
 		local instance = if Types.RbxId(idOrInstance) then instanceMap.fromIds[idOrInstance] else idOrInstance
 		if not instance then
@@ -311,6 +337,9 @@ function PatchTree.build(patch, instanceMap, changeListHeaders)
 				break
 			end
 
+			if cancelled() then
+				return nil
+			end
 			instanceMap:insert(parentId, parentObject) -- This ensures we can find the parent later
 			table.insert(ancestryIds, 1, parentId)
 			knownAncestors[parentId] = true
@@ -318,10 +347,16 @@ function PatchTree.build(patch, instanceMap, changeListHeaders)
 			parentId = instanceMap.fromInstances[parentObject] or HttpService:GenerateGUID(false)
 		end
 
-		tree:buildAncestryNodes(previousId, ancestryIds, patch, instanceMap)
+		tree:buildAncestryNodes(previousId, ancestryIds, patch, instanceMap, isCurrent)
+		if cancelled() then
+			return nil
+		end
 
 		-- Add this node to tree
 		local nodeId = instanceMap.fromInstances[instance] or HttpService:GenerateGUID(false)
+		if cancelled() then
+			return nil
+		end
 		instanceMap:insert(nodeId, instance)
 		tree:addNode(instanceMap.fromInstances[instance.Parent], {
 			id = nodeId,
@@ -333,9 +368,12 @@ function PatchTree.build(patch, instanceMap, changeListHeaders)
 	end
 	Timer.stop()
 
-	Timer.start("patch.added")
+	Timer.start("patch.added", "wall")
 	for id, change in patch.added do
 		clock = yieldIfNeeded(clock)
+		if cancelled() then
+			return nil
+		end
 
 		-- Gather ancestors from existing DOM or future additions
 		local ancestryIds = {}
@@ -367,7 +405,10 @@ function PatchTree.build(patch, instanceMap, changeListHeaders)
 			end
 		end
 
-		tree:buildAncestryNodes(previousId, ancestryIds, patch, instanceMap)
+		tree:buildAncestryNodes(previousId, ancestryIds, patch, instanceMap, isCurrent)
+		if cancelled() then
+			return nil
+		end
 
 		-- Gather detail text
 		local changeList, changeInfo = nil, nil

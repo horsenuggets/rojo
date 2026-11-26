@@ -135,6 +135,7 @@ body:
           Properties:
             Value:
               String: "File #5"
+      origin: filesystem
       removed: []
       updated: []
 packetType: messages

@@ -221,7 +221,9 @@ mod tests {
         ] {
             command.env_remove(key);
         }
-        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        // Git for Windows recognizes this spelling too. Uppercase NUL can fail
+        // access checks before Git initializes the fixture.
+        let null = "/dev/null";
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", null)
@@ -478,11 +480,6 @@ mod tests {
         let run = |operation: &str, contents: &[u8]| {
             let mut command = git_command()
                 .args(["lfs", operation, "Terrain.rbxm"])
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env(
-                    "GIT_CONFIG_GLOBAL",
-                    if cfg!(windows) { "NUL" } else { "/dev/null" },
-                )
                 .env_remove("GIT_LFS_SKIP_SMUDGE")
                 .current_dir(directory.path())
                 .stdin(Stdio::piped())
@@ -583,7 +580,10 @@ mod tests {
                 assert_eq!(values[offset + 2], value.as_bytes(), "{name:?}");
             }
         }
-        for triple in values[names.len() * 12..values.len() - 1].chunks_exact(3) {
+        for triple in values[names.len() * 12..values.len() - 1]
+            .as_chunks::<3>()
+            .0
+        {
             assert_eq!(triple[2], b"unspecified");
         }
     }

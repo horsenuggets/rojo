@@ -31,6 +31,72 @@ pub enum ScriptType {
     RunContextClient,
 }
 
+/// The class and `RunContext` value that a script file's name declares by itself.
+fn script_class(
+    script_type: &ScriptType,
+    emit_legacy_scripts: bool,
+) -> (&'static str, Option<u32>) {
+    let run_context = |name: &str| {
+        rbx_reflection_database::get()
+            .unwrap()
+            .enums
+            .get("RunContext")
+            .expect("Unable to get RunContext enums!")
+            .items
+            .get(name)
+            .copied()
+    };
+    match script_type {
+        ScriptType::Server if emit_legacy_scripts => ("Script", run_context("Legacy")),
+        ScriptType::Server | ScriptType::RunContextServer => ("Script", run_context("Server")),
+        ScriptType::Client if emit_legacy_scripts => ("LocalScript", None),
+        ScriptType::Client | ScriptType::RunContextClient => ("Script", run_context("Client")),
+        ScriptType::Module => ("ModuleScript", None),
+        ScriptType::Plugin => ("Script", run_context("Plugin")),
+        ScriptType::LegacyServer => ("Script", run_context("Legacy")),
+        ScriptType::LegacyClient => ("LocalScript", None),
+    }
+}
+
+/// The `RunContext` a script middleware's file name already implies. A sidecar
+/// repeating it would be redundant, such as `RunContext: Server` beside `.server.luau`.
+fn implied_run_context(middleware: super::Middleware, emit_legacy_scripts: bool) -> Option<u32> {
+    use super::Middleware;
+    // Mirrors the script types each middleware snapshots with.
+    let script_type = match middleware {
+        Middleware::ServerScript => ScriptType::Server,
+        Middleware::ClientScript => ScriptType::Client,
+        Middleware::PluginScript | Middleware::PluginScriptDir => ScriptType::Plugin,
+        Middleware::LegacyServerScript | Middleware::LegacyServerScriptDir => {
+            ScriptType::LegacyServer
+        }
+        Middleware::RunContextServerScript | Middleware::ServerScriptDir => {
+            ScriptType::RunContextServer
+        }
+        Middleware::RunContextClientScript | Middleware::ClientScriptDir => {
+            ScriptType::RunContextClient
+        }
+        _ => return None,
+    };
+    script_class(&script_type, emit_legacy_scripts).1
+}
+
+/// Whether the destination file name already declares the instance's `RunContext`,
+/// so its sidecar must not repeat it.
+fn run_context_is_implied(snapshot: &SyncbackSnapshot) -> bool {
+    // Suffix migrations leave the middleware unset and are dispatched by this choice.
+    let middleware = snapshot
+        .middleware
+        .unwrap_or_else(|| crate::syncback::get_best_middleware(snapshot));
+    let emit_legacy_scripts = snapshot
+        .old_inst()
+        .is_some_and(|old| old.metadata().context.emit_legacy_scripts);
+    implied_run_context(middleware, emit_legacy_scripts).is_some_and(|value| {
+        snapshot.new_inst().properties.get(&ustr("RunContext"))
+            == Some(&Variant::Enum(Enum::from_u32(value)))
+    })
+}
+
 /// Core routine for turning Lua files into snapshots.
 pub fn snapshot_lua(
     context: &InstanceContext,
@@ -54,45 +120,25 @@ fn snapshot_lua_source(
     name: &str,
     script_type: ScriptType,
 ) -> anyhow::Result<InstanceSnapshot> {
-    let run_context_enums = &rbx_reflection_database::get()
-        .unwrap()
-        .enums
-        .get("RunContext")
-        .expect("Unable to get RunContext enums!")
-        .items;
-
-    let (class_name, run_context) = match script_type {
-        ScriptType::Server => {
-            if context.emit_legacy_scripts {
-                ("Script", run_context_enums.get("Legacy"))
-            } else {
-                ("Script", run_context_enums.get("Server"))
-            }
-        }
-        ScriptType::Client => {
-            if context.emit_legacy_scripts {
-                ("LocalScript", None)
-            } else {
-                ("Script", run_context_enums.get("Client"))
-            }
-        }
-        ScriptType::Module => ("ModuleScript", None),
-        ScriptType::Plugin => ("Script", run_context_enums.get("Plugin")),
-        ScriptType::LegacyServer => ("Script", run_context_enums.get("Legacy")),
-        ScriptType::LegacyClient => ("LocalScript", None),
-        ScriptType::RunContextServer => ("Script", run_context_enums.get("Server")),
-        ScriptType::RunContextClient => ("Script", run_context_enums.get("Client")),
-    };
+    let (class_name, run_context) = script_class(&script_type, context.emit_legacy_scripts);
 
     let contents = vfs.read_to_string_lf_normalized(path)?;
 
     // Emit native anchored imports in DataModels and relative imports in models.
     // Keep the authored source separate so syncback can reverse this lowering.
+    let mut import_inputs = None;
+    let mut shared = context
+        .import_input_scope
+        .0
+        .as_ref()
+        .map(|cache| cache.lock().unwrap());
+    let mut local = luaurc::ImportInputCache::new(context.captures_import_inputs());
+    let inputs = shared.as_deref_mut().unwrap_or(&mut local);
     let source = if let Some(ref req_ctx) = context.require_context {
         let info = ResolveInfo {
             file_path: path,
             vfs,
-            path_mappings: &req_ctx.path_mappings,
+            path_mappings: req_ctx.path_mappings(),
             project_root: &req_ctx.project_root,
         };
 
@@ -100,25 +146,44 @@ fn snapshot_lua_source(
             .package_mount
             .as_ref()
             .and_then(|(_, installed)| installed.parent());
-        match luaurc::resolve_requires_with_package_dependencies(
+        match luaurc::resolve_requires_with_inputs(
             &contents,
             &info,
             req_ctx.datamodel,
             package_dependencies,
+            Some(&luaurc::PathMappingIndex::for_context(req_ctx)),
+            inputs,
         ) {
-            Ok(resolved) => resolved,
+            Ok((resolved, inputs)) => {
+                import_inputs = inputs;
+                resolved
+            }
             Err(err) if err.is::<luaurc::UnmappedDataModelImport>() => {
                 return Err(err)
                     .with_context(|| format!("Cannot resolve imports in {}", path.display()));
             }
             Err(err) => {
+                // Syntax errors belong to the payload, not the import context. A
+                // successful configuration read remains evidence even if lowering
+                // failed. Read/configuration errors never populate this witness.
+                import_inputs = inputs.witness_for(path);
                 log::warn!("Failed to resolve requires in {}: {}", path.display(), err);
                 contents.as_str().to_string()
             }
         }
     } else {
+        if context.captures_import_inputs() {
+            match inputs.capture_for(vfs, path) {
+                Ok(witness) => import_inputs = witness,
+                Err(error) => log::warn!(
+                    "Cannot capture import inputs in {}. {error:#}",
+                    path.display()
+                ),
+            }
+        }
         contents.as_str().to_string()
     };
+    drop(shared);
 
     let mut properties = UstrMap::with_capacity(2);
     properties.insert(ustr("Source"), source.as_str().into());
@@ -145,6 +210,7 @@ fn snapshot_lua_source(
                 .context(context),
         );
     snapshot.metadata.source_transform = transform;
+    snapshot.metadata.import_inputs = import_inputs;
     Ok(snapshot)
 }
 
@@ -195,8 +261,10 @@ pub fn snapshot_lua_init(
         })
         .collect();
     let source_transform = init_snapshot.metadata.source_transform.take();
+    let import_inputs = init_snapshot.metadata.import_inputs.take();
     init_snapshot.metadata = dir_snapshot.metadata;
     init_snapshot.metadata.source_transform = source_transform;
+    init_snapshot.metadata.import_inputs = import_inputs;
     track_init_file(&mut init_snapshot, init_path);
 
     DirectoryMetadata::read_and_apply_all(vfs, folder_path, &mut init_snapshot)?;
@@ -258,6 +326,9 @@ pub fn syncback_lua<'sync>(
         // Scripts have relatively few properties that we care about, so shifting
         // is fine.
         meta.properties.shift_remove(&ustr("Source"));
+        if run_context_is_implied(snapshot) {
+            meta.properties.shift_remove(&ustr("RunContext"));
+        }
 
         let meta_path = snapshot
             .path
@@ -345,6 +416,9 @@ pub fn syncback_lua_init<'sync>(
         // Scripts have relatively few properties that we care about, so shifting
         // is fine.
         meta.properties.shift_remove(&ustr("Source"));
+        if run_context_is_implied(snapshot) {
+            meta.properties.shift_remove(&ustr("RunContext"));
+        }
 
         let meta_path = snapshot.path.join("init.meta.json");
         if !meta.is_empty() || metadata_exists(snapshot.vfs(), &meta_path) {

@@ -3,6 +3,750 @@ return function()
 	local Http = require(script.Parent.Parent.Packages.Http)
 	local Promise = require(script.Parent.Parent.Packages.Promise)
 
+	local function startupResponses()
+		local Config = require(script.Parent.Config)
+		return {
+			info = {
+				sessionId = "session",
+				serverVersion = "7.7.1",
+				protocolVersion = Config.protocolVersion,
+				projectName = "Project",
+				rootInstanceId = "ROOT",
+			},
+			read = { sessionId = "session", messageCursor = 4, instances = {} },
+		}
+	end
+
+	-- Every timing boundary is controlled here, including an HTTP response arriving late.
+	local function withStartupHttp(run)
+		local originalGet, originalDelay = Http.get, Promise.delay
+		local control = { requests = {}, delays = {}, responses = startupResponses() }
+		local function pending(list, fields)
+			local promise = Promise.new(function(resolve, reject, onCancel)
+				fields.resolve, fields.reject = resolve, reject
+				onCancel(function()
+					fields.cancelled = true
+				end)
+			end)
+			fields.promise = promise
+			table.insert(list, fields)
+			return promise
+		end
+		Http.get = function(url)
+			return pending(control.requests, { url = url })
+		end
+		Promise.delay = function(seconds)
+			expect(seconds > 0 and seconds <= 1).to.equal(true)
+			return pending(control.delays, { seconds = seconds })
+		end
+		control.answer = function(index, phase, mutate)
+			local body = table.clone(control.responses[phase])
+			if mutate then
+				mutate(body)
+			end
+			control.requests[index].resolve({ code = 200, body = Http.msgpackEncode(body) })
+		end
+		local success, problem = pcall(run, control)
+		Http.get, Promise.delay = originalGet, originalDelay
+		assert(success, problem)
+	end
+
+	it("rejects malformed directional info with optional typechecking disabled", function()
+		local Settings = require(script.Parent.Settings)
+		local originalGet = Settings.get
+		Settings.get = function(_, key)
+			return if key == "typecheckingEnabled" then false else originalGet(Settings, key)
+		end
+		local success, problem = pcall(function()
+			withStartupHttp(function(control)
+				local context = ApiContext.new("http://localhost")
+				local connection = context:connect()
+				control.answer(1, "info", function(body)
+					body.syncDirection = "invalid"
+					body.protocolVersion = 13
+				end)
+				expect(connection:await()).to.equal(false)
+				expect(context.__sessionId).to.equal(nil)
+				expect(context:write({}, nil, "Studio"):await()).to.equal(false)
+			end)
+		end)
+		Settings.get = originalGet
+		assert(success, problem)
+	end)
+
+	it("blocks direct API writes and modifying recovery endpoints under filesystem-only policy", function()
+		withStartupHttp(function(control)
+			local context = ApiContext.new("http://localhost")
+			local connection = context:connect()
+			control.answer(1, "info", function(body)
+				body.syncDirection = "fs-to-studio"
+				body.protocolVersion = 13
+				body.supportedSyncDirections = { "fs-to-studio", "studio-to-fs", "bidirectional" }
+			end)
+			expect(connection:await()).to.equal(true)
+			local originalPost, originalDelete = Http.post, Http.delete
+			local sent = 0
+			Http.post = function()
+				sent += 1
+				return Promise.reject("Unexpected write.")
+			end
+			Http.delete = Http.post
+			local success, problem = pcall(function()
+				expect(context:write({}, nil, "Studio"):await()).to.equal(false)
+				expect(context:createSourceCheckpoint("SCRIPT", "draft", "disk", 0):await()).to.equal(false)
+				expect(context:discardSourceCheckpoint("checkpoint"):await()).to.equal(false)
+				expect(sent).to.equal(0)
+			end)
+			Http.post, Http.delete = originalPost, originalDelete
+			assert(success, problem)
+		end)
+	end)
+
+	it("closes invalid provenance packets instead of leaving a writable socket after validation fails", function()
+		local Settings = require(script.Parent.Settings)
+		local originalGet = Settings.get
+		Settings.get = function(_, key)
+			return if key == "typecheckingEnabled" then true else originalGet(Settings, key)
+		end
+		local success, problem = pcall(function()
+			local function signal()
+				local listeners = {}
+				return {
+					Connect = function(_, callback)
+						local connection = {}
+						listeners[connection] = callback
+						function connection:Disconnect()
+							listeners[self] = nil
+						end
+						return connection
+					end,
+					Fire = function(_, value)
+						for _, callback in table.clone(listeners) do
+							callback(value)
+						end
+					end,
+				}
+			end
+			local context = ApiContext.new("http://localhost")
+			context.__sessionId = "session"
+			local closed, handled = 0, false
+			local client = { MessageReceived = signal(), Closed = signal(), Error = signal() }
+			client.Close = function()
+				closed += 1
+				client.Closed:Fire()
+			end
+			context.__createWebStreamClient = function()
+				return client
+			end
+			local socket = context:connectWebSocket({
+				messages = function()
+					handled = true
+				end,
+			})
+			client.MessageReceived:Fire(Http.msgpackEncode({
+				sessionId = "session",
+				packetType = "messages",
+				body = {
+					messageCursor = 1,
+					messages = { { origin = "ambiguous", removed = {}, added = {}, updated = {} } },
+				},
+			}))
+			expect(socket:await()).to.equal(false)
+			expect(context.__connected).to.equal(false)
+			expect(handled).to.equal(false)
+			expect(closed).to.equal(1)
+		end)
+		Settings.get = originalGet
+		assert(success, problem)
+	end)
+
+	-- Replace only the clock and scheduler boundaries of the real yield budget.
+	local function withDecodeClock(run)
+		local yieldBudget = require(script.Parent.yieldBudget)
+		local environment = getfenv(yieldBudget)
+		local control = { threads = {}, time = 0 }
+		local clock = table.clone(os)
+		clock.clock = function()
+			control.time += 1
+			return control.time
+		end
+		local budgetEnvironment = setmetatable({}, { __index = environment })
+		budgetEnvironment.os = clock
+		budgetEnvironment.task = {
+			wait = function()
+				table.insert(control.threads, coroutine.running())
+				coroutine.yield()
+			end,
+		}
+		setfenv(yieldBudget, budgetEnvironment)
+		local success, problem = pcall(run, control)
+		setfenv(yieldBudget, environment)
+		assert(success, problem)
+	end
+
+	for _, retirement in { "disconnect", "supersede" } do
+		for _, boundary in { "before", "after" } do
+			it(`should abort a {retirement} read {boundary} yielding without parsing further or retrying`, function()
+				withStartupHttp(function(control)
+					withDecodeClock(function(clock)
+						local context = ApiContext.new("http://localhost")
+						context.__sessionId = "session"
+						local function retire()
+							if retirement == "disconnect" then
+								context:disconnect()
+							else
+								context:connect()
+								control.answer(2, "info", function(body)
+									body.sessionId = "new"
+								end)
+							end
+						end
+						local original = Http.Response.msgpack
+						local completed, decodeError, checkpoints = false, nil, 0
+						local success, problem = pcall(function()
+							Http.Response.msgpack = function(response, checkpoint)
+								if checkpoint == nil then
+									return original(response)
+								end
+								local ok, body = pcall(original, response, function()
+									checkpoints += 1
+									if boundary == "before" then
+										retire()
+									end
+									checkpoint()
+								end)
+								if not ok then
+									decodeError = body
+									error(body)
+								end
+								completed = true
+								return body
+							end
+							local delivered = false
+							local read = context:read({ "ROOT" }):andThen(function()
+								delivered = true
+							end)
+							-- A malformed token beyond the first checkpoint must never be reached.
+							control.requests[1].resolve({
+								code = 200,
+								body = "\xDD\x00\x00\x10\x01" .. string.rep("\x00", 4096) .. "\xC1",
+							})
+							expect(checkpoints).to.equal(1)
+							expect(completed).to.equal(false)
+							expect(delivered).to.equal(false)
+							expect(#clock.threads).to.equal(if boundary == "before" then 0 else 1)
+							if boundary == "after" then
+								retire()
+								expect(coroutine.resume(clock.threads[1])).to.equal(true)
+							end
+							expect(tostring(decodeError):find("The connection is closed.", 1, true)).to.be.ok()
+							expect(getmetatable(decodeError) == Http.Error).to.equal(false)
+							expect(checkpoints).to.equal(1)
+							expect(completed).to.equal(false)
+							expect(delivered).to.equal(false)
+							expect(read:getStatus() == Promise.Status.Resolved).to.equal(false)
+							expect(context.__sessionId).to.equal(if retirement == "supersede" then "new" else "session")
+							expect(#control.requests).to.equal(if retirement == "supersede" then 2 else 1)
+							expect(#control.delays).to.equal(0)
+						end)
+						Http.Response.msgpack = original
+						assert(success, problem)
+					end)
+				end)
+			end)
+		end
+	end
+
+	it("should stop a suspended decode when only its returned read is cancelled", function()
+		withStartupHttp(function(control)
+			withDecodeClock(function(clock)
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "session"
+				local delivered = false
+				local read = context:read({ "ROOT" })
+				read:andThen(function()
+					delivered = true
+				end)
+				control.requests[1].resolve({
+					code = 200,
+					body = "\xDD\x00\x00\x10\x01" .. string.rep("\x00", 4096) .. "\xC1",
+				})
+				expect(#clock.threads).to.equal(1)
+				local generation = context.__generation
+				read:cancel()
+				expect(read:getStatus()).to.equal(Promise.Status.Cancelled)
+				expect(coroutine.resume(clock.threads[1])).to.equal(true)
+				expect(#clock.threads).to.equal(1)
+				expect(delivered).to.equal(false)
+				expect(context.__connected).to.equal(true)
+				expect(context.__generation).to.equal(generation)
+				expect(context.__sessionId).to.equal("session")
+				expect(#control.requests).to.equal(1)
+				expect(#control.delays).to.equal(0)
+			end)
+		end)
+	end)
+
+	for _, cancelFirst in { false, true } do
+		for _, cancelSecond in { false, true } do
+			it(
+				`should retain decoder ownership for active consumers with cancellations {cancelFirst}/{cancelSecond}`,
+				function()
+					withStartupHttp(function(control)
+						withDecodeClock(function(clock)
+							local context = ApiContext.new("http://localhost")
+							context.__sessionId = "session"
+							local delivered = { false, false }
+							local read = context:read({ "ROOT" })
+							local consumers = {}
+							for index = 1, 2 do
+								consumers[index] = read:andThen(function(body)
+									delivered[index] = true
+									return body
+								end)
+							end
+							control.answer(1, "read", function(body)
+								body.padding = table.create(2500, 0)
+							end)
+							expect(#clock.threads).to.equal(1)
+							if cancelFirst then
+								consumers[1]:cancel()
+							end
+							if cancelSecond then
+								consumers[2]:cancel()
+							end
+							expect(coroutine.resume(clock.threads[1])).to.equal(true)
+							if cancelFirst and cancelSecond then
+								expect(read:getStatus()).to.equal(Promise.Status.Cancelled)
+								expect(#clock.threads).to.equal(1)
+							else
+								expect(#clock.threads).to.equal(2)
+								expect(coroutine.resume(clock.threads[2])).to.equal(true)
+								expect(read:getStatus()).to.equal(Promise.Status.Resolved)
+							end
+							expect(delivered[1]).to.equal(not cancelFirst)
+							expect(delivered[2]).to.equal(not cancelSecond)
+							expect(context.__connected).to.equal(true)
+							expect(#control.requests).to.equal(1)
+							expect(#control.delays).to.equal(0)
+						end)
+					end)
+				end
+			)
+		end
+	end
+
+	it("should resume a healthy read only after its decode checkpoints are released", function()
+		withStartupHttp(function(control)
+			withDecodeClock(function(clock)
+				local context = ApiContext.new("http://localhost")
+				context.__sessionId = "session"
+				local delivered = false
+				local read = context:read({ "ROOT" }):andThen(function(body)
+					delivered = true
+					return body
+				end)
+				control.answer(1, "read", function(body)
+					body.padding = table.create(2500, 0)
+				end)
+				expect(#clock.threads).to.equal(1)
+				expect(delivered).to.equal(false)
+				expect(coroutine.resume(clock.threads[1])).to.equal(true)
+				expect(#clock.threads).to.equal(2)
+				expect(delivered).to.equal(false)
+				expect(coroutine.resume(clock.threads[2])).to.equal(true)
+				local accepted, body = read:await()
+				expect(accepted).to.equal(true)
+				expect(delivered).to.equal(true)
+				expect(#body.padding).to.equal(2500)
+				expect(#control.requests).to.equal(1)
+				expect(#control.delays).to.equal(0)
+			end)
+		end)
+	end)
+
+	for _, phase in { "info", "read" } do
+		local function request(context)
+			if phase == "info" then
+				return context:connect()
+			end
+			context.__sessionId = "session"
+			return context:read({ "ROOT" })
+		end
+
+		it(`should retry startup {phase} timeout and connection failures then succeed`, function()
+			withStartupHttp(function(control)
+				for _, kind in { Http.Error.Kind.Timeout, Http.Error.Kind.ConnectFailed } do
+					local context = ApiContext.new("http://localhost")
+					local index, delayIndex = #control.requests + 1, #control.delays + 1
+					local result = request(context)
+					control.requests[index].reject(Http.Error.new(kind))
+					expect(#control.requests).to.equal(index)
+					expect(#control.delays).to.equal(delayIndex)
+					control.delays[delayIndex].resolve()
+					control.answer(index + 1, phase)
+					local accepted, body = result:await()
+					expect(accepted).to.equal(true)
+					expect(body.sessionId).to.equal("session")
+					expect(context.__sessionId).to.equal("session")
+					expect(context:getMessageCursor()).to.equal(-1)
+					expect(next(context.__activeRequests)).to.equal(nil)
+				end
+			end)
+		end)
+
+		it(`should bound startup {phase} exhaustion and retain typed phase diagnostics`, function()
+			withStartupHttp(function(control)
+				local context = ApiContext.new("http://localhost")
+				local result = request(context)
+				for attempt = 1, 3 do
+					control.requests[attempt].reject(Http.Error.new(Http.Error.Kind.Timeout))
+					if attempt < 3 then
+						control.delays[attempt].resolve()
+					end
+				end
+				local accepted, problem = result:await()
+				expect(accepted).to.equal(false)
+				expect(problem.type).to.equal(Http.Error.Kind.Timeout)
+				expect(tostring(problem):find(if phase == "info" then "/api/rojo" else "/api/read", 1, true)).to.be.ok()
+				expect(tostring(problem):find("3 attempts", 1, true)).to.be.ok()
+				expect(#control.requests).to.equal(3)
+				expect(#control.delays).to.equal(2)
+				expect(next(context.__activeRequests)).to.equal(nil)
+			end)
+		end)
+
+		it(`should not retry permanent startup {phase} transport errors or timeout strings`, function()
+			withStartupHttp(function(control)
+				for _, problem in
+					{
+						Http.Error.new(Http.Error.Kind.HttpNotEnabled),
+						Http.Error.new(Http.Error.Kind.Protocol, "Invalid protocol."),
+						Http.Error.new(Http.Error.Kind.Unknown, "Unknown failure."),
+						"HttpError: Timedout",
+						{ type = Http.Error.Kind.Timeout },
+					}
+				do
+					local context = ApiContext.new("http://localhost")
+					local index = #control.requests + 1
+					local result = request(context)
+					control.requests[index].reject(problem)
+					expect(result:await()).to.equal(false)
+					expect(#control.requests).to.equal(index)
+					expect(#control.delays).to.equal(0)
+					expect(next(context.__activeRequests)).to.equal(nil)
+				end
+			end)
+		end)
+
+		it(`should cancel pending startup {phase} HTTP and ignore its late response`, function()
+			withStartupHttp(function(control)
+				local context = ApiContext.new("http://localhost")
+				local continued = false
+				local result = request(context):andThen(function()
+					continued = true
+				end)
+				expect(next(context.__activeRequests) ~= nil).to.equal(true)
+				context:disconnect()
+				control.answer(1, phase)
+				expect(control.requests[1].cancelled).to.equal(true)
+				expect(result:getStatus()).to.equal(Promise.Status.Cancelled)
+				expect(continued).to.equal(false)
+				expect(context.__sessionId).to.equal(if phase == "info" then nil else "session")
+				expect(request(context):await()).to.equal(false)
+				expect(#control.requests).to.equal(1)
+				expect(#control.delays).to.equal(0)
+				expect(next(context.__activeRequests)).to.equal(nil)
+			end)
+		end)
+
+		it(`should cancel startup {phase} backoff without dispatching another GET`, function()
+			withStartupHttp(function(control)
+				local context = ApiContext.new("http://localhost")
+				local result = request(context)
+				control.requests[1].reject(Http.Error.new(Http.Error.Kind.Timeout))
+				expect(#control.delays).to.equal(1)
+				context:disconnect()
+				control.delays[1].resolve()
+				expect(control.delays[1].cancelled).to.equal(true)
+				expect(result:getStatus()).to.equal(Promise.Status.Cancelled)
+				expect(#control.requests).to.equal(1)
+				expect(next(context.__activeRequests)).to.equal(nil)
+			end)
+		end)
+	end
+
+	it("should not retry startup HTTP status, decode, protocol, place, session or validation failures", function()
+		local Settings = require(script.Parent.Settings)
+		local enabled = Settings:get("typecheckingEnabled")
+		local success, problem = pcall(function()
+			Settings:set("typecheckingEnabled", true)
+			withStartupHttp(function(control)
+				for _, phase in { "info", "read" } do
+					for _, kind in { "status", "decode", "validation", "identity" } do
+						local context = ApiContext.new("http://localhost")
+						context.__sessionId = "session"
+						local index = #control.requests + 1
+						local result = if phase == "info" then context:connect() else context:read({ "ROOT" })
+						if kind == "status" then
+							control.requests[index].resolve({ code = 503, body = "private response body" })
+						elseif kind == "decode" then
+							control.requests[index].resolve({ code = 200, body = string.char(0x81) })
+						else
+							control.answer(index, phase, function(body)
+								if kind == "validation" then
+									if phase == "info" then
+										body.rootInstanceId = false
+									else
+										body.instances = false
+									end
+								elseif phase == "info" then
+									body.protocolVersion = -1
+								else
+									body.sessionId = "other"
+								end
+							end)
+						end
+						local accepted, message = result:await()
+						expect(accepted).to.equal(false)
+						if kind == "status" then
+							expect(tostring(message):find("private response body", 1, true)).to.equal(nil)
+						end
+						expect(#control.requests).to.equal(index)
+						expect(#control.delays).to.equal(0)
+						expect(next(context.__activeRequests)).to.equal(nil)
+					end
+				end
+				for _, field in { "expectedPlaceIds", "unexpectedPlaceIds" } do
+					local index = #control.requests + 1
+					local result = ApiContext.new("http://localhost"):connect()
+					control.answer(index, "info", function(body)
+						body[field] = { if field == "expectedPlaceIds" then game.PlaceId + 1 else game.PlaceId }
+					end)
+					expect(result:await()).to.equal(false)
+					expect(#control.requests).to.equal(index)
+					expect(#control.delays).to.equal(0)
+				end
+			end)
+		end)
+		Settings:set("typecheckingEnabled", enabled)
+		assert(success, problem)
+	end)
+
+	it("should supersede pending connect and read continuations without changing the new session", function()
+		withStartupHttp(function(control)
+			local context = ApiContext.new("http://localhost")
+			local first = context:connect()
+			local second = context:connect()
+			control.answer(2, "info")
+			control.answer(1, "info", function(body)
+				body.sessionId = "stale"
+			end)
+			expect(second:await()).to.equal(true)
+			expect(first:getStatus()).to.equal(Promise.Status.Cancelled)
+			local read = context:read({ "ROOT" })
+			local third = context:connect()
+			control.answer(4, "info", function(body)
+				body.sessionId = "new"
+			end)
+			control.answer(3, "read")
+			expect(third:await()).to.equal(true)
+			expect(read:getStatus()).to.equal(Promise.Status.Cancelled)
+			expect(context.__sessionId).to.equal("new")
+			expect(next(context.__activeRequests)).to.equal(nil)
+		end)
+	end)
+
+	it("should clean up healthy GETs without delaying or changing publication cursors", function()
+		withStartupHttp(function(control)
+			local context = ApiContext.new("http://localhost")
+			context:setMessageCursor(10)
+			local info = context:connect()
+			control.answer(1, "info")
+			expect(info:await()).to.equal(true)
+			local read = context:read({ "ROOT" })
+			control.answer(2, "read")
+			expect(read:await()).to.equal(true)
+			expect(context:getMessageCursor()).to.equal(10)
+			expect(#control.requests).to.equal(2)
+			expect(#control.delays).to.equal(0)
+			expect(next(context.__activeRequests)).to.equal(nil)
+		end)
+	end)
+
+	it("should cancel the GET or backoff when its caller cancels", function()
+		withStartupHttp(function(control)
+			for _, backoff in { false, true } do
+				local context = ApiContext.new("http://localhost")
+				local index = #control.requests + 1
+				local result = context:connect()
+				local boundary = control.requests[index]
+				if backoff then
+					boundary.reject(Http.Error.new(Http.Error.Kind.ConnectFailed))
+					boundary = control.delays[#control.delays]
+				end
+				result:cancel()
+				expect(boundary.cancelled).to.equal(true)
+				boundary.resolve()
+				expect(#control.requests).to.equal(index)
+				expect(next(context.__activeRequests)).to.equal(nil)
+			end
+		end)
+	end)
+
+	it("should retain HTTP error kinds without exposing endpoint credentials or response bodies", function()
+		withStartupHttp(function(control)
+			local context = ApiContext.new("http://private:secret@localhost")
+			local result = context:read({ "private-id" })
+			local failure = Http.Error.new(Http.Error.Kind.Unknown, "private response body")
+			failure.response = { code = 503, body = "private response body" }
+			control.requests[1].reject(failure)
+			local accepted, problem = result:await()
+			expect(accepted).to.equal(false)
+			expect(problem.type).to.equal(Http.Error.Kind.Unknown)
+			expect(tostring(problem):find("Instance read GET /api/read", 1, true)).to.be.ok()
+			for _, secret in { "private", "secret", "response body" } do
+				expect(tostring(problem):find(secret, 1, true)).to.equal(nil)
+			end
+			expect(tostring(failure):find("private response body", 1, true)).to.be.ok()
+			expect(#control.requests).to.equal(1)
+			expect(#control.delays).to.equal(0)
+		end)
+	end)
+
+	it("should not retry a typed write timeout", function()
+		local originalPost, originalDelay = Http.post, Promise.delay
+		local success, problem = pcall(function()
+			local requests = 0
+			Http.post = function()
+				requests += 1
+				return Promise.reject(Http.Error.new(Http.Error.Kind.Timeout))
+			end
+			Promise.delay = function()
+				error("Writes must never schedule retries")
+			end
+			local context = ApiContext.new("http://localhost")
+			context.__sessionId = "session"
+			expect(context:write({ added = {}, removed = {}, updated = {} }, 0, "Filesystem"):await()).to.equal(false)
+			expect(requests).to.equal(1)
+		end)
+		Http.post, Promise.delay = originalPost, originalDelay
+		assert(success, problem)
+	end)
+
+	-- The actual HTTP adapter captures HttpService at load time. The Lune harness
+	-- supplies a mutable platform boundary; Studio's native service cannot be stubbed.
+	local httpService = game:GetService("HttpService")
+	local adapterTest = if type(httpService) == "table" then it else itSKIP
+	local function withRequestAsync(run)
+		local originalRequest, originalDelay = httpService.RequestAsync, Promise.delay
+		local control: any = { requests = {}, delays = {}, responses = startupResponses() }
+		httpService.RequestAsync = function(_, request)
+			table.insert(control.requests, request)
+			return control.respond(request)
+		end
+		Promise.delay = function(seconds)
+			return Promise.new(function(resolve)
+				table.insert(control.delays, { seconds = seconds, resolve = resolve })
+			end)
+		end
+		local success, problem = pcall(run, control)
+		httpService.RequestAsync, Promise.delay = originalRequest, originalDelay
+		assert(success, problem)
+	end
+
+	for _, phase in { "info", "read" } do
+		local function request(context)
+			context.__sessionId = "session"
+			return if phase == "info" then context:connect() else context:read({ "ROOT" })
+		end
+		for _, code in { 403, 408, 504 } do
+			adapterTest(`should not retry actual HTTP {code} startup {phase} timeout responses`, function()
+				withRequestAsync(function(control)
+					control.respond = function()
+						return {
+							StatusCode = code,
+							Body = if code == 403 then "Private upstream request timed out." else "",
+							Headers = {},
+						}
+					end
+					local result = request(ApiContext.new("http://localhost"))
+					-- Check before awaiting, so a wrongly scheduled backoff fails deterministically.
+					expect(#control.delays).to.equal(0)
+					local accepted, problem = result:await()
+					expect(accepted).to.equal(false)
+					expect(getmetatable(problem)).to.equal(Http.Error)
+					expect(problem.response.code).to.equal(code)
+					expect(tostring(problem):find("Private", 1, true)).to.equal(nil)
+					expect(#control.requests).to.equal(1)
+				end)
+			end)
+		end
+		for _, failure in { "HttpError: Timedout", "HttpError: ConnectFail" } do
+			adapterTest(`should retry actual RequestAsync {failure} during startup {phase}`, function()
+				withRequestAsync(function(control)
+					control.respond = function()
+						if #control.requests == 1 then
+							error(failure, 0)
+						end
+						return { StatusCode = 200, Body = Http.msgpackEncode(control.responses[phase]), Headers = {} }
+					end
+					local result = request(ApiContext.new("http://localhost"))
+					expect(#control.delays).to.equal(1)
+					expect(control.delays[1].seconds).to.equal(0.25)
+					control.delays[1].resolve()
+					expect(result:await()).to.equal(true)
+					expect(#control.requests).to.equal(2)
+				end)
+			end)
+			adapterTest(`should bound actual RequestAsync {failure} during startup {phase}`, function()
+				withRequestAsync(function(control)
+					control.respond = function()
+						error(failure, 0)
+					end
+					local result = request(ApiContext.new("http://localhost"))
+					for attempt = 1, 2 do
+						expect(control.delays[attempt].seconds).to.equal(0.25 * attempt)
+						control.delays[attempt].resolve()
+					end
+					local accepted, problem = result:await()
+					expect(accepted).to.equal(false)
+					expect(problem.response).to.equal(nil)
+					expect(tostring(problem):find("3 attempts", 1, true)).to.be.ok()
+					expect(#control.requests).to.equal(3)
+					expect(#control.delays).to.equal(2)
+				end)
+			end)
+		end
+		adapterTest(`should not retry permanent actual RequestAsync errors during startup {phase}`, function()
+			withRequestAsync(function(control)
+				for _, failure in { "HTTP requests are not enabled", "Unknown failure", "arbitrary timed out text" } do
+					control.respond = function()
+						error(failure, 0)
+					end
+					local index = #control.requests + 1
+					local result = request(ApiContext.new("http://localhost"))
+					expect(#control.delays).to.equal(0)
+					expect(result:await()).to.equal(false)
+					expect(#control.requests).to.equal(index)
+				end
+			end)
+		end)
+	end
+
+	adapterTest("should not retry an actual RequestAsync write timeout", function()
+		withRequestAsync(function(control)
+			control.respond = function()
+				error("HttpError: Timedout", 0)
+			end
+			local context = ApiContext.new("http://localhost")
+			expect(context:write({ added = {}, removed = {}, updated = {} }, 0, "Studio"):await()).to.equal(false)
+			expect(#control.requests).to.equal(1)
+			expect(control.requests[1].Method).to.equal("POST")
+			expect(#control.delays).to.equal(0)
+		end)
+	end)
+
 	local function writeResponse(sessionId, cursor)
 		return {
 			sessionId = sessionId,
@@ -12,6 +756,33 @@ return function()
 			errors = {},
 		}
 	end
+
+	it("should keep large info and write acknowledgements synchronous by default", function()
+		withStartupHttp(function(control)
+			withDecodeClock(function(clock)
+				local context = ApiContext.new("http://localhost")
+				local info = context:connect()
+				control.answer(1, "info", function(body)
+					body.padding = table.create(2500, 0)
+				end)
+				expect(info:await()).to.equal(true)
+				local originalPost = Http.post
+				local success, problem = pcall(function()
+					Http.post = function()
+						local body = writeResponse("session", 0)
+						body.padding = table.create(2500, 0)
+						return Promise.resolve({ code = 200, body = Http.msgpackEncode(body) })
+					end
+					expect(context:write({ added = {}, removed = {}, updated = {} }, 0, "Studio"):await()).to.equal(
+						true
+					)
+					expect(#clock.threads).to.equal(0)
+				end)
+				Http.post = originalPost
+				assert(success, problem)
+			end)
+		end)
+	end)
 
 	it("should transmit private proof separately and validate capabilities even without optional checks", function()
 		local Settings = require(script.Parent.Settings)
@@ -592,6 +1363,64 @@ return function()
 		assert(success, err)
 		return table.unpack(results, 1, results.n)
 	end
+
+	it("requires directional protocol thirteen while preserving ordinary protocol twelve", function()
+		local HttpService = game:GetService("HttpService")
+		for _, direction in { false, "fs-to-studio", "studio-to-fs", "bidirectional" } do
+			for _, protocol in { 11, 12, 13, 14 } do
+				for _, encoding in { "json", "msgpack" } do
+					local info = {
+						sessionId = "server-session",
+						serverVersion = "7.7.1",
+						protocolVersion = protocol,
+						projectName = "Project",
+						rootInstanceId = "root",
+					}
+					if direction then
+						info.syncDirection = direction
+						info.supportedSyncDirections = { "fs-to-studio", "studio-to-fs", "bidirectional" }
+					end
+					local body = if encoding == "json" then HttpService:JSONEncode(info) else Http.msgpackEncode(info)
+					local connected, response = connectWithInfoBody(body)
+					local expectedProtocol = if direction then 13 else 12
+					expect(connected).to.equal(protocol == expectedProtocol)
+					if connected then
+						expect(response.protocolVersion).to.equal(expectedProtocol)
+						expect(response.syncDirection).to.equal(if direction then direction else nil)
+					else
+						expect(response:find("different protocol version", 1, true)).to.be.ok()
+					end
+				end
+			end
+		end
+	end)
+
+	it("keeps directional protocol mismatches unwritable without installing a session", function()
+		withStartupHttp(function(control)
+			local context = ApiContext.new("http://localhost")
+			local connection = context:connect()
+			control.answer(1, "info", function(body)
+				body.syncDirection = "studio-to-fs"
+				body.protocolVersion = 12
+				body.supportedSyncDirections = { "fs-to-studio", "studio-to-fs", "bidirectional" }
+			end)
+			expect(connection:await()).to.equal(false)
+			expect(context.__sessionId).to.equal(nil)
+			local originalPost = Http.post
+			local writes = 0
+			Http.post = function()
+				writes += 1
+				return Promise.reject("Unexpected write.")
+			end
+			local success, problem = pcall(function()
+				expect(context:write({ added = {}, removed = {}, updated = {} }, nil, "Studio"):await()).to.equal(false)
+				expect(writes).to.equal(0)
+				expect(#control.requests).to.equal(1)
+			end)
+			Http.post = originalPost
+			assert(success, problem)
+		end)
+	end)
 
 	it("should report a protocol mismatch when the server answers with JSON", function()
 		local HttpService = game:GetService("HttpService")

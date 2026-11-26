@@ -15,6 +15,7 @@ body:
           Name: my-new-folder
           Parent: id-2
           Properties: {}
+      origin: filesystem
       removed: []
       updated: []
 packetType: messages

@@ -230,12 +230,14 @@ end
 function StudioProvider:init()
 	self:updateTheme()
 
-	-- Preload the Fonts so that getTextBoundsAsync won't yield
+	-- Best-effort font prewarming must not hold the root UI mount behind asset loading.
 	local fontAssetIds = {}
 	for _, font in self.state.theme.Font do
 		table.insert(fontAssetIds, font.Family)
 	end
-	pcall(ContentProvider.PreloadAsync, ContentProvider, fontAssetIds)
+	task.defer(function()
+		pcall(ContentProvider.PreloadAsync, ContentProvider, fontAssetIds)
+	end)
 end
 
 function StudioProvider:render()

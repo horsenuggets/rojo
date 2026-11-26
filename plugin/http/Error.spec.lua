@@ -10,10 +10,15 @@ return function()
 		expect(err.response).to.equal(response)
 	end)
 
-	it("should treat timeouts as timeouts", function()
-		local err = Error.fromResponse({ code = 504, body = "" })
-		expect(err.type).to.equal(Error.Kind.Timeout)
-	end)
+	for _, code in { 403, 408, 504 } do
+		it(`should retain HTTP {code} timeout response provenance`, function()
+			local response = { code = code, body = if code == 403 then "The upstream request timed out." else "" }
+			local err = Error.fromResponse(response)
+			expect(err.type).to.equal(Error.Kind.Timeout)
+			expect(err.response).to.equal(response)
+			expect(tostring(err):find("timed out", 1, true)).to.be.ok()
+		end)
+	end
 
 	it("should show the details of a Rojo error body", function()
 		local body = msgpack.encode({ kind = "BadRequest", details = "Only 100% of parts arrived." })

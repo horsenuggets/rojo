@@ -31,6 +31,28 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added `rojo serve --sync-direction` with `fs-to-studio`, `studio-to-fs`, and
+  `bidirectional` modes. Filesystem-only sessions refuse Studio writes. Studio-only
+  sessions save Studio edits with Studio authority, keep editor state across reconnects,
+  and report when a save replaced a filesystem change. Explicit-direction sessions use a
+  new protocol version, so older plugins refuse them instead of syncing incorrectly.
+* Studio `RunContext` changes now rename managed script files automatically, keeping the
+  instance identity, Source, metadata, children, and `.lua` or `.luau` extension. The
+  rename refuses to take over other project mappings and recovers cleanly if a write fails.
+* Fixed filesystem Source changes being sent back to the server as Studio edits when
+  Studio delivered the change notification after the edit call returned.
+* Fixed duplicate-named siblings with equal properties being replaced or duplicated during
+  initial sync.
+* Fixed unmanaged attribute changes, such as connection markers, triggering filesystem
+  writes.
+* Fixed accepted default values, such as `Enum.RunContext.Legacy`, being lost in write
+  acknowledgements.
+* Fixed held Studio deletions consuming newer filesystem changes during their grace period.
+* Kept live-edit output locks separate from Studio's place-file locks, so generated places
+  can be saved normally.
+* Disabled notification sounds by default. The Play Sounds setting and saved preferences
+  are unchanged.
+
 ## `7.7.1-horse.2.12`
 
 * Fixed runtime alias imports for projects with filesystem mounts outside their project

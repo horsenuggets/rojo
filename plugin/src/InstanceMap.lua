@@ -3,6 +3,7 @@ local RunService = game:GetService("RunService")
 local Packages = script.Parent.Parent.Packages
 local Log = require(Packages.Log)
 local Source = require(script.Parent.Reconciler.setSource)
+local UnmanagedAttributes = require(script.Parent.Reconciler.unmanagedAttributes)
 
 --[[
 	A bidirectional map between instance IDs and Roblox instances. It lets us
@@ -320,8 +321,10 @@ function InstanceMap:__connectSignals(instance)
 				self:__maybeFireInstanceChanged(instance, "Parent")
 			end),
 
-			instance.AttributeChanged:Connect(function()
-				self:__maybeFireInstanceChanged(instance, "Attributes")
+			instance.AttributeChanged:Connect(function(attributeName)
+				if not UnmanagedAttributes.isUnmanaged(attributeName) then
+					self:__maybeFireInstanceChanged(instance, "Attributes")
+				end
 			end),
 		}
 
@@ -331,8 +334,10 @@ function InstanceMap:__connectSignals(instance)
 			instance.Changed:Connect(function(propertyName)
 				self:__maybeFireInstanceChanged(instance, propertyName)
 			end),
-			instance.AttributeChanged:Connect(function()
-				self:__maybeFireInstanceChanged(instance, "Attributes")
+			instance.AttributeChanged:Connect(function(attributeName)
+				if not UnmanagedAttributes.isUnmanaged(attributeName) then
+					self:__maybeFireInstanceChanged(instance, "Attributes")
+				end
 			end),
 		}
 	end

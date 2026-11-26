@@ -19,6 +19,132 @@ local services = require(script.Parent.services)
 -- group regardless of how large the group is.
 local MAX_CANDIDATES_TO_SCORE = 32
 
+local function structuralProfiles(bucket, virtualInstances, step)
+	if bucket.structuralPrepared then
+		return bucket.structuralProfiles
+	end
+	bucket.structuralPrepared = true
+
+	local virtualIds = bucket.virtualIds
+	if virtualIds == nil or #virtualIds ~= #bucket.instances then
+		return nil
+	end
+
+	-- Unknown children are not identity evidence. Intern only name/class pairs
+	-- explicitly described in this sibling group, including non-archivable
+	-- children that hydration can still match.
+	local relevant = {}
+	local keyCount = 0
+	for _, id in virtualIds do
+		step()
+		for _, childId in virtualInstances[id].Children do
+			step()
+			local child = virtualInstances[childId]
+			local classes = relevant[child.Name]
+			if classes == nil then
+				classes = {}
+				relevant[child.Name] = classes
+			end
+			if classes[child.ClassName] == nil then
+				keyCount += 1
+				classes[child.ClassName] = keyCount
+			end
+		end
+	end
+	if keyCount == 0 then
+		return nil
+	end
+
+	-- There are at most 32 virtual profiles. Sparse exact comparisons avoid
+	-- recursive fingerprints, sorting, and dense group-wide child vectors.
+	local profiles = {}
+	local function matchingProfile(candidate)
+		for id, profile in profiles do
+			step()
+			if profile.total == candidate.total and profile.size == candidate.size then
+				local equal = true
+				for key, count in candidate.counts do
+					step()
+					if profile.counts[key] ~= count then
+						equal = false
+						break
+					end
+				end
+				if equal then
+					return id
+				end
+			end
+		end
+		return nil
+	end
+
+	local virtualProfiles = {}
+	local histogram = {}
+	for _, id in virtualIds do
+		step()
+		local candidate = { counts = {}, total = 0, size = 0 }
+		for _, childId in virtualInstances[id].Children do
+			step()
+			local child = virtualInstances[childId]
+			local key = relevant[child.Name][child.ClassName]
+			if candidate.counts[key] == nil then
+				candidate.size += 1
+			end
+			candidate.counts[key] = (candidate.counts[key] or 0) + 1
+			candidate.total += 1
+		end
+		local profileId = matchingProfile(candidate)
+		if profileId == nil then
+			table.insert(profiles, candidate)
+			profileId = #profiles
+		end
+		virtualProfiles[id] = profileId
+		histogram[profileId] = (histogram[profileId] or 0) + 1
+	end
+
+	local nativeProfiles = {}
+	for _, instance in bucket.instances do
+		step()
+		local success, children = pcall(function()
+			return instance:GetChildren()
+		end)
+		if not success then
+			return nil
+		end
+		local candidate = { counts = {}, total = 0, size = 0 }
+		for _, child in children do
+			step()
+			local accessible, name, className = pcall(function()
+				return child.Name, child.ClassName
+			end)
+			if not accessible then
+				return nil
+			end
+			local classes = relevant[name]
+			local key = classes and classes[className]
+			if key then
+				if candidate.counts[key] == nil then
+					candidate.size += 1
+				end
+				candidate.counts[key] = (candidate.counts[key] or 0) + 1
+				candidate.total += 1
+			end
+		end
+		local profileId = matchingProfile(candidate)
+		if profileId == nil or histogram[profileId] == 0 then
+			return nil
+		end
+		nativeProfiles[instance] = profileId
+		histogram[profileId] -= 1
+	end
+
+	-- Extra or missing relevant children make the entire structural hint
+	-- ambiguous. Keep the original order fallback unless every sibling fits.
+	local result = { native = nativeProfiles, virtual = virtualProfiles }
+	bucket.structuralProfiles = result
+	return result
+end
+
 local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootInstance, step)
 	local virtualInstance = virtualInstances[rootId]
 
@@ -38,6 +164,7 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 	-- two tables (rather than a combined key) keeps the Name and ClassName checks
 	-- exact, with no way for one to bleed into the other.
 	local buckets = {}
+	local structuralBucketCount = 0
 	for _, childInstance in existingChildren do
 		-- Children that match nothing never reach the recursive call, so a
 		-- wide folder of them needs its own chances to yield.
@@ -65,6 +192,28 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 		end
 
 		table.insert(bucket.instances, childInstance)
+		if #bucket.instances == 2 then
+			bucket.virtualIds = {}
+			structuralBucketCount += 1
+		elseif #bucket.instances == MAX_CANDIDATES_TO_SCORE + 1 then
+			bucket.virtualIds = nil
+			structuralBucketCount -= 1
+		end
+	end
+
+	if structuralBucketCount > 0 then
+		for _, childId in virtualInstance.Children do
+			step()
+			local child = virtualInstances[childId]
+			local classes = buckets[child.Name]
+			local bucket = classes and classes[child.ClassName]
+			local ids = bucket and bucket.virtualIds
+			-- One extra ID is enough to reject a cardinality mismatch, without
+			-- retaining an unbounded virtual group for a small native bucket.
+			if ids and #ids <= #bucket.instances then
+				table.insert(ids, childId)
+			end
+		end
 	end
 
 	-- Tracks which existing children have already been paired, so one instance
@@ -150,15 +299,33 @@ local function hydrateInner(stats, instanceMap, virtualInstances, rootId, rootIn
 				-- Only one candidate, so there's nothing to disambiguate.
 				match = candidates[1]
 			else
-				-- Break the tie by choosing the candidate whose properties best
-				-- match the virtual instance, falling back to the earliest in
-				-- child order when scores are equal.
+				-- Properties remain the primary discriminator. Equal-property
+				-- siblings can still own different subtrees; pairing those by
+				-- order would make the initial diff replace or duplicate children.
 				local bestScore = -1
+				local bestCandidates = {}
 				for _, childInstance in candidates do
+					step()
 					local score = countMatchingProperties(childInstance, virtualChild, instanceMap)
 					if score > bestScore then
 						bestScore = score
-						match = childInstance
+						table.clear(bestCandidates)
+					end
+					if score == bestScore then
+						table.insert(bestCandidates, childInstance)
+					end
+				end
+				match = bestCandidates[1]
+				if #bestCandidates > 1 then
+					local profiles = structuralProfiles(bucket, virtualInstances, step)
+					if profiles then
+						for _, childInstance in bestCandidates do
+							step()
+							if profiles.native[childInstance] == profiles.virtual[childId] then
+								match = childInstance
+								break
+							end
+						end
 					end
 				end
 

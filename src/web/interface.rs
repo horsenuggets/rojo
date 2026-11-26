@@ -18,11 +18,13 @@ use crate::{
     rojo_ref::without_link_attributes,
     session_id::SessionId,
     snapshot::{
-        AppliedPatchSet, InstanceMetadata as RojoInstanceMetadata, InstanceWithMeta, PatchSet,
-        RojoTree,
+        AppliedPatchSet, CapturedAdditionInstance, InstanceMetadata as RojoInstanceMetadata,
+        InstanceWithMeta, PatchSet, RojoTree,
     },
 };
 
+pub use crate::serve_session::SyncDirection;
+pub use crate::snapshot::PublicationOrigin;
 pub use crate::syncback::from_studio::{ManifestEntry, StudioService};
 
 /// Server version to report over the API, not exposed outside this crate.
@@ -39,10 +41,18 @@ pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// announcements cannot overwrite newer Studio property edits.
 pub const PROTOCOL_VERSION: u64 = 12;
 
+/// Explicit-direction sessions require peers that enforce the immutable sync policy.
+/// Keep ordinary sessions on version 12 so legacy sync and export remain compatible.
+/// Version 13 makes older peers reject directional sessions before reading the tree.
+pub const DIRECTIONAL_PROTOCOL_VERSION: u64 = 13;
+
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeMessage<'a> {
+    /// Trusted publication provenance, including payload-free cursor advances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<PublicationOrigin>,
     pub removed: Vec<Ref>,
     pub added: HashMap<Ref, Instance<'a>>,
     pub updated: Vec<InstanceUpdate>,
@@ -56,17 +66,29 @@ impl<'a> SubscribeMessage<'a> {
         let removed = patch.removed;
 
         let mut added = HashMap::new();
-        for id in patch.added {
-            // Messages are read from the tree when they're sent, and an
-            // instance added then removed again is already gone. A later
-            // message removes it, so there's nothing to announce.
-            let Some(instance) = tree.get_instance(id) else {
-                continue;
-            };
-            added.insert(id, Instance::from_rojo_instance(instance));
+        if patch.origin == Some(PublicationOrigin::Studio) {
+            // A missing capture is not permission to attribute current disk state
+            // to Studio. Fail closed without consulting the mutable tree.
+            if let Some(captured) = &patch.captured_additions {
+                for instance in captured.values() {
+                    added.insert(instance.id, Instance::from_captured_instance(instance));
+                }
+            } else if !patch.added.is_empty() {
+                log::error!("Studio addition publication has no captured state.");
+            }
+        } else {
+            for id in patch.added {
+                // Filesystem messages are read from the tree when sent, and an
+                // instance added then removed again is already gone. A later
+                // message removes it, so there's nothing to announce.
+                let Some(instance) = tree.get_instance(id) else {
+                    continue;
+                };
+                added.insert(id, Instance::from_rojo_instance(instance));
 
-            for instance in tree.descendants(id) {
-                added.insert(instance.id(), Instance::from_rojo_instance(instance));
+                for instance in tree.descendants(id) {
+                    added.insert(instance.id(), Instance::from_rojo_instance(instance));
+                }
             }
         }
 
@@ -83,24 +105,7 @@ impl<'a> SubscribeMessage<'a> {
                     .changed_properties
                     .into_iter()
                     .map(|(key, value)| {
-                        // MessagePack nil map entries disappear in Luau. Send the reflection
-                        // default explicitly while keeping absent properties absent in the DOM.
-                        let value = value.or_else(|| {
-                            let instance = tree.get_instance(update.id)?;
-                            let class_name = instance.class_name();
-                            // References have no reflection default, and an explicit
-                            // null reference is the only way to clear one.
-                            if is_ref_property(class_name.as_str(), key.as_str()) {
-                                return Some(Variant::Ref(Ref::none()));
-                            }
-                            let database = rbx_reflection_database::get().unwrap();
-                            database
-                                .classes
-                                .get(class_name.as_str())?
-                                .default_properties
-                                .get(key.as_str())
-                                .cloned()
-                        });
+                        let value = value.or_else(|| property_default(tree, update.id, key));
                         let value = value.map(|value| without_link_attributes(&value).into_owned());
                         (key, value)
                     })
@@ -119,6 +124,7 @@ impl<'a> SubscribeMessage<'a> {
             .collect();
 
         Self {
+            origin: patch.origin,
             removed,
             added,
             updated,
@@ -294,6 +300,30 @@ pub struct Instance<'a> {
 }
 
 impl Instance<'_> {
+    fn from_captured_instance(source: &CapturedAdditionInstance) -> Instance<'static> {
+        let properties = source
+            .properties
+            .iter()
+            .filter(|(_key, value)| property_filter(Some(value)))
+            .map(|(key, value)| {
+                (
+                    *key,
+                    Cow::Owned(without_link_attributes(value).into_owned()),
+                )
+            })
+            .collect();
+
+        Instance {
+            id: source.id,
+            parent: source.parent,
+            name: Cow::Owned(source.name.clone()),
+            class_name: source.class_name,
+            properties,
+            children: Cow::Owned(source.children.clone()),
+            metadata: Some(InstanceMetadata::from_rojo_metadata(&source.metadata)),
+        }
+    }
+
     pub(crate) fn from_rojo_instance(source: InstanceWithMeta<'_>) -> Instance<'_> {
         let properties = source
             .properties()
@@ -310,6 +340,37 @@ impl Instance<'_> {
             properties,
             children: Cow::Borrowed(source.children()),
             metadata: Some(InstanceMetadata::from_rojo_metadata(source.metadata())),
+        }
+    }
+}
+
+/// MessagePack nil map entries disappear in Luau. Materialize wire defaults without
+/// changing the normalized property omissions in the DOM or on disk.
+fn property_default(tree: &RojoTree, id: Ref, key: Ustr) -> Option<Variant> {
+    let instance = tree.get_instance(id)?;
+    let class_name = instance.class_name();
+    // References have no reflection default, and an explicit null reference is the
+    // only way to clear one.
+    if is_ref_property(class_name.as_str(), key.as_str()) {
+        return Some(Variant::Ref(Ref::none()));
+    }
+    let database = rbx_reflection_database::get().unwrap();
+    database
+        .classes
+        .get(class_name.as_str())?
+        .default_properties
+        .get(key.as_str())
+        .cloned()
+}
+
+/// Freeze only omitted accepted properties at worker completion, before later tree changes.
+/// Existing response values and all non-property fields retain their original meaning.
+pub(crate) fn materialize_accepted_properties(tree: &RojoTree, accepted: &mut PatchSet) {
+    for update in &mut accepted.updated_instances {
+        for (key, value) in &mut update.changed_properties {
+            if value.is_none() {
+                *value = property_default(tree, update.id, *key);
+            }
         }
     }
 }
@@ -346,6 +407,12 @@ fn property_filter(value: Option<&Variant>) -> bool {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfoResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_direction: Option<SyncDirection>,
+    /// Plain strings with a default, so clients can read older servers and ignore
+    /// directions added later.
+    #[serde(default)]
+    pub supported_sync_directions: Vec<String>,
     pub session_id: SessionId,
     pub server_version: String,
     pub protocol_version: u64,
@@ -680,6 +747,116 @@ mod tests {
     use super::*;
     use crate::snapshot::{apply_patch_set, InstanceSnapshot, PatchUpdate};
     use rbx_dom_weak::ustr;
+
+    #[test]
+    fn legacy_ack_shared_defaults_preserve_publication_filtering_and_missing_instance_semantics() {
+        use rbx_dom_weak::types::{Attributes, SharedString};
+
+        let tree = RojoTree::new(InstanceSnapshot::new().class_name("Script"));
+        let id = tree.get_root_id();
+        let missing = Ref::new();
+        let message = SubscribeMessage::from_patch_update(
+            &tree,
+            AppliedPatchSet {
+                updated: vec![
+                    crate::snapshot::AppliedPatchUpdate {
+                        id,
+                        changed_name: None,
+                        changed_class_name: None,
+                        changed_parent: None,
+                        changed_metadata: None,
+                        changed_properties: UstrMap::from_iter([
+                            (ustr("RunContext"), None),
+                            (ustr("Source"), Some(Variant::String("retained".into()))),
+                            (ustr("UnknownProperty"), None),
+                            (
+                                ustr("Shared"),
+                                Some(Variant::SharedString(SharedString::new(vec![1]))),
+                            ),
+                            (
+                                ustr("Attributes"),
+                                Some(Variant::Attributes(Attributes::from_iter([
+                                    ("Rojo_Id".into(), Variant::String("private-link".into())),
+                                    ("Visible".into(), Variant::Bool(true)),
+                                ]))),
+                            ),
+                        ]),
+                    },
+                    crate::snapshot::AppliedPatchUpdate {
+                        id: missing,
+                        changed_name: None,
+                        changed_class_name: None,
+                        changed_parent: None,
+                        changed_metadata: None,
+                        changed_properties: UstrMap::from_iter([(ustr("RunContext"), None)]),
+                    },
+                ],
+                ..AppliedPatchSet::new()
+            },
+        );
+        let properties = &message.updated[0].changed_properties;
+        assert_eq!(
+            properties[&ustr("RunContext")],
+            Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(0)))
+        );
+        assert_eq!(
+            properties[&ustr("Source")],
+            Some(Variant::String("retained".into()))
+        );
+        assert_eq!(properties[&ustr("UnknownProperty")], None);
+        assert!(!properties.contains_key(&ustr("Shared")));
+        assert_eq!(
+            properties[&ustr("Attributes")],
+            Some(Variant::Attributes(Attributes::from_iter([(
+                "Visible".into(),
+                Variant::Bool(true)
+            ),])))
+        );
+        assert_eq!(
+            message.updated[1].changed_properties[&ustr("RunContext")],
+            None
+        );
+        assert!(tree.root().properties().is_empty());
+    }
+
+    #[test]
+    fn subscription_provenance_survives_wire_conversion_and_both_encodings() {
+        let tree = RojoTree::new(InstanceSnapshot::new());
+        for origin in [PublicationOrigin::Filesystem, PublicationOrigin::Studio] {
+            let message = SubscribeMessage::from_patch_update(
+                &tree,
+                AppliedPatchSet {
+                    origin: Some(origin),
+                    ..AppliedPatchSet::new()
+                },
+            );
+            assert_eq!(message.origin, Some(origin));
+            let json = serde_json::to_value(&message).unwrap();
+            assert_eq!(json["origin"], serde_json::to_value(origin).unwrap());
+            let encoded = rmp_serde::to_vec_named(&message).unwrap();
+            let decoded: SubscribeMessage<'_> = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(decoded.origin, Some(origin));
+            assert!(
+                decoded.removed.is_empty()
+                    && decoded.added.is_empty()
+                    && decoded.updated.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn studio_additions_without_capture_never_read_the_live_tree() {
+        let tree = RojoTree::new(InstanceSnapshot::new().name("LaterDiskState"));
+        let message = SubscribeMessage::from_patch_update(
+            &tree,
+            AppliedPatchSet {
+                origin: Some(PublicationOrigin::Studio),
+                added: vec![tree.get_root_id()],
+                ..AppliedPatchSet::new()
+            },
+        );
+        assert!(message.added.is_empty());
+    }
 
     #[test]
     fn operation_id_round_trips_and_rejects_unsafe_tokens() {

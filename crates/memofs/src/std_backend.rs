@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{
@@ -12,7 +12,7 @@ use crossbeam_channel::Receiver;
 use notify::{raw_watcher, RawEvent, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::watch_batch::{exists_exactly, WatchBatch};
-use crate::{DirEntry, IoResultExt, Metadata, ReadDir, VfsBackend, VfsEvent};
+use crate::{DirEntry, FileIdentity, IoResultExt, Metadata, ReadDir, VfsBackend, VfsEvent};
 
 /// A batch settles once events stop arriving for this long, which gathers the
 /// separate events of one save or move.
@@ -27,6 +27,7 @@ pub struct StdBackend {
     watcher: Mutex<RecommendedWatcher>,
     watcher_receiver: Receiver<VfsEvent>,
     watches: HashSet<PathBuf>,
+    identities: Arc<Mutex<HashMap<PathBuf, FileIdentity>>>,
 }
 
 impl StdBackend {
@@ -37,6 +38,8 @@ impl StdBackend {
         let watcher = raw_watcher(notify_tx).map_err(io::Error::other)?;
 
         let (tx, rx) = crossbeam_channel::unbounded();
+        let identities = Arc::new(Mutex::new(HashMap::new()));
+        let watched_identities = identities.clone();
 
         thread::spawn(move || {
             while let Ok(first) = notify_rx.recv() {
@@ -57,10 +60,35 @@ impl StdBackend {
                 }
 
                 let mut entries = HashMap::new();
-                for event in batch.settle(|path| exists_exactly(path, &mut entries)) {
-                    if tx.send(event).is_err() {
-                        return;
+                let events = batch.settle(|path| exists_exactly(path, &mut entries));
+                #[cfg(windows)]
+                let events = filter_windows_directory_metadata_events(events);
+                let mut known = watched_identities.lock().unwrap();
+                let mut current = HashMap::new();
+                for event in &events {
+                    let path = match event {
+                        VfsEvent::Rename { to, .. } => to,
+                        VfsEvent::Create(path) | VfsEvent::Write(path) => path,
+                        _ => continue,
+                    };
+                    if let Some(identity) = observed_identity(path) {
+                        current.insert(path.clone(), identity);
                     }
+                }
+                let events = link_identity_renames(events, &known, &current);
+                let mut events =
+                    link_moves_into_created_directories(events, &known, &mut current, |path| {
+                        identities_under(path)
+                    });
+                for event in &mut events {
+                    if let VfsEvent::Rename { to, identity, .. } = event {
+                        *identity = current.get(to).copied();
+                    }
+                }
+                update_known_identities(&mut known, &events, current);
+                drop(known);
+                if !send_batch(&tx, events) {
+                    return;
                 }
                 if disconnected {
                     return;
@@ -72,6 +100,7 @@ impl StdBackend {
             watcher: Mutex::new(watcher),
             watcher_receiver: rx,
             watches: HashSet::new(),
+            identities,
         })
     }
 }
@@ -320,10 +349,24 @@ impl VfsBackend for StdBackend {
 
     fn metadata(&self, path: &Path) -> io::Result<Metadata> {
         let inner = fs_err::metadata(path)?;
+        #[cfg(not(windows))]
+        let identity = file_identity(&inner);
+        #[cfg(windows)]
+        let identity = observed_identity(path);
+        if let Some(identity) = identity {
+            self.identities
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), identity);
+        }
 
         Ok(Metadata {
             is_file: inner.is_file(),
         })
+    }
+
+    fn file_identity(&self, path: &Path) -> io::Result<Option<FileIdentity>> {
+        Ok(observed_identity(path))
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
@@ -365,12 +408,336 @@ impl VfsBackend for StdBackend {
     }
 }
 
+#[cfg(not(windows))]
+fn file_identity(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // A stationary hard-link alias can look like a move when another alias is
+        // deleted and recreated. Directory link counts do not imply such aliases.
+        if _metadata.is_file() && _metadata.nlink() != 1 {
+            return None;
+        }
+        Some(FileIdentity {
+            device: _metadata.dev(),
+            inode: _metadata.ino(),
+            // Birth time prevents a deleted inode reused for a new file from matching.
+            // Filesystems without it fall back to native watcher linkage only.
+            created: _metadata.created().ok()?,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn observed_identity(_path: &Path) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        file_identity(&std::fs::metadata(_path).ok()?)
+    }
+    #[cfg(windows)]
+    {
+        // Consumer validation must reopen the path, never use the watcher's cache.
+        windows_identity(_path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_identity(path: &Path) -> Option<FileIdentity> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE)
+        // Do not use OPEN_REPARSE_POINT. Like std metadata, follow symlinks and junctions.
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // The handle stays open for the call and the API initializes every field on success.
+    let info = unsafe {
+        if GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) == 0 {
+            return None;
+        }
+        info.assume_init()
+    };
+    windows_identity_from_info(&info)
+}
+
+#[cfg(windows)]
+fn windows_identity_from_info(
+    info: &windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION,
+) -> Option<FileIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    // Hard-link aliases are ambiguous, but directory link counts are not aliases.
+    if !is_directory && info.nNumberOfLinks != 1 {
+        return None;
+    }
+    let inode = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    // Unsupported or unrepresentable 64-bit file IDs cannot prove rename identity.
+    if inode == 0 || inode == u64::MAX {
+        return None;
+    }
+    let created = (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
+        | u64::from(info.ftCreationTime.dwLowDateTime);
+    let elapsed = created.checked_sub(116_444_736_000_000_000)?;
+    Some(FileIdentity {
+        device: u64::from(info.dwVolumeSerialNumber),
+        inode,
+        created: std::time::UNIX_EPOCH
+            + Duration::new(elapsed / 10_000_000, ((elapsed % 10_000_000) * 100) as u32),
+    })
+}
+
+#[cfg(windows)]
+fn filter_windows_directory_metadata_events(events: Vec<VfsEvent>) -> Vec<VfsEvent> {
+    // ReadDirectoryChangesW reports directory timestamp/attribute updates separately
+    // from child name and file writes. They have no serialized content of their own.
+    // Resnapshotting an ancestor for those echoes can race the next linked move and
+    // recreate its subtree before that move's events arrive.
+    events
+        .into_iter()
+        .filter(|event| {
+            !matches!(event, VfsEvent::Write(path)
+                if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+        })
+        .collect()
+}
+
+/// A native watcher may omit a rename cookie. Only pair those endpoints when an earlier
+/// observation and the new file have the same filesystem identity, never by content.
+fn link_identity_renames(
+    events: Vec<VfsEvent>,
+    before: &HashMap<PathBuf, FileIdentity>,
+    after: &HashMap<PathBuf, FileIdentity>,
+) -> Vec<VfsEvent> {
+    let mut validated = Vec::with_capacity(events.len());
+    for event in events {
+        match event {
+            VfsEvent::Rename { from, to, .. }
+                if before
+                    .get(&from)
+                    .zip(after.get(&to))
+                    .is_some_and(|(old, new)| old != new) =>
+            {
+                validated.push(VfsEvent::Remove(from));
+                validated.push(VfsEvent::Create(to));
+            }
+            event => validated.push(event),
+        }
+    }
+    let events = validated;
+    let mut removals: HashMap<FileIdentity, Vec<usize>> = HashMap::new();
+    let mut creations: HashMap<FileIdentity, Vec<usize>> = HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            VfsEvent::Remove(path) => {
+                if let Some(identity) = before.get(path) {
+                    removals.entry(*identity).or_default().push(index);
+                }
+            }
+            VfsEvent::Create(path) => {
+                if let Some(identity) = after.get(path) {
+                    creations.entry(*identity).or_default().push(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut replacements = HashMap::new();
+    let mut skipped = vec![false; events.len()];
+    for (identity, removed) in removals {
+        let [a] = removed.as_slice() else { continue };
+        let Some(created) = creations.get(&identity) else {
+            continue;
+        };
+        let [b] = created.as_slice() else { continue };
+        let (VfsEvent::Remove(from), VfsEvent::Create(to)) = (&events[*a], &events[*b]) else {
+            unreachable!();
+        };
+        replacements.insert(
+            (*a).min(*b),
+            VfsEvent::Rename {
+                from: from.clone(),
+                to: to.clone(),
+                identity: None,
+            },
+        );
+        skipped[(*a).max(*b)] = true;
+    }
+    events
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            if skipped[index] {
+                None
+            } else {
+                Some(replacements.remove(&index).unwrap_or(event))
+            }
+        })
+        .collect()
+}
+
+/// inotify watches directories one at a time. When something moves into a directory
+/// created a moment earlier, its watch may not exist yet, so only the move-out is
+/// reported. The moved object must then be inside a directory this batch created. Link
+/// it there only when exactly one entry carries its earlier filesystem identity.
+fn link_moves_into_created_directories(
+    events: Vec<VfsEvent>,
+    before: &HashMap<PathBuf, FileIdentity>,
+    after: &mut HashMap<PathBuf, FileIdentity>,
+    mut identities_under: impl FnMut(&Path) -> Vec<(PathBuf, FileIdentity)>,
+) -> Vec<VfsEvent> {
+    let wanted: HashSet<FileIdentity> = events
+        .iter()
+        .filter_map(|event| match event {
+            VfsEvent::Remove(path) => before.get(path).copied(),
+            _ => None,
+        })
+        .collect();
+    if wanted.is_empty() {
+        return events;
+    }
+    let created: Vec<&Path> = events
+        .iter()
+        .filter_map(|event| match event {
+            VfsEvent::Create(path) => Some(path.as_path()),
+            _ => None,
+        })
+        .collect();
+    // Nested creations are already inside an outer created directory's walk.
+    let roots = created.iter().filter(|path| {
+        !path
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| created.contains(&ancestor))
+    });
+    let mut found: HashMap<FileIdentity, Vec<PathBuf>> = HashMap::new();
+    for root in roots {
+        for (path, identity) in identities_under(root) {
+            if wanted.contains(&identity) {
+                found.entry(identity).or_default().push(path);
+            }
+        }
+    }
+    let reported: HashSet<PathBuf> = events
+        .iter()
+        .filter_map(|event| match event {
+            VfsEvent::Rename { to, .. } => Some(to.clone()),
+            _ => None,
+        })
+        .collect();
+    events
+        .into_iter()
+        .map(|event| {
+            let VfsEvent::Remove(from) = &event else {
+                return event;
+            };
+            let Some(identity) = before.get(from) else {
+                return event;
+            };
+            match found.get(identity).map(Vec::as_slice) {
+                Some([to]) if !reported.contains(to) => {
+                    after.insert(to.clone(), *identity);
+                    VfsEvent::Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                        identity: None,
+                    }
+                }
+                _ => event,
+            }
+        })
+        .collect()
+}
+
+/// Lists the identities of every entry beneath a newly created directory, without
+/// following links into other trees.
+fn identities_under(root: &Path) -> Vec<(PathBuf, FileIdentity)> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_symlink() {
+                continue;
+            }
+            if let Some(identity) = observed_identity(&path) {
+                found.push((path.clone(), identity));
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    found
+}
+
+fn update_known_identities(
+    known: &mut HashMap<PathBuf, FileIdentity>,
+    events: &[VfsEvent],
+    current: HashMap<PathBuf, FileIdentity>,
+) {
+    let mut removed = HashSet::new();
+    let mut renames = HashMap::new();
+    for event in events {
+        match event {
+            VfsEvent::Remove(path) => {
+                removed.insert(path.as_path());
+            }
+            VfsEvent::Rename { from, to, .. } => {
+                removed.insert(from.as_path());
+                renames.insert(from.as_path(), to.as_path());
+            }
+            _ => {}
+        }
+    }
+    let mut relocated = Vec::new();
+    if !removed.is_empty() {
+        known.retain(|path, identity| {
+            if let Some((from, to)) = path
+                .ancestors()
+                .find_map(|from| renames.get(from).map(|to| (from, *to)))
+            {
+                relocated.push((to.join(path.strip_prefix(from).unwrap()), *identity));
+                false
+            } else {
+                !path.ancestors().any(|path| removed.contains(path))
+            }
+        });
+    }
+    // A watcher may settle another burst before the consumer snapshots the new
+    // directory. Carry its descendants too, so that burst can still identify them.
+    known.extend(relocated);
+    known.extend(current);
+}
+
+fn send_batch(sender: &crossbeam_channel::Sender<VfsEvent>, events: Vec<VfsEvent>) -> bool {
+    events.is_empty() || sender.send(VfsEvent::Batch(events)).is_ok()
+}
+
 /// Adds a raw event to the batch. Events without a path, like the rescan
 /// request FSEvents sends after dropping events, were ignored by the debouncer
 /// this replaces too.
 fn record(batch: &mut WatchBatch, event: RawEvent) {
     if let (Some(path), Ok(op)) = (event.path, event.op) {
-        batch.record(path, op);
+        batch.record(path, op, event.cookie);
     }
 }
 
@@ -401,6 +768,591 @@ fn validate_lock_file(file: &std::fs::File, path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn identity_validation_freshly_observes_replaced_files_and_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = StdBackend::new().unwrap();
+        for is_file in [false, true] {
+            let path = root.path().join(if is_file { "file" } else { "directory" });
+            let replacement = path.with_extension("replacement");
+            let retained = path.with_extension("retained");
+            for entry in [&path, &replacement] {
+                if is_file {
+                    std::fs::write(entry, "same contents").unwrap();
+                } else {
+                    std::fs::create_dir(entry).unwrap();
+                }
+            }
+            assert_eq!(backend.metadata(&path).unwrap().is_file(), is_file);
+            let old = backend.file_identity(&path).unwrap().unwrap();
+            let new = backend.file_identity(&replacement).unwrap().unwrap();
+            assert_ne!(old, new);
+            std::fs::rename(&path, &retained).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+            // No watcher is registered, so the earlier observation is still cached.
+            assert_eq!(backend.identities.lock().unwrap().get(&path), Some(&old));
+            let observed = backend.file_identity(&path).unwrap().unwrap();
+            assert_ne!(observed, old);
+            assert_eq!(observed.device, new.device);
+            assert_eq!(observed.inode, new.inode);
+            // NTFS tunneling can restore the old name's creation time on replacement.
+            assert_eq!(
+                observed.created,
+                std::fs::metadata(&path).unwrap().created().unwrap()
+            );
+            assert_eq!(observed_identity(&path), Some(observed));
+            assert_eq!(backend.file_identity(&replacement).unwrap(), None);
+            assert_eq!(backend.metadata(&path).unwrap().is_file(), is_file);
+            assert_eq!(
+                backend.identities.lock().unwrap().get(&path),
+                Some(&observed)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_matches_creation_time_and_token_eligibility() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("directory");
+        let file = root.path().join("file");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(directory.join("child")).unwrap();
+        std::fs::write(&file, "contents").unwrap();
+        let backend = StdBackend::new().unwrap();
+        for path in [&file, &directory] {
+            let standard = std::fs::metadata(path).unwrap();
+            let identity = windows_identity(path);
+            assert_eq!(identity.unwrap().created, standard.created().unwrap());
+            assert_eq!(
+                backend.metadata(path).unwrap().is_file(),
+                standard.is_file()
+            );
+            assert_eq!(backend.file_identity(path).unwrap(), identity);
+        }
+        std::fs::hard_link(&file, &alias).unwrap();
+        for path in [&file, &alias] {
+            assert_eq!(windows_identity(path), None);
+            assert!(backend.metadata(path).unwrap().is_file());
+            assert_eq!(backend.file_identity(path).unwrap(), None);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_info_preserves_identity_fields_and_link_eligibility() {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        };
+        let elapsed = 12_345_678;
+        let created = 116_444_736_000_000_000u64 + elapsed;
+        for directory in [false, true] {
+            for links in [0, 1, 2, 7] {
+                for valid_birth in [false, true] {
+                    let birth = if valid_birth { created } else { 0 };
+                    let info = BY_HANDLE_FILE_INFORMATION {
+                        dwFileAttributes: if directory {
+                            FILE_ATTRIBUTE_DIRECTORY
+                        } else {
+                            0
+                        },
+                        dwVolumeSerialNumber: 23,
+                        ftCreationTime: FILETIME {
+                            dwHighDateTime: (birth >> 32) as u32,
+                            dwLowDateTime: birth as u32,
+                        },
+                        nFileIndexHigh: 45,
+                        nFileIndexLow: 67,
+                        nNumberOfLinks: links,
+                        ..Default::default()
+                    };
+                    let expected =
+                        (valid_birth && (directory || links == 1)).then_some(FileIdentity {
+                            device: 23,
+                            inode: (45u64 << 32) | 67,
+                            created: std::time::UNIX_EPOCH + Duration::new(1, 234_567_800),
+                        });
+                    assert_eq!(windows_identity_from_info(&info), expected);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_info_rejects_unsupported_file_ids_but_accepts_zero_volume() {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        };
+        let created = 116_444_736_000_000_001u64;
+        for directory in [false, true] {
+            for device in [0, 23] {
+                for inode in [0, 1, (45u64 << 32) | 67, u64::MAX - 1, u64::MAX] {
+                    let info = BY_HANDLE_FILE_INFORMATION {
+                        dwFileAttributes: if directory {
+                            FILE_ATTRIBUTE_DIRECTORY
+                        } else {
+                            0
+                        },
+                        dwVolumeSerialNumber: device,
+                        ftCreationTime: FILETIME {
+                            dwHighDateTime: (created >> 32) as u32,
+                            dwLowDateTime: created as u32,
+                        },
+                        nFileIndexHigh: (inode >> 32) as u32,
+                        nFileIndexLow: inode as u32,
+                        nNumberOfLinks: 1,
+                        ..Default::default()
+                    };
+                    let expected = (inode != 0 && inode != u64::MAX).then_some(FileIdentity {
+                        device: u64::from(device),
+                        inode,
+                        created: std::time::UNIX_EPOCH + Duration::from_nanos(100),
+                    });
+                    assert_eq!(windows_identity_from_info(&info), expected);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_follows_symlink_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = StdBackend::new().unwrap();
+        for is_file in [false, true] {
+            let target = root.path().join(if is_file { "file" } else { "directory" });
+            let link = target.with_extension("link");
+            let result = if is_file {
+                std::fs::write(&target, "contents").unwrap();
+                std::os::windows::fs::symlink_file(&target, &link)
+            } else {
+                std::fs::create_dir(&target).unwrap();
+                std::os::windows::fs::symlink_dir(&target, &link)
+            };
+            if let Err(error) = result {
+                if error.raw_os_error() == Some(1314) || error.kind() == io::ErrorKind::Unsupported
+                {
+                    eprintln!("Skipping symlink observation because symlink creation is unavailable ({error}).");
+                    return;
+                }
+                panic!("Could not create test symlink ({}).", error);
+            }
+            let metadata = backend.metadata(&link).unwrap();
+            let identity = windows_identity(&link);
+            assert_eq!(
+                metadata.is_file(),
+                std::fs::metadata(&link).unwrap().is_file()
+            );
+            assert_eq!(metadata.is_file(), is_file);
+            assert_eq!(identity, windows_identity(&target));
+            assert!(identity.is_some());
+            assert_eq!(backend.file_identity(&link).unwrap(), identity);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_follows_junction_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = StdBackend::new().unwrap();
+        let target = root.path().join("directory");
+        let junction = root.path().join("junction");
+        std::fs::create_dir(&target).unwrap();
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            eprintln!(
+                "Skipping junction observation because junction creation is unavailable ({}).",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let metadata = backend.metadata(&junction).unwrap();
+        let identity = windows_identity(&junction);
+        assert_eq!(
+            metadata.is_file(),
+            std::fs::metadata(&junction).unwrap().is_file()
+        );
+        assert!(!metadata.is_file());
+        assert_eq!(identity, windows_identity(&target));
+        assert!(identity.is_some());
+        assert_eq!(backend.file_identity(&junction).unwrap(), identity);
+        std::fs::remove_dir(&junction).unwrap();
+        assert!(target.is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_metadata_echoes_keep_file_writes_and_all_structural_events() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("directory");
+        let file = root.path().join("source.luau");
+        let missing = root.path().join("missing");
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, "return 1\n").unwrap();
+        let events = filter_windows_directory_metadata_events(vec![
+            VfsEvent::Write(directory.clone()),
+            VfsEvent::Write(file.clone()),
+            VfsEvent::Write(missing.clone()),
+            VfsEvent::Create(directory.clone()),
+            VfsEvent::Remove(directory.clone()),
+            VfsEvent::Rename {
+                from: directory.clone(),
+                to: destination.clone(),
+                identity: None,
+            },
+        ]);
+        assert_eq!(events.len(), 5);
+        assert!(matches!(&events[0], VfsEvent::Write(path) if path == &file));
+        assert!(matches!(&events[1], VfsEvent::Write(path) if path == &missing));
+        assert!(matches!(&events[2], VfsEvent::Create(path) if path == &directory));
+        assert!(matches!(&events[3], VfsEvent::Remove(path) if path == &directory));
+        assert!(matches!(&events[4], VfsEvent::Rename { from, to, .. }
+            if from == &directory && to == &destination));
+    }
+
+    #[test]
+    fn identity_linkage_requires_a_unique_unchanged_file_identity() {
+        let identity = FileIdentity {
+            device: 1,
+            inode: 2,
+            created: std::time::UNIX_EPOCH,
+        };
+        for same_inode in [false, true] {
+            for same_birth in [false, true] {
+                for ambiguous in [false, true] {
+                    let from = PathBuf::from("old");
+                    let to = PathBuf::from("new");
+                    let mut before = HashMap::from([(from.clone(), identity)]);
+                    let after = HashMap::from([(
+                        to.clone(),
+                        FileIdentity {
+                            inode: if same_inode { 2 } else { 3 },
+                            created: identity.created + Duration::from_secs(u64::from(!same_birth)),
+                            ..identity
+                        },
+                    )]);
+                    let mut events = vec![VfsEvent::Remove(from), VfsEvent::Create(to)];
+                    if ambiguous {
+                        let other = PathBuf::from("other");
+                        before.insert(other.clone(), identity);
+                        events.push(VfsEvent::Remove(other));
+                    }
+                    let linked = link_identity_renames(events, &before, &after);
+                    assert_eq!(
+                        linked
+                            .iter()
+                            .any(|event| matches!(event, VfsEvent::Rename { .. })),
+                        same_inode && same_birth && !ambiguous
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moves_into_created_directories_link_only_a_unique_known_identity() {
+        let moved = FileIdentity {
+            device: 1,
+            inode: 2,
+            created: std::time::UNIX_EPOCH,
+        };
+        let other = FileIdentity { inode: 3, ..moved };
+        let from = PathBuf::from("/src/Module.luau");
+        let created = PathBuf::from("/src/New");
+        let destination = PathBuf::from("/src/New/Deep/Module.luau");
+        // Each row is whether the identity was known, whether a matching entry exists
+        // in the created directory, whether a second entry shares it, and whether the
+        // batch created a directory at all.
+        for row in 0..16u8 {
+            let known = row & 1 != 0;
+            let present = row & 2 != 0;
+            let duplicated = row & 4 != 0;
+            let creates = row & 8 != 0;
+            let before = if known {
+                HashMap::from([(from.clone(), moved)])
+            } else {
+                HashMap::new()
+            };
+            let mut events = vec![VfsEvent::Remove(from.clone())];
+            if creates {
+                events.insert(0, VfsEvent::Create(created.clone()));
+            }
+            let mut after = HashMap::new();
+            let mut walked = Vec::new();
+            let linked = link_moves_into_created_directories(events, &before, &mut after, |root| {
+                walked.push(root.to_path_buf());
+                let mut entries = vec![(created.join("Unrelated.luau"), other)];
+                if present {
+                    entries.push((destination.clone(), moved));
+                }
+                if present && duplicated {
+                    entries.push((created.join("Copy.luau"), moved));
+                }
+                entries
+            });
+            let expected = known && present && !duplicated && creates;
+            let renamed = linked.iter().any(|event| {
+                matches!(event, VfsEvent::Rename { from: old, to: new, .. }
+                    if old == &from && new == &destination)
+            });
+            assert_eq!(renamed, expected, "Row {row} linked incorrectly");
+            assert_eq!(
+                linked
+                    .iter()
+                    .any(|event| matches!(event, VfsEvent::Remove(path) if path == &from)),
+                !expected
+            );
+            assert_eq!(after.get(&destination).copied(), expected.then_some(moved));
+            // Walking only happens when a removal could be linked into a new directory.
+            assert_eq!(walked.len(), usize::from(known && creates));
+        }
+    }
+
+    #[test]
+    fn moves_into_created_directories_walk_only_outermost_creations_and_keep_reported_moves() {
+        let moved = FileIdentity {
+            device: 1,
+            inode: 2,
+            created: std::time::UNIX_EPOCH,
+        };
+        let from = PathBuf::from("/src/Module.luau");
+        let destination = PathBuf::from("/src/New/Deep/Module.luau");
+        let before = HashMap::from([(from.clone(), moved)]);
+        let events = vec![
+            VfsEvent::Create("/src/New".into()),
+            VfsEvent::Create("/src/New/Deep".into()),
+            VfsEvent::Remove(from.clone()),
+            VfsEvent::Rename {
+                from: "/src/Other.luau".into(),
+                to: destination.clone(),
+                identity: None,
+            },
+        ];
+        let mut walked = Vec::new();
+        let linked =
+            link_moves_into_created_directories(events, &before, &mut HashMap::new(), |root| {
+                walked.push(root.to_path_buf());
+                vec![(destination.clone(), moved)]
+            });
+        assert_eq!(walked, vec![PathBuf::from("/src/New")]);
+        // A destination the watcher already attributed to another move stays a removal.
+        assert!(linked
+            .iter()
+            .any(|event| matches!(event, VfsEvent::Remove(path) if path == &from)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identities_under_lists_nested_entries_without_following_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("New");
+        std::fs::create_dir_all(root.join("Deep")).unwrap();
+        std::fs::write(root.join("Deep/Module.luau"), "return 1\n").unwrap();
+        let outside = directory.path().join("Outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("Hidden.luau"), "return 2\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("Link")).unwrap();
+        let mut paths: Vec<_> = identities_under(&root)
+            .into_iter()
+            .map(|(path, _)| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("Deep"), PathBuf::from("Deep/Module.luau")]
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn stationary_hard_link_alias_delete_create_is_not_inferred_as_a_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let stationary = root.path().join("stationary");
+        let from = root.path().join("old");
+        let to = root.path().join("new");
+        std::fs::write(&stationary, "unchanged").unwrap();
+        assert!(observed_identity(&stationary).is_some());
+        std::fs::hard_link(&stationary, &from).unwrap();
+        let backend = StdBackend::new().unwrap();
+        for path in [&stationary, &from] {
+            backend.metadata(path).unwrap();
+            assert_eq!(backend.file_identity(path).unwrap(), None);
+        }
+        let before = backend.identities.lock().unwrap().clone();
+        std::fs::remove_file(&from).unwrap();
+        std::fs::hard_link(&stationary, &to).unwrap();
+        let after = observed_identity(&to)
+            .map(|identity| HashMap::from([(to.clone(), identity)]))
+            .unwrap_or_default();
+        assert_eq!(backend.file_identity(&to).unwrap(), None);
+        let events = link_identity_renames(
+            vec![VfsEvent::Remove(from.clone()), VfsEvent::Create(to.clone())],
+            &before,
+            &after,
+        );
+        assert!(
+            matches!(&events[..], [VfsEvent::Remove(old), VfsEvent::Create(new)]
+            if old == &from && new == &to)
+        );
+        std::fs::remove_file(&to).unwrap();
+        assert!(backend.file_identity(&stationary).unwrap().is_some());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn directory_link_counts_do_not_disqualify_native_identity() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        assert!(observed_identity(root.path()).is_some());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn settled_rename_identity_differs_after_destination_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(root.path()).unwrap();
+        let from = root.join("old");
+        let to = root.join("new");
+        let replacement = root.join("replacement");
+        std::fs::write(&from, "same contents").unwrap();
+        std::fs::write(&replacement, "same contents").unwrap();
+        let mut backend = StdBackend::new().unwrap();
+        backend.metadata(&from).unwrap();
+        let receiver = backend.event_receiver();
+        backend.watch(&root).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        std::fs::rename(&from, &to).unwrap();
+        let events = collect_until(&receiver, |events| {
+            events.iter().any(|event| {
+                matches!(event,
+                VfsEvent::Rename { from: old, to: new, .. } if old == &from && new == &to)
+            })
+        });
+        let identity = events
+            .iter()
+            .find_map(|event| match event {
+                VfsEvent::Rename {
+                    from: old,
+                    to: new,
+                    identity,
+                } if old == &from && new == &to => *identity,
+                _ => None,
+            })
+            .expect("A settled native rename must carry its destination identity.");
+        let vfs = crate::Vfs::new(backend);
+        assert_eq!(vfs.file_identity(&to).unwrap(), Some(identity));
+        std::fs::remove_file(&to).unwrap();
+        std::fs::rename(&replacement, &to).unwrap();
+        let current = vfs.file_identity(&to).unwrap().unwrap();
+        assert_ne!(identity, current);
+        assert_eq!(vfs.file_identity(&from).unwrap(), None);
+    }
+
+    #[test]
+    fn observed_replacement_invalidates_an_earlier_native_rename() {
+        let old = FileIdentity {
+            device: 1,
+            inode: 2,
+            created: std::time::UNIX_EPOCH,
+        };
+        let new = FileIdentity { inode: 3, ..old };
+        let before = HashMap::from([(PathBuf::from("/a"), old)]);
+        let after = HashMap::from([(PathBuf::from("/b"), new)]);
+        let events = link_identity_renames(
+            vec![VfsEvent::Rename {
+                from: "/a".into(),
+                to: "/b".into(),
+                identity: None,
+            }],
+            &before,
+            &after,
+        );
+        assert!(matches!(
+            &events[..],
+            [VfsEvent::Remove(_), VfsEvent::Create(_)]
+        ));
+    }
+
+    #[test]
+    fn queued_directory_renames_carry_descendant_identity_without_a_consumer_read() {
+        let root = FileIdentity {
+            device: 1,
+            inode: 2,
+            created: std::time::UNIX_EPOCH,
+        };
+        let child = FileIdentity { inode: 3, ..root };
+        let mut known = HashMap::from([
+            (PathBuf::from("/a"), root),
+            (PathBuf::from("/a/Child"), child),
+        ]);
+        let events = vec![VfsEvent::Rename {
+            from: "/a".into(),
+            to: "/b".into(),
+            identity: None,
+        }];
+        update_known_identities(
+            &mut known,
+            &events,
+            HashMap::from([(PathBuf::from("/b"), root)]),
+        );
+        assert!(!known.contains_key(Path::new("/a/Child")));
+        assert_eq!(known.get(Path::new("/b/Child")), Some(&child));
+        let events = link_identity_renames(
+            vec![
+                VfsEvent::Remove("/b/Child".into()),
+                VfsEvent::Create("/b/Renamed".into()),
+            ],
+            &known,
+            &HashMap::from([(PathBuf::from("/b/Renamed"), child)]),
+        );
+        assert!(
+            matches!(&events[..], [VfsEvent::Rename { from, to, .. }] if from == Path::new("/b/Child") && to == Path::new("/b/Renamed"))
+        );
+        update_known_identities(&mut known, &[VfsEvent::Remove("/b".into())], HashMap::new());
+        assert!(known.is_empty());
+    }
+
+    #[test]
+    fn settled_bursts_are_complete_separate_channel_messages() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let from = PathBuf::from("old");
+        let to = PathBuf::from("new");
+        let other = PathBuf::from("other");
+        let mut first = WatchBatch::default();
+        first.record(from.clone(), notify::Op::RENAME, None);
+        first.record(to.clone(), notify::Op::RENAME, None);
+        let mut second = WatchBatch::default();
+        second.record(other.clone(), notify::Op::WRITE, None);
+
+        assert!(send_batch(&sender, first.settle(|path| path == to)));
+        assert!(send_batch(&sender, Vec::new()));
+        assert!(send_batch(&sender, second.settle(|_| true)));
+
+        let VfsEvent::Batch(first) = receiver.try_recv().unwrap() else {
+            panic!("A settled burst must be delivered as one batch.");
+        };
+        assert_eq!(first.len(), 2);
+        assert!(matches!(&first[0], VfsEvent::Remove(path) if path == &from));
+        assert!(matches!(&first[1], VfsEvent::Create(path) if path == &to));
+        let VfsEvent::Batch(second) = receiver.try_recv().unwrap() else {
+            panic!("A later burst must remain a separate batch.");
+        };
+        assert_eq!(second.len(), 1);
+        assert!(matches!(&second[0], VfsEvent::Write(path) if path == &other));
+        assert!(receiver.try_recv().is_err());
+    }
+
     /// Collects watcher events until `done` is satisfied or the time runs out.
     fn collect_until(
         receiver: &Receiver<VfsEvent>,
@@ -410,7 +1362,10 @@ mod tests {
         let mut events = Vec::new();
         while !done(&events) && Instant::now() < deadline {
             if let Ok(event) = receiver.recv_timeout(Duration::from_millis(100)) {
-                events.push(event);
+                match event {
+                    VfsEvent::Batch(batch) => events.extend(batch),
+                    event => events.push(event),
+                }
             }
         }
         events
@@ -471,12 +1426,12 @@ mod tests {
         let removed = |events: &[VfsEvent]| {
             events
                 .iter()
-                .any(|event| matches!(event, VfsEvent::Remove(path) if path == &from))
+                .any(|event| matches!(event, VfsEvent::Remove(path) | VfsEvent::Rename { from: path, .. } if path == &from))
         };
         let created = |events: &[VfsEvent]| {
             events
                 .iter()
-                .any(|event| matches!(event, VfsEvent::Create(path) if path == &to))
+                .any(|event| matches!(event, VfsEvent::Create(path) | VfsEvent::Rename { to: path, .. } if path == &to))
         };
         let events = collect_until(&receiver, |events| removed(events) && created(events));
         assert!(
@@ -504,6 +1459,7 @@ mod tests {
 
         let mut backend = StdBackend::new().unwrap();
         let receiver = backend.event_receiver();
+        backend.metadata(&from).unwrap();
         backend.watch(&root).unwrap();
         thread::sleep(Duration::from_millis(500));
 
@@ -512,7 +1468,7 @@ mod tests {
         let removed = |events: &[VfsEvent]| {
             events
                 .iter()
-                .any(|event| matches!(event, VfsEvent::Remove(path) if path == &from))
+                .any(|event| matches!(event, VfsEvent::Remove(path) | VfsEvent::Rename { from: path, .. } if path == &from))
         };
         let events = collect_until(&receiver, removed);
         assert!(
@@ -520,6 +1476,9 @@ mod tests {
             "no removal of the old name in {:?}",
             events
         );
+        assert!(events.iter().any(|event| {
+            matches!(event, VfsEvent::Rename { from: old, to: new, .. } if old == &from && new == &to)
+        }), "The native watcher did not link the case-only rename. {:?}", events);
     }
 
     #[test]

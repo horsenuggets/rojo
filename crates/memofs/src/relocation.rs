@@ -90,7 +90,19 @@ pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result
 pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let mut result: Vec<_> = path.as_os_str().encode_wide().collect();
+        use std::path::{Component, Prefix};
+        let absolute = std::path::absolute(path)?;
+        let encoded = absolute.as_os_str().encode_wide();
+        // MoveFileExW does not add the extended namespace that Rust's filesystem
+        // calls use for long paths. Add it without resolving a leaf symlink.
+        let mut result: Vec<_> = match absolute.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(_) => r"\\?\".encode_utf16().chain(encoded).collect(),
+                Prefix::UNC(_, _) => r"\\?\UNC\".encode_utf16().chain(encoded.skip(2)).collect(),
+                _ => encoded.collect(),
+            },
+            _ => encoded.collect(),
+        };
         if result.contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
