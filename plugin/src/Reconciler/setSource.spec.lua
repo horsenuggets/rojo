@@ -372,6 +372,58 @@ return function()
 		end
 	end)
 
+	it("absorbs one late notification per commit when two commits return first", function()
+		for _, open in { false, true } do
+			local test = fixture(false, true)
+			local instance = test.Script("initial", open)
+			instance.DelayNotification = true
+			local map, reports = test.Map(instance)
+			local first = map:setSource(instance, "first")
+			test.Drain()
+			local second = map:setSource(instance, "second")
+			test.Drain()
+			-- Both deferred notifications arrive afterwards and read the latest text.
+			test.Notify(instance)
+			test.Notify(instance)
+			expect(first.Status).to.equal("committed")
+			expect(second.Status).to.equal("committed")
+			expect(#reports).to.equal(2)
+			expect(reports[1].Observation.Operation).to.equal(first)
+			expect(reports[2].Observation.Operation).to.equal(second)
+			-- The debts are spent, so any further identical activity is typing.
+			test.Notify(instance)
+			expect(#reports).to.equal(3)
+			expect(reports[3].Observation.Operation).to.equal(nil)
+			map:stop()
+		end
+	end)
+
+	it("keeps a late notification owed when the next commit notifies before returning", function()
+		for _, open in { false, true } do
+			local test = fixture(false, true)
+			local instance = test.Script("initial", open)
+			local map, reports = test.Map(instance)
+			instance.DelayNotification = true
+			local first = map:setSource(instance, "first")
+			test.Drain()
+			-- The second commit notifies normally, before its call returns.
+			instance.DelayNotification = false
+			local second = map:setSource(instance, "second")
+			test.Drain()
+			-- The first commit's deferred notification arrives last.
+			test.Notify(instance)
+			expect(first.Status).to.equal("committed")
+			expect(second.Status).to.equal("committed")
+			expect(#reports).to.equal(2)
+			expect(reports[1].Observation.Operation).to.equal(first)
+			expect(reports[2].Observation.Operation).to.equal(second)
+			test.Notify(instance)
+			expect(#reports).to.equal(3)
+			expect(reports[3].Observation.Operation).to.equal(nil)
+			map:stop()
+		end
+	end)
+
 	it("retains typing and exact reversions after a commit with delayed notification", function()
 		for _, open in { false, true } do
 			local test = fixture(false, true)

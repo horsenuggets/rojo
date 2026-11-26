@@ -190,22 +190,15 @@ fn execute_prepared(fs: &mut VfsLock<'_>, journal_dir: &Path, journal: &Journal)
     Ok(())
 }
 
-/// Recover one transaction, idempotently. Call before collecting session snapshots.
-/// Missing/corrupt intents or markers fail closed without removing any data. Package
-/// writes require durable ownership evidence matching the current Wally generation.
-/// Version-two structural records persist this witness before staging. Untagged legacy
-/// application journals remain recoverable unless current declarations protect their paths;
-/// they cannot prove historical package ownership after those declarations were removed.
-/// This API does not choose a cache location on the caller's behalf.
-/// Whether rolling back this journal would write outside its project folder. Only the
-/// process that wrote such a journal can vouch for that authority, so startup recovery
-/// refuses these instead of trusting a journal that a checkout may have shipped.
-/// Finished journals only clean up their own directory and are never refused.
-pub(crate) fn rolls_back_outside_project(vfs: &Vfs, journal_dir: &Path) -> io::Result<bool> {
+/// The files an unfinished script rename journal would write outside its project
+/// folder, or an empty list. Only the process that wrote such a journal can vouch for
+/// that authority, so startup recovery refuses these instead of trusting a journal that
+/// a checkout may have shipped. Finished journals only clean up their own directory.
+pub(crate) fn outside_project_writes(vfs: &Vfs, journal_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let bytes = read_file(&vfs.lock(), &journal_dir.join("intent.json"))?;
     let intent: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     if intent.get("kind").and_then(serde_json::Value::as_str) != Some("replacement") {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let journal: ReplacementJournal = serde_json::from_value(intent).map_err(io::Error::other)?;
     let Some(root) = journal
@@ -213,18 +206,29 @@ pub(crate) fn rolls_back_outside_project(vfs: &Vfs, journal_dir: &Path) -> io::R
         .as_ref()
         .and_then(|script| script.project.parent())
     else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let finished = ["commit", "rollback"]
         .iter()
         .any(|name| vfs.metadata(journal_dir.join(name)).is_ok());
-    Ok(!finished
-        && journal
-            .entries
-            .iter()
-            .any(|entry| !entry.path.starts_with(root)))
+    if finished {
+        return Ok(Vec::new());
+    }
+    Ok(journal
+        .entries
+        .iter()
+        .filter(|entry| !entry.path.starts_with(root))
+        .map(|entry| entry.path.clone())
+        .collect())
 }
 
+/// Recover one transaction, idempotently. Call before collecting session snapshots.
+/// Missing/corrupt intents or markers fail closed without removing any data. Package
+/// writes require durable ownership evidence matching the current Wally generation.
+/// Version-two structural records persist this witness before staging. Untagged legacy
+/// application journals remain recoverable unless current declarations protect their paths;
+/// they cannot prove historical package ownership after those declarations were removed.
+/// This API does not choose a cache location on the caller's behalf.
 pub fn recover(vfs: &Vfs, journal_dir: &Path) -> io::Result<Recovery> {
     // Validate current authority before acquiring the VFS lock. The locked recovery
     // checks the same durable evidence again before performing any mutation.
@@ -3891,11 +3895,18 @@ mod tests {
                 } else if fs.metadata(directory.join("commit")).is_ok() {
                     fs.remove_file(directory.join("commit")).unwrap();
                 }
+                let listed = outside_project_writes(&fs, &directory).unwrap();
                 assert_eq!(
-                    rolls_back_outside_project(&fs, &directory).unwrap(),
+                    !listed.is_empty(),
                     !finished && outside,
                     "finished={finished} outside={outside}"
                 );
+                // Every listed file is one of the journal's own writes outside the root.
+                let root = journal.script.as_ref().unwrap().project.parent().unwrap();
+                for path in &listed {
+                    assert!(!path.starts_with(root));
+                    assert!(journal.entries.iter().any(|entry| &entry.path == path));
+                }
             }
         }
     }

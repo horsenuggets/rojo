@@ -115,17 +115,21 @@ local function createSourceSetter(boundary)
 		end
 		local readSuccess, value = pcall(boundary.GetEditorSource, instance)
 		local owed = state.OwedDelivery
-		state.OwedDelivery = nil
 		if
-			readSuccess
+			not owesDelivery
+			and readSuccess
 			and owed
 			and owed.Generation == state.Generation
 			and owed.Revision == state.Revision
 			and owed.Value == value
 		then
-			-- Deferred engine delivery arrives after its successful call returned. That
-			-- call already produced this transition's one observation, so absorb exactly
-			-- one first matching delivery. Any intervening observation revokes the debt.
+			-- Deferred engine delivery arrives after its successful call returned, and
+			-- reads the latest text. Each such call already produced its observation, so
+			-- absorb one matching delivery per owed call while nothing else intervened.
+			owed.Count -= 1
+			if owed.Count == 0 then
+				state.OwedDelivery = nil
+			end
 			return
 		end
 		state.Revision += 1
@@ -134,10 +138,21 @@ local function createSourceSetter(boundary)
 		if readSuccess and active and active.ProposedRevision == state.Revision - 1 and active.Value == value then
 			candidate = active
 			active.ObservedRevision = state.Revision
-			if owesDelivery then
-				state.OwedDelivery = { Generation = state.Generation, Revision = state.Revision, Value = value }
-			end
 		end
+		-- Consecutive remote commits carry earlier debts forward, and a commit observed at
+		-- its return adds one. Any unattributed observation, such as typing, revokes them.
+		local count = if candidate
+				and owed
+				and owed.Generation == state.Generation
+				and owed.Revision == state.Revision - 1
+			then owed.Count
+			else 0
+		if candidate and owesDelivery then
+			count += 1
+		end
+		state.OwedDelivery = if count > 0
+			then { Count = count, Generation = state.Generation, Revision = state.Revision, Value = value }
+			else nil
 		local observation = {
 			Error = if readSuccess then nil else tostring(value),
 			Generation = state.Generation,

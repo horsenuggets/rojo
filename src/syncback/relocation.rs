@@ -577,10 +577,18 @@ fn recover_journals(vfs: &memofs::Vfs, cache: &Path) -> std::io::Result<()> {
             vfs.remove_dir_all(entry.path())?;
             vfs.sync_path(&cache)?;
         } else {
-            if super::relocation_transaction::rolls_back_outside_project(vfs, entry.path())? {
+            let outside = super::relocation_transaction::outside_project_writes(vfs, entry.path())?;
+            if !outside.is_empty() {
+                let files: Vec<_> = outside
+                    .iter()
+                    .map(|path| format!("\"{}\"", path.display()))
+                    .collect();
+                // The journal's stage files may hold the only copy of the originals, so it
+                // must survive until someone has restored these files by hand.
                 return Err(std::io::Error::other(format!(
-                    "Refused to recover the script rename journal at \"{}\" because it would write outside its project folder. Check the listed files, then delete the journal folder to continue.",
-                    entry.path().display()
+                    "Refused to recover the script rename journal at \"{}\" because it would write outside its project folder, to {}. Keep the journal and its stage files, which may hold the only copy of the originals. Restore those files by hand, then delete the journal folder to continue.",
+                    entry.path().display(),
+                    files.join(", ")
                 )));
             }
             super::relocation_transaction::recover(vfs, entry.path())?;
