@@ -75,7 +75,11 @@ impl StdBackend {
                         current.insert(path.clone(), identity);
                     }
                 }
-                let mut events = link_identity_renames(events, &known, &current);
+                let events = link_identity_renames(events, &known, &current);
+                let mut events =
+                    link_moves_into_created_directories(events, &known, &mut current, |path| {
+                        identities_under(path)
+                    });
                 for event in &mut events {
                     if let VfsEvent::Rename { to, identity, .. } = event {
                         *identity = current.get(to).copied();
@@ -584,6 +588,107 @@ fn link_identity_renames(
         .collect()
 }
 
+/// inotify watches directories one at a time. When something moves into a directory
+/// created a moment earlier, its watch may not exist yet, so only the move-out is
+/// reported. The moved object must then be inside a directory this batch created. Link
+/// it there only when exactly one entry carries its earlier filesystem identity.
+fn link_moves_into_created_directories(
+    events: Vec<VfsEvent>,
+    before: &HashMap<PathBuf, FileIdentity>,
+    after: &mut HashMap<PathBuf, FileIdentity>,
+    mut identities_under: impl FnMut(&Path) -> Vec<(PathBuf, FileIdentity)>,
+) -> Vec<VfsEvent> {
+    let wanted: HashSet<FileIdentity> = events
+        .iter()
+        .filter_map(|event| match event {
+            VfsEvent::Remove(path) => before.get(path).copied(),
+            _ => None,
+        })
+        .collect();
+    if wanted.is_empty() {
+        return events;
+    }
+    let created: Vec<&Path> = events
+        .iter()
+        .filter_map(|event| match event {
+            VfsEvent::Create(path) => Some(path.as_path()),
+            _ => None,
+        })
+        .collect();
+    // Nested creations are already inside an outer created directory's walk.
+    let roots = created.iter().filter(|path| {
+        !path
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| created.contains(&ancestor))
+    });
+    let mut found: HashMap<FileIdentity, Vec<PathBuf>> = HashMap::new();
+    for root in roots {
+        for (path, identity) in identities_under(root) {
+            if wanted.contains(&identity) {
+                found.entry(identity).or_default().push(path);
+            }
+        }
+    }
+    let reported: HashSet<PathBuf> = events
+        .iter()
+        .filter_map(|event| match event {
+            VfsEvent::Rename { to, .. } => Some(to.clone()),
+            _ => None,
+        })
+        .collect();
+    events
+        .into_iter()
+        .map(|event| {
+            let VfsEvent::Remove(from) = &event else {
+                return event;
+            };
+            let Some(identity) = before.get(from) else {
+                return event;
+            };
+            match found.get(identity).map(Vec::as_slice) {
+                Some([to]) if !reported.contains(to) => {
+                    after.insert(to.clone(), *identity);
+                    VfsEvent::Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                        identity: None,
+                    }
+                }
+                _ => event,
+            }
+        })
+        .collect()
+}
+
+/// Lists the identities of every entry beneath a newly created directory, without
+/// following links into other trees.
+fn identities_under(root: &Path) -> Vec<(PathBuf, FileIdentity)> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_symlink() {
+                continue;
+            }
+            if let Some(identity) = observed_identity(&path) {
+                found.push((path.clone(), identity));
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    found
+}
+
 fn update_known_identities(
     known: &mut HashMap<PathBuf, FileIdentity>,
     events: &[VfsEvent],
@@ -953,6 +1058,120 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn moves_into_created_directories_link_only_a_unique_known_identity() {
+        let moved = FileIdentity {
+            device: 1,
+            inode: 2,
+            created: std::time::UNIX_EPOCH,
+        };
+        let other = FileIdentity { inode: 3, ..moved };
+        let from = PathBuf::from("/src/Module.luau");
+        let created = PathBuf::from("/src/New");
+        let destination = PathBuf::from("/src/New/Deep/Module.luau");
+        // Each row is whether the identity was known, whether a matching entry exists
+        // in the created directory, whether a second entry shares it, and whether the
+        // batch created a directory at all.
+        for row in 0..16u8 {
+            let known = row & 1 != 0;
+            let present = row & 2 != 0;
+            let duplicated = row & 4 != 0;
+            let creates = row & 8 != 0;
+            let before = if known {
+                HashMap::from([(from.clone(), moved)])
+            } else {
+                HashMap::new()
+            };
+            let mut events = vec![VfsEvent::Remove(from.clone())];
+            if creates {
+                events.insert(0, VfsEvent::Create(created.clone()));
+            }
+            let mut after = HashMap::new();
+            let mut walked = Vec::new();
+            let linked = link_moves_into_created_directories(events, &before, &mut after, |root| {
+                walked.push(root.to_path_buf());
+                let mut entries = vec![(created.join("Unrelated.luau"), other)];
+                if present {
+                    entries.push((destination.clone(), moved));
+                }
+                if present && duplicated {
+                    entries.push((created.join("Copy.luau"), moved));
+                }
+                entries
+            });
+            let expected = known && present && !duplicated && creates;
+            let renamed = linked.iter().any(|event| {
+                matches!(event, VfsEvent::Rename { from: old, to: new, .. }
+                    if old == &from && new == &destination)
+            });
+            assert_eq!(renamed, expected, "Row {row} linked incorrectly");
+            assert_eq!(
+                linked
+                    .iter()
+                    .any(|event| matches!(event, VfsEvent::Remove(path) if path == &from)),
+                !expected
+            );
+            assert_eq!(after.get(&destination).copied(), expected.then_some(moved));
+            // Walking only happens when a removal could be linked into a new directory.
+            assert_eq!(walked.len(), usize::from(known && creates));
+        }
+    }
+
+    #[test]
+    fn moves_into_created_directories_walk_only_outermost_creations_and_keep_reported_moves() {
+        let moved = FileIdentity {
+            device: 1,
+            inode: 2,
+            created: std::time::UNIX_EPOCH,
+        };
+        let from = PathBuf::from("/src/Module.luau");
+        let destination = PathBuf::from("/src/New/Deep/Module.luau");
+        let before = HashMap::from([(from.clone(), moved)]);
+        let events = vec![
+            VfsEvent::Create("/src/New".into()),
+            VfsEvent::Create("/src/New/Deep".into()),
+            VfsEvent::Remove(from.clone()),
+            VfsEvent::Rename {
+                from: "/src/Other.luau".into(),
+                to: destination.clone(),
+                identity: None,
+            },
+        ];
+        let mut walked = Vec::new();
+        let linked =
+            link_moves_into_created_directories(events, &before, &mut HashMap::new(), |root| {
+                walked.push(root.to_path_buf());
+                vec![(destination.clone(), moved)]
+            });
+        assert_eq!(walked, vec![PathBuf::from("/src/New")]);
+        // A destination the watcher already attributed to another move stays a removal.
+        assert!(linked
+            .iter()
+            .any(|event| matches!(event, VfsEvent::Remove(path) if path == &from)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identities_under_lists_nested_entries_without_following_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("New");
+        std::fs::create_dir_all(root.join("Deep")).unwrap();
+        std::fs::write(root.join("Deep/Module.luau"), "return 1\n").unwrap();
+        let outside = directory.path().join("Outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("Hidden.luau"), "return 2\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("Link")).unwrap();
+        let mut paths: Vec<_> = identities_under(&root)
+            .into_iter()
+            .map(|(path, _)| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("Deep"), PathBuf::from("Deep/Module.luau")]
+        );
     }
 
     #[cfg(any(unix, windows))]
