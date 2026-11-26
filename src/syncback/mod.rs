@@ -468,7 +468,14 @@ impl MigrationDeclarations<'_> {
                     .ownership
                     .project(self.vfs, &project_path, Some("Migration"))?;
                 self.project(&context, &project)?;
-            } else {
+            } else if self
+                .targets
+                .iter()
+                .any(|target| target.starts_with(&canonical))
+            {
+                // Only directories on the way to a target can hold it or a project
+                // file that shadows it, so other subtrees are probed but not walked.
+                // Walking the whole project made every rename scale with project size.
                 let entries = self
                     .vfs
                     .read_dir(&path)?
@@ -2305,7 +2312,9 @@ mod test {
                 "identity" => vfs
                     .write("/project/Other/DEFAULT.project.json", "{}")
                     .unwrap(),
-                "directory" => vfs.create_dir_all("/project/Other/New").unwrap(),
+                // Only folders on the way to the script are listed, so unrelated
+                // folders such as Other can change without invalidating the rename.
+                "directory" => vfs.create_dir_all("/project/Fixture/New").unwrap(),
                 "bytes" => vfs
                     .write("/project/default.project.json", "foreign declaration")
                     .unwrap(),
@@ -2478,6 +2487,83 @@ mod test {
                 before
             );
         }
+    }
+
+    #[test]
+    fn migration_ownership_work_is_bounded_by_the_target_ancestry() {
+        use memofs::{InMemoryFs, VfsSnapshot};
+
+        // A rename must not scale with the rest of the project. Unrelated subtrees are
+        // probed for project files but never walked, so their size changes nothing.
+        let capture = |unrelated: usize| {
+            let mut backend = InMemoryFs::new();
+            backend
+                .load_snapshot(
+                    "/project",
+                    VfsSnapshot::dir([
+                        (
+                            "default.project.json",
+                            VfsSnapshot::file(
+                                r#"{"name":"Test","tree":{"$className":"Folder","$path":"src"}}"#,
+                            ),
+                        ),
+                        (
+                            "src",
+                            VfsSnapshot::dir([
+                                (
+                                    "Target",
+                                    VfsSnapshot::dir([(
+                                        "Code.legacy.luau",
+                                        VfsSnapshot::file("source"),
+                                    )]),
+                                ),
+                                (
+                                    "Unrelated",
+                                    VfsSnapshot::dir((0..unrelated).map(|index| {
+                                        (
+                                            format!("Folder{index}"),
+                                            VfsSnapshot::dir([(
+                                                "Leaf",
+                                                VfsSnapshot::dir([(
+                                                    "Module.luau",
+                                                    VfsSnapshot::file("return 1"),
+                                                )]),
+                                            )]),
+                                        )
+                                    })),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            let vfs = Vfs::new(backend);
+            vfs.set_watch_enabled(false);
+            let project =
+                Project::load_exact(&vfs, Path::new("/project/default.project.json"), None)
+                    .unwrap();
+            let source = PathBuf::from("/project/src/Target/Code.legacy.luau");
+            let destination = PathBuf::from("/project/src/Target/Code.server.luau");
+            script_migration_projects(
+                &vfs,
+                &Default::default(),
+                &project,
+                &[&source, &destination],
+            )
+            .unwrap()
+        };
+        let small = capture(2);
+        let large = capture(60);
+        assert_eq!(small.paths.len(), large.paths.len());
+        assert_eq!(small.directories.len(), large.directories.len());
+        assert_eq!(small.files.len(), large.files.len());
+        assert_eq!(small.declarations.len(), large.declarations.len());
+        assert!(!large
+            .directories
+            .contains_key(Path::new("/project/src/Unrelated")));
+        assert!(large
+            .directories
+            .contains_key(Path::new("/project/src/Target")));
     }
 
     #[test]

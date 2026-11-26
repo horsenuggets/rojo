@@ -19332,6 +19332,64 @@ mod tests {
     }
 
     #[test]
+    fn run_context_suffix_migration_never_repeats_the_suffix_in_a_sidecar() {
+        for directory in [false, true] {
+            for authored in [false, true] {
+                let sidecar = if directory {
+                    "/project/Physical/init.meta.json"
+                } else {
+                    "/project/Physical.meta.json"
+                };
+                let metadata = r#"{"properties":{"Disabled":true}}"#;
+                let mut files = if directory {
+                    vec![(
+                        "Physical",
+                        VfsSnapshot::dir([("init.legacy.luau", VfsSnapshot::file("print(1)"))]),
+                    )]
+                } else {
+                    vec![("Physical.legacy.luau", VfsSnapshot::file("print(1)"))]
+                };
+                if authored && !directory {
+                    files.push(("Physical.meta.json", VfsSnapshot::file(metadata)));
+                }
+                let (job, id) = script_job(
+                    files,
+                    if directory {
+                        "/project/Physical"
+                    } else {
+                        "/project/Physical.legacy.luau"
+                    },
+                );
+                if authored && directory {
+                    job.vfs.write(sidecar, metadata).unwrap();
+                    let mut tree = job.tree.lock().unwrap();
+                    let mut instance = tree.get_instance_mut(id).unwrap();
+                    instance
+                        .properties_mut()
+                        .insert(ustr("Disabled"), Variant::Bool(true));
+                }
+                // Every directed transition between the four contexts.
+                for value in [1, 2, 3, 0, 2, 1, 3, 2, 0, 3, 1, 0] {
+                    let result = job.handle_tree_event(property_update(
+                        id,
+                        "RunContext",
+                        Variant::Enum(rbx_dom_weak::types::Enum::from_u32(value)),
+                    ));
+                    assert!(result.2.is_empty(), "{result:?}");
+                    let written = read_text(&job.vfs, sidecar);
+                    if authored {
+                        let written = written.expect("The authored sidecar was removed");
+                        assert!(written.contains("Disabled"), "{written}");
+                        assert!(!written.contains("RunContext"), "{written}");
+                    } else {
+                        assert_eq!(written, None, "directory={directory} context={value}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn run_context_suffix_migration_composes_source_metadata_and_disk_edits() {
         let (job, id) = script_job(
             vec![
@@ -21282,6 +21340,56 @@ mod tests {
         assert_eq!(
             read_text(&job.vfs, "/project/src/Nested/code/Code.client.luau").as_deref(),
             Some("-- preserve bytes\r\nprint(0)\r\n")
+        );
+    }
+
+    #[test]
+    fn run_context_migration_refuses_a_script_also_mapped_by_an_unrelated_custom_project() {
+        // The ownership walk skips folders off the script's path. A second mapping from
+        // a custom-named project there is still found through the served tree's aliases.
+        let job = project_job(
+            "default.project.json",
+            r#"{"name":"Test","tree":{"$className":"Folder","$path":"src"}}"#,
+            vec![(
+                "src",
+                VfsSnapshot::dir([
+                    (
+                        "Target",
+                        VfsSnapshot::dir([("Code.legacy.luau", VfsSnapshot::file("print(0)"))]),
+                    ),
+                    (
+                        "Unrelated",
+                        VfsSnapshot::dir([(
+                            "Mirror.project.json",
+                            VfsSnapshot::file(
+                                r#"{"name":"Mirror","tree":{"$path":"../Target/Code.legacy.luau"}}"#,
+                            ),
+                        )]),
+                    ),
+                ]),
+            )],
+        );
+        let id = find(&job, &["Target", "Code"]);
+        assert_ne!(find(&job, &["Unrelated", "Mirror"]), id);
+        let result = studio_write(
+            &job,
+            property_update(
+                id,
+                "RunContext",
+                Variant::Enum(rbx_dom_weak::types::Enum::from_u32(2)),
+            ),
+        );
+        assert!(
+            format!("{:?}", result.2).contains("An aliased script source cannot migrate"),
+            "{result:?}"
+        );
+        assert_eq!(
+            read_text(&job.vfs, "/project/src/Target/Code.legacy.luau").as_deref(),
+            Some("print(0)")
+        );
+        assert_eq!(
+            read_text(&job.vfs, "/project/src/Target/Code.client.luau"),
+            None
         );
     }
 
