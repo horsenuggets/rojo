@@ -31,6 +31,64 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Required a separate protocol version for explicit-direction sessions so older plugins
+  reject them before hydration, while ordinary sync and Studio export remain compatible.
+* Used relevant immediate-child name/class profiles to distinguish equal-property,
+  duplicate-named siblings during hydration, avoiding unnecessary descendant replacement
+  or duplication without counting unrelated children or scanning subtrees recursively.
+* Excluded unmanaged attribute notifications from Studio write tracking so connection
+  markers and reference links do not trigger unintended filesystem writes.
+* Serialized same-session Source checkpoint operations so concurrent recovery requests
+  do not contend with one another, while independent-process ownership remains protected.
+* Retained original causal cursors and predecessor evidence while Studio detachments are
+  held, so delayed deletions cannot consume newer filesystem changes during the grace period.
+* Captured explicit default values and cleared references in accepted write receipts before
+  later filesystem changes, so MessagePack acknowledgements retain default-valued edits such
+  as `Enum.RunContext.Legacy` without changing property omission on disk.
+* Kept live-edit output ownership locks separate from Studio's own place-file locks so
+  generated places remain editable and can be saved normally.
+* Disabled notification sounds by default while retaining the Play Sounds setting and
+  existing saved preferences.
+* Migrated managed script filenames automatically when Studio changes `RunContext`,
+  retaining instance identities, effective Source, metadata, initializer children, and
+  `.lua` or `.luau` extensions. Ownership, collision, alias, and recovery guards prevent
+  migrations from taking over other project mappings or partially accepting failed writes.
+  Unrelated resolved Unicode siblings do not block absent project-file probes; ambiguous
+  or unresolved paths still prevent migration. Generated projects can migrate declared
+  scripts outside the project-file directory using captured write authority that remains
+  validated during recovery. Path overlap and declaration checks avoid quadratic scans
+  without reducing their safety evidence. Directory exemptions use frozen write-parent
+  identities to avoid unrelated parent probes while retaining live checks for every
+  applicable write.
+* Added `rojo serve --sync-direction` with explicit `fs-to-studio`, `studio-to-fs`, and
+  `bidirectional` session policies. Server information advertises supported policies through
+  MessagePack or negotiated JSON, and generated live-edit places bind the selected policy to
+  the server session. Filesystem-only sessions reject live writes before decoding or queuing
+  them and skip write-conflict history and Source baseline capture. Outer `.luaurc` changes
+  still refresh mapped script imports without collecting writable-session witnesses.
+  Studio-only sessions always apply Studio writes with Studio authority, and the plugin
+  reports when a save replaced a filesystem change it had withheld. Retained Source baselines
+  support these saves across reconnects without treating withheld filesystem payloads as
+  consumed or relaxing structural and ownership checks. Served `.luaurc` inputs and absent
+  probes are validated before retained Source saves so independent alias changes cannot
+  become Studio-authored normalizations.
+
+## `7.7.1-horse.2.11`
+
+* Shortened the `rojo serve` start message to two sentences, `Rojo+ server listening on
+  localhost:PORT.` and the browser link, with the address and URL muted. The network
+  exposure warning is now plain yellow sentences.
+* Reworded `rojo build` output as `Building project NAME...` and
+  `Built project NAME as FILE.`, with the project name muted and the place or model file in
+  bright cyan bold.
+* Added `rojo serve --live-edit-place <TEMPLATE>`, which writes the served project to a
+  `.rbxl` or `.rbxlx` place once the server is listening, replacing `{port}` in the path
+  with the bound port. The place's Workspace carries the `__RojoPlus_LiveEditUrl` marker,
+  so the plugin connects as soon as Studio opens it, while the served tree never gets the
+  attribute. Old files at the path are removed before the start message, the new file
+  appears atomically, and a failed write stops the server with an error. Live edits no
+  longer need a separate `rojo build` and marking pass.
+
 ## `7.7.1-horse.2.10`
 
 * Stopped queued two-way sync writes from reaching the server after the filesystem replaced
