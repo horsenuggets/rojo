@@ -139,18 +139,20 @@ local function createSourceSetter(boundary)
 			candidate = active
 			active.ObservedRevision = state.Revision
 		end
+		-- Consecutive remote commits carry earlier debts forward, and a commit observed at
+		-- its return adds one. Any unattributed observation, such as typing, revokes them.
+		local count = if candidate
+				and owed
+				and owed.Generation == state.Generation
+				and owed.Revision == state.Revision - 1
+			then owed.Count
+			else 0
 		if candidate and owesDelivery then
-			-- Consecutive owed commits accumulate. Anything else revokes every debt.
-			local count = if owed
-					and owed.Generation == state.Generation
-					and owed.Revision == state.Revision - 1
-				then owed.Count
-				else 0
-			state.OwedDelivery =
-				{ Count = count + 1, Generation = state.Generation, Revision = state.Revision, Value = value }
-		else
-			state.OwedDelivery = nil
+			count += 1
 		end
+		state.OwedDelivery = if count > 0
+			then { Count = count, Generation = state.Generation, Revision = state.Revision, Value = value }
+			else nil
 		local observation = {
 			Error = if readSuccess then nil else tostring(value),
 			Generation = state.Generation,
