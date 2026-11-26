@@ -109,7 +109,13 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
             component => normalized.push(component.as_os_str()),
         }
     }
-    normalized
+    // Match the compatible Windows spelling returned by the VFS canonicalizer.
+    let simplified = dunce::simplified(&normalized);
+    if simplified == normalized {
+        normalized
+    } else {
+        simplified.to_path_buf()
+    }
 }
 
 /// Checks the closest existing ancestor as well, so additions cannot traverse a link.
@@ -538,6 +544,22 @@ mod tests {
     use super::*;
     use memofs::{InMemoryFs, VfsSnapshot};
     use serde_json::{json, Value};
+
+    #[cfg(windows)]
+    #[test]
+    fn normalization_unifies_compatible_windows_verbatim_paths() {
+        let plain = Path::new(r"C:\checkout with spaces\Source");
+        for path in [
+            plain,
+            Path::new(r"\\?\C:\checkout with spaces\Source"),
+            Path::new(r"\\?\C:\checkout with spaces\Packages\..\Source"),
+        ] {
+            assert_eq!(normalize(path), plain);
+            assert_eq!(normalize(&normalize(path)), plain);
+        }
+        let reserved = Path::new(r"\\?\C:\checkout\NUL");
+        assert_eq!(normalize(reserved), reserved);
+    }
 
     fn fixture(change: impl FnOnce(&mut Value)) -> Vfs {
         let root_manifest = "[dependencies]\nFoo = \"^Source/Foo\"\n";

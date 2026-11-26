@@ -291,16 +291,17 @@ pub struct RequireContext {
     #[serde(serialize_with = "path_serializer::serialize_absolute")]
     pub project_root: PathBuf,
 
-    /// Maps filesystem paths (relative to project root) to their
-    /// DataModel path segments. Used to compute relative require
-    /// paths that match the DataModel tree structure rather than
-    /// the filesystem layout.
+    /// Maps normalized absolute filesystem paths to their DataModel path segments,
+    /// including mounts outside the project root. Used to compute require paths that
+    /// match the DataModel tree structure rather than the filesystem layout.
     ///
     /// For example, a project tree like:
     /// ```json
     /// { "Plugin": { "$path": "Source/Plugin" } }
     /// ```
-    /// produces: `("Source/Plugin", ["Plugin"])`
+    /// produces: `("<project-root>/Source/Plugin", ["Plugin"])`
+    ///
+    /// Private so replacements also reset the derived prefix cache.
     path_mappings: Vec<(PathBuf, Vec<String>)>,
     pub datamodel: bool,
     /// Lookup of `path_mappings` by path. Mappings cover every watched project
@@ -335,7 +336,12 @@ impl RequireContext {
     pub(crate) fn mapping_prefixes(&self) -> MappingPrefixes {
         let mut cached = self.mapping_prefixes.0.lock().unwrap();
         cached
-            .get_or_insert_with(|| Arc::new(build_mapping_prefixes(&self.path_mappings)))
+            .get_or_insert_with(|| {
+                Arc::new(build_mapping_prefixes(
+                    &self.path_mappings,
+                    &self.project_root,
+                ))
+            })
             .clone()
     }
 }
@@ -348,18 +354,22 @@ pub(crate) type MappingPrefixes = Arc<std::collections::HashMap<PathBuf, usize>>
 #[derive(Default)]
 struct MappingPrefixCache(std::sync::Mutex<Option<MappingPrefixes>>);
 
+/// Normalizes every mapping against `root`, so relative and absolute mounts, including
+/// those outside the project directory, are found by the same normalized lookup.
 pub(crate) fn build_mapping_prefixes(
     mappings: &[(PathBuf, Vec<String>)],
+    root: &Path,
 ) -> std::collections::HashMap<PathBuf, usize> {
     let mut prefixes = std::collections::HashMap::with_capacity(mappings.len());
     for (ordinal, (path, _)) in mappings.iter().enumerate() {
-        prefixes.entry(path.clone()).or_insert(ordinal);
-        if path
+        let prefix = crate::package_sources::normalize(&root.join(path));
+        if prefix
             .extension()
             .is_some_and(|extension| extension == "lua" || extension == "luau")
         {
-            prefixes.entry(path.with_extension("")).or_insert(ordinal);
+            prefixes.entry(prefix.with_extension("")).or_insert(ordinal);
         }
+        prefixes.entry(prefix).or_insert(ordinal);
     }
     prefixes
 }

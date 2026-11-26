@@ -2,9 +2,9 @@
   "recommendations": [
     "hashicorp.hcl",
     "hashicorp.terraform",
+    "horsenuggets.styluau",
     "jkillian.custom-local-formatters",
     "JohnnyMorganz.luau-lsp",
-    "JohnnyMorganz.stylua",
     "Kampfkarren.selene-vscode",
     "rust-lang.rust-analyzer"
   ]

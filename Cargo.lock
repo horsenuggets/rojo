@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "rojo"
-version = "7.7.1-horse.2.11"
+version = "7.7.1-horse.2.12"
 dependencies = [
  "anyhow",
  "backtrace",

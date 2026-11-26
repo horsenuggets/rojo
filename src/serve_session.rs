@@ -487,16 +487,13 @@ pub(crate) fn build_require_context_from_tree(
     fn walk(
         tree: &RojoTree,
         id: rbx_dom_weak::types::Ref,
-        root: &Path,
         dm: &mut Vec<String>,
         mappings: &mut Vec<(PathBuf, Vec<String>)>,
     ) {
         use rayon::prelude::*;
         let instance = tree.get_instance(id).unwrap();
         for path in instance.metadata().watch_paths() {
-            if let Ok(relative) = path.strip_prefix(root) {
-                mappings.push((relative.to_path_buf(), dm.clone()));
-            }
+            mappings.push((path.to_path_buf(), dm.clone()));
         }
         if dm.len() < PARALLEL_DEPTH && instance.children().len() > 1 {
             let nested: Vec<_> = instance
@@ -506,7 +503,7 @@ pub(crate) fn build_require_context_from_tree(
                     let mut dm = dm.clone();
                     dm.push(tree.get_instance(*child).unwrap().name().to_owned());
                     let mut nested = Vec::new();
-                    walk(tree, *child, root, &mut dm, &mut nested);
+                    walk(tree, *child, &mut dm, &mut nested);
                     nested
                 })
                 .collect();
@@ -515,20 +512,14 @@ pub(crate) fn build_require_context_from_tree(
         }
         for child in instance.children() {
             dm.push(tree.get_instance(*child).unwrap().name().to_owned());
-            walk(tree, *child, root, dm, mappings);
+            walk(tree, *child, dm, mappings);
             dm.pop();
         }
     }
     let mut mappings = Vec::new();
     {
         profiling::scope!("Rojo require mappings tree traversal");
-        walk(
-            tree,
-            tree.get_root_id(),
-            root,
-            &mut Vec::new(),
-            &mut mappings,
-        );
+        walk(tree, tree.get_root_id(), &mut Vec::new(), &mut mappings);
     }
     Ok(Arc::new(RequireContext::new(
         root.to_path_buf(),
@@ -538,8 +529,8 @@ pub(crate) fn build_require_context_from_tree(
 }
 
 /// Recursively extracts `$path` mappings from the project tree.
-/// Each entry maps a filesystem path (relative to the project root)
-/// to the DataModel path segments leading to that node.
+/// Each entry maps a normalized absolute filesystem path to the DataModel path segments
+/// leading to that node, including mounts outside the project file's directory.
 ///
 /// For example, given:
 /// ```json
@@ -547,8 +538,8 @@ pub(crate) fn build_require_context_from_tree(
 ///   "Plugin": { "$path": "Source/Plugin" } }
 /// ```
 /// This produces:
-/// - `("Packages", ["Packages"])`
-/// - `("Source/Plugin", ["Plugin"])`
+/// - `("<project-root>/Packages", ["Packages"])`
+/// - `("<project-root>/Source/Plugin", ["Plugin"])`
 fn extract_path_mappings(
     snapshot: &InstanceSnapshot,
     root: &Path,
@@ -556,24 +547,21 @@ fn extract_path_mappings(
     let mut mappings = Vec::new();
     fn walk(
         snapshot: &InstanceSnapshot,
-        root: &Path,
         dm: &mut Vec<String>,
         mappings: &mut Vec<(PathBuf, Vec<String>)>,
     ) {
         for path in snapshot.metadata.watch_paths() {
-            if let Ok(relative) = path.strip_prefix(root) {
-                mappings.push((relative.to_path_buf(), dm.clone()));
-            }
+            mappings.push((path.to_path_buf(), dm.clone()));
         }
         for child in &snapshot.children {
             dm.push(child.name.to_string());
-            walk(child, root, dm, mappings);
+            walk(child, dm, mappings);
             dm.pop();
         }
     }
     {
         profiling::scope!("Rojo require mappings snapshot traversal");
-        walk(snapshot, root, &mut Vec::new(), &mut mappings);
+        walk(snapshot, &mut Vec::new(), &mut mappings);
     }
     normalize_path_mappings(mappings, root, &snapshot.metadata.context)
 }
@@ -587,7 +575,10 @@ fn normalize_path_mappings(
     use rayon::prelude::*;
     let mut decorated: Vec<_> = mappings
         .into_iter()
-        .map(|mapping| (mapping.0.components().count(), mapping))
+        .map(|(path, target)| {
+            let path = crate::package_sources::normalize(&root.join(path));
+            (path.components().count(), (path, target))
+        })
         .collect();
     // Stable, like `sort_by`, so mappings sharing a path keep their tree order.
     decorated
@@ -807,7 +798,10 @@ mod test {
                 ordinal /= remaining.len();
                 mappings.push(remaining.remove(index));
             }
-            let mut expected = mappings.clone();
+            let mut expected = mappings
+                .iter()
+                .map(|(path, target)| (root.join(path), target.clone()))
+                .collect::<Vec<_>>();
             expected.sort_by(|a, b| {
                 b.0.components()
                     .count()
@@ -822,6 +816,36 @@ mod test {
                 actual
             );
         }
+    }
+
+    #[test]
+    fn generated_project_keeps_external_mounts_in_snapshot_and_tree_contexts() {
+        use crate::snapshot::InstanceMetadata;
+
+        let root = Path::new("/checkout with spaces/.local/config");
+        let external = PathBuf::from("/checkout with spaces/Packages");
+        let snapshot = InstanceSnapshot::new()
+            .class_name("DataModel")
+            .children(vec![InstanceSnapshot::new()
+                .name("ReplicatedStorage")
+                .class_name("Folder")
+                .children(vec![InstanceSnapshot::new()
+                    .name("Packages")
+                    .class_name("Folder")
+                    .metadata(
+                        InstanceMetadata::new().relevant_paths(vec![external.clone()]),
+                    )])]);
+        let expected = vec![(
+            external,
+            vec!["ReplicatedStorage".into(), "Packages".into()],
+        )];
+        let context = build_require_context(&snapshot, root).unwrap();
+        assert_eq!(context.path_mappings(), expected.as_slice());
+        let tree = RojoTree::new(snapshot);
+        assert_eq!(
+            build_require_context_from_tree(&tree, root).unwrap(),
+            context
+        );
     }
 
     #[test]
@@ -873,20 +897,24 @@ mod test {
                 actual.path_mappings(),
                 vec![
                     (
-                        "Source/Shared/Util.luau".into(),
+                        root.join("Source/Shared/Util.luau"),
                         vec!["Shared".into(), "Util".into()]
                     ),
                     (
-                        "Source/Shared/Util.meta.json".into(),
+                        root.join("Source/Shared/Util.meta.json"),
                         vec!["Shared".into(), "Util".into()]
                     ),
                     (
-                        "Packages/Util.luau".into(),
+                        root.join("Packages/Util.luau"),
                         vec!["Shared".into(), "Util".into()]
                     ),
-                    ("Source/Shared".into(), vec!["Shared".into()]),
-                    ("Other".into(), vec!["Other".into()]),
-                    ("default.project.json".into(), vec![]),
+                    (root.join("Source/Shared"), vec!["Shared".into()]),
+                    (
+                        PathBuf::from("/outside/Util.luau"),
+                        vec!["Shared".into(), "Util".into()]
+                    ),
+                    (root.join("Other"), vec!["Other".into()]),
+                    (root.join("default.project.json"), vec![]),
                 ]
             );
             assert_eq!(

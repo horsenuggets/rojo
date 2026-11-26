@@ -127,8 +127,8 @@ jobs:
       with:
         version: 'v1.1.0'
 
-    - name: Stylua
-      run: stylua --check plugin/src plugin/stories
+    - name: StyLuau
+      run: styluau --check plugin/src plugin/stories
 
     - name: Selene
       run: selene plugin/src plugin/stories

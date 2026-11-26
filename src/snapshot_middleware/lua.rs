@@ -120,6 +120,10 @@ fn snapshot_lua_source(
                 import_inputs = inputs;
                 resolved
             }
+            Err(err) if err.is::<luaurc::UnmappedDataModelImport>() => {
+                return Err(err)
+                    .with_context(|| format!("Cannot resolve imports in {}", path.display()));
+            }
             Err(err) => {
                 // Syntax errors belong to the payload, not the import context. A
                 // successful configuration read remains evidence even if lowering
