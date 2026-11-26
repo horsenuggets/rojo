@@ -577,6 +577,12 @@ fn recover_journals(vfs: &memofs::Vfs, cache: &Path) -> std::io::Result<()> {
             vfs.remove_dir_all(entry.path())?;
             vfs.sync_path(&cache)?;
         } else {
+            if super::relocation_transaction::rolls_back_outside_project(vfs, entry.path())? {
+                return Err(std::io::Error::other(format!(
+                    "Refused to recover the script rename journal at \"{}\" because it would write outside its project folder. Check the listed files, then delete the journal folder to continue.",
+                    entry.path().display()
+                )));
+            }
             super::relocation_transaction::recover(vfs, entry.path())?;
             retire_journal(vfs, entry.path())?;
         }

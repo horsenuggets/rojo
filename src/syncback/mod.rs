@@ -2466,15 +2466,17 @@ mod test {
                 _ => {}
             }
             let before = restarted.snapshot_tree(Path::new("/project")).unwrap();
-            if change == "unchanged" {
-                assert_eq!(recover(&restarted, journal).unwrap(), Recovery::Committed);
-            } else {
-                assert!(recover(&restarted, journal).is_err(), "Accepted {change}");
-                assert_eq!(
-                    restarted.snapshot_tree(Path::new("/project")).unwrap(),
-                    before
-                );
-            }
+            // The journal is committed, so later declaration changes cannot block its
+            // cleanup, and acknowledging it must never touch the project.
+            assert_eq!(
+                recover(&restarted, journal).unwrap(),
+                Recovery::Committed,
+                "Refused committed journal after {change}"
+            );
+            assert_eq!(
+                restarted.snapshot_tree(Path::new("/project")).unwrap(),
+                before
+            );
         }
     }
 

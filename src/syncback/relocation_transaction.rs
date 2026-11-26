@@ -197,6 +197,34 @@ fn execute_prepared(fs: &mut VfsLock<'_>, journal_dir: &Path, journal: &Journal)
 /// application journals remain recoverable unless current declarations protect their paths;
 /// they cannot prove historical package ownership after those declarations were removed.
 /// This API does not choose a cache location on the caller's behalf.
+/// Whether rolling back this journal would write outside its project folder. Only the
+/// process that wrote such a journal can vouch for that authority, so startup recovery
+/// refuses these instead of trusting a journal that a checkout may have shipped.
+/// Finished journals only clean up their own directory and are never refused.
+pub(crate) fn rolls_back_outside_project(vfs: &Vfs, journal_dir: &Path) -> io::Result<bool> {
+    let bytes = read_file(&vfs.lock(), &journal_dir.join("intent.json"))?;
+    let intent: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if intent.get("kind").and_then(serde_json::Value::as_str) != Some("replacement") {
+        return Ok(false);
+    }
+    let journal: ReplacementJournal = serde_json::from_value(intent).map_err(io::Error::other)?;
+    let Some(root) = journal
+        .script
+        .as_ref()
+        .and_then(|script| script.project.parent())
+    else {
+        return Ok(false);
+    };
+    let finished = ["commit", "rollback"]
+        .iter()
+        .any(|name| vfs.metadata(journal_dir.join(name)).is_ok());
+    Ok(!finished
+        && journal
+            .entries
+            .iter()
+            .any(|entry| !entry.path.starts_with(root)))
+}
+
 pub fn recover(vfs: &Vfs, journal_dir: &Path) -> io::Result<Recovery> {
     // Validate current authority before acquiring the VFS lock. The locked recovery
     // checks the same durable evidence again before performing any mutation.
@@ -1407,13 +1435,17 @@ fn recover_replacement(
     journal: &ReplacementJournal,
 ) -> io::Result<Recovery> {
     validate_replacements(fs, directory, journal)?;
-    validate_replacement_ownership(fs, directory, journal)?;
     let committed = marker(fs, directory, "commit", COMMIT)?;
     let rolled_back = marker(fs, directory, "rollback", ROLLBACK)?;
     if committed && rolled_back {
         return Err(io::Error::other(
             "Contradictory replacement journal markers",
         ));
+    }
+    // Only an unfinished journal rolls project files back. Finished journals touch
+    // nothing outside their directory, and later project edits must not block them.
+    if !committed && !rolled_back {
+        validate_replacement_ownership(fs, directory, journal)?;
     }
     for (index, entry) in journal.entries.iter().enumerate() {
         let backup_path = stage(directory, index);
@@ -3828,6 +3860,64 @@ mod tests {
     }
 
     #[test]
+    fn startup_refuses_only_unfinished_journals_that_write_outside_their_project() {
+        for real in [false, true] {
+            let (fs, temp, directory, mut journal) =
+                prepared_script_migration_fixture(real, false, false);
+            let commit = fs.read(directory.join("commit")).unwrap();
+            let truth = [(true, false), (false, false), (true, true), (false, true)];
+            for (finished, outside) in truth {
+                if outside {
+                    let root = journal.script.as_ref().unwrap().project.parent().unwrap();
+                    let elsewhere = temp.path().join("elsewhere");
+                    for entry in &mut journal.entries {
+                        if entry.path.starts_with(root) {
+                            let name = entry.path.file_name().unwrap().to_owned();
+                            entry.path = elsewhere.join(name);
+                        }
+                    }
+                    fs.write(
+                        directory.join("intent.json"),
+                        serde_json::to_vec(&journal).unwrap(),
+                    )
+                    .unwrap();
+                }
+                if finished {
+                    fs.write(directory.join("commit"), commit.as_slice())
+                        .unwrap();
+                } else if fs.metadata(directory.join("commit")).is_ok() {
+                    fs.remove_file(directory.join("commit")).unwrap();
+                }
+                assert_eq!(
+                    rolls_back_outside_project(&fs, &directory).unwrap(),
+                    !finished && outside,
+                    "finished={finished} outside={outside}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn committed_script_migration_recovers_after_later_project_edits() {
+        // A committed journal can outlive its commit when retirement fails. Later edits
+        // to the project must not turn its cleanup into a startup failure.
+        for real in [false, true] {
+            let (fs, _temp, directory, journal) =
+                prepared_script_migration_fixture(real, false, false);
+            let script = journal.script.as_ref().unwrap();
+            fs.write(
+                script.source.parent().unwrap().join("Later.luau"),
+                "return 1",
+            )
+            .unwrap();
+            let project = fs.read(&script.project).unwrap();
+            fs.write(&script.project, [project.as_slice(), b"\n"].concat())
+                .unwrap();
+            assert_eq!(recover(&fs, &directory).unwrap(), Recovery::Committed);
+        }
+    }
+
+    #[test]
     fn script_migration_recovery_nested_preintent_native() {
         let (fs, _temp, directory, _) = prepared_script_migration_fixture(true, false, true);
         assert_eq!(recover(&fs, &directory).unwrap(), Recovery::Committed);
@@ -4199,6 +4289,26 @@ mod tests {
         }
     }
 
+    /// Committed journals only acknowledge their commit, so later project changes must
+    /// not block them. Unfinished journals must still refuse those changes.
+    fn assert_recovery_refused_unless_committed(
+        fs: &Vfs,
+        directory: &Path,
+        committed: bool,
+        context: &str,
+    ) {
+        let result = recover(fs, directory);
+        if committed {
+            assert_eq!(
+                result.unwrap(),
+                Recovery::Committed,
+                "Refused committed {context}"
+            );
+        } else {
+            assert!(result.is_err(), "Accepted {context}");
+        }
+    }
+
     #[test]
     fn script_migration_recovery_external_graph_changes_preserve_every_boundary() {
         for real in [false, true] {
@@ -4238,9 +4348,11 @@ mod tests {
                     }
                     let fs = restart_migration_filesystem(fs, real, &root);
                     let before = fs.snapshot_tree(&root).unwrap();
-                    assert!(
-                        recover(&fs, &directory).is_err(),
-                        "Accepted {change}, real={real} boundary={boundary}"
+                    assert_recovery_refused_unless_committed(
+                        &fs,
+                        &directory,
+                        boundary == 7,
+                        &format!("{change}, real={real} boundary={boundary}"),
                     );
                     assert_eq!(
                         fs.snapshot_tree(&root).unwrap(),
@@ -4266,9 +4378,11 @@ mod tests {
                     .unwrap();
                 let fs = restart_migration_filesystem(fs, real, &root);
                 let before = fs.snapshot_tree(&root).unwrap();
-                assert!(
-                    recover(&fs, &directory).is_err(),
-                    "Accepted external package, real={real} boundary={boundary}"
+                assert_recovery_refused_unless_committed(
+                    &fs,
+                    &directory,
+                    boundary == 7,
+                    &format!("external package, real={real} boundary={boundary}"),
                 );
                 assert_eq!(fs.snapshot_tree(&root).unwrap(), before);
             }
@@ -4290,7 +4404,12 @@ mod tests {
             let before = fs.snapshot_tree(&moved).unwrap();
             let backup = fs.snapshot_tree(&directory).unwrap();
             let fs = restart_migration_filesystem(fs, true, &root);
-            assert!(recover(&fs, &directory).is_err());
+            assert_recovery_refused_unless_committed(
+                &fs,
+                &directory,
+                boundary == 7,
+                &format!("substituted ancestor, boundary={boundary}"),
+            );
             assert_eq!(fs.snapshot_tree(&moved).unwrap(), before);
             assert_eq!(fs.snapshot_tree(&directory).unwrap(), backup);
         }
@@ -4535,9 +4654,11 @@ mod tests {
                     };
                     restarted.set_watch_enabled(false);
                     let before = restarted.snapshot_tree(&root).unwrap();
-                    assert!(
-                        recover(&restarted, &directory).is_err(),
-                        "Accepted {change}, phase {phase}, real {real}"
+                    assert_recovery_refused_unless_committed(
+                        &restarted,
+                        &directory,
+                        phase == 7,
+                        &format!("{change}, phase {phase}, real {real}"),
                     );
                     assert_eq!(restarted.snapshot_tree(&root).unwrap(), before);
                 }
@@ -4613,9 +4734,11 @@ mod tests {
                             .unwrap()
                     })
                     .collect();
-                assert!(
-                    recover(&restarted, &directory).is_err(),
-                    "Accepted {link}, phase {phase}"
+                assert_recovery_refused_unless_committed(
+                    &restarted,
+                    &directory,
+                    phase == 7,
+                    &format!("{link}, phase {phase}"),
                 );
                 assert_eq!(restarted.snapshot_tree(&directory).unwrap(), journal_before);
                 assert_eq!(restarted.snapshot_tree(&outside).unwrap(), outside_before);
@@ -4751,6 +4874,17 @@ mod tests {
                     restarted.set_watch_enabled(false);
                     if change != "unchanged" {
                         let before = restarted.snapshot_tree(&root).unwrap();
+                        if phase == 7 {
+                            // A committed journal is only acknowledged, never replayed.
+                            assert_recovery_refused_unless_committed(
+                                &restarted,
+                                &directory,
+                                true,
+                                &format!("{change}, phase {phase}, real {real}"),
+                            );
+                            assert_eq!(restarted.snapshot_tree(&root).unwrap(), before);
+                            continue;
+                        }
                         if recover(&restarted, &directory).is_ok() {
                             accepted.push(format!("{change}, phase {phase}, real {real}"));
                             continue;
