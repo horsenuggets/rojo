@@ -299,20 +299,56 @@ pub(super) fn resolve_requires_with_inputs(
     index: Option<&PathMappingIndex>,
     inputs: &mut ImportInputCache,
 ) -> anyhow::Result<(String, Option<Arc<crate::snapshot::ImportInputs>>)> {
+    let inputs = lookup_inputs(info, inputs)?;
+    resolve_requires_with_lookup(
+        source,
+        info,
+        datamodel,
+        package_dependencies,
+        index,
+        &inputs,
+    )
+}
+
+/// The cached `.luaurc` inputs for a script's directory. Only this lookup needs the
+/// shared cache, so callers can release its lock before rewriting Source.
+pub(super) fn lookup_inputs(
+    info: &ResolveInfo,
+    inputs: &mut ImportInputCache,
+) -> anyhow::Result<ImportLookup> {
     let directory = info
         .file_path
         .parent()
         .context("script file has no parent directory")?;
-    let inputs = inputs.find(info.vfs, directory)?;
+    Ok(ImportLookup(inputs.find(info.vfs, directory)?))
+}
+
+/// A directory's immutable `.luaurc` inputs, detached from the shared cache.
+pub(super) struct ImportLookup(Arc<LuauRcInputs>);
+
+impl ImportLookup {
+    pub(super) fn witness(&self) -> Option<Arc<crate::snapshot::ImportInputs>> {
+        self.0.witness.clone()
+    }
+}
+
+pub(super) fn resolve_requires_with_lookup(
+    source: &str,
+    info: &ResolveInfo,
+    datamodel: bool,
+    package_dependencies: Option<&Path>,
+    index: Option<&PathMappingIndex>,
+    inputs: &ImportLookup,
+) -> anyhow::Result<(String, Option<Arc<crate::snapshot::ImportInputs>>)> {
     let source = resolve_requires_from_inputs(
         source,
         info,
         datamodel,
         package_dependencies,
         index,
-        &inputs.nearest,
+        &inputs.0.nearest,
     )?;
-    Ok((source, inputs.witness.clone()))
+    Ok((source, inputs.witness()))
 }
 
 fn resolve_requires_from_inputs(
