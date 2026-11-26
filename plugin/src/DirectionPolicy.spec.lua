@@ -46,6 +46,22 @@ return function()
 		end).to.throw()
 	end)
 
+	it("ignores directions added by newer servers but still requires the known three", function()
+		const extended = table.clone(directions)
+		table.insert(extended, "future-direction")
+		Policy.validateServer({ supportedSyncDirections = extended })
+		expect(Policy.negotiate({
+			sessionId = "session",
+			syncDirection = "bidirectional",
+			supportedSyncDirections = extended,
+		}, marker("bidirectional"), false)).to.equal("bidirectional")
+		for _, malformed in { { "fs-to-studio", "studio-to-fs", "bidirectional", 4 }, { key = "bidirectional" } } do
+			expect(function()
+				Policy.validateServer({ supportedSyncDirections = malformed })
+			end).to.throw()
+		end
+	end)
+
 	it("rejects incomplete and malformed generated-place markers", function()
 		for _, args in
 			{

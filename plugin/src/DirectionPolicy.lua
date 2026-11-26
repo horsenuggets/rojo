@@ -18,13 +18,13 @@ function DirectionPolicy.validateServer(info)
 	assert(type(info) == "table", "Server info must be a table.")
 	if info.supportedSyncDirections ~= nil then
 		assert(type(info.supportedSyncDirections) == "table", "Invalid supported sync directions.")
+		-- Unknown entries are ignored so a server that adds directions stays compatible.
 		const seen = {}
 		for key, direction in info.supportedSyncDirections do
 			assert(
-				type(key) == "number" and key % 1 == 0 and key >= 1 and key <= #DIRECTIONS,
+				type(key) == "number" and key % 1 == 0 and key >= 1 and type(direction) == "string",
 				"Invalid supported sync directions."
 			)
-			assert(DirectionPolicy.isDirection(direction) and not seen[direction], "Invalid supported sync directions.")
 			seen[direction] = true
 		end
 		for _, direction in DIRECTIONS do
