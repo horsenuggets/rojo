@@ -431,7 +431,9 @@ impl ApiService {
 
         let info = ServerInfoResponse {
             sync_direction,
-            supported_sync_directions: SyncDirection::ALL,
+            supported_sync_directions: SyncDirection::ALL
+                .map(|direction| direction.as_str().to_owned())
+                .to_vec(),
             server_version: SERVER_VERSION.to_owned(),
             protocol_version: if sync_direction.is_some() {
                 DIRECTIONAL_PROTOCOL_VERSION
@@ -1206,7 +1208,10 @@ mod tests {
                     deserialize_msgpack(&bytes).unwrap()
                 };
                 assert_eq!(info.sync_direction, direction);
-                assert_eq!(info.supported_sync_directions, SyncDirection::ALL);
+                assert_eq!(
+                    info.supported_sync_directions,
+                    ["fs-to-studio", "studio-to-fs", "bidirectional"]
+                );
                 assert_eq!(info.protocol_version, expected_protocol_version);
                 assert_eq!(info.session_id, session.session_id());
                 let value: serde_json::Value = if content_type == "application/json" {

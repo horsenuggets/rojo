@@ -409,7 +409,10 @@ fn property_filter(value: Option<&Variant>) -> bool {
 pub struct ServerInfoResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_direction: Option<SyncDirection>,
-    pub supported_sync_directions: [SyncDirection; 3],
+    /// Plain strings with a default, so clients can read older servers and ignore
+    /// directions added later.
+    #[serde(default)]
+    pub supported_sync_directions: Vec<String>,
     pub session_id: SessionId,
     pub server_version: String,
     pub protocol_version: u64,
