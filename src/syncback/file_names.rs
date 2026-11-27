@@ -458,8 +458,10 @@ pub fn sibling_order_key(file_name: &str) -> (Cow<'_, str>, u64) {
 /// Natural names such as `Model.__10` (including their sanitized file stems) are
 /// the first sibling, not the tenth. A generated `.__N` is not a file extension.
 pub(crate) fn sibling_number(file_name: &str, logical_name: &str, class_name: &str) -> u64 {
-    let stem = sanitize_stem(logical_name, class_name);
-    let unnumbered = [logical_name, stem.as_str()].iter().any(|&name| {
+    let file_name = file_name.to_lowercase();
+    let stem = sanitize_stem(logical_name, class_name).to_lowercase();
+    let logical_name = logical_name.to_lowercase();
+    let unnumbered = [logical_name.as_str(), stem.as_str()].iter().any(|&name| {
         file_name.strip_prefix(name).is_some_and(|rest| {
             rest.is_empty() || (rest.starts_with('.') && !rest.starts_with(".__"))
         })
@@ -467,7 +469,7 @@ pub(crate) fn sibling_number(file_name: &str, logical_name: &str, class_name: &s
     if unnumbered {
         1
     } else {
-        sibling_order_key(file_name).1
+        sibling_order_key(&file_name).1
     }
 }
 
@@ -620,6 +622,40 @@ mod test {
         }
         // The transient unreleased spelling remains an ordinary name.
         assert_eq!(sibling_number("Twin__100.luau", "Twin", "ModuleScript"), 1);
+    }
+
+    #[test]
+    fn sibling_numbers_normalize_case_for_natural_and_generated_names() {
+        for class in ["Folder", "ModuleScript", "Script", "StringValue"] {
+            for logical_name in ["Twin.__100", "Odd?.__100", "İtem.__100"] {
+                let stem = sanitize_stem(logical_name, class);
+                for physical in [stem.clone(), stem.to_lowercase(), stem.to_uppercase()] {
+                    for logical in [
+                        logical_name.to_owned(),
+                        logical_name.to_lowercase(),
+                        logical_name.to_uppercase(),
+                    ] {
+                        for extension in ["", ".luau", ".server.luau", ".model.json"] {
+                            assert_eq!(
+                                sibling_number(&format!("{physical}{extension}"), &logical, class),
+                                1,
+                                "natural physical name {physical:?} and logical name {logical:?}",
+                            );
+                            for marker in ["~", ".__"] {
+                                assert_eq!(
+                                    sibling_number(
+                                        &format!("{physical}{marker}2{extension}"),
+                                        &logical,
+                                        class,
+                                    ),
+                                    2,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
