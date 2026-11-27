@@ -3618,6 +3618,7 @@ impl JobThreadContext {
             parent,
             &directory,
             &existing,
+            moving.contains(&ids.id).then_some(ids.id),
             model,
         )?;
         validate_write_targets(&self.project(), &new.fs_snapshot)?;

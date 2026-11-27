@@ -466,6 +466,15 @@ impl FsSnapshot {
         let base_path = base.as_ref();
         self.validate_shared(base_path, &mut lock)?;
         self.establish_shared(&mut lock)?;
+        // Ownership and ignored-file checks happen while planning. Remove old
+        // layouts before creating any outputs, including descendants of a reused
+        // directory. Skipping an overlapping removal would leave stale old data.
+        for dir_path in &self.removed_dirs {
+            lock.remove_dir_all(base_path.join(dir_path))?;
+        }
+        for path in self.removed_files.intersection(&self.added_dirs) {
+            lock.remove_file(base_path.join(path))?;
+        }
         for dir_path in &self.added_dirs {
             match lock.create_dir_all(base_path.join(dir_path)) {
                 Ok(_) => (),
@@ -473,24 +482,14 @@ impl FsSnapshot {
                 Err(err) => return Err(err),
             };
         }
-        // A directory can be replaced by a file with the same name, like a
-        // folder named `FX.rbxm` next to an `FX` that becomes a model file.
-        // It has to go before the file can be written in its place.
-        let replaced = |dir_path: &PathBuf| self.added_files.contains_key(dir_path);
-        for dir_path in self.removed_dirs.iter().filter(|path| replaced(path)) {
-            lock.remove_dir_all(base_path.join(dir_path))?;
-        }
         for (path, contents) in &self.added_files {
             lock.write(base_path.join(path), contents)?;
-        }
-        for dir_path in self.removed_dirs.iter().filter(|path| !replaced(path)) {
-            lock.remove_dir_all(base_path.join(dir_path))?;
         }
         for path in &self.removed_files {
             // An Instance that moves to a new layout is removed and written
             // as new. If it lands on its old path after all, the file that was
             // just written must survive.
-            if self.added_files.contains_key(path) {
+            if self.added_files.contains_key(path) || self.added_dirs.contains(path) {
                 continue;
             }
             lock.remove_file(base_path.join(path))?;
@@ -811,6 +810,44 @@ mod tests {
             .load_snapshot("/project/Terrain.rbxm", VfsSnapshot::file("old"))
             .unwrap();
         Vfs::new(backend)
+    }
+
+    #[test]
+    fn recursive_removals_precede_replacement_subtree_writes() {
+        for file_to_directory in [false, true] {
+            let mut backend = InMemoryFs::new();
+            backend
+                .load_snapshot("/project", VfsSnapshot::empty_dir())
+                .unwrap();
+            if file_to_directory {
+                backend
+                    .load_snapshot("/project/Twin", VfsSnapshot::file("old file"))
+                    .unwrap();
+            } else {
+                backend
+                    .load_snapshot("/project/Twin", VfsSnapshot::empty_dir())
+                    .unwrap();
+                backend
+                    .load_snapshot("/project/Twin/stale", VfsSnapshot::file("stale"))
+                    .unwrap();
+            }
+            let vfs = Vfs::new(backend);
+            let mut snapshot = FsSnapshot::new()
+                .with_added_dir("Twin")
+                .with_added_dir("Twin/Replacement")
+                .with_added_file("Twin/Replacement/data", b"incoming".to_vec());
+            if file_to_directory {
+                snapshot.remove_file("Twin");
+            } else {
+                snapshot.remove_dir("Twin");
+            }
+            snapshot.write_to_vfs("/project", &vfs).unwrap();
+            assert_eq!(
+                &**vfs.read("/project/Twin/Replacement/data").unwrap(),
+                b"incoming"
+            );
+            assert!(vfs.metadata("/project/Twin/stale").is_err());
+        }
     }
 
     #[test]

@@ -40,6 +40,9 @@ use crate::{
 };
 
 pub use addition::{drop_duplicate_ids, drop_ignored_properties, syncback_new_subtree};
+#[cfg(test)]
+pub(crate) use file_names::sanitize_stem;
+pub(crate) use file_names::sibling_number;
 pub use file_names::{
     directory_middleware_for_instance, extension_for_middleware, name_for_inst, sibling_order_key,
     unique_child_stems, validate_file_name,
@@ -1398,7 +1401,8 @@ fn syncback_snapshot<'sync>(
             // very paths an ignore conflict is reported to protect.
             Err(err)
                 if middleware == Middleware::Dir
-                    && err.downcast_ref::<IgnoreConflict>().is_none() =>
+                    && err.downcast_ref::<IgnoreConflict>().is_none()
+                    && err.downcast_ref::<OwnershipConflict>().is_none() =>
             {
                 let new_middleware = match env::var(DEBUG_MODEL_FORMAT_VAR) {
                     Ok(value) if value == "1" => Middleware::Rbxmx,
@@ -1508,6 +1512,11 @@ fn syncback_snapshot<'sync>(
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct IgnoreConflict(pub String);
+
+/// Conflicting source ownership cannot be repaired by collapsing the parent to a model.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct OwnershipConflict(pub String);
 
 pub struct SyncbackReturn<'sync> {
     pub fs_snapshot: FsSnapshot,

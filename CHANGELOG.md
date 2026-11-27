@@ -31,6 +31,17 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Fixed newly allocated syncback paths colliding with NTFS short-name aliases by
+  sanitizing literal tildes and numbering duplicates with `.__2`, `.__3`, and so on,
+  keeping the first unsuffixed.
+  Metadata preserves Instance names, and legacy `~N` exports still load in numeric order.
+  Incremental additions append after existing same-named siblings, including sparse
+  legacy ordinals, without treating natural numbered names as generated duplicates.
+* Preserved duplicate sibling order and filesystem metadata across legacy exports and
+  same-parent layout replacements.
+* Fixed class and layout replacements deleting their newly written subtree, while
+  retaining ignored-file and conflicting-source ownership checks.
+
 ## `7.7.1-horse.2.14`
 
 * Fixed filesystem Source writes being echoed back as Studio edits when several writes
