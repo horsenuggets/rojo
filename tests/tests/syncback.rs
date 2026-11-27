@@ -1494,6 +1494,444 @@ fn directory_class_script_relayout_removes_stale_init_before_writing() {
     }
 }
 
+/// Exact normalized destinations justify renames without losing their metadata.
+#[test]
+fn directory_normalized_renames_preserve_metadata() {
+    use rbx_dom_weak::InstanceBuilder;
+
+    for (old_name, new_name, stem) in [("Twin", "twin", "Twin"), ("a?", "a*", "a_")] {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("default.project.json");
+        fs_err::create_dir_all(dir.path().join("src")).unwrap();
+        fs_err::write(
+            &project,
+            r#"{"name":"Rename","syncbackRules":{"instancesAsDirectories":true},
+            "tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src"}}}"#,
+        )
+        .unwrap();
+        fs_err::write(dir.path().join(format!("src/{stem}.luau")), "return 'old'").unwrap();
+        fs_err::write(
+            dir.path().join(format!("src/{stem}.meta.json")),
+            serde_json::to_vec(&serde_json::json!({"name":old_name, "id":"owner",
+                "$schema":"schema.json", "ignoreUnknownInstances":true}))
+            .unwrap(),
+        )
+        .unwrap();
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("ReplicatedStorage").with_child(
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name(new_name)
+                        .with_property("Source", "return 'renamed'"),
+                ),
+            ),
+        );
+        let input = dir.path().join("incoming.rbxl");
+        rbx_binary::to_writer(
+            fs_err::File::create(&input).unwrap(),
+            &dom,
+            dom.root().children(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let result = Command::new(ROJO_PATH)
+                .arg("syncback")
+                .arg(&project)
+                .arg("--input")
+                .arg(&input)
+                .arg("--non-interactive")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let meta: serde_json::Value = serde_json::from_slice(
+                &fs_err::read(dir.path().join(format!("src/{stem}.meta.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(meta["id"], "owner");
+            assert_eq!(meta["$schema"], "schema.json");
+            assert_eq!(meta["ignoreUnknownInstances"], true);
+            assert_eq!(meta["name"], new_name);
+            assert_eq!(
+                fs_err::read_to_string(dir.path().join(format!("src/{stem}.luau"))).unwrap(),
+                "return 'renamed'"
+            );
+            let output = dir.path().join("rebuilt.rbxl");
+            let result = Command::new(ROJO_PATH)
+                .arg("build")
+                .arg(&project)
+                .arg("--output")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let rebuilt = rbx_binary::from_reader(fs_err::File::open(output).unwrap()).unwrap();
+            let child = rebuilt
+                .descendants()
+                .find(|child| child.class == "ModuleScript")
+                .unwrap();
+            assert_eq!(child.name, new_name);
+            assert_eq!(
+                child.properties[&ustr("Source")],
+                Variant::String("return 'renamed'".into())
+            );
+        }
+    }
+}
+
+/// Full reconciliation appends after retained sparse ordinals across all layouts.
+#[test]
+fn directory_full_sync_appends_after_retained_ordinals() {
+    use rbx_dom_weak::InstanceBuilder;
+
+    for (last_stem, last_directory, mixed_case) in [
+        ("Twin~8", false, false),
+        ("Twin.__8", false, false),
+        ("Twin~8", true, false),
+        ("TWIN.__8", true, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("default.project.json");
+        let src = dir.path().join("src");
+        fs_err::create_dir_all(&src).unwrap();
+        fs_err::write(
+            &project,
+            r#"{"name":"Append","syncbackRules":{"instancesAsDirectories":true},
+            "tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src"}}}"#,
+        )
+        .unwrap();
+        fs_err::write(src.join("Twin.luau"), "return 1").unwrap();
+        fs_err::write(
+            src.join("Twin.meta.json"),
+            r#"{"id":"first","$schema":"first-schema","ignoreUnknownInstances":true}"#,
+        )
+        .unwrap();
+        let last_meta = if last_directory {
+            fs_err::create_dir(src.join(last_stem)).unwrap();
+            fs_err::write(src.join(last_stem).join("init.luau"), "return 8").unwrap();
+            src.join(last_stem).join("init.meta.jsonc")
+        } else {
+            fs_err::write(src.join(format!("{last_stem}.luau")), "return 8").unwrap();
+            src.join(format!("{last_stem}.meta.jsonc"))
+        };
+        let last_name = if mixed_case { "twin" } else { "Twin" };
+        fs_err::write(
+            &last_meta,
+            serde_json::to_vec(&serde_json::json!({"name":last_name,
+            "id":"eighth","$schema":"eighth-schema","ignoreUnknownInstances":true}))
+            .unwrap(),
+        )
+        .unwrap();
+        // Retain both suffix generations and a naturally numbered logical name.
+        fs_err::write(src.join("Twin.__3.luau"), "return 3").unwrap();
+        fs_err::write(
+            src.join("Twin.__3.meta.json"),
+            r#"{"name":"Twin","id":"third"}"#,
+        )
+        .unwrap();
+        fs_err::create_dir(src.join("twin.__100")).unwrap();
+        fs_err::write(src.join("twin.__100/init.meta.json"), r#"{"id":"natural"}"#).unwrap();
+        let mut storage = InstanceBuilder::new("ReplicatedStorage");
+        for number in [1, 3, 8, 10, 11] {
+            let name = if number == 8 {
+                last_name
+            } else if mixed_case && number >= 10 {
+                "TWIN"
+            } else {
+                "Twin"
+            };
+            storage = storage.with_child(
+                InstanceBuilder::new("ModuleScript")
+                    .with_name(name)
+                    .with_property("Source", format!("return {number}")),
+            );
+        }
+        // This pending directory owns the ninth script's sidecar destination.
+        storage =
+            storage.with_child(InstanceBuilder::new("Folder").with_name("Twin.__9.meta.json"));
+        // A naturally numbered logical name must not raise the Twin ordinal floor.
+        for _ in 0..3 {
+            storage = storage.with_child(InstanceBuilder::new("Folder").with_name("twin.__100"));
+        }
+        let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_child(storage));
+        let input = dir.path().join("incoming.rbxl");
+        rbx_binary::to_writer(
+            fs_err::File::create(&input).unwrap(),
+            &dom,
+            dom.root().children(),
+        )
+        .unwrap();
+        let mut previous = None;
+        for _ in 0..3 {
+            let result = Command::new(ROJO_PATH)
+                .arg("syncback")
+                .arg(&project)
+                .arg("--input")
+                .arg(&input)
+                .arg("--non-interactive")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let added_name = if mixed_case { "TWIN" } else { "Twin" };
+            assert_eq!(
+                fs_err::read_to_string(src.join(format!("{added_name}.__10.luau"))).unwrap(),
+                "return 10"
+            );
+            assert_eq!(
+                fs_err::read_to_string(src.join(format!("{added_name}.__11.luau"))).unwrap(),
+                "return 11"
+            );
+            assert_eq!(
+                fs_err::read_to_string(src.join("Twin.__3.luau")).unwrap(),
+                "return 3"
+            );
+            let third: serde_json::Value =
+                serde_json::from_slice(&fs_err::read(src.join("Twin.__3.meta.json")).unwrap())
+                    .unwrap();
+            assert_eq!(third["id"], "third");
+            let natural: serde_json::Value = serde_json::from_slice(
+                &fs_err::read(src.join("twin.__100/init.meta.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(natural["id"], "natural");
+            for ordinal in [2, 3] {
+                let meta: serde_json::Value = serde_json::from_slice(
+                    &fs_err::read(src.join(format!("twin.__100.__{ordinal}/init.meta.json")))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(meta["name"], "twin.__100");
+            }
+            for (path, id) in [
+                (src.join("Twin.meta.json"), "first"),
+                (last_meta.clone(), "eighth"),
+            ] {
+                let meta = jsonc_parser::parse_to_serde_value(
+                    &fs_err::read_to_string(path).unwrap(),
+                    &Default::default(),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(meta["id"], id);
+                assert_eq!(meta["$schema"], format!("{id}-schema"));
+                assert_eq!(meta["ignoreUnknownInstances"], true);
+            }
+            let files = read_files(&src);
+            if let Some(previous) = previous.replace(files.clone()) {
+                assert_eq!(files, previous);
+            }
+            let output = dir.path().join("rebuilt.rbxl");
+            let result = Command::new(ROJO_PATH)
+                .arg("build")
+                .arg(&project)
+                .arg("--output")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let rebuilt = rbx_binary::from_reader(fs_err::File::open(output).unwrap()).unwrap();
+            let storage = rebuilt
+                .descendants()
+                .find(|child| child.class == "ReplicatedStorage")
+                .unwrap();
+            let sources: Vec<_> = storage
+                .children()
+                .iter()
+                .filter_map(|id| {
+                    let child = rebuilt.get_by_ref(*id).unwrap();
+                    child
+                        .name
+                        .eq_ignore_ascii_case("Twin")
+                        .then(|| child.properties[&ustr("Source")].clone())
+                })
+                .collect();
+            assert_eq!(
+                sources,
+                [1, 3, 8, 10, 11].map(|number| Variant::String(format!("return {number}")))
+            );
+            rbx_binary::to_writer(
+                fs_err::File::create(&input).unwrap(),
+                &rebuilt,
+                rebuilt.root().children(),
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// Exhausted ordinals must fail without wrapping or falling back to a model file.
+#[test]
+fn directory_full_sync_ordinal_exhaustion_preserves_sources() {
+    use rbx_dom_weak::InstanceBuilder;
+
+    for blocked_last in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("default.project.json");
+        let src = dir.path().join("src");
+        fs_err::create_dir_all(&src).unwrap();
+        fs_err::write(
+            &project,
+            r#"{"name":"Exhaustion","syncbackRules":{"instancesAsDirectories":true},
+            "tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src"}}}"#,
+        )
+        .unwrap();
+        let ordinal = if blocked_last { u64::MAX - 1 } else { u64::MAX };
+        for (stem, number) in [("Twin".to_owned(), 1), (format!("Twin~{ordinal}"), 8)] {
+            fs_err::write(src.join(format!("{stem}.luau")), format!("return {number}")).unwrap();
+            fs_err::write(src.join(format!("{stem}.meta.json")), r#"{"name":"Twin"}"#).unwrap();
+        }
+        if blocked_last {
+            fs_err::write(src.join(format!("Twin.__{}.meta.jsonc", u64::MAX)), "{}").unwrap();
+        }
+        let before = read_files(&src);
+        let mut storage = InstanceBuilder::new("ReplicatedStorage");
+        for number in [1, 8, 9] {
+            storage = storage.with_child(
+                InstanceBuilder::new("ModuleScript")
+                    .with_name("Twin")
+                    .with_property("Source", format!("return {number}")),
+            );
+        }
+        let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_child(storage));
+        let input = dir.path().join("incoming.rbxl");
+        rbx_binary::to_writer(
+            fs_err::File::create(&input).unwrap(),
+            &dom,
+            dom.root().children(),
+        )
+        .unwrap();
+        let result = Command::new(ROJO_PATH)
+            .arg("syncback")
+            .arg(&project)
+            .arg("--input")
+            .arg(input)
+            .arg("--non-interactive")
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("Sibling ordinals are exhausted"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(read_files(&src), before);
+        assert!(!dir.path().join("src.rbxm").exists());
+    }
+}
+
+/// Fresh serialization retains root identity but never stale script properties.
+#[test]
+fn directory_script_to_folder_relayout_preserves_root_metadata() {
+    use rbx_dom_weak::InstanceBuilder;
+
+    for meta_name in ["init.meta.json", "init.meta.jsonc"] {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("default.project.json");
+        let source = dir.path().join("src/Twin");
+        fs_err::create_dir_all(source.join("Retained")).unwrap();
+        fs_err::write(
+            &project,
+            r#"{"name":"Metadata","syncbackRules":{"instancesAsDirectories":true},
+            "tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src"}}}"#,
+        )
+        .unwrap();
+        fs_err::write(source.join("init.luau"), "return 'stale'").unwrap();
+        fs_err::write(
+            source.join(meta_name),
+            r#"{"id":"owner","$schema":"schema.json","ignoreUnknownInstances":true,
+            "properties":{"Archivable":false},"attributes":{"Stale":"old"}}"#,
+        )
+        .unwrap();
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("ReplicatedStorage").with_child(
+                    InstanceBuilder::new("Folder")
+                        .with_name("Twin")
+                        .with_child(InstanceBuilder::new("Folder").with_name("Retained"))
+                        .with_child(InstanceBuilder::new("Folder").with_name("Replacement")),
+                ),
+            ),
+        );
+        let input = dir.path().join("incoming.rbxl");
+        rbx_binary::to_writer(
+            fs_err::File::create(&input).unwrap(),
+            &dom,
+            dom.root().children(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let result = Command::new(ROJO_PATH)
+                .arg("syncback")
+                .arg(&project)
+                .arg("--input")
+                .arg(&input)
+                .arg("--non-interactive")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let meta_path = ["init.meta.json", "init.meta.jsonc"]
+                .into_iter()
+                .map(|name| source.join(name))
+                .find(|path| path.is_file())
+                .unwrap();
+            let meta: serde_json::Value =
+                serde_json::from_slice(&fs_err::read(meta_path).unwrap()).unwrap();
+            assert_eq!(meta["id"], "owner");
+            assert_eq!(meta["$schema"], "schema.json");
+            assert_eq!(meta["ignoreUnknownInstances"], true);
+            assert!(meta["properties"].get("Source").is_none());
+            assert!(meta["properties"].get("Archivable").is_none());
+            assert!(meta["attributes"].get("Stale").is_none());
+            assert!(!source.join("init.luau").exists());
+            let output = dir.path().join("rebuilt.rbxl");
+            let result = Command::new(ROJO_PATH)
+                .arg("build")
+                .arg(&project)
+                .arg("--output")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let rebuilt = rbx_binary::from_reader(fs_err::File::open(output).unwrap()).unwrap();
+            let child = rebuilt
+                .descendants()
+                .find(|child| child.name == "Twin")
+                .unwrap();
+            assert_eq!(child.class.as_str(), "Folder");
+            let names: Vec<_> = child
+                .children()
+                .iter()
+                .map(|id| rebuilt.get_by_ref(*id).unwrap().name.as_str())
+                .collect();
+            assert_eq!(names, ["Retained", "Replacement"]);
+            assert!(!child.properties.contains_key(&ustr("Source")));
+        }
+    }
+}
+
 /// Reads every file under `dir` into a map from relative path to contents. Paths
 /// always use `/`, so tests can name them the same way on every platform.
 fn read_files(dir: &Path) -> std::collections::BTreeMap<String, String> {

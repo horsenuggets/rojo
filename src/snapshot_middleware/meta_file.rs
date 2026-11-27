@@ -387,13 +387,13 @@ impl AdjacentMetadata {
         }
 
         let ignore_unknown_instances = snapshot
-            .old_inst()
-            .map(|inst| inst.metadata().ignore_unknown_instances)
+            .old_metadata()
+            .map(|metadata| metadata.ignore_unknown_instances)
             .unwrap_or_default();
 
         let schema = snapshot
-            .old_inst()
-            .and_then(|inst| inst.metadata().schema.clone());
+            .old_metadata()
+            .and_then(|metadata| metadata.schema.clone());
 
         let class = &snapshot.new_inst().class;
         let (mut properties, mut attributes) = serialize_values(
@@ -411,8 +411,8 @@ impl AdjacentMetadata {
 
         let id = metadata_id(
             snapshot
-                .old_inst()
-                .and_then(|inst| inst.metadata().specified_id.as_ref()),
+                .old_metadata()
+                .and_then(|metadata| metadata.specified_id.as_ref()),
             &attributes,
         );
 
@@ -654,13 +654,13 @@ impl DirectoryMetadata {
         }
 
         let ignore_unknown_instances = snapshot
-            .old_inst()
-            .map(|inst| inst.metadata().ignore_unknown_instances)
+            .old_metadata()
+            .map(|metadata| metadata.ignore_unknown_instances)
             .unwrap_or_default();
 
         let schema = snapshot
-            .old_inst()
-            .and_then(|inst| inst.metadata().schema.clone());
+            .old_metadata()
+            .and_then(|metadata| metadata.schema.clone());
 
         let class = &snapshot.new_inst().class;
         let (mut properties, mut attributes) = serialize_values(
@@ -675,8 +675,8 @@ impl DirectoryMetadata {
 
         let id = metadata_id(
             snapshot
-                .old_inst()
-                .and_then(|inst| inst.metadata().specified_id.as_ref()),
+                .old_metadata()
+                .and_then(|metadata| metadata.specified_id.as_ref()),
             &attributes,
         );
 

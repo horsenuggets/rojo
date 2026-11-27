@@ -106,6 +106,7 @@ pub fn syncback_new_subtree(
             attribute_ids: &attribute_ids,
         },
         old: Some(parent),
+        metadata_source: None,
         new: destination,
         path: directory.to_path_buf(),
         middleware: None,
