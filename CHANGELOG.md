@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## `7.7.1-horse.2.15`
+
 * Fixed newly allocated syncback paths colliding with NTFS short-name aliases by
   sanitizing literal tildes and numbering duplicates with `.__2`, `.__3`, and so on,
   keeping the first unsuffixed.
