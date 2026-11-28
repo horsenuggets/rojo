@@ -909,14 +909,18 @@ fn syncback_scoped(
     Ok(output)
 }
 
-/// Returns an error if a staged scoped write would add, change, or remove a path
+/// Returns an error if a staged write would add, change, or remove a path
 /// the project's syncback rules exclude. Run this on the final write targets, after
 /// retargeting and filtering, since those decide which files actually change.
 pub fn validate_write_targets(project: &Project, staged: &FsSnapshot) -> anyhow::Result<()> {
     let Some(rules) = &project.syncback_rules else {
         return Ok(());
     };
-    let globs = Some(rules.compile_globs()?);
+    let globs = rules.compile_globs()?;
+    if globs.is_empty() || staged.is_empty() {
+        return Ok(());
+    }
+    let globs = Some(globs);
     let base = project.folder_location();
     let excluded = staged
         .added_paths()
@@ -930,6 +934,105 @@ pub fn validate_write_targets(project: &Project, staged: &FsSnapshot) -> anyhow:
         ),
         None => Ok(()),
     }
+}
+
+fn is_adjacent_metadata_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".meta.json") || name.ends_with(".meta.jsonc"))
+}
+
+/// Reusing a sidecar through a case or filesystem alias must stage its tracked
+/// spelling, or the old-path removal will delete the just-written output.
+/// Match physical directory entries, not folded names or distinct hard links.
+pub(crate) fn reused_model_metadata_path(
+    snapshot: &SyncbackSnapshot,
+    output: &Path,
+) -> anyhow::Result<PathBuf> {
+    if snapshot.metadata_source.is_none() {
+        return Ok(output.to_owned());
+    }
+    let Some(metadata) = snapshot.old_metadata() else {
+        return Ok(output.to_owned());
+    };
+    let Some(physical) = snapshot.vfs().canonicalize(output).with_not_found()? else {
+        return Ok(output.to_owned());
+    };
+    let parent = output
+        .parent()
+        .context("Model metadata should have a parent")?;
+    let parent_path = snapshot.vfs().canonicalize(parent)?;
+    let mut reused = None;
+    for tracked in metadata
+        .relevant_paths
+        .iter()
+        .skip(1)
+        .filter(|path| is_adjacent_metadata_path(path))
+    {
+        if tracked == output {
+            reused = Some(tracked.clone());
+            break;
+        }
+        if snapshot
+            .vfs()
+            .canonicalize(tracked)
+            .with_not_found()?
+            .as_ref()
+            != Some(&physical)
+            || snapshot.vfs().canonicalize(tracked.parent().unwrap())? != parent_path
+        {
+            continue;
+        }
+        if tracked.file_name() != output.file_name() {
+            let entries = snapshot
+                .vfs()
+                .read_dir(parent)?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            if entries
+                .iter()
+                .any(|entry| entry.path().file_name() == output.file_name())
+            {
+                continue;
+            }
+        }
+        reused = Some(tracked.clone());
+        break;
+    }
+    let conflict = || {
+        OwnershipConflict(format!(
+            "Cannot reuse model metadata {} because another source owns its destination",
+            output.display()
+        ))
+    };
+    let reused = reused.ok_or_else(conflict)?;
+    let physical_path = snapshot.vfs().canonicalize(&reused)?;
+    for instance in snapshot
+        .data
+        .old_tree
+        .descendants(snapshot.data.old_tree.get_root_id())
+    {
+        if Some(instance.id()) == snapshot.metadata_source {
+            continue;
+        }
+        for tracked in instance
+            .metadata()
+            .relevant_paths
+            .iter()
+            .skip(1)
+            .filter(|path| is_adjacent_metadata_path(path))
+        {
+            if snapshot
+                .vfs()
+                .canonicalize(tracked)
+                .with_not_found()?
+                .as_ref()
+                == Some(&physical_path)
+            {
+                return Err(conflict().into());
+            }
+        }
+    }
+    Ok(reused)
 }
 
 /// Returns the file holding an instance's own source, which for a directory
@@ -1216,15 +1319,41 @@ pub fn syncback_loop(
         }
     }
 
-    fs_snapshot.guard_packages(
-        vfs,
-        old_tree
-            .root()
-            .metadata()
-            .context
-            .package_sources
-            .as_deref(),
-    );
+    let packages = old_tree
+        .root()
+        .metadata()
+        .context
+        .package_sources
+        .as_deref();
+    let reused_metadata: Vec<_> = if packages.is_some() {
+        let removed: HashSet<_> = fs_snapshot.removed_files().into_iter().collect();
+        fs_snapshot
+            .file_changes()
+            .into_iter()
+            .filter_map(|(path, contents)| {
+                if !is_adjacent_metadata_path(path) || !removed.contains(path) {
+                    return None;
+                }
+                Some((path.to_owned(), contents?.to_vec()))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    fs_snapshot.guard_packages(vfs, packages);
+    // Package filtering elides identical writes, but these sidecars must be
+    // restaged after removal. A protected removal cancels the batch, so restore
+    // only replacements whose removal survived the package guard.
+    let removals: HashSet<_> = fs_snapshot
+        .removed_files()
+        .into_iter()
+        .map(Path::to_owned)
+        .collect();
+    for (path, contents) in reused_metadata {
+        if removals.contains(&path) {
+            fs_snapshot.add_file(path, contents);
+        }
+    }
     fs_snapshot.package_expected = package_expected;
     Ok(fs_snapshot)
 }
@@ -1481,12 +1610,20 @@ fn syncback_snapshot<'sync>(
                 } else {
                     fs_snapshot.remove_file(path)
                 }
-                // The metadata that names a model file's root would otherwise
-                // outlive it, since nothing else is written next to it.
-                if inst.metadata().middleware.is_some_and(is_model_file) {
+                // All model formats read adjacent metadata. Remove only their
+                // tracked sidecars, using physical spellings rather than logical
+                // names. Reused outputs are restaged by the destination writer.
+                if inst.metadata().middleware.is_some_and(|middleware| {
+                    is_model_file(middleware) || middleware == Middleware::JsonModel
+                }) {
                     for meta_path in inst.metadata().relevant_paths.iter().skip(1) {
-                        if meta_path.is_file()
+                        if is_adjacent_metadata_path(meta_path)
                             && is_valid_path(ignore_patterns, project_path, meta_path)
+                            && snapshot
+                                .vfs()
+                                .metadata(meta_path)
+                                .with_not_found()?
+                                .is_some_and(|metadata| metadata.is_file())
                         {
                             fs_snapshot.remove_file(meta_path)
                         }

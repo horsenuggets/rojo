@@ -48,6 +48,9 @@ Making a new release? Simply add the new header with the version and date undern
 * Rewrote existing JSONC script, text, and localization metadata in place so stale name
   and property overrides cannot survive syncback. Ambiguous dual JSON/JSONC sidecars
   are rejected before persistence rather than overwriting either owner.
+* Cleaned up tracked model sidecars on removal and preserved reused metadata through
+  format conversion. Exact physical ownership protects unrelated case variants, and
+  required ignored-sidecar rewrites fail without persisting duplicate identity.
 
 ## `7.7.1-horse.2.14`
 

@@ -634,11 +634,12 @@ mod test {
                     .with_property("Source", "return 'new'"),
             ),
         );
-        let project: Project = crate::json::from_str(
+        let mut project: Project = crate::json::from_str(
             r#"{"name":"Test","tree":{"$className":"Folder"},
             "syncbackRules":{"instancesAsDirectories":true}}"#,
         )
         .unwrap();
+        project.file_location = "/default.project.json".into();
         let attribute_ids = HashSet::new();
         let snapshot = SyncbackSnapshot {
             data: SyncbackData {
@@ -710,6 +711,9 @@ mod test {
             assert!(rebuilt.metadata.ignore_unknown_instances);
             assert_eq!(rebuilt.children.len(), 1);
             assert_eq!(rebuilt.children[0].name, "Replacement");
+            for path in planned.fs_snapshot.added_files() {
+                vfs.remove_file(path).unwrap();
+            }
         }
     }
 

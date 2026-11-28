@@ -118,8 +118,13 @@ pub(super) fn syncback_model_name(
         snapshot.old_metadata(),
         &attributes,
     )?;
+    let meta_path = crate::syncback::reused_model_metadata_path(snapshot, &meta_path)?;
     match updated {
-        Some(contents) if existing != Some(contents.as_slice()) => {
+        // A fresh layout removes the old model and its sidecar, even when
+        // the destination reuses that sidecar without changing its bytes.
+        Some(contents)
+            if snapshot.metadata_source.is_some() || existing != Some(contents.as_slice()) =>
+        {
             fs_snapshot.add_file(meta_path, contents)
         }
         Some(_) => {}
@@ -388,6 +393,14 @@ mod test {
                 );
                 if dual {
                     assert!(result.err().unwrap().to_string().contains("Both"));
+                    continue;
+                }
+                if ignored && format.starts_with("model.") {
+                    let error = result.err().unwrap();
+                    assert!(error
+                        .downcast_ref::<crate::syncback::IgnoreConflict>()
+                        .is_some());
+                    assert!(error.to_string().contains("excluded"));
                     continue;
                 }
                 let output = result.unwrap();

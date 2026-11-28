@@ -3756,6 +3756,410 @@ fn jsonc_metadata_writers_reject_dual_files_without_persistence() {
     }
 }
 
+/// Removed models release only their tracked, non-ignored adjacent metadata.
+#[test]
+fn release_review_removed_model_sidecars() {
+    for format in ["model.json", "model.jsonc", "rbxm", "rbxmx"] {
+        for extension in ["json", "jsonc"] {
+            for ignored in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let src = dir.path().join("src");
+                fs_err::create_dir_all(&src).unwrap();
+                let original = release_review_old_twin(
+                    &src,
+                    "Root",
+                    "Root",
+                    1,
+                    if format == "model.jsonc" {
+                        "model.json"
+                    } else {
+                        format
+                    },
+                );
+                if format == "model.jsonc" {
+                    fs_err::rename(src.join("Root.model.json"), src.join("Root.model.jsonc"))
+                        .unwrap();
+                }
+                let sidecar = src.join(format!("Root.meta.{extension}"));
+                if original != sidecar {
+                    fs_err::rename(&original, &sidecar).unwrap();
+                }
+                let before = fs_err::read(&sidecar).unwrap();
+                let unrelated = src.join("Untracked.meta.json");
+                fs_err::write(&unrelated, "{\"id\":\"unrelated\"}").unwrap();
+                let project = release_review_project(
+                    dir.path(),
+                    serde_json::json!({
+                        "instancesAsDirectories":false,
+                        "ignorePaths":if ignored { vec![format!("**/*.meta.{extension}")] } else { vec![] }
+                    }),
+                );
+                let input = release_review_input(dir.path(), vec![]);
+                let result = release_review_sync(&project, &input);
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert!(!src.join(format!("Root.{format}")).exists());
+                assert_eq!(
+                    sidecar.exists(),
+                    ignored,
+                    "{format}, {extension}, ignored {ignored}"
+                );
+                if ignored {
+                    assert_eq!(fs_err::read(&sidecar).unwrap(), before);
+                }
+                assert_eq!(
+                    fs_err::read_to_string(&unrelated).unwrap(),
+                    "{\"id\":\"unrelated\"}"
+                );
+                release_review_build(&project);
+            }
+        }
+    }
+}
+
+/// Inline storage must not leave a second filesystem representation of a child.
+#[test]
+fn release_review_json_sidecars_removed_when_inlined() {
+    for extension in ["json", "jsonc"] {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs_err::create_dir_all(&src).unwrap();
+        let parent = src.join("Parent");
+        fs_err::create_dir_all(&parent).unwrap();
+        let model = parent.join(format!("Root.model.{extension}"));
+        let meta = parent.join(format!("Root.meta.{extension}"));
+        fs_err::write(&model, r#"{"className":"Folder"}"#).unwrap();
+        fs_err::write(&meta, r#"{"id":"owner","ignoreUnknownInstances":true}"#).unwrap();
+        let project = release_review_project(
+            dir.path(),
+            serde_json::json!({"instancesAsDirectories":true}),
+        );
+        let input = release_review_input(
+            dir.path(),
+            vec![rbx_dom_weak::InstanceBuilder::new("Folder")
+                .with_name("Parent")
+                .with_child(
+                    rbx_dom_weak::InstanceBuilder::new("Folder")
+                        .with_name("Root")
+                        .with_child(
+                            rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Added"),
+                        ),
+                )],
+        );
+        for _ in 0..2 {
+            let result = release_review_sync(&project, &input);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(!model.exists());
+            assert!(!meta.exists(), "{extension} left stale inline metadata");
+            let rebuilt = release_review_build(&project);
+            assert_eq!(
+                rebuilt
+                    .descendants()
+                    .filter(|inst| inst.name == "Root")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rebuilt
+                    .descendants()
+                    .filter(|inst| inst.name == "Added")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+/// Fresh same-stem model outputs must restage even byte-identical sidecars.
+#[test]
+fn release_review_model_format_conversions_preserve_sidecars() {
+    for (source, target) in [
+        ("rbxm", "rbxmx"),
+        ("rbxmx", "rbxm"),
+        ("model.json", "rbxm"),
+        ("model.json", "rbxmx"),
+        ("model.jsonc", "rbxm"),
+        ("model.jsonc", "rbxmx"),
+    ] {
+        for extension in ["json", "jsonc"] {
+            for directories in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                crate::rojo_test::package_sources::setup(dir.path());
+                let src = dir.path().join("src");
+                fs_err::create_dir_all(&src).unwrap();
+                let original = release_review_old_twin(
+                    &src,
+                    "Root",
+                    "Root",
+                    1,
+                    if source == "model.jsonc" {
+                        "model.json"
+                    } else {
+                        source
+                    },
+                );
+                if source == "model.jsonc" {
+                    fs_err::rename(src.join("Root.model.json"), src.join("Root.model.jsonc"))
+                        .unwrap();
+                }
+                let sidecar = src.join(format!("Root.meta.{extension}"));
+                if original != sidecar {
+                    fs_err::rename(&original, &sidecar).unwrap();
+                }
+                let canonical = "{\n    \"$schema\": \"schema.json\",\n    \"id\": \"owner\",\n    \"ignoreUnknownInstances\": true\n}\n";
+                fs_err::write(&sidecar, canonical).unwrap();
+                let project = release_review_project(
+                    dir.path(),
+                    serde_json::json!({
+                        "instancesAsDirectories":directories,
+                        "modelTrees":[{"pattern":"ReplicatedStorage/Root", "format":target}]
+                    }),
+                );
+                let input = release_review_input(dir.path(), vec![release_review_twin("Root", 1)]);
+                let mut previous = None;
+                for _ in 0..2 {
+                    let result = release_review_sync(&project, &input);
+                    assert!(
+                        result.status.success(),
+                        "{source} to {target}, directories {directories}, {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    assert!(!src.join(format!("Root.{source}")).exists());
+                    assert!(src.join(format!("Root.{target}")).is_file());
+                    assert_eq!(fs_err::read_to_string(&sidecar).unwrap(), canonical);
+                    release_review_build(&project);
+                    let bytes = release_review_bytes(&src);
+                    if let Some(previous) = previous.replace(bytes.clone()) {
+                        assert_eq!(bytes, previous);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Case-only logical names must not expand cleanup to untracked sidecars.
+#[test]
+fn release_review_json_relayout_cleans_exact_tracked_sidecars() {
+    for directories in [false, true] {
+        for format in ["model.json", "model.jsonc"] {
+            for target in ["rbxm", "rbxmx"] {
+                let dir = tempfile::tempdir().unwrap();
+                let src = dir.path().join("src");
+                fs_err::create_dir_all(&src).unwrap();
+                let meta = release_review_old_twin(&src, "ROOT", "Root", 1, "model.json");
+                if format == "model.jsonc" {
+                    fs_err::rename(src.join("ROOT.model.json"), src.join("ROOT.model.jsonc"))
+                        .unwrap();
+                }
+                let unrelated = src.join("Other.meta.json");
+                fs_err::write(&unrelated, "{\"id\":\"unrelated\"}").unwrap();
+                let project = release_review_project(
+                    dir.path(),
+                    serde_json::json!({
+                        "instancesAsDirectories":directories,
+                        "modelTrees":[{"pattern":"ReplicatedStorage/Root", "format":target}]
+                    }),
+                );
+                let input = release_review_input(dir.path(), vec![release_review_twin("Root", 2)]);
+                // Case-insensitive filesystems reuse the tracked sidecar itself.
+                // Case-sensitive ones must remove it and write a distinct file.
+                let replacement = if src.join("Root.meta.jsonc").is_file() {
+                    meta.clone()
+                } else {
+                    src.join("Root.meta.json")
+                };
+                for _ in 0..2 {
+                    let result = release_review_sync(&project, &input);
+                    assert!(
+                        result.status.success(),
+                        "{format} to {target}, directories {directories}, {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    let files = release_review_bytes(&src);
+                    assert!(!files.contains_key(Path::new(&format!("ROOT.{format}"))));
+                    assert_eq!(
+                        files.contains_key(meta.strip_prefix(&src).unwrap()),
+                        meta == replacement
+                    );
+                    let contents = files
+                        .get(replacement.strip_prefix(&src).unwrap())
+                        .unwrap_or_else(|| {
+                            panic!("Missing replacement metadata in {:?}", files.keys())
+                        });
+                    let metadata = jsonc_parser::parse_to_serde_value(
+                        std::str::from_utf8(contents).unwrap(),
+                        &Default::default(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(metadata["id"], "owner-1");
+                    assert_eq!(metadata["$schema"], "schema-1");
+                    assert_eq!(metadata["ignoreUnknownInstances"], true);
+                    assert_eq!(
+                        fs_err::read_to_string(&unrelated).unwrap(),
+                        "{\"id\":\"unrelated\"}"
+                    );
+                    release_review_build(&project);
+                }
+            }
+        }
+    }
+}
+
+/// Clearing a reused case-alias sidecar must not schedule two physical deletions.
+#[test]
+fn release_review_case_alias_sidecar_removal() {
+    for extension in ["json", "jsonc"] {
+        for target in ["rbxm", "rbxmx"] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            fs_err::create_dir_all(&src).unwrap();
+            fs_err::write(
+                src.join(format!("ROOT.model.{extension}")),
+                r#"{"className":"Folder"}"#,
+            )
+            .unwrap();
+            fs_err::write(
+                src.join(format!("ROOT.meta.{extension}")),
+                r#"{"name":"Root"}"#,
+            )
+            .unwrap();
+            let project = release_review_project(
+                dir.path(),
+                serde_json::json!({
+                    "instancesAsDirectories":false,
+                    "modelTrees":[{"pattern":"ReplicatedStorage/Root", "format":target}]
+                }),
+            );
+            let input = release_review_input(
+                dir.path(),
+                vec![rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Root")],
+            );
+            for _ in 0..2 {
+                let result = release_review_sync(&project, &input);
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let files = release_review_bytes(&src);
+                assert_eq!(files.len(), 1, "{files:?}");
+                assert!(files.contains_key(Path::new(&format!("Root.{target}"))));
+                release_review_build(&project);
+            }
+        }
+    }
+}
+
+/// Ignored metadata that already has the desired values needs no rewrite.
+#[test]
+fn release_review_json_unchanged_ignored_sidecar_is_retained() {
+    for extension in ["json", "jsonc"] {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs_err::create_dir_all(&src).unwrap();
+        fs_err::write(
+            src.join(format!("Root.model.{extension}")),
+            r#"{"className":"Folder","id":"owner","$schema":"schema.json"}"#,
+        )
+        .unwrap();
+        let sidecar = src.join(format!("Root.meta.{extension}"));
+        let original = if extension == "jsonc" {
+            "{ /* Keep this comment. */ \"ignoreUnknownInstances\": true }"
+        } else {
+            "{\"ignoreUnknownInstances\":true}"
+        };
+        fs_err::write(&sidecar, original).unwrap();
+        let project = release_review_project(
+            dir.path(),
+            serde_json::json!({
+                "instancesAsDirectories":false,
+                "ignorePaths":[format!("**/*.meta.{extension}")]
+            }),
+        );
+        let input = release_review_input(
+            dir.path(),
+            vec![rbx_dom_weak::InstanceBuilder::new("Folder")
+                .with_name("Root")
+                .with_child(rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Added"))],
+        );
+        for _ in 0..2 {
+            let result = release_review_sync(&project, &input);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(fs_err::read_to_string(&sidecar).unwrap(), original);
+            let rebuilt = release_review_build(&project);
+            assert_eq!(
+                rebuilt
+                    .descendants()
+                    .filter(|inst| inst.name == "Added")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+/// An ignored sidecar cannot be filtered out after identity has moved inline.
+#[test]
+fn release_review_json_identity_rewrite_rejects_ignored_sidecars() {
+    for model_extension in ["json", "jsonc"] {
+        for meta_extension in ["json", "jsonc"] {
+            for field in ["id", "$schema"] {
+                let dir = tempfile::tempdir().unwrap();
+                let src = dir.path().join("src");
+                fs_err::create_dir_all(&src).unwrap();
+                let model = src.join(format!("Root.model.{model_extension}"));
+                fs_err::write(&model, r#"{"className":"Folder"}"#).unwrap();
+                fs_err::write(
+                    src.join(format!("Root.meta.{meta_extension}")),
+                    serde_json::json!({field:"owner"}).to_string(),
+                )
+                .unwrap();
+                let project = release_review_project(
+                    dir.path(),
+                    serde_json::json!({
+                        "instancesAsDirectories":false,
+                        "ignorePaths":[format!("**/*.meta.{meta_extension}")]
+                    }),
+                );
+                let input = release_review_input(
+                    dir.path(),
+                    vec![rbx_dom_weak::InstanceBuilder::new("Folder")
+                        .with_name("Root")
+                        .with_child(
+                            rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Added"),
+                        )],
+                );
+                let before = release_review_bytes(dir.path());
+                let result = release_review_sync(&project, &input);
+                assert!(
+                    !result.status.success(),
+                    "{model_extension}, {meta_extension}, {field} unexpectedly succeeded"
+                );
+                assert!(
+                    String::from_utf8_lossy(&result.stderr).contains("excluded"),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert_eq!(release_review_bytes(dir.path()), before);
+                release_review_build(&project);
+            }
+        }
+    }
+}
+
 fn release_review_project(root: &Path, rules: serde_json::Value) -> std::path::PathBuf {
     let project = root.join("default.project.json");
     fs_err::write(

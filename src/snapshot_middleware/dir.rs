@@ -683,8 +683,10 @@ fn keeps_directory_layout(snapshot: &SyncbackSnapshot, new: Ref, old: InstanceWi
     let Some(old_middleware) = old.metadata().middleware else {
         return true;
     };
-    let paired = snapshot.with_new_path(snapshot.path.clone(), new, Some(old.id()));
-    let middleware = crate::syncback::get_best_middleware(&paired);
+    // A changed initializer must follow the incoming class, not inherit the
+    // removed class's middleware in the default (non-directory) layout mode.
+    let fresh = snapshot.with_new_path(snapshot.path.clone(), new, None);
+    let middleware = crate::syncback::get_best_middleware(&fresh);
     let changes_initializer = matches!(
         old.class_name().as_str(),
         "Script" | "LocalScript" | "ModuleScript" | "LocalizationTable"
@@ -757,7 +759,6 @@ pub fn syncback_dir_no_meta<'sync>(
 
     let mut children = Vec::new();
     let mut removed_children = Vec::new();
-    let mut removed_model_metadata = Vec::new();
 
     if instances_as_directories(snapshot.project()) {
         let mut stems = unique_child_stems(snapshot.new_tree(), new_inst, snapshot.model_trees());
@@ -1057,12 +1058,19 @@ pub fn syncback_dir_no_meta<'sync>(
                 .zip(&needs_fresh)
                 .filter_map(|(pair, fresh)| pair.filter(|_| *fresh))
                 .collect();
-            let mut source_owners: HashMap<String, Vec<usize>> = HashMap::new();
+            // Ownership uses actual physical paths, not collision keys. On a
+            // case-sensitive filesystem, TWIN.meta.json cannot release an
+            // unrelated Twin.meta.json entry. Canonicalize tracked paths to use
+            // their on-disk spelling even when the filesystem ignores case.
+            let mut source_owners: HashMap<_, Vec<usize>> = HashMap::new();
             for (index, old) in old_children.iter().enumerate() {
-                source_owners
-                    .entry(old_paths[index].clone())
-                    .or_default()
-                    .push(index);
+                if let Some(source) = snapshot
+                    .vfs()
+                    .canonicalize(&old.metadata().relevant_paths[0])
+                    .with_not_found()?
+                {
+                    source_owners.entry(source).or_default().push(index);
+                }
                 if old
                     .metadata()
                     .middleware
@@ -1076,11 +1084,10 @@ pub fn syncback_dir_no_meta<'sync>(
                                 name.ends_with(".meta.json") || name.ends_with(".meta.jsonc")
                             })
                         {
-                            if let Some(name) = path.file_name() {
-                                source_owners
-                                    .entry(name.to_string_lossy().to_lowercase())
-                                    .or_default()
-                                    .push(index);
+                            if let Some(path) =
+                                snapshot.vfs().canonicalize(path).with_not_found()?
+                            {
+                                source_owners.entry(path).or_default().push(index);
                             }
                         }
                     }
@@ -1093,19 +1100,18 @@ pub fn syncback_dir_no_meta<'sync>(
                 .with_not_found()?
                 .is_some_and(|meta| meta.is_dir())
             {
+                let directory = snapshot.vfs().canonicalize(&snapshot.path)?;
                 for entry in snapshot.vfs().read_dir(&snapshot.path)? {
                     let entry = entry?;
-                    let name = entry
-                        .path()
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_lowercase();
+                    let name = entry.path().file_name().unwrap();
+                    // Keep this entry's exact name rather than resolving it as
+                    // a symlink, which could lend another entry's ownership.
+                    let physical = directory.join(name);
                     if !source_owners
-                        .get(&name)
+                        .get(&physical)
                         .is_some_and(|owners| owners.iter().all(|owner| removed.contains(owner)))
                     {
-                        disk_reserved.insert(name);
+                        disk_reserved.insert(name.to_string_lossy().to_lowercase());
                     }
                 }
             }
@@ -1157,26 +1163,6 @@ pub fn syncback_dir_no_meta<'sync>(
             let old_child = pair.and_then(|index| old_children[index].take());
             if let Some(old_child) = old_child.filter(|_| needs_fresh) {
                 snapshot.validate_layout_change(old_child)?;
-                // Generic model removal covers binary/XML sidecars. A JSON
-                // model also releases sidecars that its fresh output won't reuse.
-                if old_child.metadata().middleware == Some(Middleware::JsonModel) {
-                    let output_names = directory_output_names(&fresh);
-                    removed_model_metadata.extend(
-                        old_child
-                            .metadata()
-                            .relevant_paths
-                            .iter()
-                            .skip(1)
-                            .filter(|path| {
-                                path.parent() != fresh.path.parent()
-                                    || !path.file_name().is_some_and(|name| {
-                                        output_names
-                                            .contains(&name.to_string_lossy().to_lowercase())
-                                    })
-                            })
-                            .cloned(),
-                    );
-                }
                 removed_children.push(old_child);
                 layout_changed = true;
                 children.push(snapshot.with_fresh_path(fresh.path, fresh.new, old_child.id()));
@@ -1205,16 +1191,6 @@ pub fn syncback_dir_no_meta<'sync>(
     }
 
     let mut fs_snapshot = FsSnapshot::new();
-    for path in removed_model_metadata {
-        if snapshot
-            .vfs()
-            .metadata(&path)
-            .with_not_found()?
-            .is_some_and(|meta| meta.is_file())
-        {
-            fs_snapshot.remove_file(path);
-        }
-    }
 
     if let Some(old_ref) = snapshot.old {
         let new_hash = hash_json_instance(snapshot.project(), snapshot.new_tree(), snapshot.new)
@@ -1327,6 +1303,257 @@ mod test {
     use memofs::{InMemoryFs, VfsSnapshot};
 
     use crate::syncback::sanitize_stem;
+
+    fn directory_syncback_fixture(
+        source: VfsSnapshot,
+        rules: &str,
+    ) -> (Vfs, crate::Project, memofs::test_support::RecordingHandle) {
+        let mut imfs = InMemoryFs::new();
+        imfs.load_snapshot(
+            "/project",
+            VfsSnapshot::dir([
+                (
+                    "default.project.json",
+                    VfsSnapshot::file(format!(
+                        r#"{{"name":"Test","tree":{{"$path":"Source"}},"syncbackRules":{rules}}}"#
+                    )),
+                ),
+                ("Source", source),
+            ]),
+        )
+        .unwrap();
+        let (backend, recording) = memofs::test_support::RecordingBackend::new(imfs);
+        let vfs = Vfs::new(backend);
+        vfs.set_watch_enabled(false);
+        let project = crate::Project::load_exact(
+            &vfs,
+            Path::new("/project/default.project.json"),
+            Some("Test"),
+        )
+        .unwrap();
+        (vfs, project, recording)
+    }
+
+    fn directory_syncback_tree(vfs: &Vfs, project: &crate::Project) -> crate::snapshot::RojoTree {
+        crate::snapshot::RojoTree::new(
+            snapshot_from_vfs(&InstanceContext::default(), vfs, &project.file_location)
+                .unwrap()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn relayout_releases_only_exact_paired_sidecars() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        let model = WeakDom::new(InstanceBuilder::new("Model").with_name("Twin"));
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &model, &[model.root_ref()]).unwrap();
+        for extension in ["json", "jsonc"] {
+            for (source_stem, ownership, directories) in [
+                ("Twin", "paired"),
+                ("TWIN", "paired"),
+                ("TWIN", "case-variant"),
+                ("TWIN", "shared"),
+            ]
+            .into_iter()
+            .flat_map(|(stem, owner)| {
+                [false, true].map(move |directories| (stem, owner, directories))
+            }) {
+                let mut entries = vec![
+                    (
+                        format!("{source_stem}.rbxm"),
+                        VfsSnapshot::file(bytes.clone()),
+                    ),
+                    (
+                        format!("{source_stem}.meta.{extension}"),
+                        VfsSnapshot::file(r#"{"id":"paired-owner","name":"Twin"}"#),
+                    ),
+                ];
+                if ownership == "case-variant" {
+                    entries.push((
+                        format!("Twin.meta.{extension}"),
+                        VfsSnapshot::file(r#"{"id":"unrelated-owner"}"#),
+                    ));
+                } else if ownership == "shared" {
+                    // Both sources read the exact same sidecar, but only the
+                    // paired model justifies releasing its old representation.
+                    entries.push(("TWIN.luau".to_owned(), VfsSnapshot::file("return 1")));
+                }
+                let (vfs, project, recording) = directory_syncback_fixture(
+                    VfsSnapshot::dir(entries),
+                    &format!(
+                        r#"{{"instancesAsDirectories":{directories},"modelTrees":[{{"pattern":"Twin","format":"rbxmx"}}]}}"#
+                    ),
+                );
+                let before = vfs.snapshot_tree(Path::new("/project")).unwrap();
+                let mut tree = directory_syncback_tree(&vfs, &project);
+                let incoming = WeakDom::new(
+                    InstanceBuilder::new("Folder")
+                        .with_name("Test")
+                        .with_child(InstanceBuilder::new("Model").with_name("Twin")),
+                );
+                recording.start();
+                let staged = crate::syncback::syncback_loop(&vfs, &mut tree, incoming, &project);
+                if ownership != "paired" {
+                    let error = staged.err().unwrap_or_else(|| panic!(
+                        "An unrelated or shared sidecar must block relayout for {source_stem}, {ownership}, directory mode {directories}, {extension}"
+                    ));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("another source owns its destination")
+                            || (!directories
+                                && ownership == "shared"
+                                && error.to_string().contains("duplicated on the file system")),
+                        "{error:#}"
+                    );
+                    assert_eq!(vfs.snapshot_tree(Path::new("/project")).unwrap(), before);
+                    assert!(recording.stop().keys().all(|call| matches!(
+                        call.operation,
+                        "read"
+                            | "read_dir"
+                            | "metadata"
+                            | "exists"
+                            | "canonicalize"
+                            | "snapshot_tree"
+                    )));
+                } else {
+                    staged.unwrap().write_to_vfs("/project", &vfs).unwrap();
+                    let reloaded = directory_syncback_tree(&vfs, &project);
+                    let child = reloaded
+                        .get_instance(reloaded.root().children()[0])
+                        .unwrap();
+                    assert_eq!(child.name(), "Twin");
+                    assert_eq!(child.metadata().middleware, Some(Middleware::Rbxmx));
+                    assert_eq!(
+                        child.metadata().specified_id.as_ref().unwrap().to_string(),
+                        "paired-owner"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_layout_class_replacements_use_fresh_localization_initializers() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        for old_class in ["LocalizationTable", "Folder"] {
+            let new_class = if old_class == "Folder" {
+                "LocalizationTable"
+            } else {
+                "Folder"
+            };
+            let temp = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(temp.path()).unwrap();
+            let vfs = Vfs::new_default().unwrap();
+            vfs.set_watch_enabled(false);
+            vfs.create_dir_all(root.join("Source/Holder/Table/Child"))
+                .unwrap();
+            if old_class == "LocalizationTable" {
+                vfs.write(
+                    root.join("Source/Holder/Table/init.csv"),
+                    "Key,Source\nhello,Hello\n",
+                )
+                .unwrap();
+            }
+            let project_path = root.join("default.project.json");
+            vfs.write(
+                &project_path,
+                r#"{"name":"Test","tree":{"$path":"Source"}}"#,
+            )
+            .unwrap();
+            let project = crate::Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+            for _ in 0..2 {
+                let mut tree = directory_syncback_tree(&vfs, &project);
+                let mut child = InstanceBuilder::new(new_class)
+                    .with_name("Table")
+                    .with_child(InstanceBuilder::new("Folder").with_name("Child"));
+                if new_class == "LocalizationTable" {
+                    child = child.with_property("Contents", "[]");
+                }
+                let incoming = WeakDom::new(
+                    InstanceBuilder::new("Folder").with_name("Test").with_child(
+                        InstanceBuilder::new("Folder")
+                            .with_name("Holder")
+                            .with_child(child),
+                    ),
+                );
+                let staged =
+                    crate::syncback::syncback_loop(&vfs, &mut tree, incoming, &project).unwrap();
+                staged.write_to_vfs(&root, &vfs).unwrap();
+                let reloaded = directory_syncback_tree(&vfs, &project);
+                let holder = reloaded
+                    .get_instance(reloaded.root().children()[0])
+                    .unwrap();
+                assert_eq!(holder.children().len(), 1);
+                let child = reloaded.get_instance(holder.children()[0]).unwrap();
+                assert_eq!(child.class_name(), ustr(new_class));
+                assert_eq!(child.children().len(), 1);
+                assert_eq!(
+                    vfs.metadata(root.join("Source/Holder/Table/init.csv"))
+                        .with_not_found()
+                        .unwrap()
+                        .is_some(),
+                    new_class == "LocalizationTable"
+                );
+                assert_eq!(
+                    child.metadata().middleware,
+                    Some(if new_class == "Folder" {
+                        Middleware::Dir
+                    } else {
+                        Middleware::CsvDir
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn case_variant_json_relayout_removes_only_the_actual_old_sidecar() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        let (vfs, project, _) = directory_syncback_fixture(
+            VfsSnapshot::dir([
+                (
+                    "ROOT.model.json",
+                    VfsSnapshot::file(r#"{"className":"Model"}"#),
+                ),
+                (
+                    "ROOT.meta.jsonc",
+                    VfsSnapshot::file(r#"{"id":"root-owner","name":"Root"}"#),
+                ),
+            ]),
+            r#"{"instancesAsDirectories":true,"modelTrees":[{"pattern":"Root","format":"rbxm"}]}"#,
+        );
+        for _ in 0..2 {
+            let mut tree = directory_syncback_tree(&vfs, &project);
+            let incoming = WeakDom::new(
+                InstanceBuilder::new("Folder")
+                    .with_name("Test")
+                    .with_child(InstanceBuilder::new("Model").with_name("Root")),
+            );
+            let staged =
+                crate::syncback::syncback_loop(&vfs, &mut tree, incoming, &project).unwrap();
+            staged.write_to_vfs("/project", &vfs).unwrap();
+            let mut names: Vec<_> = vfs
+                .read_dir("/project/Source")
+                .unwrap()
+                .map(|entry| entry.unwrap().path().file_name().unwrap().to_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["Root.meta.json", "Root.rbxm"]);
+            let reloaded = directory_syncback_tree(&vfs, &project);
+            let child = reloaded
+                .get_instance(reloaded.root().children()[0])
+                .unwrap();
+            assert_eq!(
+                child.metadata().specified_id.as_ref().unwrap().to_string(),
+                "root-owner"
+            );
+        }
+    }
 
     fn names(children: &[InstanceSnapshot]) -> Vec<(String, String)> {
         children

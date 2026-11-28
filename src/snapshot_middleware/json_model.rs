@@ -16,7 +16,10 @@ use crate::{
     snapshot_middleware::meta_file::{
         metadata_id, serialize_values, write_metadata, AdjacentMetadata,
     },
-    syncback::{filter_json_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
+    syncback::{
+        filter_json_properties_preallocated, reused_model_metadata_path, validate_write_targets,
+        FsSnapshot, IgnoreConflict, SyncbackReturn, SyncbackSnapshot,
+    },
     RojoRef,
 };
 
@@ -109,6 +112,45 @@ pub fn syncback_json_model<'sync>(
             metadata.is_empty(),
         )?;
     }
+    // Do not rewrite equivalent metadata merely to normalize formatting. In
+    // particular, an ignored sidecar can stay untouched when no values move.
+    // Fresh layouts must still restage it because shared cleanup removes it.
+    if snapshot.metadata_source.is_none()
+        && fs_snapshot
+            .file_changes()
+            .into_iter()
+            .all(|(path, contents)| {
+                let Some(contents) = contents else {
+                    return false;
+                };
+                let Ok(existing) = snapshot.vfs().read(path) else {
+                    return false;
+                };
+                match (
+                    json::from_slice::<serde_json::Value>(&existing),
+                    json::from_slice::<serde_json::Value>(contents),
+                ) {
+                    (Ok(existing), Ok(updated)) => existing == updated,
+                    _ => false,
+                }
+            })
+    {
+        fs_snapshot = FsSnapshot::new();
+    }
+    let metadata_paths: Vec<_> = fs_snapshot
+        .added_files()
+        .into_iter()
+        .map(Path::to_owned)
+        .collect();
+    for path in metadata_paths {
+        let tracked = reused_model_metadata_path(snapshot, &path)?;
+        fs_snapshot.retarget_added_file(&path, &tracked);
+    }
+    // Identity moves inline only if its required sidecar rewrite can be
+    // persisted too. Full syncback would otherwise filter the sidecar later,
+    // leaving duplicate IDs or schemas that make the next build fail.
+    validate_write_targets(snapshot.project(), &fs_snapshot)
+        .map_err(|error| IgnoreConflict(error.to_string()))?;
     fs_snapshot.add_file(
         &snapshot.path,
         crate::json::to_vec_pretty(&model).context("failed to serialize new JSON Model")?,
@@ -226,6 +268,80 @@ mod test {
     use super::*;
 
     use memofs::{InMemoryFs, VfsSnapshot};
+
+    #[test]
+    fn removed_json_models_clean_only_exact_tracked_sidecars() {
+        use crate::{serve_session::ServeSession, syncback::syncback_loop};
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        for extension in ["json", "jsonc"] {
+            for target in ["rbxm", "rbxmx"] {
+                // This backend is case-sensitive even on a case-insensitive host.
+                let vfs = Vfs::new(InMemoryFs::new());
+                vfs.create_dir_all("/project/src").unwrap();
+                let project_path = Path::new("/project/default.project.json");
+                vfs.write(
+                    project_path,
+                    serde_json::json!({
+                        "name":"Review", "tree":{"$path":"src"},
+                        "syncbackRules":{"instancesAsDirectories":false,
+                            "modelTrees":[{"pattern":"Renamed", "format":target}]}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let source = format!("/project/src/ROOT.model.{extension}");
+                vfs.write(&source, r#"{"className":"Folder"}"#).unwrap();
+                let tracked = format!("/project/src/ROOT.meta.{extension}");
+                let untracked = format!("/project/src/root.meta.{extension}");
+                vfs.write(&tracked, r#"{"name":"Renamed","id":"owner","$schema":"schema.json","ignoreUnknownInstances":true}"#).unwrap();
+                let untouched = r#"{"id":"unrelated"}"#;
+                vfs.write(&untracked, untouched).unwrap();
+                let session = ServeSession::new(vfs, project_path).unwrap();
+                let incoming = WeakDom::new(
+                    InstanceBuilder::new("Folder").with_child(
+                        InstanceBuilder::new("Folder")
+                            .with_name("Renamed")
+                            .with_child(InstanceBuilder::new("Folder").with_name("Added")),
+                    ),
+                );
+                let output = syncback_loop(
+                    session.vfs(),
+                    &mut session.tree(),
+                    incoming,
+                    session.root_project(),
+                )
+                .unwrap();
+                assert!(output.removed_files().contains(&Path::new(&tracked)));
+                assert!(!output.removed_files().contains(&Path::new(&untracked)));
+                output.write_to_vfs("/project", session.vfs()).unwrap();
+                assert!(session.vfs().metadata(&source).is_err());
+                assert!(session.vfs().metadata(&tracked).is_err());
+                assert_eq!(
+                    session.vfs().read_to_string(&untracked).unwrap().as_str(),
+                    untouched
+                );
+                let rebuilt = super::super::snapshot_from_vfs(
+                    &InstanceContext::default(),
+                    session.vfs(),
+                    &Path::new("/project/src").join(format!("Renamed.{target}")),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    rebuilt
+                        .metadata
+                        .specified_id
+                        .as_ref()
+                        .map(ToString::to_string),
+                    Some("owner".into())
+                );
+                assert_eq!(rebuilt.metadata.schema.as_deref(), Some("schema.json"));
+                assert!(rebuilt.metadata.ignore_unknown_instances);
+                assert_eq!(rebuilt.children[0].name, "Added");
+            }
+        }
+    }
 
     #[test]
     fn json_model_rewrite_preserves_supported_root_metadata_once() {
