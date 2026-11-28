@@ -48,6 +48,9 @@ pub struct SyncbackData<'sync> {
 pub struct SyncbackSnapshot<'sync> {
     pub data: SyncbackData<'sync>,
     pub old: Option<Ref>,
+    /// Root identity used only for filesystem metadata when the old representation
+    /// is removed. Its middleware, properties, and children must not be reused.
+    pub metadata_source: Option<Ref>,
     pub new: Ref,
     pub path: PathBuf,
     pub middleware: Option<Middleware>,
@@ -71,6 +74,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
                 ..self.data
             },
             old: old_ref,
+            metadata_source: None,
             new: new_ref,
             path: PathBuf::new(),
             middleware: None,
@@ -101,6 +105,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
                 ..self.data
             },
             old: old_ref,
+            metadata_source: None,
             new: new_ref,
             path: PathBuf::new(),
             middleware: None,
@@ -168,6 +173,7 @@ impl<'sync> SyncbackSnapshot<'sync> {
                 ..self.data
             },
             old: old_ref,
+            metadata_source: None,
             new: new_ref,
             path: PathBuf::new(),
             middleware: None,
@@ -189,10 +195,29 @@ impl<'sync> SyncbackSnapshot<'sync> {
                 ..self.data
             },
             old: old_ref,
+            metadata_source: None,
             new: new_ref,
             path,
             middleware: None,
         }
+    }
+
+    /// Rebuilds a removed representation at a fresh destination while retaining
+    /// only its root's filesystem metadata. Resolve middleware before supplying
+    /// that identity so the incompatible old middleware cannot influence it.
+    pub fn with_fresh_path(&self, path: PathBuf, new_ref: Ref, old_ref: Ref) -> Self {
+        let mut snapshot = self.with_new_path(path, new_ref, None);
+        snapshot.middleware = Some(get_best_middleware(&snapshot));
+        snapshot.metadata_source = Some(old_ref);
+        snapshot
+    }
+
+    /// Returns filesystem-only metadata without making a removed subtree eligible
+    /// for content hashing, child pairing, or source-path reuse.
+    pub fn old_metadata(&self) -> Option<&'sync crate::snapshot::InstanceMetadata> {
+        self.old
+            .or(self.metadata_source)
+            .and_then(|old| self.data.old_tree.get_metadata(old))
     }
 
     /// Allows a middleware to be 'forced' onto a SyncbackSnapshot to override
@@ -572,6 +597,125 @@ mod test {
     use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
     use super::inst_path as inst_path_outer;
+
+    #[test]
+    fn directory_fresh_relayout_keeps_only_root_metadata() {
+        use super::{SyncbackData, SyncbackSnapshot};
+        use crate::{
+            snapshot::{InstanceMetadata, InstanceSnapshot, RojoTree},
+            snapshot_middleware::Middleware,
+            Project, RojoRef,
+        };
+        use memofs::{InMemoryFs, Vfs};
+        use std::{collections::HashSet, path::Path};
+
+        let vfs = Vfs::new(InMemoryFs::new());
+        vfs.set_watch_enabled(false);
+        let old_tree = RojoTree::new(
+            InstanceSnapshot::new()
+                .name("Twin")
+                .class_name("ModuleScript")
+                .metadata(
+                    InstanceMetadata::new()
+                        .middleware(Middleware::ModuleScriptDir)
+                        .instigating_source(Path::new("/src/Twin"))
+                        .ignore_unknown_instances(true)
+                        .specified_id(Some(RojoRef::new("owner".into())))
+                        .schema(Some("schema.json".into())),
+                )
+                .children(vec![InstanceSnapshot::new()
+                    .name("Stale")
+                    .class_name("Folder")]),
+        );
+        let new_tree = WeakDom::new(
+            InstanceBuilder::new("Folder").with_name("Twin").with_child(
+                InstanceBuilder::new("ModuleScript")
+                    .with_name("Replacement")
+                    .with_property("Source", "return 'new'"),
+            ),
+        );
+        let mut project: Project = crate::json::from_str(
+            r#"{"name":"Test","tree":{"$className":"Folder"},
+            "syncbackRules":{"instancesAsDirectories":true}}"#,
+        )
+        .unwrap();
+        project.file_location = "/default.project.json".into();
+        let attribute_ids = HashSet::new();
+        let snapshot = SyncbackSnapshot {
+            data: SyncbackData {
+                vfs: &vfs,
+                old_tree: &old_tree,
+                new_tree: &new_tree,
+                project: &project,
+                scoped: false,
+                context: None,
+                script_containers: None,
+                model_trees: None,
+                attribute_ids: &attribute_ids,
+            },
+            old: Some(old_tree.get_root_id()),
+            metadata_source: None,
+            new: new_tree.root_ref(),
+            path: "/src/Twin".into(),
+            middleware: None,
+        };
+        let fresh =
+            snapshot.with_fresh_path(snapshot.path.clone(), snapshot.new, old_tree.get_root_id());
+        assert!(fresh.old_inst().is_none());
+        assert_eq!(
+            crate::syncback::get_best_middleware(&fresh),
+            Middleware::Dir
+        );
+        let planned = Middleware::Dir.syncback(&fresh).unwrap();
+        planned
+            .fs_snapshot
+            .write_to_vfs(Path::new("/"), &vfs)
+            .unwrap();
+        let serialized: serde_json::Value =
+            serde_json::from_slice(&vfs.read("/src/Twin/init.meta.json").unwrap()).unwrap();
+        assert_eq!(serialized["id"], "owner");
+        assert_eq!(serialized["$schema"], "schema.json");
+        assert_eq!(serialized["ignoreUnknownInstances"], true);
+        assert!(planned.removed_children.is_empty());
+        assert_eq!(planned.children.len(), 1);
+        assert!(planned.children[0].old_inst().is_none());
+        assert!(planned.children[0].old_metadata().is_none());
+
+        for extension in ["json", "jsonc"] {
+            let path = Path::new("/src").join(format!("Twin.model.{extension}"));
+            let fresh = snapshot
+                .with_fresh_path(path.clone(), snapshot.new, old_tree.get_root_id())
+                .middleware(Middleware::JsonModel);
+            assert!(fresh.old_inst().is_none());
+            let planned = Middleware::JsonModel.syncback(&fresh).unwrap();
+            planned
+                .fs_snapshot
+                .write_to_vfs(Path::new("/"), &vfs)
+                .unwrap();
+            let rebuilt = crate::snapshot_middleware::snapshot_from_vfs(
+                &crate::snapshot::InstanceContext::default(),
+                &vfs,
+                &path,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                rebuilt
+                    .metadata
+                    .specified_id
+                    .as_ref()
+                    .map(ToString::to_string),
+                Some("owner".into())
+            );
+            assert_eq!(rebuilt.metadata.schema.as_deref(), Some("schema.json"));
+            assert!(rebuilt.metadata.ignore_unknown_instances);
+            assert_eq!(rebuilt.children.len(), 1);
+            assert_eq!(rebuilt.children[0].name, "Replacement");
+            for path in planned.fs_snapshot.added_files() {
+                vfs.remove_file(path).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn inst_path() {

@@ -349,12 +349,13 @@ pub fn syncback_lua<'sync>(
             .path
             .parent_err()?
             .join(format!("{}.meta.json", snapshot.file_stem()));
-        if !meta.is_empty() || metadata_exists(snapshot.vfs(), &meta_path) {
-            fs_snapshot.add_file(
-                meta_path,
-                crate::json::to_vec_pretty(&meta).context("cannot serialize metadata")?,
-            );
-        }
+        super::meta_file::write_metadata(
+            snapshot.vfs(),
+            &mut fs_snapshot,
+            &meta_path,
+            &meta,
+            meta.is_empty(),
+        )?;
     }
 
     Ok(SyncbackReturn {
@@ -436,28 +437,16 @@ pub fn syncback_lua_init<'sync>(
         }
 
         let meta_path = snapshot.path.join("init.meta.json");
-        if !meta.is_empty() || metadata_exists(snapshot.vfs(), &meta_path) {
-            dir_syncback.fs_snapshot.add_file(
-                meta_path,
-                crate::json::to_vec_pretty(&meta)
-                    .context("could not serialize new init.meta.json")?,
-            );
-        }
+        super::meta_file::write_metadata(
+            snapshot.vfs(),
+            &mut dir_syncback.fs_snapshot,
+            &meta_path,
+            &meta,
+            meta.is_empty(),
+        )?;
     }
 
     Ok(dir_syncback)
-}
-
-/// Returns whether metadata already exists at `path` or its `.jsonc` sibling.
-/// Metadata with nothing left to store is normally skipped, but an existing
-/// file must still be rewritten, or the values just cleared would stay on disk.
-pub(super) fn metadata_exists(vfs: &Vfs, path: &Path) -> bool {
-    [path.to_path_buf(), path.with_extension("jsonc")]
-        .iter()
-        .any(|candidate| {
-            vfs.metadata(candidate)
-                .is_ok_and(|metadata| metadata.is_file())
-        })
 }
 
 #[cfg(test)]

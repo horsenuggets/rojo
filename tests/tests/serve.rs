@@ -2985,6 +2985,195 @@ fn post_write(
     deserialize_msgpack(&response).unwrap()
 }
 
+#[test]
+fn incremental_additions_append_after_released_legacy_ordinals() {
+    assert_incremental_sibling_order(&[1, 2, 3], false, None, &[4]);
+}
+
+#[test]
+fn incremental_additions_do_not_backfill_sparse_legacy_ordinals() {
+    assert_incremental_sibling_order(&[1, 3], false, None, &[4]);
+}
+
+#[test]
+fn incremental_additions_preserve_mixed_representations_and_markers() {
+    assert_incremental_sibling_order(&[1, 2, 3], true, None, &[4, 5]);
+}
+
+#[test]
+fn incremental_additions_keep_appending_across_requests() {
+    assert_incremental_sibling_order(&[1, 3], true, None, &[4, 5, 6]);
+}
+
+#[test]
+fn incremental_additions_do_not_number_unrelated_natural_names() {
+    for natural in ["Twin.__2", "Twin.__100"] {
+        let next = if natural == "Twin.__2" { 3 } else { 2 };
+        assert_incremental_sibling_order(&[1], true, Some(natural), &[next, next + 1]);
+    }
+}
+
+/// Exercises live additions and then a fresh CLI build, whose child order is what
+/// a new server must match against Studio. Source and child markers identify each
+/// sibling independently of its representation or physical suffix spelling.
+fn assert_incremental_sibling_order(
+    ordinals: &[u64],
+    mixed: bool,
+    natural: Option<&str>,
+    additions: &[u64],
+) {
+    use crate::rojo_test::{io_util::ROJO_PATH, serve_util::TestServeSession};
+    use librojo::web_api::InstanceAddition;
+    use std::process::Command;
+
+    let mut session = TestServeSession::with_setup("add_folder", |root| {
+        fs::write(
+            root.join("default.project.json"),
+            r#"{"name":"Test","tree":{"$className":"Folder","$path":"src"},"syncbackRules":{"instancesAsDirectories":true}}"#,
+        )
+        .unwrap();
+        for &number in ordinals {
+            let stem = if number == 1 {
+                "Twin".to_owned()
+            } else {
+                format!("Twin~{number}")
+            };
+            let (source, metadata) = if mixed && number % 2 == 0 {
+                fs::create_dir(root.join("src").join(&stem)).unwrap();
+                (
+                    format!("src/{stem}/init.luau"),
+                    format!("src/{stem}/init.meta.jsonc"),
+                )
+            } else {
+                (format!("src/{stem}.luau"), format!("src/{stem}.meta.json"))
+            };
+            fs::write(root.join(source), format!("return {number}\n")).unwrap();
+            // Case variants share the same logical ordinal group.
+            let name = if number % 2 == 0 { "tWiN" } else { "Twin" };
+            fs::write(root.join(metadata), format!(r#"{{"name":"{name}"}}"#)).unwrap();
+        }
+        if let Some(name) = natural {
+            let directory = root.join("src").join(name);
+            fs::create_dir(&directory).unwrap();
+            fs::create_dir(directory.join("NaturalMarker")).unwrap();
+            fs::write(
+                directory.join("init.meta.json"),
+                format!(r#"{{"name":"{name}"}}"#),
+            )
+            .unwrap();
+        }
+    });
+    let info = session.wait_to_come_online();
+    let parent = info.root_instance_id;
+    for &number in additions {
+        let marker = format!("Marker{number}");
+        let (model, ids) = if mixed {
+            created_subtree("Twin", &[(&marker, "Folder")])
+        } else {
+            use rbx_dom_weak::{InstanceBuilder, WeakDom};
+            let dom = WeakDom::new(
+                InstanceBuilder::new("Folder").with_child(
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name("Twin")
+                        .with_property("Source", format!("return {number}")),
+                ),
+            );
+            let mut bytes = Vec::new();
+            rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+            (
+                bytes,
+                librojo::web_api::AddedIds {
+                    id: Ref::new(),
+                    name: "Twin".into(),
+                    class_name: ustr("ModuleScript"),
+                    children: Vec::new(),
+                },
+            )
+        };
+        let id = ids.id;
+        let read = session.get_api_read(parent).unwrap();
+        let response = session.post_api_write(&WriteRequest {
+            session_id: info.session_id,
+            operation_id: None,
+            predecessor: None,
+            source_baselines: Default::default(),
+            message_cursor: Some(read.message_cursor),
+            authority: WriteAuthority::Filesystem,
+            removed: Vec::new(),
+            added: [(id, InstanceAddition { parent, model, ids })].into(),
+            updated: Vec::new(),
+        });
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(session
+            .get_api_read(parent)
+            .unwrap()
+            .instances
+            .contains_key(&id));
+    }
+
+    let output = session.path().join("rebuilt.rbxm");
+    let result = Command::new(ROJO_PATH)
+        .arg("build")
+        .arg(session.path())
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let dom = rbx_binary::from_reader(fs::File::open(output).unwrap()).unwrap();
+    let root = dom.get_by_ref(dom.root().children()[0]).unwrap();
+    let actual: Vec<u64> = root
+        .children()
+        .iter()
+        .map(|id| dom.get_by_ref(*id).unwrap())
+        .filter(|child| child.name.to_lowercase() == "twin")
+        .map(|child| {
+            if let Some(Variant::String(source)) = child.properties.get(&ustr("Source")) {
+                source
+                    .trim()
+                    .strip_prefix("return ")
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            } else {
+                let marker = dom.get_by_ref(child.children()[0]).unwrap();
+                marker.name.strip_prefix("Marker").unwrap().parse().unwrap()
+            }
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        ordinals
+            .iter()
+            .chain(additions)
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    for number in additions {
+        let extension = if mixed { "" } else { ".luau" };
+        let path = session
+            .path()
+            .join(format!("src/Twin.__{number}{extension}"));
+        assert!(path.exists(), "Missing allocated path {}", path.display());
+    }
+    if let Some(name) = natural {
+        let child = root
+            .children()
+            .iter()
+            .map(|id| dom.get_by_ref(*id).unwrap())
+            .find(|child| child.name == name)
+            .unwrap();
+        assert_eq!(
+            dom.get_by_ref(child.children()[0]).unwrap().name,
+            "NaturalMarker"
+        );
+    }
+}
+
 // A subtree created in Studio is written as new files and keeps the ids
 // Studio picked, so the server's announcement of it isn't a second copy, and
 // the watcher seeing the new files changes nothing.
@@ -3001,7 +3190,7 @@ fn studio_created_subtrees_are_written_as_directories_and_keep_their_ids() {
             "return \"Code\"\n"
         );
         assert!(directory.join("Same").is_dir());
-        assert!(directory.join("Same~2").is_dir());
+        assert!(directory.join("Same.__2").is_dir());
     });
 }
 
@@ -3232,6 +3421,137 @@ fn model_tree_rules_reach_instances_stored_in_metadata() {
     assert_eq!(parent_of(&session, outer), Some(mover));
     assert_eq!(parent_of(&session, fx), Some(outer));
     assert_eq!(parent_of(&session, spark), Some(fx));
+}
+
+/// Only the directory needs a relayout. Its already-model siblings must not
+/// force it past their ordinals when the files are read by a fresh process.
+#[test]
+fn model_tree_relayout_preserves_duplicate_sibling_ordinals() {
+    use crate::rojo_test::{io_util::ROJO_PATH, serve_util::TestServeSession};
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use std::process::Command;
+
+    for (ordinals, replacement) in [(vec![1, 2], 1), (vec![1, 3, 8], 3)] {
+        let mut session = TestServeSession::with_setup("add_folder", |root| {
+            fs::write(
+                root.join("default.project.json"),
+                r#"{"name":"Test","tree":{"$className":"Folder","$path":"src"},"syncbackRules":{"instancesAsDirectories":true,"modelTrees":[{"pattern":"Twi?"}]}}"#,
+            )
+            .unwrap();
+            for &number in &ordinals {
+                let stem = if number == 1 {
+                    "Twin".to_owned()
+                } else {
+                    format!("Twin.__{number}")
+                };
+                let marker = format!("Marker{number}");
+                if number == replacement {
+                    fs::create_dir_all(root.join("src").join(&stem).join(marker)).unwrap();
+                    fs::write(
+                        root.join("src").join(&stem).join("init.meta.json"),
+                        r#"{"name":"Twin"}"#,
+                    )
+                    .unwrap();
+                } else {
+                    let dom = WeakDom::new(
+                        InstanceBuilder::new("Folder").with_child(
+                            InstanceBuilder::new("Folder")
+                                .with_name("Twin")
+                                .with_child(InstanceBuilder::new("Folder").with_name(marker)),
+                        ),
+                    );
+                    rbx_binary::to_writer(
+                        fs::File::create(root.join(format!("src/{stem}.rbxm"))).unwrap(),
+                        &dom,
+                        dom.root().children(),
+                    )
+                    .unwrap();
+                    fs::write(
+                        root.join(format!("src/{stem}.meta.json")),
+                        r#"{"name":"Twin"}"#,
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let info = session.wait_to_come_online();
+        let before = session.get_api_read(info.root_instance_id).unwrap();
+        let original_ids = before.instances[&info.root_instance_id].children.clone();
+        let untouched: Vec<_> = ordinals
+            .iter()
+            .filter(|&&number| number != replacement)
+            .map(|number| {
+                let stem = if *number == 1 {
+                    "Twin".to_owned()
+                } else {
+                    format!("Twin.__{number}")
+                };
+                let path = session.path().join(format!("src/{stem}.rbxm"));
+                let contents = fs::read(&path).unwrap();
+                (path, contents)
+            })
+            .collect();
+        // Queue the rule update before choosing authority, so no existing model
+        // is first converted to a directory by an unrelated ruleset.
+        set_model_trees(&session, r#"[{"pattern":"Twin"}]"#);
+        announce_authority(&session, WriteAuthority::Studio);
+        assert!(eventually(|| !session
+            .path()
+            .join(if replacement == 1 {
+                "src/Twin".to_owned()
+            } else {
+                format!("src/Twin.__{replacement}")
+            })
+            .exists()));
+        let after = session.get_api_read(info.root_instance_id).unwrap();
+        assert_eq!(
+            after.instances[&info.root_instance_id].children.len(),
+            original_ids.len()
+        );
+        assert!(original_ids
+            .iter()
+            .all(|id| after.instances.contains_key(id)));
+
+        for (path, contents) in untouched {
+            assert_eq!(fs::read(path).unwrap(), contents);
+        }
+        let output = session.path().join("rebuilt.rbxm");
+        let result = Command::new(ROJO_PATH)
+            .arg("build")
+            .arg(session.path())
+            .arg("--output")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let dom = rbx_binary::from_reader(fs::File::open(output).unwrap()).unwrap();
+        let root = dom.get_by_ref(dom.root().children()[0]).unwrap();
+        let markers: Vec<_> = root
+            .children()
+            .iter()
+            .map(|id| {
+                let twin = dom.get_by_ref(*id).unwrap();
+                dom.get_by_ref(twin.children()[0]).unwrap().name.clone()
+            })
+            .collect();
+        assert_eq!(
+            markers,
+            ordinals
+                .iter()
+                .map(|number| format!("Marker{number}"))
+                .collect::<Vec<_>>()
+        );
+        let stem = if replacement == 1 {
+            "Twin".to_owned()
+        } else {
+            format!("Twin.__{replacement}")
+        };
+        assert!(session.path().join(format!("src/{stem}.rbxm")).is_file());
+    }
 }
 
 // Changing the modelTrees rules while serving moves matching instances to
