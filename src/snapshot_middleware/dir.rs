@@ -226,7 +226,11 @@ pub fn syncback_dir<'sync>(
         if !meta.is_empty() || (inline && was_inline) || (!leaving_inline && is_file(&meta_path)?) {
             let contents = crate::json::to_vec_pretty(&meta)
                 .context("could not serialize new init.meta.json")?;
-            if snapshot.vfs().read(&meta_path).with_not_found()?.as_deref() != Some(&contents) {
+            // A fresh relayout removes the old directory before writing, including
+            // metadata whose serialized bytes happen to be unchanged.
+            if snapshot.metadata_source.is_some()
+                || snapshot.vfs().read(&meta_path).with_not_found()?.as_deref() != Some(&contents)
+            {
                 dir_syncback.fs_snapshot.add_file(&meta_path, contents);
             }
             wrote_meta = true;
@@ -666,9 +670,9 @@ fn rojo_id_attribute(instance: &rbx_dom_weak::Instance) -> Option<&str> {
     }
 }
 
-/// Class replacements cannot retain an init script for the old class, or keep a
-/// file where the new class needs a directory. Unchanged classes retain the
-/// existing canonical-script and model-relayout policies.
+/// Class replacements cannot retain a class-defining initializer, or keep a file
+/// where the new class needs a directory. Unchanged classes retain the existing
+/// canonical-script and model-relayout policies.
 fn keeps_directory_layout(snapshot: &SyncbackSnapshot, new: Ref, old: InstanceWithMeta) -> bool {
     if !snapshot.keeps_model_layout(new, old) {
         return false;
@@ -681,11 +685,13 @@ fn keeps_directory_layout(snapshot: &SyncbackSnapshot, new: Ref, old: InstanceWi
     };
     let paired = snapshot.with_new_path(snapshot.path.clone(), new, Some(old.id()));
     let middleware = crate::syncback::get_best_middleware(&paired);
+    let changes_initializer = matches!(
+        old.class_name().as_str(),
+        "Script" | "LocalScript" | "ModuleScript" | "LocalizationTable"
+    ) || snapshot.get_new_instance(new).unwrap().class
+        == "LocalizationTable";
     old_middleware.is_dir() == middleware.is_dir()
-        && (!matches!(
-            old.class_name().as_str(),
-            "Script" | "LocalScript" | "ModuleScript"
-        ) || old_middleware == middleware)
+        && (!changes_initializer || old_middleware == middleware)
 }
 
 /// Full syncback must append after actual retained ordinals, not the count of
@@ -706,20 +712,42 @@ fn appended_directory_stem(
         .map_err(|error| crate::syncback::OwnershipConflict(error.to_string()).into())
 }
 
-fn reserve_directory_output(child: &SyncbackSnapshot, reserved: &mut HashSet<String>) {
-    reserved.insert(
-        child
-            .path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_lowercase(),
-    );
+fn directory_output_names(child: &SyncbackSnapshot) -> Vec<String> {
+    let mut names = vec![child
+        .path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_lowercase()];
     if !crate::syncback::get_best_middleware(child).is_dir() {
         let stem = child.file_stem();
-        reserved.insert(format!("{stem}.meta.json").to_lowercase());
-        reserved.insert(format!("{stem}.meta.jsonc").to_lowercase());
+        names.push(format!("{stem}.meta.json").to_lowercase());
+        names.push(format!("{stem}.meta.jsonc").to_lowercase());
     }
+    names
+}
+
+fn reserve_directory_output(child: &SyncbackSnapshot, reserved: &mut HashSet<String>) {
+    reserved.extend(directory_output_names(child));
+}
+
+/// Replacements must keep their logical ordinal exactly. Advancing past a taken
+/// path could put this sibling after another retained sibling on the next reload.
+fn replacement_directory_stem(
+    child: &rbx_dom_weak::Instance,
+    middleware: Middleware,
+    number: u64,
+    reserved: &HashSet<String>,
+) -> anyhow::Result<String> {
+    let stem = free_child_stem(child, middleware, reserved, number)
+        .map_err(|error| crate::syncback::OwnershipConflict(error.to_string()))?;
+    if sibling_number(&stem, &child.name, &child.class) != number {
+        return Err(crate::syncback::OwnershipConflict(format!(
+            "Cannot preserve sibling ordinal {number} for instance {:?} because another source owns its destination",
+            child.name
+        )).into());
+    }
+    Ok(stem)
 }
 
 pub fn syncback_dir_no_meta<'sync>(
@@ -729,6 +757,7 @@ pub fn syncback_dir_no_meta<'sync>(
 
     let mut children = Vec::new();
     let mut removed_children = Vec::new();
+    let mut removed_model_metadata = Vec::new();
 
     if instances_as_directories(snapshot.project()) {
         let mut stems = unique_child_stems(snapshot.new_tree(), new_inst, snapshot.model_trees());
@@ -853,6 +882,50 @@ pub fn syncback_dir_no_meta<'sync>(
                 })
             })
             .collect();
+        // Assign potential replacements before deciding which retained sources a
+        // relayout displaces. Vector positions backfill sparse exports and can
+        // reverse mixed-layout siblings, including legacy and natural names.
+        let mut seen_names = HashSet::new();
+        let duplicate_names: HashSet<_> = new_keys
+            .iter()
+            .map(|key| key.0.to_lowercase())
+            .filter(|name| !seen_names.insert(name.clone()))
+            .collect();
+        let mut preserved_numbers = vec![None; fresh_children.len()];
+        for (index, fresh) in fresh_children.iter_mut().enumerate() {
+            let Some(old_index) = pairs[index] else {
+                continue;
+            };
+            let old = old_children[old_index];
+            if migrating.contains(&new_keys[index])
+                || old.name().to_lowercase() != new_keys[index].0.to_lowercase()
+            {
+                continue;
+            }
+            let number = sibling_number(&old_paths[old_index], old.name(), &old.class_name());
+            // A retained singleton may already have a higher allocation to make
+            // way for an unrelated model (FX versus FX.rbxm). That displacement
+            // cannot reorder logical peers, but must never backfill a sparse floor.
+            let allocated =
+                sibling_number(&fresh_paths[index], new_keys[index].0, &new_keys[index].1);
+            if !relayout[index]
+                && !duplicate_names.contains(&new_keys[index].0.to_lowercase())
+                && allocated > number
+            {
+                preserved_numbers[index] = Some(allocated);
+                continue;
+            }
+            let stem = replacement_directory_stem(
+                fresh.new_inst(),
+                crate::syncback::get_best_middleware(fresh),
+                number,
+                &HashSet::new(),
+            )?;
+            *fresh = snapshot.with_stem(&snapshot.path, fresh.new, None, &stem);
+            fresh_paths[index] = physical_name(fresh);
+            stems.insert(fresh.new, stem);
+            preserved_numbers[index] = Some(number);
+        }
         let kept_paths: Vec<_> = fresh_children
             .iter()
             .zip(&pairs)
@@ -971,12 +1044,139 @@ pub fn syncback_dir_no_meta<'sync>(
                 )).into());
             }
         }
+        if preserved_numbers
+            .iter()
+            .zip(&needs_fresh)
+            .any(|(number, fresh)| number.is_some() && *fresh)
+        {
+            // Only paired, freshly rebuilt owners release their source paths.
+            // Unpaired removals, unknown files, and project-owned entries cannot
+            // justify reusing a destination, even if they would later disappear.
+            let removed: HashSet<_> = pairs
+                .iter()
+                .zip(&needs_fresh)
+                .filter_map(|(pair, fresh)| pair.filter(|_| *fresh))
+                .collect();
+            let mut source_owners: HashMap<String, Vec<usize>> = HashMap::new();
+            for (index, old) in old_children.iter().enumerate() {
+                source_owners
+                    .entry(old_paths[index].clone())
+                    .or_default()
+                    .push(index);
+                if old
+                    .metadata()
+                    .middleware
+                    .is_some_and(|middleware| !middleware.is_dir())
+                {
+                    let source = &old.metadata().relevant_paths[0];
+                    for path in old.metadata().relevant_paths.iter().skip(1) {
+                        if path.parent() == source.parent()
+                            && path.file_name().is_some_and(|name| {
+                                let name = name.to_string_lossy();
+                                name.ends_with(".meta.json") || name.ends_with(".meta.jsonc")
+                            })
+                        {
+                            if let Some(name) = path.file_name() {
+                                source_owners
+                                    .entry(name.to_string_lossy().to_lowercase())
+                                    .or_default()
+                                    .push(index);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut disk_reserved = HashSet::new();
+            if snapshot
+                .vfs()
+                .metadata(&snapshot.path)
+                .with_not_found()?
+                .is_some_and(|meta| meta.is_dir())
+            {
+                for entry in snapshot.vfs().read_dir(&snapshot.path)? {
+                    let entry = entry?;
+                    let name = entry
+                        .path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_lowercase();
+                    if !source_owners
+                        .get(&name)
+                        .is_some_and(|owners| owners.iter().all(|owner| removed.contains(owner)))
+                    {
+                        disk_reserved.insert(name);
+                    }
+                }
+            }
+            let pending: Vec<_> = fresh_children
+                .iter()
+                .enumerate()
+                .map(|(index, fresh)| {
+                    if needs_fresh[index] {
+                        directory_output_names(fresh)
+                    } else {
+                        directory_output_names(&snapshot.with_stem(
+                            &snapshot.path,
+                            fresh.new,
+                            pairs[index].map(|old| old_children[old].id()),
+                            &stems[&fresh.new],
+                        ))
+                    }
+                })
+                .collect();
+            let mut counts = HashMap::new();
+            for path in pending.iter().flatten() {
+                *counts.entry(path.clone()).or_insert(0usize) += 1;
+            }
+            let mut reserved = disk_reserved.clone();
+            reserved.extend(counts.keys().cloned());
+            for (index, fresh) in fresh_children.iter().enumerate() {
+                let Some(number) = preserved_numbers[index].filter(|_| needs_fresh[index]) else {
+                    continue;
+                };
+                // Remove only this output's own reservation. Counts keep a
+                // colliding peer's file or either sidecar reserved in linear time.
+                for path in &pending[index] {
+                    if counts[path] == 1 && !disk_reserved.contains(path) {
+                        reserved.remove(path);
+                    }
+                }
+                replacement_directory_stem(
+                    fresh.new_inst(),
+                    crate::syncback::get_best_middleware(fresh),
+                    number,
+                    &reserved,
+                )?;
+                reserved.extend(pending[index].iter().cloned());
+            }
+        }
         let mut old_children: Vec<_> = old_children.into_iter().map(Some).collect();
         let mut layout_changed = false;
         for ((fresh, pair), needs_fresh) in fresh_children.into_iter().zip(pairs).zip(needs_fresh) {
             let old_child = pair.and_then(|index| old_children[index].take());
             if let Some(old_child) = old_child.filter(|_| needs_fresh) {
                 snapshot.validate_layout_change(old_child)?;
+                // Generic model removal covers binary/XML sidecars. A JSON
+                // model also releases sidecars that its fresh output won't reuse.
+                if old_child.metadata().middleware == Some(Middleware::JsonModel) {
+                    let output_names = directory_output_names(&fresh);
+                    removed_model_metadata.extend(
+                        old_child
+                            .metadata()
+                            .relevant_paths
+                            .iter()
+                            .skip(1)
+                            .filter(|path| {
+                                path.parent() != fresh.path.parent()
+                                    || !path.file_name().is_some_and(|name| {
+                                        output_names
+                                            .contains(&name.to_string_lossy().to_lowercase())
+                                    })
+                            })
+                            .cloned(),
+                    );
+                }
                 removed_children.push(old_child);
                 layout_changed = true;
                 children.push(snapshot.with_fresh_path(fresh.path, fresh.new, old_child.id()));
@@ -1005,6 +1205,16 @@ pub fn syncback_dir_no_meta<'sync>(
     }
 
     let mut fs_snapshot = FsSnapshot::new();
+    for path in removed_model_metadata {
+        if snapshot
+            .vfs()
+            .metadata(&path)
+            .with_not_found()?
+            .is_some_and(|meta| meta.is_file())
+        {
+            fs_snapshot.remove_file(path);
+        }
+    }
 
     if let Some(old_ref) = snapshot.old {
         let new_hash = hash_json_instance(snapshot.project(), snapshot.new_tree(), snapshot.new)
@@ -1084,9 +1294,10 @@ fn children_by_name<'sync>(
                         old_child.name()
                     );
                     continue;
-                } else if !snapshot.keeps_model_layout(*new_child_ref, old_child) {
+                } else if !keeps_directory_layout(snapshot, *new_child_ref, old_child) {
                     snapshot.validate_layout_change(old_child)?;
-                    children.push(snapshot.with_joined_path(*new_child_ref, None)?);
+                    let fresh = snapshot.with_joined_path(*new_child_ref, None)?;
+                    children.push(snapshot.with_fresh_path(fresh.path, fresh.new, old_child.id()));
                     removed_children.push(old_child);
                     continue;
                 }
@@ -1134,6 +1345,52 @@ mod test {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn replacement_stems_keep_exact_ordinals_or_report_ownership_conflicts() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        for name in ["Twin", "twin", "Twin.__100", "Odd?.__100"] {
+            for middleware in [
+                Middleware::Dir,
+                Middleware::Rbxm,
+                Middleware::Rbxmx,
+                Middleware::JsonModel,
+            ] {
+                let dom = WeakDom::new(InstanceBuilder::new("Folder").with_name(name));
+                let base = sanitize_stem(name, "Folder");
+                for number in [1, 3, 8, u64::MAX] {
+                    let expected = if number == 1 {
+                        base.clone()
+                    } else {
+                        format!("{base}.__{number}")
+                    };
+                    assert_eq!(
+                        replacement_directory_stem(dom.root(), middleware, number, &HashSet::new())
+                            .unwrap(),
+                        expected
+                    );
+                    let extensions: &[&str] = match middleware {
+                        Middleware::Dir => &[""],
+                        Middleware::Rbxm => &[".rbxm", ".meta.json", ".meta.jsonc"],
+                        Middleware::Rbxmx => &[".rbxmx", ".meta.json", ".meta.jsonc"],
+                        Middleware::JsonModel => &[".model.json", ".meta.json", ".meta.jsonc"],
+                        _ => unreachable!(),
+                    };
+                    for extension in extensions {
+                        let reserved =
+                            HashSet::from([format!("{expected}{extension}").to_lowercase()]);
+                        let error =
+                            replacement_directory_stem(dom.root(), middleware, number, &reserved)
+                                .unwrap_err();
+                        assert!(error
+                            .downcast_ref::<crate::syncback::OwnershipConflict>()
+                            .is_some());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

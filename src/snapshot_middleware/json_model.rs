@@ -13,7 +13,9 @@ use crate::{
     json,
     resolution::{normalize_property_names, UnresolvedValue},
     snapshot::{InstanceContext, InstanceSnapshot},
-    snapshot_middleware::meta_file::serialize_values,
+    snapshot_middleware::meta_file::{
+        metadata_id, serialize_values, write_metadata, AdjacentMetadata,
+    },
     syncback::{filter_json_properties_preallocated, FsSnapshot, SyncbackReturn, SyncbackSnapshot},
     RojoRef,
 };
@@ -65,6 +67,8 @@ pub fn snapshot_json_model(
         .specified_id(id)
         .schema(schema);
 
+    AdjacentMetadata::read_and_apply_all(vfs, path, name, &mut snapshot)?;
+
     Ok(Some(snapshot))
 }
 
@@ -77,18 +81,41 @@ pub fn syncback_json_model<'sync>(
     // We don't need the name on the root, but we do for children.
     model.name = None;
 
-    if let Some(old_inst) = snapshot.old_inst() {
-        // TODO: Is it worth this being an Arc or Rc? I doubt that enough
-        // schemas will ever exist in one project for it to matter, but it
-        // could have a performance cost.
-        model.schema = old_inst.metadata().schema.clone();
+    if let Some(metadata) = snapshot.old_metadata() {
+        model.id = metadata_id(metadata.specified_id.as_ref(), &model.attributes);
+        model.schema = metadata.schema.clone();
     }
 
+    let mut fs_snapshot = FsSnapshot::new();
+    if let Some(mut metadata) =
+        AdjacentMetadata::from_syncback_snapshot(snapshot, snapshot.path.clone())?
+    {
+        // JSON models support root identity inline, but ignore behavior and name
+        // overrides belong in the sidecar. Never write identity in both places.
+        metadata.id = None;
+        metadata.schema = None;
+        metadata.properties.clear();
+        metadata.attributes.clear();
+        let parent = snapshot
+            .path
+            .parent()
+            .context("JSON models should have a parent directory")?;
+        let meta_path = parent.join(format!("{}.meta.json", snapshot.file_stem()));
+        write_metadata(
+            snapshot.vfs(),
+            &mut fs_snapshot,
+            &meta_path,
+            &metadata,
+            metadata.is_empty(),
+        )?;
+    }
+    fs_snapshot.add_file(
+        &snapshot.path,
+        crate::json::to_vec_pretty(&model).context("failed to serialize new JSON Model")?,
+    );
+
     Ok(SyncbackReturn {
-        fs_snapshot: FsSnapshot::new().with_added_file(
-            &snapshot.path,
-            crate::json::to_vec_pretty(&model).context("failed to serialize new JSON Model")?,
-        ),
+        fs_snapshot,
         children: Vec::new(),
         removed_children: Vec::new(),
     })
@@ -201,6 +228,175 @@ mod test {
     use memofs::{InMemoryFs, VfsSnapshot};
 
     #[test]
+    fn json_model_rewrite_preserves_supported_root_metadata_once() {
+        use crate::{serve_session::ServeSession, syncback::syncback_model_file};
+        use rbx_dom_weak::{types::Attributes, InstanceBuilder, WeakDom};
+
+        for extension in ["json", "jsonc"] {
+            for meta_extension in ["json", "jsonc"] {
+                for bits in 0..8 {
+                    for (ignore, attribute_id) in [false, true]
+                        .into_iter()
+                        .flat_map(|ignore| [false, true].map(|attribute_id| (ignore, attribute_id)))
+                    {
+                        let temp = tempfile::tempdir().unwrap();
+                        let vfs = Vfs::new_default().unwrap();
+                        vfs.set_watch_enabled(false);
+                        let project_path = temp.path().join("default.project.json");
+                        vfs.write(&project_path, r#"{"name":"Test","tree":{"$path":"src"}}"#)
+                            .unwrap();
+                        vfs.create_dir_all(temp.path().join("src")).unwrap();
+                        let path = temp.path().join(format!("src/Root.model.{extension}"));
+                        let mut model = serde_json::json!({"className":"Folder","properties":{"Archivable":false},"attributes":{"Stale":1}});
+                        if bits & 1 != 0 {
+                            model["id"] = "owner".into();
+                        }
+                        if bits & 2 != 0 {
+                            model["$schema"] = "schema.json".into();
+                        }
+                        vfs.write(&path, serde_json::to_vec(&model).unwrap())
+                            .unwrap();
+                        let sidecar = temp.path().join(format!("src/Root.meta.{meta_extension}"));
+                        if bits & 4 != 0 {
+                            vfs.write(
+                                &sidecar,
+                                format!(r#"{{"ignoreUnknownInstances":{ignore}}}"#),
+                            )
+                            .unwrap();
+                        }
+                        let session = ServeSession::new(vfs, &project_path).unwrap();
+                        let root = session.tree().root().children()[0];
+                        let mut incoming_root = InstanceBuilder::new("Folder")
+                            .with_name("Root")
+                            .with_child(InstanceBuilder::new("Folder").with_name("Replacement"));
+                        if attribute_id {
+                            let mut attributes = Attributes::new();
+                            attributes.insert(
+                                crate::REF_ID_ATTRIBUTE_NAME.into(),
+                                Variant::String("new-owner".into()),
+                            );
+                            incoming_root = incoming_root.with_property("Attributes", attributes);
+                        }
+                        let incoming = WeakDom::new(incoming_root);
+                        let output = syncback_model_file(
+                            session.vfs(),
+                            &session.tree(),
+                            session.root_project(),
+                            root,
+                            incoming,
+                        )
+                        .unwrap();
+                        output.write_to_vfs(temp.path(), session.vfs()).unwrap();
+                        let rebuilt = crate::snapshot_middleware::snapshot_from_vfs(
+                            &crate::snapshot::InstanceContext::default(),
+                            session.vfs(),
+                            &path,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            rebuilt
+                                .metadata
+                                .specified_id
+                                .as_ref()
+                                .map(ToString::to_string),
+                            (bits & 1 != 0 && !attribute_id).then(|| "owner".to_owned()),
+                            "{extension} {meta_extension} bits {bits} ignore {ignore}"
+                        );
+                        assert_eq!(
+                            rebuilt.metadata.schema.as_deref(),
+                            (bits & 2 != 0).then_some("schema.json")
+                        );
+                        assert_eq!(
+                            rebuilt.metadata.ignore_unknown_instances,
+                            bits & 4 != 0 && ignore
+                        );
+                        assert!(!rebuilt
+                            .properties
+                            .contains_key(&rbx_dom_weak::ustr("Archivable")));
+                        if let Some(Variant::Attributes(attributes)) =
+                            rebuilt.properties.get(&rbx_dom_weak::ustr("Attributes"))
+                        {
+                            assert!(attributes.get("Stale").is_none());
+                            assert_eq!(
+                                attributes.get(crate::REF_ID_ATTRIBUTE_NAME),
+                                Some(&Variant::String("new-owner".into()))
+                            );
+                            assert!(attribute_id);
+                        } else {
+                            assert!(!attribute_id);
+                        }
+                        let model: serde_json::Value =
+                            serde_json::from_slice(&session.vfs().read(&path).unwrap()).unwrap();
+                        assert!(model.get("ignoreUnknownInstances").is_none());
+                        for sidecar in [sidecar, temp.path().join("src/Root.meta.json")] {
+                            if let Ok(bytes) = session.vfs().read(sidecar) {
+                                let meta: serde_json::Value =
+                                    crate::json::from_slice(&bytes).unwrap();
+                                assert!(meta.get("id").is_none());
+                                assert!(meta.get("$schema").is_none());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_root_identity_and_schema_cannot_be_duplicated_by_sidecars() {
+        for extension in ["json", "jsonc"] {
+            for field in ["id", "$schema"] {
+                let mut imfs = InMemoryFs::new();
+                let mut model = serde_json::json!({"className":"Folder"});
+                model[field] = "identity".into();
+                imfs.load_snapshot(
+                    "/Root.model.json",
+                    VfsSnapshot::file(serde_json::to_vec(&model).unwrap()),
+                )
+                .unwrap();
+                let mut sidecar = serde_json::json!({});
+                sidecar[field] = "identity".into();
+                imfs.load_snapshot(
+                    format!("/Root.meta.{extension}"),
+                    VfsSnapshot::file(serde_json::to_vec(&sidecar).unwrap()),
+                )
+                .unwrap();
+                let error = snapshot_json_model(
+                    &InstanceContext::default(),
+                    &Vfs::new(imfs),
+                    Path::new("/Root.model.json"),
+                    "Root",
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(if field == "id" {
+                        "cannot specify an ID"
+                    } else {
+                        "cannot specify a schema"
+                    }),
+                    "{error:#}"
+                );
+            }
+        }
+    }
+
+    fn without_adjacent_paths(mut snapshot: InstanceSnapshot) -> InstanceSnapshot {
+        assert_eq!(
+            snapshot.metadata.relevant_paths,
+            [
+                Path::new("/foo.model.json"),
+                Path::new("/foo.meta.json"),
+                Path::new("/foo.meta.jsonc"),
+            ]
+        );
+        // Assert the new dependencies directly while keeping the existing snapshots
+        // as regression coverage for all unrelated model content and metadata.
+        snapshot.metadata.relevant_paths.truncate(1);
+        snapshot
+    }
+
+    #[test]
     fn model_from_vfs() {
         let mut imfs = InMemoryFs::new();
         imfs.load_snapshot(
@@ -235,7 +431,7 @@ mod test {
         .unwrap()
         .unwrap();
 
-        insta::assert_yaml_snapshot!(instance_snapshot);
+        insta::assert_yaml_snapshot!(without_adjacent_paths(instance_snapshot));
     }
 
     #[test]
@@ -273,6 +469,6 @@ mod test {
         .unwrap()
         .unwrap();
 
-        insta::assert_yaml_snapshot!(instance_snapshot);
+        insta::assert_yaml_snapshot!(without_adjacent_paths(instance_snapshot));
     }
 }
