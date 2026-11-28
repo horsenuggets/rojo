@@ -634,11 +634,12 @@ mod test {
                     .with_property("Source", "return 'new'"),
             ),
         );
-        let project: Project = crate::json::from_str(
+        let mut project: Project = crate::json::from_str(
             r#"{"name":"Test","tree":{"$className":"Folder"},
             "syncbackRules":{"instancesAsDirectories":true}}"#,
         )
         .unwrap();
+        project.file_location = "/default.project.json".into();
         let attribute_ids = HashSet::new();
         let snapshot = SyncbackSnapshot {
             data: SyncbackData {
@@ -679,6 +680,41 @@ mod test {
         assert_eq!(planned.children.len(), 1);
         assert!(planned.children[0].old_inst().is_none());
         assert!(planned.children[0].old_metadata().is_none());
+
+        for extension in ["json", "jsonc"] {
+            let path = Path::new("/src").join(format!("Twin.model.{extension}"));
+            let fresh = snapshot
+                .with_fresh_path(path.clone(), snapshot.new, old_tree.get_root_id())
+                .middleware(Middleware::JsonModel);
+            assert!(fresh.old_inst().is_none());
+            let planned = Middleware::JsonModel.syncback(&fresh).unwrap();
+            planned
+                .fs_snapshot
+                .write_to_vfs(Path::new("/"), &vfs)
+                .unwrap();
+            let rebuilt = crate::snapshot_middleware::snapshot_from_vfs(
+                &crate::snapshot::InstanceContext::default(),
+                &vfs,
+                &path,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                rebuilt
+                    .metadata
+                    .specified_id
+                    .as_ref()
+                    .map(ToString::to_string),
+                Some("owner".into())
+            );
+            assert_eq!(rebuilt.metadata.schema.as_deref(), Some("schema.json"));
+            assert!(rebuilt.metadata.ignore_unknown_instances);
+            assert_eq!(rebuilt.children.len(), 1);
+            assert_eq!(rebuilt.children[0].name, "Replacement");
+            for path in planned.fs_snapshot.added_files() {
+                vfs.remove_file(path).unwrap();
+            }
+        }
     }
 
     #[test]

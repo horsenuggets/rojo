@@ -40,12 +40,17 @@ Making a new release? Simply add the new header with the version and date undern
   Full and incremental additions append after existing same-named siblings, including
   sparse legacy ordinals, without treating mixed-case natural numbered names as duplicates.
 * Preserved duplicate sibling order and filesystem metadata across legacy exports and
-  same-parent layout replacements.
-* Fixed class and layout replacements deleting their newly written subtree, while
-  retaining ignored-file and conflicting-source ownership checks.
+  same-parent layout replacements, including sparse ordinals and metadata-only IDs/schemas
+  across directory, binary, XML, and JSON model formats.
+* Fixed class and layout replacements deleting their newly written subtree or retaining
+  stale script/localization initializers, while retaining ignored-file and conflicting-source
+  ownership checks.
 * Rewrote existing JSONC script, text, and localization metadata in place so stale name
   and property overrides cannot survive syncback. Ambiguous dual JSON/JSONC sidecars
   are rejected before persistence rather than overwriting either owner.
+* Cleaned up tracked model sidecars on removal and preserved reused metadata through
+  format conversion. Exact physical ownership protects unrelated case variants, and
+  required ignored-sidecar rewrites fail without persisting duplicate identity.
 
 ## `7.7.1-horse.2.14`
 

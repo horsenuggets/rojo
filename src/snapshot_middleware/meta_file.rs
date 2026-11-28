@@ -108,7 +108,7 @@ pub fn serialize_values<'a>(
 /// an old ID beside a new attribute would write a stale value that disappears
 /// on the next syncback. Only keep the metadata ID when no valid attribute
 /// supplies the instance's ID.
-fn metadata_id(
+pub(super) fn metadata_id(
     specified_id: Option<&RojoRef>,
     attributes: &IndexMap<String, UnresolvedValue>,
 ) -> Option<String> {
@@ -326,7 +326,7 @@ impl InlineInstance {
 #[serde(rename_all = "camelCase")]
 pub struct AdjacentMetadata {
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
-    schema: Option<String>,
+    pub(super) schema: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -510,7 +510,9 @@ impl AdjacentMetadata {
                 self.path.display()
             );
         }
-        snapshot.metadata.specified_id = self.id.take().map(RojoRef::new);
+        if let Some(id) = self.id.take() {
+            snapshot.metadata.specified_id = Some(RojoRef::new(id));
+        }
         Ok(())
     }
 
@@ -518,7 +520,9 @@ impl AdjacentMetadata {
         if self.schema.is_some() && snapshot.metadata.schema.is_some() {
             anyhow::bail!("cannot specify a schema using {} (instance has a schema from somewhere else. how did we get here?)", self.path.display());
         }
-        snapshot.metadata.schema = self.schema.take();
+        if let Some(schema) = self.schema.take() {
+            snapshot.metadata.schema = Some(schema);
+        }
         Ok(())
     }
 
@@ -535,26 +539,32 @@ impl AdjacentMetadata {
     /// worth persisting in it. Specifically:
     ///
     /// - The number of properties and attributes is 0
-    /// - `ignore_unknown_instances` is None
+    /// - `ignore_unknown_instances`, `id`, and `schema` are None
     /// - `name` is None
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.attributes.is_empty()
             && self.properties.is_empty()
             && self.ignore_unknown_instances.is_none()
+            && self.id.is_none()
+            && self.schema.is_none()
             && self.name.is_none()
     }
 
     /// Returns what the metadata file at `path` should hold next to a model
     /// file whose root is named `name`. The model file stores the root's
     /// properties and attributes itself, so any that `existing` sets are
-    /// dropped, or they would override the synced values when read back. The
-    /// other fields are kept. Returns `None` when nothing would be left to
+    /// dropped, or they would override the synced values when read back. Root
+    /// identity and ignore behavior come from `metadata` even for fresh layouts;
+    /// valid IDs in the model's attributes remain authoritative. No other source
+    /// metadata is inherited. Returns `None` when nothing would be left to
     /// store, so the file shouldn't exist.
     pub fn for_model_root(
         existing: Option<&[u8]>,
         path: &Path,
         name: Option<String>,
+        metadata: Option<&InstanceMetadata>,
+        attributes: &IndexMap<String, UnresolvedValue>,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let mut meta = match existing {
             Some(contents) => Self::from_slice(contents, path.to_path_buf())?,
@@ -568,10 +578,23 @@ impl AdjacentMetadata {
                 path: path.to_path_buf(),
             },
         };
+        if let Some(metadata) = metadata {
+            meta.id = metadata.specified_id.as_ref().map(ToString::to_string);
+            meta.schema = metadata.schema.clone();
+            // A fresh destination has no sidecar spelling to retain. False is the
+            // reader's default, but an existing explicit false remains explicit.
+            meta.ignore_unknown_instances = if metadata.ignore_unknown_instances {
+                Some(true)
+            } else {
+                meta.ignore_unknown_instances.map(|_| false)
+            };
+        }
+        let specified_id = meta.id.take().map(RojoRef::new);
+        meta.id = metadata_id(specified_id.as_ref(), attributes);
         meta.name = name;
         meta.properties.clear();
         meta.attributes.clear();
-        if meta.is_empty() && meta.id.is_none() && meta.schema.is_none() {
+        if meta.is_empty() {
             return Ok(None);
         }
         let contents = json::to_vec_pretty(&meta).context("could not serialize metadata")?;
@@ -826,9 +849,9 @@ impl DirectoryMetadata {
     /// worth persisting in it. Specifically:
     ///
     /// - The number of properties and attributes is 0
-    /// - `ignore_unknown_instances` is None
+    /// - `ignore_unknown_instances`, `id`, and `schema` are None
     /// - `name` is None
-    /// - `class_name` is either None or not Some("Folder")
+    /// - `class_name` is either None or Some("Folder")
     /// - There are no inline children
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -836,6 +859,8 @@ impl DirectoryMetadata {
             && self.properties.is_empty()
             && self.children.is_empty()
             && self.ignore_unknown_instances.is_none()
+            && self.id.is_none()
+            && self.schema.is_none()
             && self.name.is_none()
             && if let Some(class) = &self.class_name {
                 class == "Folder"
@@ -880,6 +905,111 @@ mod test {
     use rbx_dom_weak::ustr;
 
     use super::*;
+
+    #[test]
+    fn root_metadata_emptiness_includes_identity_and_schema() {
+        for id in [false, true] {
+            for schema in [false, true] {
+                for ignore in [None, Some(false), Some(true)] {
+                    let mut value = serde_json::json!({});
+                    if id {
+                        value["id"] = "owner".into();
+                    }
+                    if schema {
+                        value["$schema"] = "schema.json".into();
+                    }
+                    if let Some(ignore) = ignore {
+                        value["ignoreUnknownInstances"] = ignore.into();
+                    }
+                    let adjacent: AdjacentMetadata = serde_json::from_value(value.clone()).unwrap();
+                    let directory: DirectoryMetadata =
+                        serde_json::from_value(value.clone()).unwrap();
+                    let empty = !id && !schema && ignore.is_none();
+                    assert_eq!(adjacent.is_empty(), empty, "adjacent {value}");
+                    assert_eq!(directory.is_empty(), empty, "directory {value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_to_empty_folder_relayout_keeps_root_only_metadata() {
+        use crate::{serve_session::ServeSession, syncback::syncback_loop};
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        for extension in ["json", "jsonc"] {
+            for bits in 0..8 {
+                for ignore in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let vfs = Vfs::new_default().unwrap();
+                    vfs.set_watch_enabled(false);
+                    let project_path = temp.path().join("default.project.json");
+                    vfs.write(&project_path, r#"{"name":"Test","tree":{"$path":"src"},"syncbackRules":{"instancesAsDirectories":true}}"#).unwrap();
+                    vfs.create_dir_all(temp.path().join("src")).unwrap();
+                    let old = WeakDom::new(
+                        InstanceBuilder::new("DataModel")
+                            .with_child(InstanceBuilder::new("Folder").with_name("Root")),
+                    );
+                    let mut model = Vec::new();
+                    rbx_binary::to_writer(&mut model, &old, old.root().children()).unwrap();
+                    vfs.write(temp.path().join("src/Root.rbxm"), model).unwrap();
+                    let mut meta = serde_json::json!({});
+                    if bits & 1 != 0 {
+                        meta["id"] = "owner".into();
+                    }
+                    if bits & 2 != 0 {
+                        meta["$schema"] = "schema.json".into();
+                    }
+                    if bits & 4 != 0 {
+                        meta["ignoreUnknownInstances"] = ignore.into();
+                    }
+                    let old_sidecar = temp.path().join(format!("src/Root.meta.{extension}"));
+                    vfs.write(&old_sidecar, serde_json::to_vec(&meta).unwrap())
+                        .unwrap();
+                    let session = ServeSession::new(vfs, &project_path).unwrap();
+                    let incoming = WeakDom::new(
+                        InstanceBuilder::new("Folder")
+                            .with_child(InstanceBuilder::new("Folder").with_name("Root")),
+                    );
+                    let output = syncback_loop(
+                        session.vfs(),
+                        &mut session.tree(),
+                        incoming,
+                        session.root_project(),
+                    )
+                    .unwrap();
+                    output.write_to_vfs(temp.path(), session.vfs()).unwrap();
+                    assert!(!session.vfs().exists(&old_sidecar).unwrap());
+                    let rebuilt = crate::snapshot_middleware::snapshot_from_vfs(
+                        &crate::snapshot::InstanceContext::default(),
+                        session.vfs(),
+                        &temp.path().join("src/Root"),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(
+                        rebuilt
+                            .metadata
+                            .specified_id
+                            .as_ref()
+                            .map(ToString::to_string),
+                        (bits & 1 != 0).then(|| "owner".to_owned()),
+                        "{extension} bits {bits} ignore {ignore}"
+                    );
+                    assert_eq!(
+                        rebuilt.metadata.schema.as_deref(),
+                        (bits & 2 != 0).then_some("schema.json")
+                    );
+                    assert_eq!(
+                        rebuilt.metadata.ignore_unknown_instances,
+                        bits & 4 != 0 && ignore
+                    );
+                    assert_eq!(rebuilt.class_name, "Folder");
+                    assert!(rebuilt.children.is_empty());
+                }
+            }
+        }
+    }
 
     #[test]
     fn metadata_output_selects_one_format_and_clears_existing_values() {
@@ -1106,6 +1236,8 @@ mod test {
                 existing.map(str::as_bytes),
                 path,
                 name.map(str::to_owned),
+                None,
+                &IndexMap::new(),
             )
             .unwrap()
             .map(|contents| String::from_utf8(contents).unwrap())
