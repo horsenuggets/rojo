@@ -19,15 +19,16 @@ use crate::{
     },
     syncback::{
         directory_middleware_for_instance, extension_for_middleware, filter_properties,
-        hash_json_instance, instances_as_directories, is_valid_path, sibling_order_key,
-        unique_child_stems, FsSnapshot, SyncbackReturn, SyncbackSnapshot,
+        free_child_stem, hash_json_instance, instances_as_directories, is_valid_path,
+        sibling_number, sibling_order_key, unique_child_stems, FsSnapshot, SyncbackReturn,
+        SyncbackSnapshot,
     },
     REF_ID_ATTRIBUTE_NAME,
 };
 
 use super::{
     meta_file::{serialize_values, DirectoryMetadata, InlineInstance},
-    snapshot_from_vfs,
+    snapshot_from_vfs, Middleware,
 };
 
 const EMPTY_DIR_KEEP_NAME: &str = ".gitkeep";
@@ -84,7 +85,8 @@ pub fn snapshot_dir_no_meta(
         .filter(|child| !is_path_ignored(&context.path_ignore_rules, child.path()))
         .collect();
     // Restore the original order of duplicate-named siblings, which syncback
-    // numbers `~2`, `~3`, ... and a plain listing would put `~10` before `~2`.
+    // numbers `.__2`, `.__3`, ... and a plain listing puts `.__10` before `.__2`.
+    // Legacy `~N` exports retain the same numeric ordering.
     entries.sort_by_cached_key(|entry| {
         let name = entry
             .path()
@@ -115,7 +117,9 @@ pub fn snapshot_dir_no_meta(
         .zip(children)
         .filter_map(|(entry, child)| {
             let file_name = entry.path().file_name()?.to_string_lossy();
-            Some((sibling_order_key(&file_name).1, child?))
+            let child = child?;
+            let number = sibling_number(&file_name, &child.name, &child.class_name);
+            Some((number, child))
         })
         .collect();
     let snapshot_children = order_duplicate_siblings(numbered_children);
@@ -141,13 +145,13 @@ pub fn snapshot_dir_no_meta(
 }
 
 /// Puts children that share a name back in the order syncback numbered them, given
-/// each child with the `~N` number from its file name (1 when it has none).
+/// each child with the `.__N` or legacy `~N` number from its file name (1 when absent).
 ///
-/// Sorting directory entries by file name keeps `Twin~2.luau` after `Twin.luau`,
-/// but not when the siblings are written differently. `Twin~2/` sorts before
-/// `Twin.luau`, which would reverse them. Only same-named children move, and each
-/// group keeps the positions it had. Syncback numbers names regardless of case, so
-/// they're grouped the same way.
+/// Sorting directory entries by their sibling order key keeps `Twin.__2.luau`
+/// after `Twin.luau`, but not when siblings are written differently. `Twin.__2/`
+/// has a key before `Twin.luau`, which would reverse them. Only same-named children
+/// move, and each group keeps its positions. Syncback numbers names regardless of
+/// case, so they're grouped the same way.
 fn order_duplicate_siblings(children: Vec<(u64, InstanceSnapshot)>) -> Vec<InstanceSnapshot> {
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, (_, child)) in children.iter().enumerate() {
@@ -505,8 +509,26 @@ fn pair_indices(new: &[(&str, Ustr)], old: &[(&str, Ustr)]) -> Vec<Option<usize>
         }
     }
 
-    // Queues keep duplicates in child order, so the nth `Model` pairs with the
-    // nth remaining old `Model`.
+    pair_remaining_by_name(new, old, &mut pairs, &mut taken);
+
+    // A renamed child keeps its position and class.
+    for index in 0..shared {
+        if pairs[index].is_none() && !taken[index] && new[index].1 == old[index].1 {
+            taken[index] = true;
+            pairs[index] = Some(index);
+        }
+    }
+
+    pairs
+}
+
+/// Queues keep duplicates in sibling order, without reusing a consumed entry.
+fn pair_remaining_by_name(
+    new: &[(&str, Ustr)],
+    old: &[(&str, Ustr)],
+    pairs: &mut [Option<usize>],
+    taken: &mut [bool],
+) {
     let mut queues: HashMap<(&str, Ustr), VecDeque<usize>> = HashMap::new();
     for (old_index, key) in old.iter().enumerate() {
         if !taken[old_index] {
@@ -522,16 +544,116 @@ fn pair_indices(new: &[(&str, Ustr)], old: &[(&str, Ustr)]) -> Vec<Option<usize>
             *pair = Some(old_index);
         }
     }
+}
 
-    // A renamed child keeps its position and class.
-    for index in 0..shared {
-        if pairs[index].is_none() && !taken[index] && new[index].1 == old[index].1 {
-            taken[index] = true;
-            pairs[index] = Some(index);
+/// Pair logical siblings in their original order, independently of generated
+/// stems. A released or sparse suffix must not steal another sibling's identity
+/// just because it matches a newly allocated physical path.
+fn pair_directory_indices(new: &[(&str, Ustr)], old: &[(&str, Ustr)]) -> Vec<Option<usize>> {
+    let mut taken = vec![false; old.len()];
+    let mut pairs = vec![None; new.len()];
+    pair_remaining_by_name(new, old, &mut pairs, &mut taken);
+    pairs
+}
+
+/// A class change or same-class rename can reuse only the unconsumed source at
+/// its exact normalized output path. Logical name-and-class pairs have priority,
+/// including retained legacy paths.
+fn pair_directory_replacements(
+    new: &[(&str, Ustr)],
+    old: &[(&str, Ustr)],
+    outputs: &[String],
+    old_paths: &[String],
+    pairs: &mut [Option<usize>],
+) {
+    let taken: HashSet<_> = pairs.iter().flatten().copied().collect();
+    let claimed: HashSet<_> = outputs
+        .iter()
+        .zip(pairs.iter())
+        .filter_map(|(path, pair)| pair.is_some().then_some(path))
+        .collect();
+    let mut available = HashMap::new();
+    for (index, path) in old_paths.iter().enumerate() {
+        // Ambiguous physical ownership must not transfer arbitrary metadata,
+        // even if another owner has already paired and is moving elsewhere.
+        available
+            .entry(path)
+            .and_modify(|entry| *entry = None)
+            .or_insert_with(|| (!taken.contains(&index)).then_some(index));
+    }
+    for (index, pair) in pairs.iter_mut().enumerate() {
+        if pair.is_some() || claimed.contains(&outputs[index]) {
+            continue;
+        }
+        if let Some(Some(old_index)) = available.remove(&outputs[index]) {
+            if new[index].0 == old[old_index].0 || new[index].1 == old[old_index].1 {
+                *pair = Some(old_index);
+            }
         }
     }
+}
 
-    pairs
+/// Canonical script suffix migrations retain their existing physical allocation
+/// policy. Falling back by duplicate name here would send two sources to the same
+/// canonical destination; unchanged (including released) paths use ordered pairing.
+fn pair_script_migration_indices(
+    new: &[(&str, Ustr)],
+    old: &[(&str, Ustr)],
+    new_paths: &[String],
+    old_paths: &[String],
+    migrating: &HashSet<(&str, Ustr)>,
+    pairs: &mut [Option<usize>],
+) {
+    let mut old_groups: HashMap<_, Vec<usize>> = HashMap::new();
+    let mut new_counts = HashMap::new();
+    let mut paths = HashMap::new();
+    for (index, key) in old.iter().enumerate() {
+        old_groups.entry(*key).or_default().push(index);
+        paths.insert((old_paths[index].as_str(), *key), index);
+    }
+    for key in new {
+        *new_counts.entry(*key).or_insert(0) += 1;
+    }
+    for (index, key) in new.iter().enumerate() {
+        if !migrating.contains(key) {
+            continue;
+        }
+        pairs[index] = paths
+            .remove(&(new_paths[index].as_str(), *key))
+            .or_else(|| {
+                let group = old_groups.get(key)?;
+                (group.len() == 1 && new_counts[key] == 1).then_some(group[0])
+            });
+    }
+}
+
+/// A model relayout can displace a retained source, which must then use its own
+/// allocated path. Other collisions still go through the existing write guards.
+fn directory_fresh_outputs(
+    fresh: &[String],
+    kept: &[Option<String>],
+    relayout: &[bool],
+) -> Vec<bool> {
+    let mut paths: HashMap<_, _> = kept
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| path.as_ref().map(|path| (path, index)))
+        .collect();
+    let mut needs_fresh: Vec<_> = kept.iter().map(Option::is_none).collect();
+    let mut pending: Vec<_> = relayout
+        .iter()
+        .enumerate()
+        .filter_map(|(index, relayout)| relayout.then_some(index))
+        .collect();
+    while let Some(index) = pending.pop() {
+        if let Some(displaced) = paths.remove(&fresh[index]) {
+            if !needs_fresh[displaced] {
+                needs_fresh[displaced] = true;
+                pending.push(displaced);
+            }
+        }
+    }
+    needs_fresh
 }
 
 fn rojo_id_attribute(instance: &rbx_dom_weak::Instance) -> Option<&str> {
@@ -544,6 +666,62 @@ fn rojo_id_attribute(instance: &rbx_dom_weak::Instance) -> Option<&str> {
     }
 }
 
+/// Class replacements cannot retain an init script for the old class, or keep a
+/// file where the new class needs a directory. Unchanged classes retain the
+/// existing canonical-script and model-relayout policies.
+fn keeps_directory_layout(snapshot: &SyncbackSnapshot, new: Ref, old: InstanceWithMeta) -> bool {
+    if !snapshot.keeps_model_layout(new, old) {
+        return false;
+    }
+    if snapshot.get_new_instance(new).unwrap().class == old.class_name() {
+        return true;
+    }
+    let Some(old_middleware) = old.metadata().middleware else {
+        return true;
+    };
+    let paired = snapshot.with_new_path(snapshot.path.clone(), new, Some(old.id()));
+    let middleware = crate::syncback::get_best_middleware(&paired);
+    old_middleware.is_dir() == middleware.is_dir()
+        && (!matches!(
+            old.class_name().as_str(),
+            "Script" | "LocalScript" | "ModuleScript"
+        ) || old_middleware == middleware)
+}
+
+/// Full syncback must append after actual retained ordinals, not the count of
+/// incoming siblings. The shared allocator also checks pending sidecar owners.
+fn appended_directory_stem(
+    child: &rbx_dom_weak::Instance,
+    middleware: Middleware,
+    maximum: u64,
+    reserved: &HashSet<String>,
+) -> anyhow::Result<String> {
+    let required = maximum.checked_add(1).ok_or_else(|| {
+        crate::syncback::OwnershipConflict(format!(
+            "Sibling ordinals are exhausted for instance {:?}",
+            child.name
+        ))
+    })?;
+    free_child_stem(child, middleware, reserved, required)
+        .map_err(|error| crate::syncback::OwnershipConflict(error.to_string()).into())
+}
+
+fn reserve_directory_output(child: &SyncbackSnapshot, reserved: &mut HashSet<String>) {
+    reserved.insert(
+        child
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase(),
+    );
+    if !crate::syncback::get_best_middleware(child).is_dir() {
+        let stem = child.file_stem();
+        reserved.insert(format!("{stem}.meta.json").to_lowercase());
+        reserved.insert(format!("{stem}.meta.jsonc").to_lowercase());
+    }
+}
+
 pub fn syncback_dir_no_meta<'sync>(
     snapshot: &SyncbackSnapshot<'sync>,
 ) -> anyhow::Result<SyncbackReturn<'sync>> {
@@ -553,19 +731,9 @@ pub fn syncback_dir_no_meta<'sync>(
     let mut removed_children = Vec::new();
 
     if instances_as_directories(snapshot.project()) {
-        // Duplicate and unsafe names are given unique file names instead of
-        // being rejected, so children are matched to the old tree by the file
-        // name they would be written to rather than by their Instance name.
-        let stems = unique_child_stems(snapshot.new_tree(), new_inst, snapshot.model_trees());
-        let mut old_child_map = HashMap::new();
-        let mut old_name_counts = HashMap::new();
-        let mut old_name_paths = HashMap::new();
-        let mut new_name_counts = HashMap::new();
-        for child in new_inst.children() {
-            *new_name_counts
-                .entry(snapshot.get_new_instance(*child).unwrap().name.as_str())
-                .or_insert(0) += 1;
-        }
+        let mut stems = unique_child_stems(snapshot.new_tree(), new_inst, snapshot.model_trees());
+        let mut old_children = Vec::new();
+        let mut old_paths = Vec::new();
         let mut project_children = HashMap::new();
         if let Some(old_inst) = snapshot.old_inst() {
             for child in old_inst.children() {
@@ -586,15 +754,14 @@ pub fn syncback_dir_no_meta<'sync>(
                     .and_then(|path| path.file_name())
                     .and_then(|name| name.to_str());
                 if let Some(file_name) = file_name {
-                    *old_name_counts.entry(inst.name()).or_insert(0) += 1;
-                    let key = file_name.to_lowercase();
-                    old_name_paths.insert(inst.name(), key.clone());
-                    old_child_map.insert(key, inst);
+                    old_paths.push(file_name.to_lowercase());
+                    old_children.push(inst);
                 }
             }
         }
 
-        let mut layout_changed = false;
+        let mut fresh_children = Vec::new();
+        let mut new_keys = Vec::new();
         for new_child_ref in new_inst.children() {
             let new_child = snapshot.get_new_instance(*new_child_ref).unwrap();
             if let Some(remaining) = project_children.get_mut(new_child.name.as_str()) {
@@ -606,49 +773,233 @@ pub fn syncback_dir_no_meta<'sync>(
             }
             let stem = &stems[new_child_ref];
             let fresh = snapshot.with_stem(&snapshot.path, *new_child_ref, None, stem);
-            let file_name = fresh
+            new_keys.push((new_child.name.as_str(), new_child.class));
+            fresh_children.push(fresh);
+        }
+        let old_keys: Vec<_> = old_children
+            .iter()
+            .map(|child| (child.name(), child.class_name()))
+            .collect();
+        let mut pairs = pair_directory_indices(&new_keys, &old_keys);
+        let physical_name = |child: &SyncbackSnapshot<'_>| {
+            child
                 .path
                 .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_lowercase);
-            let old_child: Option<InstanceWithMeta> = file_name
-                .and_then(|name| old_child_map.remove(&name))
-                .or_else(|| {
-                    // Unique logical names can keep their custom physical stem
-                    // when a suffix changes. Duplicate names still use allocation.
-                    if old_name_counts.get(new_child.name.as_str()) != Some(&1)
-                        || new_name_counts.get(new_child.name.as_str()) != Some(&1)
-                    {
-                        return None;
+                .unwrap()
+                .to_string_lossy()
+                .to_lowercase()
+        };
+        let mut fresh_paths: Vec<_> = fresh_children.iter().map(physical_name).collect();
+        let migrating: HashSet<_> = fresh_children
+            .iter()
+            .zip(&pairs)
+            .enumerate()
+            .filter_map(|(index, (fresh, pair))| {
+                let old_index = (*pair)?;
+                let old = old_children[old_index];
+                if !keeps_directory_layout(snapshot, fresh.new, old) {
+                    return None;
+                }
+                let paired = snapshot.with_stem(
+                    &snapshot.path,
+                    fresh.new,
+                    Some(old.id()),
+                    &stems[&fresh.new],
+                );
+                (physical_name(&paired) != old_paths[old_index]).then_some(new_keys[index])
+            })
+            .collect();
+        if !migrating.is_empty() {
+            pair_script_migration_indices(
+                &new_keys,
+                &old_keys,
+                &fresh_paths,
+                &old_paths,
+                &migrating,
+                &mut pairs,
+            );
+        }
+        let paired_outputs: Vec<_> = fresh_children
+            .iter()
+            .zip(&pairs)
+            .map(|(fresh, pair)| {
+                pair.filter(|index| {
+                    keeps_directory_layout(snapshot, fresh.new, old_children[*index])
+                })
+                .map(|index| {
+                    physical_name(&snapshot.with_stem(
+                        &snapshot.path,
+                        fresh.new,
+                        Some(old_children[index].id()),
+                        &stems[&fresh.new],
+                    ))
+                })
+                .unwrap_or_else(|| physical_name(fresh))
+            })
+            .collect();
+        pair_directory_replacements(
+            &new_keys,
+            &old_keys,
+            &paired_outputs,
+            &old_paths,
+            &mut pairs,
+        );
+        let relayout: Vec<_> = fresh_children
+            .iter()
+            .zip(&pairs)
+            .map(|(fresh, pair)| {
+                pair.is_some_and(|index| {
+                    !keeps_directory_layout(snapshot, fresh.new, old_children[index])
+                })
+            })
+            .collect();
+        let kept_paths: Vec<_> = fresh_children
+            .iter()
+            .zip(&pairs)
+            .map(|(fresh, pair)| {
+                let old = old_children[(*pair)?];
+                keeps_directory_layout(snapshot, fresh.new, old).then(|| {
+                    physical_name(&snapshot.with_stem(
+                        &snapshot.path,
+                        fresh.new,
+                        Some(old.id()),
+                        &stems[&fresh.new],
+                    ))
+                })
+            })
+            .collect();
+        let needs_fresh = directory_fresh_outputs(&fresh_paths, &kept_paths, &relayout);
+        let consumed: HashSet<_> = pairs.iter().flatten().copied().collect();
+        let retained_names: HashSet<_> = pairs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pair)| pair.map(|_| new_keys[index].0.to_lowercase()))
+            .collect();
+        let unconsumed_names: HashSet<_> = old_keys
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !consumed.contains(index))
+            .map(|(_, key)| key.0.to_lowercase())
+            .collect();
+        // A dropped migration pair or an unconsumed same-named owner still goes
+        // through the existing conflict guards. Only genuine additions append.
+        let additions: Vec<_> = new_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                pairs[index].is_none()
+                    && !migrating.contains(key)
+                    && retained_names.contains(&key.0.to_lowercase())
+                    && !unconsumed_names.contains(&key.0.to_lowercase())
+            })
+            .collect();
+        if additions.iter().any(|addition| *addition) {
+            let mut maximums: HashMap<String, u64> = HashMap::new();
+            let mut reserved = HashSet::new();
+            if snapshot
+                .vfs()
+                .metadata(&snapshot.path)
+                .with_not_found()?
+                .is_some_and(|metadata| metadata.is_dir())
+            {
+                for entry in snapshot.vfs().read_dir(&snapshot.path)? {
+                    let entry = entry?;
+                    if let Some(name) = entry.path().file_name() {
+                        reserved.insert(name.to_string_lossy().to_lowercase());
                     }
-                    let key = old_name_paths.get(new_child.name.as_str())?;
-                    old_child_map.remove(key)
-                });
-            let old_child = match old_child {
-                Some(old_child) if !snapshot.keeps_model_layout(*new_child_ref, old_child) => {
-                    snapshot.validate_layout_change(old_child)?;
-                    removed_children.push(old_child);
-                    layout_changed = true;
-                    None
                 }
-                other => other,
+            }
+            for (index, fresh) in fresh_children.iter().enumerate() {
+                if additions[index] {
+                    continue;
+                }
+                let output = if needs_fresh[index] {
+                    snapshot.with_new_path(fresh.path.clone(), fresh.new, None)
+                } else {
+                    snapshot.with_stem(
+                        &snapshot.path,
+                        fresh.new,
+                        pairs[index].map(|old| old_children[old].id()),
+                        &stems[&fresh.new],
+                    )
+                };
+                reserve_directory_output(&output, &mut reserved);
+                let ordinal = sibling_number(
+                    &physical_name(&output),
+                    new_keys[index].0,
+                    &new_keys[index].1,
+                );
+                maximums
+                    .entry(new_keys[index].0.to_lowercase())
+                    .and_modify(|maximum| *maximum = (*maximum).max(ordinal))
+                    .or_insert(ordinal);
+            }
+            for (index, fresh) in fresh_children.iter_mut().enumerate() {
+                if !additions[index] {
+                    continue;
+                }
+                let child = fresh.new_inst();
+                let key = child.name.to_lowercase();
+                let middleware = crate::syncback::get_best_middleware(fresh);
+                let stem = appended_directory_stem(child, middleware, maximums[&key], &reserved)?;
+                *fresh = snapshot.with_stem(&snapshot.path, fresh.new, None, &stem);
+                fresh_paths[index] = physical_name(fresh);
+                maximums.insert(
+                    key,
+                    sibling_number(&fresh_paths[index], &child.name, &child.class),
+                );
+                reserve_directory_output(fresh, &mut reserved);
+                stems.insert(fresh.new, stem);
+            }
+        }
+        let mut outputs = HashSet::new();
+        let unpaired_paths: HashSet<_> = old_paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| (!consumed.contains(&index)).then_some(path))
+            .collect();
+        for (index, fresh) in fresh_paths.iter().enumerate() {
+            let output = if needs_fresh[index] {
+                fresh
+            } else {
+                kept_paths[index].as_ref().unwrap()
             };
+            if !outputs.insert(output) || unpaired_paths.contains(output) {
+                return Err(crate::syncback::OwnershipConflict(format!(
+                    "Cannot stage directory children at the same destination {} because another source owns its destination",
+                    snapshot.path.join(output).display()
+                )).into());
+            }
+        }
+        let mut old_children: Vec<_> = old_children.into_iter().map(Some).collect();
+        let mut layout_changed = false;
+        for ((fresh, pair), needs_fresh) in fresh_children.into_iter().zip(pairs).zip(needs_fresh) {
+            let old_child = pair.and_then(|index| old_children[index].take());
+            if let Some(old_child) = old_child.filter(|_| needs_fresh) {
+                snapshot.validate_layout_change(old_child)?;
+                removed_children.push(old_child);
+                layout_changed = true;
+                children.push(snapshot.with_fresh_path(fresh.path, fresh.new, old_child.id()));
+                continue;
+            }
             children.push(match old_child {
-                Some(old_child) => {
-                    snapshot.with_stem(&snapshot.path, *new_child_ref, Some(old_child.id()), stem)
-                }
+                Some(old_child) => snapshot.with_stem(
+                    &snapshot.path,
+                    fresh.new,
+                    Some(old_child.id()),
+                    &stems[&fresh.new],
+                ),
                 None => fresh,
             });
         }
-        // A model file can claim the path of an unrelated sibling, which
-        // leaves the Instance's own old files unpaired. They are then removed
-        // like those of a deleted Instance, so they get the same check.
+        // Relayout outputs can also replace unpaired old sources. Check those
+        // removals for ignored files just like the explicitly displaced sources.
         if layout_changed {
-            for old_child in old_child_map.values() {
+            for old_child in old_children.iter().flatten() {
                 snapshot.validate_layout_change(*old_child)?;
             }
         }
-        removed_children.extend(old_child_map.into_values());
+        removed_children.extend(old_children.into_iter().flatten());
     } else {
         children_by_name(snapshot, &mut children, &mut removed_children)?;
     }
@@ -764,6 +1115,8 @@ mod test {
 
     use memofs::{InMemoryFs, VfsSnapshot};
 
+    use crate::syncback::sanitize_stem;
+
     fn names(children: &[InstanceSnapshot]) -> Vec<(String, String)> {
         children
             .iter()
@@ -785,7 +1138,7 @@ mod test {
 
     #[test]
     fn duplicate_siblings_go_back_in_numbered_order() {
-        // `Twin~2/` sorts before `Twin.luau`, so the second Twin is listed first.
+        // `Twin.__2/` has a key before `Twin.luau`, listing the second Twin first.
         let ordered = order_duplicate_siblings(numbered(&[
             (1, "Alpha", "Folder"),
             (2, "Twin", "Folder"),
@@ -871,6 +1224,265 @@ mod test {
         let new = keys(&[("Model", "Model"), ("Model", "Model")]);
         // Neither Model kept its slot, so each takes the next remaining one in order.
         assert_eq!(pair_indices(&new, &old), [Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn directory_pairing_keeps_legacy_duplicates_in_sibling_order() {
+        let old = keys(&[
+            ("Twin", "Folder"),
+            ("Twin", "ModuleScript"),
+            ("Twin", "Folder"),
+            ("Twin", "ModuleScript"),
+        ]);
+        let new = keys(&[
+            ("Unrelated", "Folder"),
+            ("Twin", "Folder"),
+            ("Twin", "ModuleScript"),
+            ("Twin", "Folder"),
+            ("Twin", "ModuleScript"),
+            ("Twin", "Folder"),
+        ]);
+        assert_eq!(
+            pair_directory_indices(&new, &old),
+            [None, Some(0), Some(1), Some(2), Some(3), None]
+        );
+    }
+
+    #[test]
+    fn directory_pairing_follows_name_and_class_without_position_preference() {
+        let old = keys(&[
+            ("Other", "Folder"),
+            ("Twin", "Folder"),
+            ("Twin", "ModuleScript"),
+            ("Twin", "Folder"),
+        ]);
+        let new = keys(&[
+            ("Twin", "Folder"),
+            ("Twin", "Folder"),
+            ("Other", "Folder"),
+            ("Twin", "ModuleScript"),
+        ]);
+        assert_eq!(
+            pair_directory_indices(&new, &old),
+            [Some(1), Some(3), Some(0), Some(2)]
+        );
+    }
+
+    #[test]
+    fn directory_pairing_never_takes_another_name_or_class_metadata() {
+        let old = keys(&[("Twin", "Folder"), ("Other", "ModuleScript")]);
+        let new = keys(&[("Twin", "ModuleScript"), ("Other", "Folder")]);
+        assert_eq!(pair_directory_indices(&new, &old), [None, None]);
+    }
+
+    #[test]
+    fn directory_replacements_require_unconsumed_same_name_same_path_ownership() {
+        let old = keys(&[
+            ("Twin", "Folder"),
+            ("Twin", "Configuration"),
+            ("Other", "Folder"),
+        ]);
+        let new = keys(&[("Twin", "Model"), ("Twin", "Tool"), ("Wrong", "Model")]);
+        let paths = ["twin", "twin.__2", "other"].map(String::from);
+        let mut pairs = pair_directory_indices(&new, &old);
+        pair_directory_replacements(&new, &old, &paths, &paths, &mut pairs);
+        assert_eq!(pairs, [Some(0), Some(1), None]);
+
+        // Reordering changed classes still follows exact paths, not old class queues.
+        let reordered = keys(&[("Twin", "Tool"), ("Twin", "Model"), ("Other", "Model")]);
+        let mut pairs = pair_directory_indices(&reordered, &old);
+        pair_directory_replacements(&reordered, &old, &paths, &paths, &mut pairs);
+        assert_eq!(pairs, [Some(0), Some(1), Some(2)]);
+
+        // Sparse legacy paths do not justify lending metadata by name alone.
+        let sparse = ["twin~3", "twin~8", "other"].map(String::from);
+        let mut pairs = pair_directory_indices(&new, &old);
+        pair_directory_replacements(&new, &old, &paths, &sparse, &mut pairs);
+        assert_eq!(pairs, [None, None, None]);
+    }
+
+    #[test]
+    fn directory_replacements_do_not_steal_paired_or_retained_destinations() {
+        let old = keys(&[("Twin", "Folder"), ("Twin", "Model")]);
+        let new = keys(&[("Twin", "Model"), ("Twin", "Tool")]);
+        let old_paths = ["twin", "twin.__2"].map(String::from);
+        let outputs = ["twin.__2", "twin.__2"].map(String::from);
+        let mut pairs = pair_directory_indices(&new, &old);
+        pair_directory_replacements(&new, &old, &outputs, &old_paths, &mut pairs);
+        assert_eq!(pairs, [Some(1), None]);
+
+        // The first old source is consumed even when a relayout moves its output.
+        let new = keys(&[("Twin", "Folder"), ("Twin", "Tool")]);
+        let outputs = ["elsewhere", "twin"].map(String::from);
+        let mut pairs = pair_directory_indices(&new, &old);
+        pair_directory_replacements(&new, &old, &outputs, &old_paths, &mut pairs);
+        assert_eq!(pairs, [Some(0), None]);
+    }
+
+    #[test]
+    fn directory_replacements_reject_ambiguous_physical_metadata() {
+        let old = keys(&[("Twin", "Folder"), ("Twin", "Configuration")]);
+        let new = keys(&[("Twin", "Model")]);
+        let mut pairs = pair_directory_indices(&new, &old);
+        pair_directory_replacements(
+            &new,
+            &old,
+            &["twin".into()],
+            &["twin".into(), "twin".into()],
+            &mut pairs,
+        );
+        assert_eq!(pairs, [None]);
+
+        let new = keys(&[("Twin", "Folder"), ("Twin", "Model")]);
+        let mut pairs = pair_directory_indices(&new, &old);
+        pair_directory_replacements(
+            &new,
+            &old,
+            &["elsewhere".into(), "twin".into()],
+            &["twin".into(), "twin".into()],
+            &mut pairs,
+        );
+        assert_eq!(pairs, [Some(0), None]);
+    }
+
+    #[test]
+    fn directory_replacements_follow_only_justified_normalized_renames() {
+        for (before, after, path) in [("Twin", "twin", "twin.luau"), ("a?", "a*", "a_.luau")] {
+            let old = keys(&[(before, "ModuleScript")]);
+            let new = keys(&[(after, "ModuleScript")]);
+            let mut pairs = pair_directory_indices(&new, &old);
+            pair_directory_replacements(&new, &old, &[path.into()], &[path.into()], &mut pairs);
+            assert_eq!(pairs, [Some(0)]);
+        }
+
+        let old = keys(&[("Twin", "ModuleScript"), ("Twin", "ModuleScript")]);
+        let new = keys(&[("twin", "ModuleScript"), ("Twin", "ModuleScript")]);
+        let mut pairs = pair_directory_indices(&new, &old);
+        pair_directory_replacements(
+            &new,
+            &old,
+            &["twin.luau".into(), "twin.luau".into()],
+            &["twin.luau".into(), "twin~8.luau".into()],
+            &mut pairs,
+        );
+        assert_eq!(pairs, [None, Some(0)]);
+
+        let old = keys(&[("a?", "Folder"), ("a*", "Folder")]);
+        let new = keys(&[("a:", "Folder")]);
+        let mut pairs = pair_directory_indices(&new, &old);
+        pair_directory_replacements(
+            &new,
+            &old,
+            &["a_".into()],
+            &["a_".into(), "a_".into()],
+            &mut pairs,
+        );
+        assert_eq!(pairs, [None]);
+    }
+
+    #[test]
+    fn directory_append_stems_respect_sparse_floors_pending_paths_and_exhaustion() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        for name in ["Twin", "twin", "TWIN", "Twin.__100"] {
+            let dom = WeakDom::new(InstanceBuilder::new("ModuleScript").with_name(name));
+            let base = sanitize_stem(name, "ModuleScript");
+            let reserved = HashSet::from([
+                format!("{base}.__9.meta.json").to_lowercase(),
+                format!("{base}.__10.meta.jsonc").to_lowercase(),
+                format!("{base}.__11.luau").to_lowercase(),
+            ]);
+            assert_eq!(
+                appended_directory_stem(dom.root(), Middleware::ModuleScript, 8, &reserved)
+                    .unwrap(),
+                format!("{}.__12", sanitize_stem(name, "ModuleScript"))
+            );
+            assert!(appended_directory_stem(
+                dom.root(),
+                Middleware::ModuleScript,
+                u64::MAX,
+                &reserved
+            )
+            .is_err());
+        }
+        let dom = WeakDom::new(InstanceBuilder::new("Folder").with_name("Twin"));
+        assert_eq!(
+            appended_directory_stem(dom.root(), Middleware::Dir, u64::MAX - 1, &HashSet::new())
+                .unwrap(),
+            format!("Twin.__{}", u64::MAX)
+        );
+        assert!(appended_directory_stem(
+            dom.root(),
+            Middleware::Dir,
+            u64::MAX - 1,
+            &HashSet::from([format!("twin.__{}", u64::MAX)])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn directory_pairing_preserves_canonical_script_migration_allocation() {
+        let old = keys(&[
+            ("Effect", "LocalScript"),
+            ("Effect", "LocalScript"),
+            ("Twin", "ModuleScript"),
+            ("Twin", "ModuleScript"),
+        ]);
+        let new = old.clone();
+        let old_paths = [
+            "effect.client.luau",
+            "effect.local.luau",
+            "twin.luau",
+            "twin~3.luau",
+        ]
+        .map(String::from);
+        let new_paths = [
+            "effect.local.luau",
+            "effect.__2.local.luau",
+            "twin.luau",
+            "twin.__2.luau",
+        ]
+        .map(String::from);
+        let mut pairs = pair_directory_indices(&new, &old);
+        let migrating = HashSet::from([("Effect", ustr("LocalScript"))]);
+        pair_script_migration_indices(&new, &old, &new_paths, &old_paths, &migrating, &mut pairs);
+        assert_eq!(pairs, [Some(1), None, Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn directory_layout_changes_displace_only_conflicting_retained_sources() {
+        let fresh = ["fx.rbxm", "fx.rbxm.__2", "third", "safe"].map(String::from);
+        let kept = [
+            None,
+            Some("fx.rbxm".into()),
+            Some("fx.rbxm.__2".into()),
+            Some("safe~8".into()),
+        ];
+        assert_eq!(
+            directory_fresh_outputs(&fresh, &kept, &[true, false, false, false]),
+            [true, true, true, false]
+        );
+        assert_eq!(
+            directory_fresh_outputs(&fresh, &kept, &[false; 4]),
+            [true, false, false, false]
+        );
+        let kept = fresh.iter().cloned().map(Some).collect::<Vec<_>>();
+        assert_eq!(
+            directory_fresh_outputs(&fresh, &kept, &[false; 4]),
+            [false; 4]
+        );
+        // Merely sharing another sibling's freshly allocated stem is harmless
+        // when both old sources can stay where they are.
+        let kept = [
+            Some("fx.rbxm.__2".into()),
+            Some("fx.rbxm".into()),
+            Some("third~8".into()),
+            Some("safe".into()),
+        ];
+        assert_eq!(
+            directory_fresh_outputs(&fresh, &kept, &[false; 4]),
+            [false; 4]
+        );
     }
 
     /// Large folders of identical children are common in maps, so pairing must
@@ -1004,6 +1616,68 @@ mod test {
                         rbx_dom_weak::types::Variant::String(format!(
                             "return {group} * 16 + {script}"
                         ))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_exports_reload_in_order_with_legacy_and_mixed_layouts() {
+        for (marker, name, extension) in [".__", "~"].into_iter().flat_map(|marker| {
+            ["bucket", "Part.__2", "Part__10", "Odd?.__10"]
+                .into_iter()
+                .flat_map(move |name| {
+                    ["json", "jsonc"]
+                        .into_iter()
+                        .map(move |extension| (marker, name, extension))
+                })
+        }) {
+            let base = sanitize_stem(name, "ModuleScript");
+            let mut entries = Vec::new();
+            for number in 1..=14 {
+                let stem = if number == 1 {
+                    base.clone()
+                } else {
+                    format!("{base}{marker}{number}")
+                };
+                let source = VfsSnapshot::file(format!("return {number}"));
+                let meta = VfsSnapshot::file(format!(r#"{{"name":"{name}"}}"#));
+                if number % 2 == 0 {
+                    entries.push((
+                        stem,
+                        VfsSnapshot::dir([
+                            ("init.luau".to_owned(), source),
+                            (format!("init.meta.{extension}"), meta),
+                        ]),
+                    ));
+                } else {
+                    entries.push((format!("{stem}.luau"), source));
+                    entries.push((format!("{stem}.meta.{extension}"), meta));
+                }
+            }
+            let mut imfs = InMemoryFs::new();
+            imfs.load_snapshot("/root", VfsSnapshot::dir(entries))
+                .unwrap();
+            let vfs = Vfs::new(imfs);
+            vfs.set_watch_enabled(false);
+            for workers in [1, 4] {
+                let loaded = rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        snapshot_from_vfs(&InstanceContext::default(), &vfs, Path::new("/root"))
+                            .unwrap()
+                            .unwrap()
+                    });
+                assert_eq!(loaded.children.len(), 14);
+                for (index, child) in loaded.children.iter().enumerate() {
+                    assert_eq!(child.name, name);
+                    assert_eq!(child.class_name, ustr("ModuleScript"));
+                    assert_eq!(
+                        child.properties[&ustr("Source")],
+                        Variant::String(format!("return {}", index + 1))
                     );
                 }
             }

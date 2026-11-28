@@ -14,12 +14,12 @@ use rbx_dom_weak::{
 
 use crate::{
     rojo_ref::{RojoRef, REF_ID_ATTRIBUTE_NAME},
-    snapshot::RojoTree,
+    snapshot::{InstanceWithMeta, RojoTree},
     Project,
 };
 
 use super::{
-    file_names::{directory_middleware_for_instance, free_child_stem},
+    file_names::{directory_middleware_for_instance, free_child_stem, sibling_number},
     get_property_filter, inline, link_scoped_referents,
     model_trees::{CompiledModelTreeRules, ModelTrees},
     ref_properties::attribute_ids,
@@ -36,11 +36,13 @@ pub struct NewSubtree {
 /// Serializes `model`'s only top-level instance as a new child of `parent`,
 /// with files inside `directory`, the directory that stores `parent`'s
 /// children. `existing` holds the lowercased names of the entries already in
-/// `directory`, which the new files must not take.
+/// `directory`, which the new files must not take. `replacement` identifies the
+/// old root, whose ordinal is kept only within the same parent and name group.
 ///
 /// The output is the same as a full syncback would write for the subtree, so
 /// the project's naming, layout, and ignore rules all apply. Nothing is written
 /// to disk.
+#[allow(clippy::too_many_arguments)]
 pub fn syncback_new_subtree(
     vfs: &Vfs,
     old_tree: &RojoTree,
@@ -48,6 +50,7 @@ pub fn syncback_new_subtree(
     parent: Ref,
     directory: &Path,
     existing: &HashSet<String>,
+    replacement: Option<Ref>,
     mut model: WeakDom,
 ) -> anyhow::Result<NewSubtree> {
     let top_level = model.root().children().to_vec();
@@ -103,6 +106,7 @@ pub fn syncback_new_subtree(
             attribute_ids: &attribute_ids,
         },
         old: Some(parent),
+        metadata_source: None,
         new: destination,
         path: directory.to_path_buf(),
         middleware: None,
@@ -112,7 +116,8 @@ pub fn syncback_new_subtree(
     let middleware = model_trees
         .middleware(subtree)
         .unwrap_or_else(|| directory_middleware_for_instance(child));
-    let stem = free_child_stem(child, middleware, existing);
+    let required_number = next_child_number(old_tree, parent_instance, &child.name, replacement)?;
+    let stem = free_child_stem(child, middleware, existing, required_number)?;
     let root_snapshot = parent_snapshot.with_stem(directory, subtree, None, &stem);
 
     let ignore_patterns = project
@@ -164,6 +169,50 @@ pub fn syncback_new_subtree(
         fs_snapshot,
         root_path,
     })
+}
+
+/// Uses the same logical-name groups and physical ordinals as directory reload.
+/// Counting siblings would backfill sparse exports, while reading physical names
+/// alone would mistake an unrelated natural `Twin.__100` for the hundredth Twin.
+fn next_child_number(
+    old_tree: &RojoTree,
+    parent: InstanceWithMeta<'_>,
+    logical_name: &str,
+    replacement: Option<Ref>,
+) -> anyhow::Result<u64> {
+    let key = logical_name.to_lowercase();
+    let ordinal = |sibling: InstanceWithMeta<'_>| {
+        sibling
+            .metadata()
+            .relevant_paths
+            .first()
+            .and_then(|path| path.file_name())
+            .map(|file_name| {
+                sibling_number(
+                    &file_name.to_string_lossy(),
+                    sibling.name(),
+                    &sibling.class_name(),
+                )
+            })
+            .unwrap_or(1)
+    };
+    if let Some(old) = replacement.and_then(|id| old_tree.get_instance(id)) {
+        if old.parent() == parent.id() && old.name().to_lowercase() == key {
+            return Ok(ordinal(old));
+        }
+    }
+    let mut maximum = 0;
+    for id in parent.children() {
+        let sibling = old_tree
+            .get_instance(*id)
+            .context("A sibling is no longer known")?;
+        if sibling.name().to_lowercase() == key {
+            maximum = maximum.max(ordinal(sibling));
+        }
+    }
+    maximum
+        .checked_add(1)
+        .with_context(|| format!("Sibling ordinals are exhausted for instance {logical_name:?}"))
 }
 
 /// Removes the properties the project's syncback rules ignore from every
@@ -231,6 +280,257 @@ mod test {
 
     use super::*;
     use crate::snapshot::{InstanceMetadata, InstanceSnapshot};
+
+    fn sibling_tree(siblings: &[(&str, &str, Option<&str>)]) -> RojoTree {
+        RojoTree::new(
+            InstanceSnapshot::new().children(
+                siblings
+                    .iter()
+                    .map(|(name, class, source)| {
+                        InstanceSnapshot::new()
+                            .name(*name)
+                            .class_name(*class)
+                            .metadata(InstanceMetadata::new().relevant_paths(
+                                source.iter().map(|path| PathBuf::from(*path)).collect(),
+                            ))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    }
+
+    #[test]
+    fn sibling_floor_appends_after_the_maximum_actual_logical_sibling() {
+        for (name, class) in [
+            ("Twin", "Folder"),
+            ("Twin.__2", "ModuleScript"),
+            ("Odd?.__100", "Folder"),
+        ] {
+            let stem = super::super::file_names::sanitize_stem(name, class);
+            let case_variant = name.to_lowercase();
+            let first = format!("{stem}.luau");
+            let third = format!("{stem}~3");
+            let fourth = format!("{stem}.__4.server.luau");
+            let tree = sibling_tree(&[
+                (name, class, Some(&first)),
+                (&case_variant, class, Some(&third)),
+                (name, class, Some(&fourth)),
+                ("Unrelated", "Folder", Some("Twin.__9999")),
+            ]);
+            assert_eq!(
+                next_child_number(&tree, tree.root(), name, None).unwrap(),
+                5
+            );
+            let sparse = sibling_tree(&[(name, class, Some(&third))]);
+            assert_eq!(
+                next_child_number(&sparse, sparse.root(), name, None).unwrap(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_floor_uses_logical_names_instead_of_stripping_extensions() {
+        let tree = sibling_tree(&[
+            ("Twin", "ModuleScript", Some("Twin.luau")),
+            ("Twin.__2", "Folder", Some("Twin.__2")),
+            ("Twin.__100", "Folder", Some("Twin.__100")),
+            ("Twin.luau", "Folder", Some("Twin.luau.__999")),
+        ]);
+        assert_eq!(
+            next_child_number(&tree, tree.root(), "Twin", None).unwrap(),
+            2
+        );
+        assert_eq!(
+            next_child_number(&tree, tree.root(), "Twin.__100", None).unwrap(),
+            2
+        );
+        assert_eq!(
+            next_child_number(&tree, tree.root(), "Other", None).unwrap(),
+            1
+        );
+        let virtual_siblings = sibling_tree(&[("Twin", "Folder", None)]);
+        assert_eq!(
+            next_child_number(&virtual_siblings, virtual_siblings.root(), "Twin", None).unwrap(),
+            2
+        );
+        // Reload groups Unicode case variants with the same lowercase key too.
+        let unicode = sibling_tree(&[("Tŵin", "Folder", Some("Tŵin~3"))]);
+        assert_eq!(
+            next_child_number(&unicode, unicode.root(), "TŴIN", None).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn replacements_in_other_parents_or_name_groups_still_append() {
+        let mut tree = sibling_tree(&[
+            ("Twin", "ModuleScript", Some("Twin.luau")),
+            ("Twin", "Folder", Some("Twin~3")),
+            ("Other", "Folder", Some("Other")),
+        ]);
+        let other = tree.root().children()[2];
+        let elsewhere = tree.insert_instance(other, InstanceSnapshot::new().name("Twin"));
+        for replacement in [None, Some(other), Some(elsewhere), Some(Ref::new())] {
+            assert_eq!(
+                next_child_number(&tree, tree.root(), "Twin", replacement).unwrap(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_keeps_its_original_sibling_ordinal() {
+        let tree = sibling_tree(&[
+            ("Twin", "Folder", Some("Twin")),
+            ("Twin", "Folder", Some("Twin.__3.rbxm")),
+            ("Twin", "Folder", Some("Twin.__8")),
+        ]);
+        for (index, expected) in [1, 3, 8].into_iter().enumerate() {
+            assert_eq!(
+                next_child_number(
+                    &tree,
+                    tree.root(),
+                    "tWiN",
+                    Some(tree.root().children()[index])
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_ordinals_still_obey_physical_and_sidecar_reservations() {
+        let dom = WeakDom::new(InstanceBuilder::new("ModuleScript").with_name("Twin"));
+        for number in [1, 3] {
+            let stem = if number == 1 {
+                "Twin".to_owned()
+            } else {
+                format!("Twin.__{number}")
+            };
+            let source = format!("{stem}.luau");
+            let tree = sibling_tree(&[("Twin", "ModuleScript", Some(&source))]);
+            let required =
+                next_child_number(&tree, tree.root(), "Twin", Some(tree.root().children()[0]))
+                    .unwrap();
+            for reserved in [
+                source.to_lowercase(),
+                format!("{}.meta.json", stem.to_lowercase()),
+                format!("{}.meta.jsonc", stem.to_lowercase()),
+            ] {
+                let existing = HashSet::from([reserved]);
+                let actual = free_child_stem(
+                    dom.root(),
+                    directory_middleware_for_instance(dom.root()),
+                    &existing,
+                    required,
+                )
+                .unwrap();
+                assert_eq!(actual, format!("Twin.__{}", number + 1));
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_floor_reports_exhaustion_without_overflow() {
+        for marker in ["~", ".__"] {
+            let last = format!("Twin{marker}{}", u64::MAX);
+            let tree = sibling_tree(&[("Twin", "Folder", Some(&last))]);
+            let error = next_child_number(&tree, tree.root(), "Twin", None).unwrap_err();
+            assert!(error.to_string().contains("Sibling ordinals are exhausted"));
+        }
+    }
+
+    #[test]
+    fn incremental_additions_skip_pending_paths_without_a_parent_snapshot_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("src");
+        std::fs::create_dir(&directory).unwrap();
+        let project = temp.path().join("default.project.json");
+        std::fs::write(&project, r#"{"name":"Test","tree":{"$className":"Folder","$path":"src"},"syncbackRules":{"instancesAsDirectories":true}}"#).unwrap();
+        for number in [1, 3] {
+            let stem = if number == 1 {
+                "Twin".to_owned()
+            } else {
+                format!("Twin~{number}")
+            };
+            std::fs::write(
+                directory.join(format!("{stem}.luau")),
+                format!("return {number}"),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join(format!("{stem}.meta.json")),
+                r#"{"name":"Twin"}"#,
+            )
+            .unwrap();
+        }
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let session = crate::serve_session::ServeSession::new(vfs, &project).unwrap();
+        let tree = session.tree();
+        let mut existing: HashSet<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_lowercase())
+            .collect();
+        // A pending sidecar reserves ordinal 4 even though no logical sibling
+        // has reached the parent snapshot yet. JSON and JSONC both count.
+        for extension in ["json", "jsonc"] {
+            existing.insert(format!("twin.__4.meta.{extension}"));
+        }
+        for number in 5..=7 {
+            let model = WeakDom::new(
+                InstanceBuilder::new("Folder").with_child(
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name("Twin")
+                        .with_property("Source", format!("return {number}")),
+                ),
+            );
+            let created = syncback_new_subtree(
+                session.vfs(),
+                &tree,
+                session.root_project(),
+                tree.get_root_id(),
+                &directory,
+                &existing,
+                None,
+                model,
+            )
+            .unwrap();
+            assert_eq!(
+                created.root_path,
+                directory.join(format!("Twin.__{number}.luau"))
+            );
+            created
+                .fs_snapshot
+                .write_to_vfs(temp.path(), session.vfs())
+                .unwrap();
+            existing.insert(
+                created
+                    .root_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_lowercase(),
+            );
+        }
+        assert_eq!(tree.root().children().len(), 2);
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let reloaded = crate::serve_session::ServeSession::new(vfs, &project).unwrap();
+        let tree = reloaded.tree();
+        let sources: Vec<_> = tree
+            .root()
+            .children()
+            .iter()
+            .map(|id| tree.get_instance(*id).unwrap().properties()[&ustr("Source")].clone())
+            .collect();
+        assert_eq!(
+            sources,
+            [1, 3, 5, 6, 7].map(|number| Variant::String(format!("return {number}")))
+        );
+    }
 
     fn has_id(model: &WeakDom, name: &str) -> bool {
         let instance = model

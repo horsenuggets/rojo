@@ -502,6 +502,7 @@ mod test {
             tree.get_root_id(),
             &root.join("src"),
             &HashSet::new(),
+            None,
             terrain_dom(),
         )
         .unwrap();
@@ -753,7 +754,7 @@ mod test {
 
         assert!(root.join("src/FX.rbxm").is_file());
         assert!(!root.join("src/FX").exists());
-        let moved = std::fs::read_to_string(root.join("src/FX.rbxm~2/init.meta.json")).unwrap();
+        let moved = std::fs::read_to_string(root.join("src/FX.rbxm.__2/init.meta.json")).unwrap();
         assert!(moved.contains(r#""name": "FX.rbxm""#), "{moved}");
     }
 

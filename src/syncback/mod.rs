@@ -40,10 +40,13 @@ use crate::{
 };
 
 pub use addition::{drop_duplicate_ids, drop_ignored_properties, syncback_new_subtree};
+#[cfg(test)]
+pub(crate) use file_names::sanitize_stem;
 pub use file_names::{
     directory_middleware_for_instance, extension_for_middleware, name_for_inst, sibling_order_key,
     unique_child_stems, validate_file_name,
 };
+pub(crate) use file_names::{free_child_stem, sibling_number};
 pub use fs_snapshot::FsSnapshot;
 pub use hash::*;
 pub(crate) use inline::is_script_class;
@@ -791,6 +794,7 @@ fn syncback_scoped(
             attribute_ids: &attribute_ids,
         },
         old: Some(id),
+        metadata_source: None,
         new: new_tree.root_ref(),
         path: migration
             .filter(|_| !middleware.is_dir())
@@ -1171,6 +1175,7 @@ pub fn syncback_loop(
     let mut snapshots = vec![SyncbackSnapshot {
         data: syncback_data,
         old: Some(old_tree.get_root_id()),
+        metadata_source: None,
         new: new_tree.root_ref(),
         path: project.file_location.clone(),
         middleware: Some(Middleware::Project),
@@ -1398,7 +1403,8 @@ fn syncback_snapshot<'sync>(
             // very paths an ignore conflict is reported to protect.
             Err(err)
                 if middleware == Middleware::Dir
-                    && err.downcast_ref::<IgnoreConflict>().is_none() =>
+                    && err.downcast_ref::<IgnoreConflict>().is_none()
+                    && err.downcast_ref::<OwnershipConflict>().is_none() =>
             {
                 let new_middleware = match env::var(DEBUG_MODEL_FORMAT_VAR) {
                     Ok(value) if value == "1" => Middleware::Rbxmx,
@@ -1508,6 +1514,11 @@ fn syncback_snapshot<'sync>(
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct IgnoreConflict(pub String);
+
+/// Conflicting source ownership cannot be repaired by collapsing the parent to a model.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct OwnershipConflict(pub String);
 
 pub struct SyncbackReturn<'sync> {
     pub fs_snapshot: FsSnapshot,
@@ -2622,6 +2633,7 @@ mod test {
                             attribute_ids: &attribute_ids,
                         },
                         old: Some(tree.get_root_id()),
+                        metadata_source: None,
                         new: input.root_ref(),
                         path: path.clone(),
                         middleware: Some(Middleware::Project),

@@ -115,12 +115,13 @@ pub fn syncback_csv<'sync>(
             .path
             .parent_err()?
             .join(format!("{}.meta.json", snapshot.file_stem()));
-        if !meta.is_empty() || super::lua::metadata_exists(snapshot.vfs(), &meta_path) {
-            fs_snapshot.add_file(
-                meta_path,
-                crate::json::to_vec_pretty(&meta).context("cannot serialize metadata")?,
-            )
-        }
+        super::meta_file::write_metadata(
+            snapshot.vfs(),
+            &mut fs_snapshot,
+            &meta_path,
+            &meta,
+            meta.is_empty(),
+        )?;
     }
 
     Ok(SyncbackReturn {
@@ -154,13 +155,13 @@ pub fn syncback_csv_init<'sync>(
         // about, so shifting is fine.
         meta.properties.shift_remove(&ustr("Contents"));
         let meta_path = snapshot.path.join("init.meta.json");
-        if !meta.is_empty() || super::lua::metadata_exists(snapshot.vfs(), &meta_path) {
-            dir_syncback.fs_snapshot.add_file(
-                meta_path,
-                crate::json::to_vec_pretty(&meta)
-                    .context("could not serialize new init.meta.json")?,
-            );
-        }
+        super::meta_file::write_metadata(
+            snapshot.vfs(),
+            &mut dir_syncback.fs_snapshot,
+            &meta_path,
+            &meta,
+            meta.is_empty(),
+        )?;
     }
 
     Ok(dir_syncback)
