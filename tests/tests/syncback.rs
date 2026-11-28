@@ -3546,3 +3546,212 @@ fn syncing_back_again_only_changes_what_changed() {
     );
     pretty_assertions::assert_eq!(sync(&place), expected);
 }
+
+/// Exercise every adjacent and initializer writer with the same metadata contract.
+fn check_jsonc_metadata_writer(
+    extension: &str,
+    initializer: bool,
+    old_name: &str,
+    new_name: &str,
+    stem: &str,
+    clearing: bool,
+    dual: bool,
+) {
+    use rbx_dom_weak::InstanceBuilder;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("default.project.json");
+    let src = dir.path().join("src");
+    fs_err::create_dir_all(&src).unwrap();
+    fs_err::write(
+        &project,
+        r#"{"name":"Metadata","syncbackRules":{"instancesAsDirectories":true},
+        "tree":{"$className":"DataModel","ReplicatedStorage":{"$path":"src"}}}"#,
+    )
+    .unwrap();
+    let (source_path, meta_path) = if initializer {
+        let folder = src.join(stem);
+        fs_err::create_dir(&folder).unwrap();
+        (
+            folder.join(format!("init.{extension}")),
+            folder.join("init.meta.jsonc"),
+        )
+    } else {
+        (
+            src.join(format!("{stem}.{extension}")),
+            src.join(format!("{stem}.meta.jsonc")),
+        )
+    };
+    let (class, property, original, incoming) = match extension {
+        "luau" => ("ModuleScript", "Source", "return 'old'", "return 'new'"),
+        "txt" => ("StringValue", "Value", "old", "new"),
+        "csv" => (
+            "LocalizationTable",
+            "Contents",
+            "Key,Source\nGreeting,Old\n",
+            r#"[{"key":"Greeting","source":"New","values":{}}]"#,
+        ),
+        _ => unreachable!(),
+    };
+    fs_err::write(&source_path, original).unwrap();
+    let mut meta = serde_json::json!({"name":old_name,
+        "properties":{"Archivable":false}, "attributes":{"Stale":"old"}});
+    let preserve_identity = !clearing && old_name == "a?";
+    if preserve_identity {
+        meta["id"] = "owner".into();
+        meta["$schema"] = "schema.json".into();
+        meta["ignoreUnknownInstances"] = true.into();
+    }
+    // A real JSONC file, not just JSON with a different extension.
+    fs_err::write(&meta_path, format!("// Existing metadata.\n{meta}\n")).unwrap();
+    if dual {
+        fs_err::write(meta_path.with_extension("json"), "{}").unwrap();
+    }
+    let mut child = InstanceBuilder::new(class)
+        .with_name(new_name)
+        .with_property(property, incoming);
+    if initializer {
+        // Initially inline children must be materialized once, never resurrected
+        // from a stale second metadata file on a later build.
+        meta["children"] = serde_json::json!([{"className":"Folder", "name":"Retained"}]);
+        fs_err::write(&meta_path, format!("// Existing metadata.\n{meta}\n")).unwrap();
+        child = child.with_child(InstanceBuilder::new("Folder").with_name("Retained"));
+    }
+    let dom = WeakDom::new(
+        InstanceBuilder::new("DataModel")
+            .with_child(InstanceBuilder::new("ReplicatedStorage").with_child(child)),
+    );
+    let input = dir.path().join("incoming.rbxl");
+    rbx_binary::to_writer(
+        fs_err::File::create(&input).unwrap(),
+        &dom,
+        dom.root().children(),
+    )
+    .unwrap();
+    let before = read_files(&src);
+    let mut previous = None;
+    for _ in 0..2 {
+        let result = Command::new(ROJO_PATH)
+            .arg("syncback")
+            .arg(&project)
+            .arg("--input")
+            .arg(&input)
+            .arg("--non-interactive")
+            .output()
+            .unwrap();
+        if dual {
+            assert!(
+                !result.status.success(),
+                "Dual metadata must fail before persistence for {source_path:?}."
+            );
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("hold this instance's metadata"),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(read_files(&src), before);
+            return;
+        }
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = dir.path().join("rebuilt.rbxl");
+        let result = Command::new(ROJO_PATH)
+            .arg("build")
+            .arg(&project)
+            .arg("--output")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rebuilt = rbx_binary::from_reader(fs_err::File::open(output).unwrap()).unwrap();
+        let child = rebuilt
+            .descendants()
+            .find(|child| child.class == class)
+            .unwrap();
+        assert_eq!(child.name, new_name, "{source_path:?}");
+        assert_eq!(
+            child.properties[&ustr(property)],
+            Variant::String(incoming.into())
+        );
+        assert_ne!(
+            child.properties.get(&ustr("Archivable")),
+            Some(&Variant::Bool(false))
+        );
+        assert!(!matches!(child.properties.get(&ustr("Attributes")),
+            Some(Variant::Attributes(attributes)) if attributes.get("Stale").is_some()));
+        if initializer {
+            assert_eq!(child.children().len(), 1);
+            assert_eq!(
+                rebuilt.get_by_ref(child.children()[0]).unwrap().name,
+                "Retained"
+            );
+        }
+        assert!(!meta_path.with_extension("json").exists());
+        let updated: serde_json::Value =
+            serde_json::from_slice(&fs_err::read(&meta_path).unwrap()).unwrap();
+        if clearing {
+            assert_eq!(updated, serde_json::json!({}));
+        } else {
+            assert_eq!(updated["name"], new_name);
+            if preserve_identity {
+                assert_eq!(updated["id"], "owner");
+                assert_eq!(updated["$schema"], "schema.json");
+                assert_eq!(updated["ignoreUnknownInstances"], true);
+            }
+        }
+        let files = read_files(&src);
+        if let Some(previous) = previous.replace(files.clone()) {
+            assert_eq!(files, previous);
+        }
+    }
+}
+
+#[test]
+fn jsonc_metadata_writers_round_trip_normalized_renames() {
+    for (extension, initializer) in [
+        ("luau", false),
+        ("luau", true),
+        ("txt", false),
+        ("csv", false),
+        ("csv", true),
+    ] {
+        for (old, new, stem) in [("Twin", "twin", "Twin"), ("a?", "a*", "a_")] {
+            check_jsonc_metadata_writer(extension, initializer, old, new, stem, false, false);
+        }
+    }
+}
+
+#[test]
+fn jsonc_metadata_writers_clear_removed_values() {
+    for (extension, initializer) in [
+        ("luau", false),
+        ("luau", true),
+        ("txt", false),
+        ("csv", false),
+        ("csv", true),
+    ] {
+        check_jsonc_metadata_writer(extension, initializer, "Twin", "Twin", "Twin", true, false);
+    }
+}
+
+#[test]
+fn jsonc_metadata_writers_reject_dual_files_without_persistence() {
+    for (extension, initializer) in [
+        ("luau", false),
+        ("luau", true),
+        ("txt", false),
+        ("csv", false),
+        ("csv", true),
+    ] {
+        check_jsonc_metadata_writer(extension, initializer, "Twin", "twin", "Twin", false, true);
+        check_jsonc_metadata_writer(extension, initializer, "a?", "a*", "a_", false, true);
+        check_jsonc_metadata_writer(extension, initializer, "Twin", "Twin", "Twin", true, true);
+    }
+}

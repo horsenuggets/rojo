@@ -1,6 +1,5 @@
 use std::{path::Path, str};
 
-use anyhow::Context as _;
 use memofs::Vfs;
 use rbx_dom_weak::types::Variant;
 use rbx_dom_weak::ustr;
@@ -60,12 +59,13 @@ pub fn syncback_txt<'sync>(
             .path
             .parent_err()?
             .join(format!("{}.meta.json", snapshot.file_stem()));
-        if !meta.is_empty() || super::lua::metadata_exists(snapshot.vfs(), &meta_path) {
-            fs_snapshot.add_file(
-                meta_path,
-                crate::json::to_vec_pretty(&meta).context("could not serialize metadata")?,
-            );
-        }
+        super::meta_file::write_metadata(
+            snapshot.vfs(),
+            &mut fs_snapshot,
+            &meta_path,
+            &meta,
+            meta.is_empty(),
+        )?;
     }
 
     Ok(SyncbackReturn {

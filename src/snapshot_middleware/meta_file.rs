@@ -15,10 +15,47 @@ use crate::{
         normalize_json_variant, normalize_property_names, AmbiguousValue, UnresolvedValue,
     },
     snapshot::{InstanceMetadata, InstanceSnapshot},
-    syncback::SyncbackSnapshot,
+    syncback::{FsSnapshot, SyncbackSnapshot},
     variant_eq::variant_eq,
     RojoRef, REF_ID_ATTRIBUTE_NAME,
 };
+
+/// Stages metadata in its existing format, including an empty rewrite that
+/// clears old overrides. Both files are applied by the readers, so dual files
+/// cannot safely receive the same payload (IDs, schemas, and inline children
+/// would be applied twice). Like model and scoped writers, refuse that case
+/// rather than removing a file or changing ignored/scoped ownership.
+pub(super) fn write_metadata<T: Serialize>(
+    vfs: &Vfs,
+    output: &mut FsSnapshot,
+    json_path: &Path,
+    metadata: &T,
+    empty: bool,
+) -> anyhow::Result<()> {
+    let jsonc_path = json_path.with_extension("jsonc");
+    let is_file = |path: &Path| -> anyhow::Result<bool> {
+        Ok(vfs
+            .metadata(path)
+            .with_not_found()?
+            .is_some_and(|metadata| metadata.is_file()))
+    };
+    let json_exists = is_file(json_path)?;
+    let jsonc_exists = is_file(&jsonc_path)?;
+    anyhow::ensure!(
+        !(json_exists && jsonc_exists),
+        "Both {} and {} hold this instance's metadata, so it can't be safely rewritten",
+        json_path.display(),
+        jsonc_path.display()
+    );
+    if !empty || json_exists || jsonc_exists {
+        let path = if jsonc_exists { &jsonc_path } else { json_path };
+        output.add_file(
+            path,
+            json::to_vec_pretty(metadata).context("could not serialize metadata")?,
+        );
+    }
+    Ok(())
+}
 
 /// Splits serializable values into metadata properties and attributes, sorted
 /// by name.
@@ -843,6 +880,223 @@ mod test {
     use rbx_dom_weak::ustr;
 
     use super::*;
+
+    #[test]
+    fn metadata_output_selects_one_format_and_clears_existing_values() {
+        for path in ["/src/Twin.meta.json", "/src/Twin/init.meta.json"] {
+            let path = Path::new(path);
+            let jsonc = path.with_extension("jsonc");
+            for files in 0..4 {
+                for empty in [false, true] {
+                    let mut imfs = InMemoryFs::new();
+                    imfs.load_snapshot(path.parent().unwrap(), VfsSnapshot::empty_dir())
+                        .unwrap();
+                    for (bit, candidate) in [(1, path), (2, jsonc.as_path())] {
+                        if files & bit != 0 {
+                            imfs.load_snapshot(
+                                candidate,
+                                VfsSnapshot::file(r#"{"name":"Twin","attributes":{"Stale":1}}"#),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    let vfs = Vfs::new(imfs);
+                    let mut output = FsSnapshot::new();
+                    let metadata = if empty {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"name":"twin", "id":"owner",
+                            "$schema":"schema.json", "ignoreUnknownInstances":true})
+                    };
+                    let result = write_metadata(&vfs, &mut output, path, &metadata, empty);
+                    if files == 3 {
+                        assert!(result.unwrap_err().to_string().contains("Both"));
+                        assert!(output.is_empty());
+                        continue;
+                    }
+                    result.unwrap();
+                    assert!(output.removed_paths().is_empty());
+                    if files == 0 && empty {
+                        assert!(output.is_empty());
+                        continue;
+                    }
+                    let target = if files == 2 { jsonc.as_path() } else { path };
+                    assert_eq!(output.added_files(), [target]);
+                    output.write_to_vfs("/", &vfs).unwrap();
+                    let mut snapshot = InstanceSnapshot::new().name("Twin");
+                    if path.ends_with("init.meta.json") {
+                        DirectoryMetadata::read_and_apply_all(
+                            &vfs,
+                            path.parent().unwrap(),
+                            &mut snapshot,
+                        )
+                        .unwrap();
+                    } else {
+                        AdjacentMetadata::read_and_apply_all(
+                            &vfs,
+                            &path.with_extension("luau"),
+                            "Twin",
+                            &mut snapshot,
+                        )
+                        .unwrap();
+                    }
+                    assert_eq!(snapshot.name, if empty { "Twin" } else { "twin" });
+                    assert!(!snapshot.properties.contains_key(&ustr("Attributes")));
+                    assert_eq!(snapshot.metadata.ignore_unknown_instances, !empty);
+                    assert_eq!(snapshot.metadata.specified_id.is_some(), !empty);
+                    assert_eq!(snapshot.metadata.schema.is_some(), !empty);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_output_keeps_scoped_and_ignored_ownership() {
+        use crate::{
+            snapshot::RojoTree,
+            snapshot_middleware::Middleware,
+            syncback::{syncback_instance, validate_write_targets},
+            Project,
+        };
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+        for (middleware, extension, class, property, value, initializer) in [
+            (
+                Middleware::ModuleScript,
+                "luau",
+                "ModuleScript",
+                "Source",
+                "return 1",
+                false,
+            ),
+            (
+                Middleware::ModuleScriptDir,
+                "luau",
+                "ModuleScript",
+                "Source",
+                "return 1",
+                true,
+            ),
+            (
+                Middleware::Text,
+                "txt",
+                "StringValue",
+                "Value",
+                "text",
+                false,
+            ),
+            (
+                Middleware::Csv,
+                "csv",
+                "LocalizationTable",
+                "Contents",
+                "[]",
+                false,
+            ),
+            (
+                Middleware::CsvDir,
+                "csv",
+                "LocalizationTable",
+                "Contents",
+                "[]",
+                true,
+            ),
+        ] {
+            for (dual, ignored) in [(false, false), (false, true), (true, false)] {
+                let temp = tempfile::tempdir().unwrap();
+                let vfs = Vfs::new_default().unwrap();
+                vfs.set_watch_enabled(false);
+                let project_path = temp.path().join("default.project.json");
+                let mut project = serde_json::json!({"name":"Test","tree":{"$className":"Folder"}});
+                if ignored {
+                    project["syncbackRules"] =
+                        serde_json::json!({"ignorePaths":["**/*.meta.jsonc"]});
+                }
+                vfs.write(&project_path, serde_json::to_vec(&project).unwrap())
+                    .unwrap();
+                let project = Project::load_exact(&vfs, &project_path, Some("Test")).unwrap();
+                let path = temp.path().join(if initializer {
+                    "Twin".to_owned()
+                } else {
+                    format!("Twin.{extension}")
+                });
+                let meta_path = if initializer {
+                    vfs.create_dir_all(&path).unwrap();
+                    path.join("init.meta.jsonc")
+                } else {
+                    temp.path().join("Twin.meta.jsonc")
+                };
+                let source = if initializer {
+                    path.join(format!("init.{extension}"))
+                } else {
+                    path.clone()
+                };
+                vfs.write(
+                    &source,
+                    if extension == "csv" {
+                        "Key,Source,Context,Example\n"
+                    } else {
+                        value
+                    },
+                )
+                .unwrap();
+                let original = r#"{"id":"owner","$schema":"schema.json","ignoreUnknownInstances":true,"attributes":{"Stale":1}}"#;
+                vfs.write(&meta_path, original).unwrap();
+                if dual {
+                    vfs.write(meta_path.with_extension("json"), "{}").unwrap();
+                }
+                let mut root = InstanceSnapshot::new()
+                    .name("Twin")
+                    .class_name(class)
+                    .property(ustr(property), value)
+                    .metadata(
+                        InstanceMetadata::new()
+                            .middleware(middleware)
+                            .instigating_source(path.clone())
+                            .relevant_paths(vec![source.clone(), meta_path.clone()]),
+                    );
+                if initializer {
+                    DirectoryMetadata::read_and_apply_all(&vfs, &path, &mut root).unwrap();
+                } else {
+                    AdjacentMetadata::read_and_apply_all(&vfs, &path, "Twin", &mut root).unwrap();
+                }
+                let tree = RojoTree::new(root);
+                let incoming = WeakDom::new(
+                    InstanceBuilder::new(class)
+                        .with_name("Twin")
+                        .with_property(property, value),
+                );
+                let result = syncback_instance(&vfs, &tree, &project, tree.get_root_id(), incoming);
+                if dual {
+                    assert!(result.err().unwrap().to_string().contains("Both"));
+                    assert_eq!(vfs.read_to_string(&meta_path).unwrap().as_str(), original);
+                    continue;
+                }
+                let output = result.unwrap();
+                assert!(output.removed_paths().is_empty());
+                assert!(!output
+                    .added_files()
+                    .contains(&meta_path.with_extension("json").as_path()));
+                if ignored {
+                    assert!(validate_write_targets(&project, &output).is_err());
+                    assert_eq!(vfs.read_to_string(&meta_path).unwrap().as_str(), original);
+                    continue;
+                }
+                validate_write_targets(&project, &output).unwrap();
+                let expected =
+                    FsSnapshot::capture_file_contents(&[source, meta_path.clone()], &vfs).unwrap();
+                output
+                    .write_single_file_to_vfs(temp.path(), &vfs, &expected)
+                    .unwrap();
+                let updated: serde_json::Value =
+                    serde_json::from_slice(&vfs.read(&meta_path).unwrap()).unwrap();
+                assert_eq!(updated["id"], "owner");
+                assert_eq!(updated["$schema"], "schema.json");
+                assert_eq!(updated["ignoreUnknownInstances"], true);
+                assert!(updated.get("attributes").is_none());
+            }
+        }
+    }
 
     #[test]
     fn model_root_metadata_keeps_only_what_the_model_cannot_hold() {
